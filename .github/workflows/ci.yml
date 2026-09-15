@@ -20,5 +20,9 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
-      # 网络集成用例会启动真实子进程并争用同一组本机端口；CI 串行跑文件，避免用例之间互相冒充客户环境冲突。
-      - run: npm test -- --fileParallelism=false
+      - run: npm run prepare:xray
+      # 这三组用例依赖全局端口与真实子进程，先在干净现场单独跑，避免前序故障演练留下的系统级状态干扰判据。
+      - name: Run clean-state network lifecycle tests
+        run: npx --no-install vitest run tests/tunnel/ipc-actions.test.ts tests/tunnel/self-repair.test.ts tests/tunnel/self-repair-timeout.test.ts
+      - name: Run remaining tests
+        run: npx --no-install vitest run --exclude tests/tunnel/ipc-actions.test.ts --exclude tests/tunnel/self-repair.test.ts --exclude tests/tunnel/self-repair-timeout.test.ts
