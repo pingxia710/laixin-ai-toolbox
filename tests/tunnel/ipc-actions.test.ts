@@ -100,6 +100,7 @@ describe('五动作与桥注册(判据 3②③主进程侧、6 IPC 负向、12 �
         spawnedChildren.push(child)
       },
       routesFile: join(SIDECAR_DIR, 'routes.default.json'),
+      reuseDirect: false,
       connectorOverride: {
         kind: 'loopback-probe',
         host: '127.0.0.1',

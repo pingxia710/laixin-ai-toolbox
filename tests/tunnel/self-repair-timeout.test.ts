@@ -33,7 +33,7 @@ async function setup(timeoutMs: number, pollFlag: string[], adapterFile = './fix
   const service = new TunnelService({ dataDir, sidecarDir, picker: async () => packageDir,
     trust: { whitelistDigests: [built.digest], signingPublicKeys: [] }, now: () => Date.parse('2026-10-01T00:00:00Z'),
     spawnDaemon: (_dir, runId) => launch('start', runId), spawnRestore: () => launch('restore'),
-    routesFile: join(sidecarDir, 'routes.default.json'), repairTimeoutMs: timeoutMs,
+    routesFile: join(sidecarDir, 'routes.default.json'), reuseDirect: false, repairTimeoutMs: timeoutMs,
     // 出口 IP 拿不到：通道与系统代理都已应用，但复验永远不达标（类似生产的「通道待确认」）。
     connectorOverride: { kind: 'loopback-probe', host: '127.0.0.1', port: upstream.port, exitIp: '' } })
   cleanups.push(async () => {
