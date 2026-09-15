@@ -1,0 +1,157 @@
+.pinned-platforms {
+  display: grid;
+  gap: 4px;
+}
+
+.pinned-platform-row {
+  position: relative;
+  display: block;
+  border-radius: 8px;
+}
+
+.pinned-platform-row:active { cursor: grabbing; }
+/* 与其他导航项一致：同样的高度、内边距与图标尺寸。 */
+.pinned-platform-entry .platform-logo { width: 18px; height: 18px; flex-shrink: 0; }
+.pinned-platform-row.is-dragging { opacity: .46; }
+.pinned-platform-row.is-drop-before { box-shadow: inset 0 2px 0 var(--accent); }
+.pinned-platform-row.is-drop-after { box-shadow: inset 0 -2px 0 var(--accent); }
+.pinned-platform-entry { min-width: 0; }
+
+/* 收回按钮不抢占日常导航视觉；鼠标进入整行后才成为可点控件。 */
+.pinned-platform-row > .platform-layout-action {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.pinned-platform-row:hover > .platform-layout-action,
+.pinned-platform-row:has(:focus-visible) > .platform-layout-action {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.platform-layout-action {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  color: var(--muted);
+  font-size: 19px;
+  line-height: 1;
+  transition: opacity 160ms var(--ease-out), color 160ms var(--ease-out), background-color 160ms var(--ease-out), border-color 160ms var(--ease-out), transform 160ms var(--ease-out);
+}
+
+.platform-layout-action:hover {
+  border-color: var(--line);
+  background: var(--surface-soft);
+  color: var(--accent);
+}
+
+.platform-layout-action:active { transform: translateY(1px); }
+
+.more-platforms-popover {
+  display: grid;
+  gap: 10px;
+}
+
+.more-platform-entry {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) 30px;
+  min-height: 42px;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 4px 6px 8px;
+  border-radius: 8px;
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 20px;
+}
+
+.more-platform-entry:hover { background: var(--surface-soft); }
+.more-platform-entry-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.more-platform-layout-button {
+  display: flex;
+  width: 100%;
+  min-height: 40px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface-soft);
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 600;
+  transition: border-color 160ms var(--ease-out), background-color 160ms var(--ease-out), transform 160ms var(--ease-out);
+}
+
+.more-platform-layout-button:hover { border-color: var(--accent); background: var(--accent-soft); }
+.more-platform-layout-button:active { transform: translateY(1px); }
+.more-platform-layout-button .icon { width: 16px; height: 16px; }
+
+.platform-layout-page {
+  display: grid;
+  max-width: 760px;
+  gap: 20px;
+}
+
+.platform-layout-header {
+  display: grid;
+  gap: 6px;
+}
+
+.platform-layout-header p { max-width: 48rem; }
+
+.platform-layout-summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.platform-layout-column {
+  display: grid;
+  align-content: start;
+  gap: 8px;
+  min-height: 180px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+.platform-layout-column h3 { font-size: 15px; }
+.platform-layout-column > p { font-size: 13px; }
+
+.platform-layout-platform-list {
+  display: grid;
+  gap: 4px;
+  margin: 2px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.platform-layout-platform-list li {
+  display: flex;
+  min-height: 36px;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 8px;
+  border-radius: 8px;
+  background: var(--surface-soft);
+  color: var(--ink);
+  font-size: 14px;
+}
+
+.platform-layout-note {
+  padding: 14px 16px;
+  border-radius: 10px;
+  background: var(--accent-soft);
+  color: var(--ink);
+  font-size: 13px;
+}
+
+@media (max-width: 720px) {
+  .platform-layout-summary { grid-template-columns: 1fr; }
+}

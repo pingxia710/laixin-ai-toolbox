@@ -1,0 +1,20 @@
+export const installationStageLabels: Readonly<Record<string, string>> = {
+  'download-not-downloaded': '安装包尚未准备', 'download-needs-tunnel': '下载渠道暂不可用',
+  'download-downloading': '正在下载安装包', 'download-verifying': '正在校验安装包', 'download-ready': '安装包已准备，等待打开',
+  'download-interrupted-resumable': '下载中断，可继续下载', 'download-interrupted-terminal': '下载中断，需重新下载',
+  'download-cancelled': '已取消下载', 'download-failed': '安装包下载或校验失败', 'download-handed-off-install': '已打开安装入口，安装结果待确认',
+  'codex-windows-open-installer': '准备打开 Codex Windows 安装包', 'codex-windows-installed': '确认 ChatGPT 安装并打开',
+  'codex-windows-sign-in': '在官方应用登录 ChatGPT', 'codex-windows-first-reply': '确认 Codex 首次真实回复',
+  'codex-windows-reopen': '重开后确认 Codex 回复', 'codex-windows-complete': '已由本人确认 Codex 安装与使用',
+  'installer-open': '准备打开安装包', 'ready-to-launch': '准备启动安装器', 'installer-running': '正在安装',
+  installed: '安装文件已生成，继续确认使用', 'installation-unknown': '安装结果尚未确认',
+  'installation-incomplete': '安装尚未完成', 'installation-failure': '安装遇到错误',
+  'drag-to-applications': '按引导放入应用程序', 'installed-awaiting-real-runtime': '已检测到安装，登录和首次运行待确认',
+  'config-provider': '选择模型服务', 'config-key-intro': '了解模型账号与费用', 'config-key-register': '注册模型平台账号',
+  'config-key-create': '在模型平台创建密钥', 'config-fill-model': '在 AI 软件中配置模型',
+  'config-first-reply': '确认 AI 的首次真实回复', 'config-tunnel-independent-reply': '确认 AI 日常使用网络',
+  'config-reopen-reverify': '关闭重开后确认 AI 回复', 'config-error-auth': '模型认证遇到错误',
+  'config-error-balance': '模型余额不足', 'config-error-rate-limit': '模型请求受到速率限制',
+  'config-error-model-config': '模型配置需要核对', 'config-error-probe-inconclusive': '尚不能确认模型平台连通情况',
+  'config-error-hermes': 'Hermes 运行遇到错误'
+}

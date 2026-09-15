@@ -1,0 +1,88 @@
+import { diagnosticCheckCodes, type DiagnosticSoftware, type NetworkDiagnosticReport } from '../../../network-diagnostics-types'
+import { button, statusPill } from '../page-ui'
+import { refreshSupportContext, registerSupportContext, revealSupport } from '../support-widget'
+import type { PageModule } from './types'
+
+const names: Record<DiagnosticSoftware, string> = { codex: 'Codex', claude: 'Claude', hermes: 'Hermes（DeepSeek）' }
+const states = { passed: '已确认', attention: '需要处理', unknown: '未能确认', 'not-checked': '未检查' } as const
+const codes = new Set<string>(diagnosticCheckCodes)
+
+export function parseDiagnosticReport(snapshot: string): NetworkDiagnosticReport {
+  const report = JSON.parse(snapshot) as NetworkDiagnosticReport
+  if (!report || !Object.hasOwn(names, report.software) || !Number.isSafeInteger(report.checkedAt) ||
+      !Array.isArray(report.checks) || report.checks.length !== 5 ||
+      report.checks.some((check, index) => !check || check.id !== ['internet', 'tunnel', 'service', 'account', 'application'][index] ||
+        !Object.hasOwn(states, check.state) || !codes.has(check.code) || typeof check.label !== 'string' || check.label.length > 30 ||
+        typeof check.message !== 'string' || check.message.length > 300 ||
+        (check.elapsedMs !== undefined && (!Number.isSafeInteger(check.elapsedMs) || check.elapsedMs < 0 || check.elapsedMs > 60_000)))) throw new Error('DIAGNOSTIC_REPORT_INVALID')
+  return report
+}
+
+let cleanup = (): void => undefined
+export const page: PageModule = {
+  moduleId: 'network.diagnostics', tab: 'tunnel', order: 5,
+  mount: (element, context) => {
+    cleanup()
+    let active = true
+    let report: NetworkDiagnosticReport | undefined
+    let expiry: ReturnType<typeof setTimeout> | undefined
+    const details = document.createElement('details'); details.className = 'technical-details network-diagnostics'
+    const summary = document.createElement('summary'); summary.textContent = 'AI 打不开？检查原因'
+    const body = document.createElement('div')
+    const note = document.createElement('p'); note.className = 'account-note'; note.textContent = '检查基础网络、当前通道和目标服务；登录与额度请在软件内确认。'
+    const row = document.createElement('div'); row.className = 'setting-row'
+    const label = document.createElement('label'); label.htmlFor = 'network-diagnostic-software'; label.textContent = '遇到问题的软件'
+    const select = document.createElement('select'); select.id = label.htmlFor; select.className = 'theme-select'
+    for (const [value, textContent] of Object.entries(names)) select.append(Object.assign(document.createElement('option'), { value, textContent }))
+    const feedback = document.createElement('p'); feedback.className = 'account-note'; feedback.setAttribute('role', 'status')
+    const list = document.createElement('ol'); list.className = 'diagnostic-checks'; list.hidden = true
+    const help = button('查看客服信息', { onClick: revealSupport }); help.hidden = true
+    const unregister = registerSupportContext(list, () => {
+      const current = report && Date.now() >= report.checkedAt && Date.now() - report.checkedAt < 10 * 60_000 ? report : undefined
+      return { software: current ? names[current.software] : 'AI网络', cardId: 'network-diagnostics', stageCode: 'NETWORK_DIAG',
+        reasonCodes: current ? [...new Set(current.checks.map((check) => check.code))] : ['NETWORK_DIAGNOSTIC_STALE'],
+        summary: current ? `最近检查：${names[current.software]} · ${new Date(current.checkedAt).toLocaleString('zh-CN')}。登录和对话未验证。` : '检查结果已过期，请重新检查。' }
+    })
+    const run = button('开始检查', { onClick: () => { void inspect() } })
+    const reset = () => {
+      clearTimeout(expiry)
+      report = undefined; list.replaceChildren(); list.hidden = true; help.hidden = true; feedback.textContent = ''
+      refreshSupportContext()
+    }
+    select.addEventListener('change', reset)
+    const inspect = async () => {
+      if (run.disabled) return
+      reset(); select.disabled = run.disabled = true; feedback.textContent = '正在检查，请稍候…'
+      try {
+        const result = await window.toolbox.networkdiagnostics.run({ software: select.value as DiagnosticSoftware })
+        if (!active) return
+        report = parseDiagnosticReport(result.snapshot)
+        if (report.software !== select.value) throw new Error('DIAGNOSTIC_REPORT_INVALID')
+        for (const check of report.checks) {
+          const item = document.createElement('li')
+          const title = document.createElement('div'); title.className = 'diagnostic-check-title'
+          title.append(Object.assign(document.createElement('strong'), { textContent: check.label }),
+            statusPill(check.id === 'application' && check.state === 'not-checked' ? '尚无法确认' : states[check.state], check.state === 'passed' ? 'positive' : check.state === 'attention' ? 'warning' : 'neutral'))
+          item.append(title, Object.assign(document.createElement('p'), { textContent: check.message }))
+          list.append(item)
+        }
+        list.hidden = help.hidden = false
+        refreshSupportContext()
+        expiry = setTimeout(refreshSupportContext, Math.max(0, report.checkedAt + 10 * 60_000 - Date.now()))
+        feedback.textContent = `检查完成 · ${new Date(report.checkedAt).toLocaleTimeString('zh-CN')}。可在客服信息中复制本次结果。`
+      } catch {
+        if (active) { reset(); feedback.textContent = '本次检查未完成，请重试或联系客服。' }
+      } finally { if (active) select.disabled = run.disabled = false }
+    }
+    row.append(label, select, run); body.append(note, row, feedback, list, help); details.append(summary, body); element.append(details)
+    // 从出错的软件跳进来：预选那个软件、展开这一节并滚到眼前，客户不用自己找。
+    if (context.diagnosticSoftware !== undefined && Object.hasOwn(names, context.diagnosticSoftware)) {
+      select.value = context.diagnosticSoftware
+      details.open = true
+      feedback.textContent = `已选中${names[context.diagnosticSoftware]}，点「开始检查」看是哪一层不通。`
+      requestAnimationFrame(() => { if (active) { details.scrollIntoView({ block: 'nearest' }); run.focus() } })
+    }
+    cleanup = () => { active = false; clearTimeout(expiry); unregister(); select.removeEventListener('change', reset) }
+  },
+  unmount: () => cleanup()
+}

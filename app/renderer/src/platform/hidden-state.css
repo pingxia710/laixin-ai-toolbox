@@ -1,0 +1,30 @@
+/* 切换前的「隐形状态」提示。只用自己的 class 与全局色板变量，⛔ 改别的样式文件。 */
+.hidden-state-notice { display: grid; gap: 14px; padding: 20px; border: 1px solid var(--line); border-left: 3px solid var(--muted); border-radius: 12px; background: var(--surface); }
+.hidden-state-notice[data-severity='blocking'] { border-left-color: var(--danger); background: var(--danger-soft); }
+.hidden-state-notice[data-severity='warning'] { border-left-color: var(--warning); background: var(--warning-soft); }
+.hidden-state-headline { margin: 0; color: var(--ink); font-size: 15px; font-weight: 600; }
+.hidden-state-lead { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.6; }
+
+.hidden-state-list { display: grid; gap: 12px; margin: 0; padding: 0; list-style: none; }
+.hidden-state-item { display: grid; gap: 6px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.hidden-state-item > p { margin: 0; }
+.hidden-state-item-title { color: var(--ink); font-size: 14px; font-weight: 600; }
+.hidden-state-item-tag { justify-self: start; padding: 2px 8px; border-radius: 999px; background: var(--surface-soft); color: var(--muted); font-size: 12px; }
+.hidden-state-item[data-severity='blocking'] .hidden-state-item-tag { background: var(--danger-soft); color: var(--danger); }
+.hidden-state-item[data-severity='warning'] .hidden-state-item-tag { background: var(--warning-soft); color: var(--warning); }
+/* 路径和脱敏后的值用等宽，长路径换行不撑破卡片。 */
+.hidden-state-item-where { color: var(--muted); font-family: var(--font-mono); font-size: 12px; overflow-wrap: anywhere; }
+.hidden-state-item-impact { color: var(--ink); font-size: 13px; line-height: 1.6; }
+.hidden-state-item-suggestion { color: var(--muted); font-size: 13px; line-height: 1.6; }
+.hidden-state-item .hidden-state-clean { justify-self: start; min-height: 36px; margin-top: 4px; }
+
+.hidden-state-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.hidden-state-actions button { min-height: 40px; }
+.hidden-state-actions button[hidden] { display: none; }
+.hidden-state-actions button[aria-busy='true'] { opacity: .6; }
+
+.hidden-state-status { margin: 0; padding: 10px 14px; border-radius: 8px; background: var(--surface-soft); color: var(--ink); font-size: 13px; line-height: 1.6; }
+.hidden-state-status[hidden] { display: none; }
+.hidden-state-status[data-tone='positive'] { background: var(--positive-soft); color: var(--positive); }
+.hidden-state-status[data-tone='danger'] { background: var(--danger-soft); color: var(--danger); }
+.hidden-state-unreadable { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.6; }

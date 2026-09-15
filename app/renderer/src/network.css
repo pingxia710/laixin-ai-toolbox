@@ -1,0 +1,48 @@
+/* Connection, details and actions keep the same places in every account/network state. */
+.tunnel-page { display: grid; gap: 18px; }
+#tab-panel .tunnel-page .connection-card { min-height: 250px; padding: 26px 28px 0; border: 1px solid var(--line); border-radius: 14px; background: radial-gradient(ellipse at top right, var(--accent-soft), transparent 75%), var(--surface); }
+.tunnel-page .card-kicker { color: var(--accent-strong); font-weight: 600; }
+.tunnel-page .connection-main { min-height: 160px; padding: 14px 0 22px; }
+.tunnel-page .connection-main > div:first-child { min-width: 0; }
+#tab-panel .tunnel-page .connection-main h2 { color: var(--ink); font-size: clamp(26px, 2.8vw, 36px); letter-spacing: -.035em; }
+#tab-panel .tunnel-page .connection-main p { max-width: 60em; font-size: 14px; line-height: 1.7; }
+.tunnel-page .connection-hint { min-height: 22px; margin-top: 12px; }
+#tab-panel .tunnel-page .power-button { width: 96px; height: 96px; min-height: 96px; margin: 0 12px; }
+.tunnel-page .connection-footer { display: grid; grid-template-columns: 1.1fr 1fr 1.1fr; gap: 12px; min-height: 58px; }
+.tunnel-page .connection-footer > span { min-width: 0; overflow-wrap: anywhere; }
+.tunnel-page .connection-footer strong { font-size: 13px; }
+.tunnel-page .network-details { padding: 0; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); }
+.tunnel-page .network-details-header { padding: 18px 24px; }
+.tunnel-page .network-details > .detail-list .detail-row { grid-template-columns: 115px minmax(0, 1fr); padding: 12px 24px; }
+.network-shortcuts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+#tab-panel .network-shortcut { display: flex; min-width: 0; flex-direction: column; align-items: flex-start; gap: 10px; padding: 20px; border-radius: 12px; text-align: left; }
+.network-shortcut .icon { color: var(--accent-strong); width: 22px; height: 22px; }
+.network-shortcut strong { font-size: 15px; }
+.network-shortcut span { font-size: 12px; font-weight: 400; line-height: 1.65; color: var(--muted); overflow-wrap: anywhere; }
+.network-extra { border: 1px solid var(--line); border-radius: 12px; background: var(--surface); overflow: hidden; }
+.network-extra > summary { padding: 14px 20px; cursor: pointer; color: var(--muted); }
+.network-extra .route-explanation { border: 0; }
+.tunnel-page .network-repair { padding: 20px 24px; border: 1px solid var(--line); border-radius: 14px; }
+.network-repair h3 { margin: 0 0 8px; }
+.network-repair-actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 14px 0; }
+.network-repair small { display: block; color: var(--muted); }
+.network-repair-result { margin: 10px 0 0; color: var(--muted); overflow-wrap: anywhere; }
+.network-repair-result[data-outcome="recovered"] { color: var(--accent-strong); }
+/* 回执号要能被客户一眼看见、念得出来：等宽、可选中、字距拉开。 */
+.network-repair .network-report-scope { margin: 0 0 4px; }
+.network-report-receipt { margin: 10px 0 0; color: var(--muted); overflow-wrap: anywhere; }
+.network-report-receipt strong { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: .08em; color: var(--ink); user-select: text; }
+@media (max-width: 1100px) {
+  .network-shortcuts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .tunnel-page .connection-footer { grid-template-columns: 1fr; gap: 6px; }
+}
+@media (max-width: 700px) {
+  #tab-panel .tunnel-page .connection-card { padding: 20px 20px 0; }
+  .tunnel-page .connection-main { flex-direction: row; align-items: center; gap: 14px; }
+  #tab-panel .tunnel-page .power-button { width: 64px; height: 64px; min-height: 64px; margin: 0; }
+  .tunnel-page .connection-actions small { max-width: 80px; text-align: center; }
+}
+@media (max-width: 580px) {
+  .network-shortcuts { grid-template-columns: 1fr; }
+  .tunnel-page .network-details > .detail-list .detail-row { grid-template-columns: 75px minmax(0, 1fr); padding: 12px 18px; }
+}

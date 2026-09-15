@@ -1,0 +1,41 @@
+.codex-usage { --usage-border: var(--line); --usage-surface: var(--surface); --usage-soft: var(--surface-soft); --usage-ink: var(--ink); --usage-muted: var(--muted); --usage-accent: var(--accent); color: var(--usage-ink); font-size: 14px; line-height: 1.6; }
+.codex-usage h2, .codex-usage h3, .codex-usage h4, .codex-usage p { margin: 0; }
+.usage-header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px; }
+.usage-header h2 { font-size: 25px; font-weight: 650; letter-spacing: -.03em; }
+.usage-eyebrow { font-size: 12px; font-weight: 600; color: var(--usage-muted); }
+.usage-refresh { min-height: 44px; padding: 8px 16px; border: 1px solid var(--usage-accent); border-radius: 8px; background: var(--usage-accent); color: var(--on-accent); font: inherit; font-weight: 600; cursor: pointer; white-space: nowrap; }
+.usage-refresh:disabled { background: var(--usage-soft); border-color: var(--usage-border); color: var(--usage-muted); cursor: default; }
+.usage-refresh:focus-visible { outline: 3px solid var(--usage-accent); outline-offset: 3px; }
+.codex-usage .usage-notice { margin: 16px 0; color: var(--usage-muted); font-size: 13px; min-height: 22px; }
+.usage-notice[data-state='unavailable'], .usage-notice[data-state='timeout'] { color: var(--warning); }
+.usage-content { display: grid; grid-template-columns: 210px minmax(0, 1fr); gap: 16px; align-items: start; }
+.usage-account { padding: 20px 16px; background: var(--usage-soft); border-radius: 10px; overflow-wrap: anywhere; }
+.usage-account h3 { font-size: 14px; margin: 8px 0 10px; }
+.usage-account p { margin-top: 16px; font-size: 12px; color: var(--usage-muted); }
+.usage-plan { display: inline-block; padding: 3px 9px; border: 1px solid var(--usage-border); border-radius: 5px; font-size: 12px; font-weight: 600; }
+.usage-quotas { display: grid; gap: 16px; }
+.usage-bucket { background: var(--usage-surface); padding: 20px; border: 1px solid var(--usage-border); border-radius: 10px; }
+.usage-bucket h3 { font-size: 16px; overflow-wrap: anywhere; }
+.usage-window { margin-top: 18px; }
+.usage-window + .usage-window { padding-top: 16px; border-top: 1px solid var(--usage-border); }
+.usage-window h4 { font-size: 13px; font-weight: 500; color: var(--usage-muted); }
+.usage-numbers { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 6px 12px; margin: 6px 0 10px; font-variant-numeric: tabular-nums; }
+.usage-numbers strong { font-size: 21px; font-weight: 650; }
+.usage-numbers span { color: var(--usage-muted); font-size: 12px; }
+.usage-progress { display: block; appearance: none; width: 100%; height: 7px; border: 0; border-radius: 8px; overflow: hidden; }
+.usage-progress::-webkit-progress-bar { background: var(--usage-soft); }
+.usage-progress::-webkit-progress-value { background: var(--usage-accent); border-radius: 8px; }
+.usage-progress[data-level='low']::-webkit-progress-value { background: var(--warning); }
+.codex-usage .usage-reset { margin-top: 8px; font-size: 11px; color: var(--usage-muted); font-variant-numeric: tabular-nums; }
+.usage-muted, .usage-credits { font-size: 12px; color: var(--usage-muted); }
+.codex-usage .usage-credits { margin-top: 16px; }
+.codex-usage .usage-footnote { margin-top: 20px; color: var(--usage-muted); font-size: 12px; }
+.usage-empty { grid-column: 1 / -1; padding: 36px 24px; background: var(--usage-surface); border: 1px dashed var(--usage-border); border-radius: 10px; }
+.usage-empty h3 { font-size: 16px; }
+.usage-empty p { margin-top: 10px; color: var(--usage-muted); }
+.usage-empty button { margin-top: 20px; }
+.codex-usage .usage-reset, .usage-numbers span, .usage-account p { font-size: 13px; }
+@media (max-width: 620px) { .usage-content { grid-template-columns: minmax(0, 1fr); } .usage-account { padding: 16px; } .usage-header { align-items: flex-start; } }
+.usage-stats { display: flex; flex-wrap: wrap; gap: 16px 32px; margin-top: 18px; }
+.usage-stat { display: grid; gap: 4px; }
+.usage-stat strong { font-size: 21px; font-weight: 650; font-variant-numeric: tabular-nums; }

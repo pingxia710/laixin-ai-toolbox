@@ -1,0 +1,366 @@
+{
+  "catalogVersion": "3",
+  "resources": [
+    {
+      "id": "hermes-macos-arm64",
+      "software": "Hermes",
+      "platform": "macos",
+      "architecture": "arm64",
+      "type": "download",
+      "officialPageUrl": "https://hermes-agent.nousresearch.com/desktop",
+      "assetUrl": "https://hermes-assets.nousresearch.com/Hermes-Setup.dmg?build=06402ecb7ca5",
+      "sources": [
+        { "id": "official-direct", "assetUrl": "https://hermes-assets.nousresearch.com/Hermes-Setup.dmg?build=06402ecb7ca5", "allowedHosts": ["hermes-assets.nousresearch.com"], "network": "direct" },
+        { "id": "official-tunnel", "assetUrl": "https://hermes-assets.nousresearch.com/Hermes-Setup.dmg?build=06402ecb7ca5", "allowedHosts": ["hermes-assets.nousresearch.com"], "network": "tunnel" }
+      ],
+      "allowedHosts": [
+        "hermes-assets.nousresearch.com"
+      ],
+      "version": "0.0.1",
+      "officialVersionLabel": "Hermes Agent v0.21.0",
+      "format": "dmg",
+      "expectedBytes": "6752854",
+      "officialSha256": null,
+      "recordedSha256": "b61e047efe3059faf1c55fec3252e661f2d2a993a7a3eebf5cc6a9aa5c1790f5",
+      "identity": {
+        "installerBundleIdentifier": "com.nousresearch.hermes.setup",
+        "installedBundleIdentifier": null,
+        "signingSubject": "Developer ID Application: Brooklyn Nicholson (T2F6S8MF7C)",
+        "architecture": "arm64",
+        "maintenanceNote": "签名核验按 Developer ID 全串 + Team ID 钉死(实测签名主体是个人名 Brooklyn Nicholson,不是组织名)。厂商换签名证书时我们会拒掉正版包——这是一条需要有人维护的条目:换证书后必须实测新证书并更新本条目。"
+      },
+      "approval": {
+        "approvedAt": "2026-09-07T01:36:30+08:00",
+        "approvedBy": "本片开发方",
+        "sourceBuild": "06402ecb7ca5",
+        "scope": "核准的是这一次下载的那个包(Hermes-Setup.dmg 本身),不是它装出来的版本——官方安装器是下载型 stub,总装当刻最新,装出来的版本钉不住。"
+      }
+    },
+    {
+      "id": "codex-macos-arm64",
+      "software": "Codex",
+      "platform": "macos",
+      "architecture": "arm64",
+      "type": "download",
+      "officialPageUrl": "https://learn.chatgpt.com/docs/app",
+      "assetUrl": "https://persistent.oaistatic.com/codex-app-prod/Codex.dmg",
+      "allowedHosts": [
+        "persistent.oaistatic.com"
+      ],
+      "sources": [
+        {
+          "id": "official-direct",
+          "assetUrl": "https://persistent.oaistatic.com/codex-app-prod/Codex.dmg",
+          "allowedHosts": [
+            "persistent.oaistatic.com"
+          ],
+          "network": "direct"
+        },
+        {
+          "id": "official-tunnel",
+          "assetUrl": "https://persistent.oaistatic.com/codex-app-prod/Codex.dmg",
+          "allowedHosts": [
+            "persistent.oaistatic.com"
+          ],
+          "network": "tunnel"
+        }
+      ],
+      "version": "26.901.51231",
+      "officialVersionLabel": "Codex for Mac 26.901.51231",
+      "format": "dmg",
+      "expectedBytes": "643007873",
+      "officialSha256": null,
+      "recordedSha256": "b6ffed73d581047862e85de5b4d322ba431004949a5338736e7059182dff6082",
+      "identity": {
+        "installerBundleIdentifier": "com.openai.codex",
+        "installedBundleIdentifier": "com.openai.codex",
+        "signingSubject": "Developer ID Application: OpenAI OpCo, LLC (2DC432GLL2)",
+        "architecture": "arm64",
+        "maintenanceNote": "签名核验按 Developer ID 全串 + Team ID 钉死(实测主体是组织名 OpenAI OpCo, LLC,Team ID 2DC432GLL2)。厂商换签名证书时我们会拒掉正版包——这是一条需要有人维护的条目:换证书后必须实测新证书并更新本条目。"
+      },
+      "approval": {
+        "approvedAt": "2026-09-07T16:03:25+08:00",
+        "approvedBy": "方案窗口第五任实测(2026-09-07),下载核验半片开发方录入",
+        "sourceBuild": "8109",
+        "scope": "核准的是 26.901.51231 这个版本——Codex 是拖拽型完整包,版本写在包内(CFBundleVersion 8109),与 Hermes 的 stub 不同,版本钉得住;官方发新版时 sha256 随之改变,下载核验会报「官方包已更新」,届时实测新包并更新本条目。功能核准已完成(2026-09-08 真实下载核验、隔离安装、首次启动确认 Codex 界面,记录见交付报告)。"
+      }
+    },
+    {
+      "id": "hermes-windows-x86-64",
+      "software": "Hermes",
+      "platform": "windows",
+      "architecture": "x86_64",
+      "type": "download",
+      "officialPageUrl": "https://hermes-agent.nousresearch.com/desktop",
+      "assetUrl": "https://hermes-assets.nousresearch.com/Hermes-Setup.exe?build=d70fb4e6bd6c",
+      "sources": [
+        { "id": "official-direct", "assetUrl": "https://hermes-assets.nousresearch.com/Hermes-Setup.exe?build=d70fb4e6bd6c", "allowedHosts": ["hermes-assets.nousresearch.com"], "network": "direct" }
+      ],
+      "allowedHosts": [
+        "hermes-assets.nousresearch.com"
+      ],
+      "version": "0.0.1",
+      "officialVersionLabel": "Hermes Setup 0.0.1 (Windows x64, build d70fb4e6bd6c)",
+      "format": "exe",
+      "expectedBytes": "7946048",
+      "officialSha256": null,
+      "recordedSha256": "cfc818adf831a748c61a407152a03c7a426ebee78f499d20a31fae2b5ac5d827",
+      "identity": null,
+      "approval": {
+        "approvedAt": "2026-09-08T01:25:00+08:00",
+        "approvedBy": "本片开发方",
+        "sourceBuild": "d70fb4e6bd6c",
+        "scope": "核准的是这一次从官方主机下载的 Hermes-Setup.exe 本身(PE32+ x86-64,ProductName/FileDescription 均为 Hermes,Company 为 Nous Research),不是它装出来的版本。identity 为 null: Authenticode 签名主体尚未在 Windows 真机用 Get-AuthenticodeSignature 核准,当前信任根只有官方 HTTPS 来源加整包 sha256 钉死;真机核准签名后必须回填 identity 并收紧校验。官方安装器同为下载型 stub,装出来的版本钉不住。"
+      }
+    },
+    {
+      "id": "codex-windows-x86-64",
+      "software": "Codex",
+      "platform": "windows",
+      "architecture": "x86_64",
+      "type": "download",
+      "officialPageUrl": "https://learn.chatgpt.com/docs/enterprise/windows-deployment",
+      "assetUrl": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-x64.msix",
+      "sources": [
+        {
+          "id": "official-direct",
+          "assetUrl": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-x64.msix",
+          "allowedHosts": [
+            "persistent.oaistatic.com"
+          ],
+          "network": "direct"
+        },
+        {
+          "id": "official-tunnel",
+          "assetUrl": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-x64.msix",
+          "allowedHosts": [
+            "persistent.oaistatic.com"
+          ],
+          "network": "tunnel"
+        }
+      ],
+      "allowedHosts": [
+        "persistent.oaistatic.com"
+      ],
+      "version": "26.901.6511.0",
+      "officialVersionLabel": "ChatGPT / Codex for Windows x64 26.901.6511.0",
+      "format": "msix",
+      "expectedBytes": "796592344",
+      "officialSha256": null,
+      "recordedSha256": "fd9ae9eeeeaf11577191ce5a39d0b8f95fa73d591aa3a94f688b84d294d1fa85",
+      "identity": null,
+      "approval": {
+        "approvedAt": "2026-09-09T10:00:00+08:00",
+        "approvedBy": "Windows Codex 安装接入窗口",
+        "sourceBuild": "26.901.6511.0",
+        "scope": "从官方部署文档链接实测下载完整 MSIX，核对整包摘要、AppxManifest 的 OpenAI.Codex/x64/26.901.6511.0、发布者与 Microsoft Marketplace 证书链字段；最低 Windows 10.0.19041.0。客户端以官方 HTTPS 来源和本次整包 SHA-256 核验，identity 为 null，不冒充运行时签名验证；安装时由 Windows 验证商店签名。原生安装尚未实测，见 docs/codex-windows-delivery.md。"
+      }
+    },
+    {
+      "id": "codex-windows-official-installer",
+      "software": "Codex",
+      "platform": "windows",
+      "architecture": "x86_64",
+      "type": "external-entry",
+      "officialPageUrl": "https://get.microsoft.com/installer/download/9PLM9XGG6VKS?cid=website_cta_psi",
+      "allowedHosts": [
+        "get.microsoft.com"
+      ],
+      "version": "official-current",
+      "officialVersionLabel": "OpenAI 官方 Windows 安装助手",
+      "approval": {
+        "approvedAt": "2026-09-09T10:00:00+08:00",
+        "approvedBy": "Windows Codex 安装接入窗口",
+        "sourceBuild": "9PLM9XGG6VKS",
+        "scope": "OpenAI 官方部署文档公开的 Microsoft Web Installer 备用入口；浏览器打开仅记交接，不代表安装完成。"
+      }
+    },
+    {
+      "id": "codex-official-download",
+      "software": "Codex",
+      "platform": "macos",
+      "architecture": "arm64",
+      "type": "external-entry",
+      "officialPageUrl": "https://chatgpt.com/download/",
+      "allowedHosts": ["chatgpt.com"],
+      "version": "official-current",
+      "officialVersionLabel": "OpenAI 官方 Codex 下载页",
+      "approval": {
+        "approvedAt": "2026-09-11T00:00:00+08:00",
+        "approvedBy": "来信 AI 工具箱",
+        "sourceBuild": "official-download-page",
+        "scope": "工具箱只打开 OpenAI 官方下载页，由该页面按客户系统提供当前安装包；浏览器打开不代表已经安装。"
+      }
+    },
+    {
+      "id": "claude-code-official-install",
+      "software": "claude",
+      "platform": "macos",
+      "architecture": "arm64",
+      "type": "external-entry",
+      "officialPageUrl": "https://claude.com/download?utm_source=claude_code&utm_medium=docs",
+      "allowedHosts": ["claude.com", "code.claude.com"],
+      "version": "official-current",
+      "officialVersionLabel": "Anthropic 官方 Claude Code 安装页",
+      "approval": {
+        "approvedAt": "2026-09-11T00:00:00+08:00",
+        "approvedBy": "来信 AI 工具箱",
+        "sourceBuild": "official-install-page",
+        "scope": "工具箱只打开 Anthropic 官方安装说明页，不代替客户执行命令或确认安装完成。"
+      }
+    },
+    {
+      "id": "hermes-official-download",
+      "software": "hermes",
+      "platform": "macos",
+      "architecture": "arm64",
+      "type": "external-entry",
+      "officialPageUrl": "https://hermes-agent.nousresearch.com/desktop",
+      "allowedHosts": ["hermes-agent.nousresearch.com"],
+      "version": "official-current",
+      "officialVersionLabel": "Hermes 官方下载页",
+      "approval": {
+        "approvedAt": "2026-09-11T00:00:00+08:00",
+        "approvedBy": "来信 AI 工具箱",
+        "sourceBuild": "official-desktop-page",
+        "scope": "工具箱只打开 Nous Research 官方下载页，由客户选择适用的官方安装方式。"
+      }
+    },
+    {
+      "id": "deepseek-harness-official-install",
+      "software": "deepseek-harness",
+      "platform": "macos",
+      "architecture": "arm64",
+      "type": "external-entry",
+      "officialPageUrl": "https://www.deepseek.com/harness/",
+      "allowedHosts": ["www.deepseek.com"],
+      "version": "official-current",
+      "officialVersionLabel": "DeepSeek Harness 官方安装页",
+      "approval": {
+        "approvedAt": "2026-09-11T00:00:00+08:00",
+        "approvedBy": "来信 AI 工具箱",
+        "sourceBuild": "official-harness-page",
+        "scope": "工具箱只打开 DeepSeek 官方 Harness 页面；该产品处于开发者预览，安装方式以官方页面当前说明为准。"
+      }
+    },
+    {
+      "id": "zcode-official-download",
+      "software": "zcode",
+      "platform": "macos",
+      "architecture": "arm64",
+      "type": "external-entry",
+      "officialPageUrl": "https://zcode.z.ai/cn/docs/install",
+      "allowedHosts": ["zcode.z.ai"],
+      "version": "official-current",
+      "officialVersionLabel": "ZCode 官方下载页",
+      "approval": {
+        "approvedAt": "2026-09-11T00:00:00+08:00",
+        "approvedBy": "来信 AI 工具箱",
+        "sourceBuild": "official-install-page",
+        "scope": "工具箱只打开 ZCode 官方安装页，由该页面按客户系统提供当前安装包。"
+      }
+    },
+    {
+      "id": "kimi-code-official-install",
+      "software": "kimi-code",
+      "platform": "macos",
+      "architecture": "arm64",
+      "type": "external-entry",
+      "officialPageUrl": "https://www.kimi.com/code/docs/",
+      "allowedHosts": ["www.kimi.com"],
+      "version": "official-current",
+      "officialVersionLabel": "Kimi Code 官方安装页",
+      "approval": {
+        "approvedAt": "2026-09-11T00:00:00+08:00",
+        "approvedBy": "来信 AI 工具箱",
+        "sourceBuild": "official-code-docs",
+        "scope": "工具箱只打开 Kimi 官方 Kimi Code 文档页，不代替客户执行安装命令或确认安装完成。"
+      }
+    },
+    {
+      "id": "codex-github",
+      "software": "Codex",
+      "platform": "macos",
+      "architecture": "arm64",
+      "type": "external-entry",
+      "officialPageUrl": "https://github.com/openai/codex",
+      "allowedHosts": ["github.com"],
+      "version": "official-current",
+      "officialVersionLabel": "OpenAI Codex 官方 GitHub",
+      "approval": {
+        "approvedAt": "2026-09-11T00:00:00+08:00",
+        "approvedBy": "来信 AI 工具箱",
+        "sourceBuild": "openai-codex-repository",
+        "scope": "工具箱只打开 OpenAI 维护的 Codex 源码与发行说明页；不替客户挑选架构相关的 GitHub 发行包，也不代表已下载安装。"
+      }
+    },
+    {
+      "id": "claude-code-github",
+      "software": "claude",
+      "platform": "macos",
+      "architecture": "arm64",
+      "type": "external-entry",
+      "officialPageUrl": "https://github.com/anthropics/claude-code",
+      "allowedHosts": ["github.com"],
+      "version": "official-current",
+      "officialVersionLabel": "Anthropic Claude Code 官方 GitHub",
+      "approval": {
+        "approvedAt": "2026-09-11T00:00:00+08:00",
+        "approvedBy": "来信 AI 工具箱",
+        "sourceBuild": "anthropics-claude-code-repository",
+        "scope": "工具箱只打开 Anthropic 维护的 Claude Code 源码与发行说明页；安装仍按官方下载页的推荐方式进行。"
+      }
+    },
+    {
+      "id": "hermes-github",
+      "software": "hermes",
+      "platform": "macos",
+      "architecture": "arm64",
+      "type": "external-entry",
+      "officialPageUrl": "https://github.com/NousResearch/hermes-agent",
+      "allowedHosts": ["github.com"],
+      "version": "official-current",
+      "officialVersionLabel": "Nous Research Hermes 官方 GitHub",
+      "approval": {
+        "approvedAt": "2026-09-11T00:00:00+08:00",
+        "approvedBy": "来信 AI 工具箱",
+        "sourceBuild": "nousresearch-hermes-agent-repository",
+        "scope": "工具箱只打开 Nous Research 维护的 Hermes 源码与发行说明页；不把源码页当作受控安装包。"
+      }
+    },
+    {
+      "id": "deepseek-harness-github",
+      "software": "deepseek-harness",
+      "platform": "macos",
+      "architecture": "arm64",
+      "type": "external-entry",
+      "officialPageUrl": "https://github.com/deepseek-ai/deepseek-harness",
+      "allowedHosts": ["github.com"],
+      "version": "official-current",
+      "officialVersionLabel": "DeepSeek Harness 官方 GitHub",
+      "approval": {
+        "approvedAt": "2026-09-11T00:00:00+08:00",
+        "approvedBy": "来信 AI 工具箱",
+        "sourceBuild": "deepseek-ai-deepseek-harness-repository",
+        "scope": "工具箱只打开 DeepSeek 维护的 Harness 源码与发行说明页；安装方式仍以官方安装页当前说明为准。"
+      }
+    },
+    {
+      "id": "kimi-code-github",
+      "software": "kimi-code",
+      "platform": "macos",
+      "architecture": "arm64",
+      "type": "external-entry",
+      "officialPageUrl": "https://github.com/MoonshotAI/kimi-code",
+      "allowedHosts": ["github.com"],
+      "version": "official-current",
+      "officialVersionLabel": "Kimi Code 官方 GitHub",
+      "approval": {
+        "approvedAt": "2026-09-11T00:00:00+08:00",
+        "approvedBy": "来信 AI 工具箱",
+        "sourceBuild": "moonshotai-kimi-code-repository",
+        "scope": "工具箱只打开 Moonshot AI 维护的 Kimi Code 源码与发行说明页；不替客户挑选平台和架构对应的发行包。"
+      }
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+本软件包含未经修改的 Xray-core v26.6.1 可执行文件及 GeoIP、GeoSite 数据。
+源码和发行来源：https://github.com/XTLS/Xray-core/releases/tag/v26.6.1
+源码许可证：Mozilla Public License 2.0，见同目录 LICENSE。
+GeoIP 数据来源：https://github.com/v2fly/geoip
+GeoSite 数据来源：https://github.com/v2fly/domain-list-community
+Xray 仅作为本软件的独立子进程运行。来信AI工具箱的界面、连接管理与其他代码不属于 Xray 项目。

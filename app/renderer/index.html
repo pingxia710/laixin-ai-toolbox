@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="Content-Security-Policy" content="__TOOLBOX_CSP__" />
+    <title>来信AI工具箱</title>
+    <link rel="icon" type="image/png" href="./src/assets/brand/laixin-icon.png" />
+  </head>
+  <body>
+    <a class="skip-link" href="#tab-panel">跳到页面内容</a>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"><img class="brand-logo" src="./src/assets/brand/laixin-icon.png" alt="" width="44" height="44" /></span>
+          <div>
+            <p class="brand-name">来信 AI 工具箱</p>
+            <p class="brand-tagline">便捷使用AI</p>
+          </div>
+        </div>
+        <nav id="tabs" aria-label="工具箱服务" aria-orientation="vertical" class="tab-list" role="tablist"></nav>
+        <div id="more-platforms-slot" class="more-platforms-slot"></div>
+      </aside>
+      <main class="workspace">
+        <header class="topbar">
+          <h1 id="page-title">仪表盘</h1>
+          <span id="page-breadcrumb" hidden>仪表盘</span>
+          <div class="topbar-right"><p id="app-state" class="build-tag" aria-live="polite">正在读取客户端信息…</p><button id="account-shortcut" class="account-shortcut" type="button">我的账号</button></div>
+        </header>
+        <div class="workspace-content">
+          <section id="tab-panel" class="tab-panel" role="tabpanel" tabindex="-1"></section>
+        </div>
+      </main>
+    </div>
+    <script type="module" src="./src/renderer.ts"></script>
+  </body>
+</html>

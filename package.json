@@ -1,0 +1,153 @@
+{
+  "name": "laixin-ai-toolbox",
+  "version": "0.5.6",
+  "productName": "来信AI工具箱统一版",
+  "private": false,
+  "description": "来信AI工具箱桌面客户端骨架",
+  "main": "./out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "lint": "eslint app tests --max-warnings=0",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run prepare:sidecar && npm run prepare:xray && vitest run",
+    "prepare:sidecar": "node scripts/prepare-sidecar.mjs",
+    "prepare:xray": "node scripts/prepare-xray.mjs",
+    "prepare:koffi": "node scripts/prepare-koffi.mjs",
+    "build": "npm run prepare:sidecar && npm run lint && npm run typecheck && npm run prepare:xray && electron-vite build && electron-builder --mac --arm64 --publish never",
+    "build:pilot": "npm run prepare:sidecar && npm run lint && npm run typecheck && node scripts/prepare-xray.mjs mac-arm64 win-x64 && npm run prepare:koffi && electron-vite build && electron-builder --mac --arm64 --publish never && electron-builder --win --x64 --publish never",
+    "verify:release-account-origin": "node scripts/verify-release-account-origin.mjs",
+    "postinstall": "node node_modules/electron/install.js"
+  },
+  "build": {
+    "appId": "com.laixin.ai-toolbox.ui-capabilities",
+    "productName": "来信AI工具箱统一版",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "out/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "vendor/xray/${os}-${arch}/",
+        "to": "xray/"
+      },
+      {
+        "from": "sidecar/mac/",
+        "to": "sidecar/mac/"
+      },
+      {
+        "from": "resources/打开说明.md",
+        "to": "打开说明.md"
+      },
+      {
+        "from": "sidecar/win/",
+        "to": "sidecar/win/"
+      },
+      {
+        "from": "resources/update-helper.cjs",
+        "to": "update-helper.cjs"
+      },
+      {
+        "from": "resources/update-helper.ps1",
+        "to": "update-helper.ps1"
+      },
+      {
+        "from": "resources/trayTemplate.png",
+        "to": "trayTemplate.png"
+      },
+      {
+        "from": "resources/tray.ico",
+        "to": "tray.ico"
+      }
+    ],
+    "mac": {
+      "target": [
+        "dmg",
+        "dir"
+      ],
+      "category": "public.app-category.utilities",
+      "icon": "build/laixin-icon.icns",
+      "identity": "-",
+      "hardenedRuntime": false
+    },
+    "dmg": {
+      "contents": [
+        {
+          "x": 100,
+          "y": 220
+        },
+        {
+          "x": 270,
+          "y": 220,
+          "type": "file",
+          "path": "resources/打开说明.md"
+        },
+        {
+          "x": 440,
+          "y": 220,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/laixin-icon.ico",
+      "extraResources": [
+        {
+          "from": "node_modules/koffi/",
+          "to": "sidecar/win/node_modules/koffi/",
+          "filter": [
+            "package.json",
+            "index.cjs",
+            "index.js",
+            "indirect.cjs",
+            "indirect.js",
+            "src/koffi/*.cjs",
+            "src/koffi/*.js",
+            "src/koffi/src/*.cjs",
+            "src/koffi/src/*.js"
+          ]
+        },
+        {
+          "from": "vendor/koffi/win32-x64/",
+          "to": "sidecar/win/node_modules/@koromix/koffi-win32-x64/"
+        }
+      ]
+    },
+    "nsis": {
+      "include": "build/installer.nsh"
+    }
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "26.4.1",
+    "electron": "44.2.0",
+    "electron-builder": "26.15.3",
+    "electron-vite": "5.0.0",
+    "eslint": "10.10.0",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.69.0",
+    "vitest": "5.0.0"
+  },
+  "dependencies": {
+    "koffi": "^3.2.1"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pingxia710/laixin-ai-toolbox.git"
+  },
+  "homepage": "https://laixin.net.cn/AI-tools/",
+  "bugs": {
+    "url": "https://github.com/pingxia710/laixin-ai-toolbox/issues"
+  }
+}
