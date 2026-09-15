@@ -20,4 +20,5 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
-      - run: npm test
+      # 网络集成用例会启动真实子进程并争用同一组本机端口；CI 串行跑文件，避免用例之间互相冒充客户环境冲突。
+      - run: npm test -- --fileParallelism=false
