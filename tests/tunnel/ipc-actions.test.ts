@@ -168,7 +168,7 @@ describe('五动作与桥注册(判据 3②③主进程侧、6 IPC 负向、12 �
     expect(((await registry.execute('tunnel.importConfig', undefined)) as { outcome: string }).outcome).toBe('imported')
     expect(((await registry.execute('tunnel.applyPending', undefined)) as { outcome: string }).outcome).toBe('applied')
     expect(((await registry.execute('tunnel.start', undefined)) as { outcome: string }).outcome).toBe('started')
-    await waitFor(() => service.status().state === '已连', 10_000)
+    await waitFor(() => service.status().state === '已连' && service.status().exitIp === EXIT_IP, 10_000)
     expect(service.status().exitIp).toBe(EXIT_IP)
 
     const appliedWhileConnected = (await registry.execute('tunnel.applyPending', undefined)) as {
@@ -271,9 +271,13 @@ describe('五动作与桥注册(判据 3②③主进程侧、6 IPC 负向、12 �
     expect(((await actions.execute('tunnel.importConfig', undefined)) as { outcome: string }).outcome).toBe('imported')
     expect(((await actions.execute('tunnel.applyPending', undefined)) as { outcome: string }).outcome).toBe('applied')
     expect(((await actions.execute('tunnel.start', undefined)) as { outcome: string }).outcome).toBe('started')
-    await waitFor(() => readTunnelSnapshot().state === 'connected', 10_000)
-
-    expect(readTunnelSnapshot()).toEqual({ state: 'connected', localProxyUrl: 'http://127.0.0.1:18080' })
+    await waitFor(() => {
+      const snapshot = readTunnelSnapshot()
+      return snapshot.state === 'connected' && snapshot.localProxyUrl !== undefined
+    }, 10_000)
+    const bridgePort = readJsonFile<{ bridgePort: number }>(layout.state(dataDir)).bridgePort
+    expect(bridgePort).toBeGreaterThan(0)
+    expect(readTunnelSnapshot()).toEqual({ state: 'connected', localProxyUrl: `http://127.0.0.1:${bridgePort}` })
     expect(((await anotherMainModule.execute('tunnel.status', undefined)) as { state: string }).state).toBe('已连')
 
     expect(((await anotherMainModule.execute('tunnel.stop', undefined)) as { outcome: string }).outcome).toBe('stopped')
