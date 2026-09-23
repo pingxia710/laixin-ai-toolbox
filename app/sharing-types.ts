@@ -96,7 +96,41 @@ export interface SharingPostView extends SharingPostDraft {
   createdAt: number
   updatedAt: number
 }
-export type SharingOperation = 'catalog' | 'standards' | 'posts' | 'myPosts' | 'publish' | 'closePost' | 'list' | 'create' | 'detail' | 'pay' | 'reveal' | 'complete' | 'cancel' | 'report' | 'intentions' | 'share'
+export type SharingResponseStatus = 'responded' | 'presented' | 'rejected' | 'selected' | 'confirmed' | 'declined' | 'withdrawn'
+export interface SharingResponseView {
+  id: string
+  demandPostId: string
+  supplyPostId: string
+  status: SharingResponseStatus
+  createdAt: number
+  updatedAt: number
+}
+export interface SharingSpecSummary {
+  productId: SharingProductId
+  software: SharingSoftware
+  accountPlan: string | null
+  apiProvider: string | null
+  apiModel: string | null
+  termDays: number
+  quotaAmount: number | null
+  quotaUnit: SharingQuotaUnit | null
+  usageTier: SharingUsageTier | null
+}
+export interface SharingCandidateView extends SharingSpecSummary {
+  responseId: string
+  priceCents: number
+  availableCount: number
+  deliveryHours: number
+  respondedAt: number
+  status: 'presented' | 'selected'
+}
+export interface SharingResponseDemandSummary extends SharingSpecSummary {
+  postId: string
+  priceCents: number
+  status: SharingPostStatus
+}
+export interface SharingMyResponseView extends SharingResponseView { demand: SharingResponseDemandSummary | null }
+export type SharingOperation = 'catalog' | 'standards' | 'posts' | 'myPosts' | 'publish' | 'closePost' | 'list' | 'create' | 'detail' | 'pay' | 'reveal' | 'complete' | 'cancel' | 'report' | 'intentions' | 'share' | 'respond' | 'demandResponses' | 'myResponses' | 'selectResponse' | 'confirmResponse' | 'declineResponse' | 'withdrawResponse'
 export const sharingMessages: Record<string, string> = {
   SHARING_UNAVAILABLE: '账号分享暂未开放租用。',
   SHARING_INVALID: '信息不完整，请刷新后重试。',
@@ -105,5 +139,8 @@ export const sharingMessages: Record<string, string> = {
   SHARING_UNPAID: '尚未确认付款，请先完成付款。',
   SHARING_DELIVERY_UNAVAILABLE: '暂时无法读取交付资料，请联系来信客服。',
   SHARING_INTENTION_INVALID: '登记信息不完整，请检查后重试。',
-  SHARING_POST_INVALID: '发布内容不符合标准模板，请检查后重试。'
+  SHARING_POST_INVALID: '发布内容不符合标准模板，请检查后重试。',
+  SHARING_RESPONSE_INVALID: '无法回应这个需求：规格不一致或发布状态已变化。',
+  SHARING_CANDIDATE_FULL: '这个需求的候选已满，请稍后再试或联系客服。',
+  SHARING_POST_CLOSED: '该发布已关闭。'
 }

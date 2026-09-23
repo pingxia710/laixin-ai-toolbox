@@ -14,10 +14,19 @@ import { createFileTaskStore, taskPaths } from '../download/task-store'
 import { downloadTunnelSnapshot } from '../download/tunnel-runtime'
 import type { DownloadTaskSnapshot } from '../download/types'
 import { captureDownloadReport } from '../account/installation-report'
+import { canChooseLocalDownload } from '../download/runtime-compatibility'
 
 let manager: DownloadManager | undefined
 let managerRecovery: Promise<void> | undefined
 let choosingLocal = false
+const officialEntries = new Set([
+  'codex-official-download', 'codex-github',
+  'claude-code-official-install', 'claude-code-github',
+  'hermes-official-download', 'hermes-github',
+  'deepseek-harness-official-install', 'deepseek-harness-github',
+  'zcode-official-download',
+  'kimi-code-official-install', 'kimi-code-github'
+])
 
 const taskSchema = schema.object({ taskId: schema.string({ maxLength: 100 }) })
 const resourceSchema = schema.object({ resourceId: schema.string({ maxLength: 100 }) })
@@ -34,75 +43,95 @@ const resultSchema = schema.object({
 })
 
 export function registerActions(registry: BridgeRegistry): void {
-  registerHandlers(registry, getManager)
+  registerHandlers(registry, getManager, false)
 }
 
-// 测试用注入口:handler 链与线上逐字相同,只是 manager 由调用方备好(照 actions/guide.ts 的先例)。
+// 历史下载链路仅供旧任务回归；产品注册不开放这些动作。
 export function registerDownloadActions(registry: BridgeRegistry, manager: DownloadManager): void {
-  registerHandlers(registry, async () => manager)
+  registerHandlers(registry, async () => manager, true)
 }
 
-function registerHandlers(registry: BridgeRegistry, resolveManager: () => Promise<DownloadManager>): void {
+function registerHandlers(registry: BridgeRegistry, resolveManager: () => Promise<DownloadManager>, legacyActions: boolean): void {
   registry.registerAction({ name: 'download.latest', paramsSchema: resourceSchema, resultSchema,
-    handler: (params) => respond(() => resolveManager().then((manager) => manager.latest(readResourceId(params))), true) })
-  registry.registerAction({ name: 'download.chooseLocal', paramsSchema: resourceSchema, resultSchema, handler: async (params) => {
-    if (choosingLocal) throw new Error('DOWNLOAD_PICKER_BUSY')
-    const resourceId = readResourceId(params)
-    const resource = loadCatalog().resources.find((item) => item.id === resourceId && item.type === 'download')
-    const platformMatches = (process.platform === 'darwin' && resource?.platform === 'macos') ||
-      (process.platform === 'win32' && process.arch === 'x64' && resource?.platform === 'windows' && resource.architecture === 'x86_64')
-    if (!resource || !platformMatches) throw new Error('DOWNLOAD_LOCAL_IMPORT_UNAVAILABLE')
-    choosingLocal = true
-    const report = captureDownloadReport()
-    try {
-      const selected = await dialog.showOpenDialog({ title: '选择已经下载的安装包', properties: ['openFile'], filters: [{ name: '安装包', extensions: [resource.format ?? 'dmg'] }] })
-      const manager = await resolveManager()
-      if (selected.canceled || selected.filePaths.length !== 1) return toOptionalResult(await manager.latest(resourceId))
-      const task = await manager.importLocal(resourceId, selected.filePaths[0]); report(task); return toBridgeResult(task)
-    } finally { choosingLocal = false }
-  } })
-  registry.registerAction({
-    name: 'download.start',
-    paramsSchema: resourceSchema,
-    resultSchema,
-    handler: (params) => respond(() => resolveManager().then((manager) => manager.start(readResourceId(params))))
-  })
-  registry.registerAction({
-    name: 'download.cancel',
-    paramsSchema: taskSchema,
-    resultSchema,
-    handler: (params) => respond(() => resolveManager().then((manager) => manager.cancel(readTaskId(params))))
-  })
-  registry.registerAction({
-    name: 'download.retry',
-    paramsSchema: taskSchema,
-    resultSchema,
-    handler: (params) => respond(() => resolveManager().then((manager) => manager.retry(readTaskId(params))))
-  })
-  registry.registerAction({
-    name: 'download.resume',
-    paramsSchema: taskSchema,
-    resultSchema,
-    handler: (params) => respond(() => resolveManager().then((manager) => manager.resume(readTaskId(params))))
-  })
+    handler: (params) => legacyActions
+      ? respond(() => resolveManager().then((manager) => manager.latest(readResourceId(params))), true)
+      : historyStore().list().then((tasks) => toOptionalResult(tasks.filter((task) => task.resourceId === readResourceId(params))
+        .sort((a, b) => b.startedAt.localeCompare(a.startedAt))[0])) })
   registry.registerAction({
     name: 'download.status',
     paramsSchema: taskSchema,
     resultSchema,
-    handler: (params) => respond(() => resolveManager().then((manager) => manager.status(readTaskId(params))), true)
+    handler: (params) => legacyActions
+      ? respond(() => resolveManager().then((manager) => manager.status(readTaskId(params))), true)
+      : historyStore().get(readTaskId(params)).then((task) => {
+        if (!task) throw new Error('DOWNLOAD_TASK_NOT_FOUND')
+        return toBridgeResult(task)
+      })
   })
-  registry.registerAction({
-    name: 'download.openInstaller',
-    paramsSchema: taskSchema,
-    resultSchema,
-    handler: (params) => respond(() => resolveManager().then((manager) => manager.openInstaller(readTaskId(params))))
-  })
+  if (legacyActions) {
+    registry.registerAction({ name: 'download.chooseLocal', paramsSchema: resourceSchema, resultSchema, handler: async (params) => {
+      if (choosingLocal) throw new Error('DOWNLOAD_PICKER_BUSY')
+      const resourceId = readResourceId(params)
+      const resource = loadCatalog().resources.find((item) => item.id === resourceId && item.type === 'download')
+      if (!resource || !canChooseLocalDownload({ platform: process.platform, architecture: process.arch }, resource)) throw new Error('DOWNLOAD_LOCAL_IMPORT_UNAVAILABLE')
+      choosingLocal = true
+      const report = captureDownloadReport()
+      try {
+        const selected = await dialog.showOpenDialog({ title: '选择已经下载的安装包', properties: ['openFile'], filters: [{ name: '安装包', extensions: [resource.format ?? 'dmg'] }] })
+        const manager = await resolveManager()
+        if (selected.canceled || selected.filePaths.length !== 1) return toOptionalResult(await manager.latest(resourceId))
+        const task = await manager.importLocal(resourceId, selected.filePaths[0]); report(task); return toBridgeResult(task)
+      } finally { choosingLocal = false }
+    } })
+    registry.registerAction({
+      name: 'download.start',
+      paramsSchema: resourceSchema,
+      resultSchema,
+      handler: (params) => respond(() => resolveManager().then((manager) => manager.start(readResourceId(params))))
+    })
+    registry.registerAction({
+      name: 'download.cancel',
+      paramsSchema: taskSchema,
+      resultSchema,
+      handler: (params) => respond(() => resolveManager().then((manager) => manager.cancel(readTaskId(params))))
+    })
+    registry.registerAction({
+      name: 'download.retry',
+      paramsSchema: taskSchema,
+      resultSchema,
+      handler: (params) => respond(() => resolveManager().then((manager) => manager.retry(readTaskId(params))))
+    })
+    registry.registerAction({
+      name: 'download.resume',
+      paramsSchema: taskSchema,
+      resultSchema,
+      handler: (params) => respond(() => resolveManager().then((manager) => manager.resume(readTaskId(params))))
+    })
+    registry.registerAction({
+      name: 'download.openInstaller',
+      paramsSchema: taskSchema,
+      resultSchema,
+      handler: (params) => respond(() => resolveManager().then((manager) => manager.openInstaller(readTaskId(params))))
+    })
+  }
   registry.registerAction({
     name: 'download.openExternal',
     paramsSchema: resourceSchema,
     resultSchema,
-    handler: (params) => respond(() => resolveManager().then((manager) => manager.openExternal(readResourceId(params))))
+    handler: async (params) => {
+      const resourceId = readResourceId(params)
+      if (legacyActions) return respond(() => resolveManager().then((manager) => manager.openExternal(resourceId)))
+      if (!officialEntries.has(resourceId)) throw new Error('DOWNLOAD_ENTRY_UNAVAILABLE')
+      const resource = loadCatalog().resources.find((item) => item.id === resourceId && item.type === 'external-entry')
+      if (!resource) throw new Error('DOWNLOAD_ENTRY_UNAVAILABLE')
+      await shell.openExternal(resource.officialPageUrl)
+      return { taskId: '', state: 'opened-external', reason: '', message: '已打开官方页面', receivedBytes: '0', totalBytes: '0', retryCount: '0', localSha256: '', installerPath: '' }
+    }
   })
+}
+
+function historyStore() {
+  return createFileTaskStore(join(app.getPath('userData'), 'toolbox-download'))
 }
 
 async function respond(operation: () => Promise<DownloadTaskSnapshot | undefined>, passive = false) {

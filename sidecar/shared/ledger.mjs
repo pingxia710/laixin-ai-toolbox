@@ -4,6 +4,9 @@
 import { appendFileSync, writeFileSync, readFileSync, renameSync, existsSync, mkdirSync, lstatSync, rmSync, statSync, linkSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { randomBytes } from 'node:crypto'
+import { spawnSync } from 'node:child_process'
+import { uptime } from 'node:os'
+import { createRequire } from 'node:module'
 
 export const ENTRY_STATUS = Object.freeze({
   applied: 'applied', // 已生效
@@ -51,6 +54,157 @@ const sleepSync = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuf
 export function processAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false
   try { process.kill(pid, 0); return true } catch (error) { return error?.code === 'EPERM' }
+}
+
+// ---- 持有者身份对账(PID 复用防线)----
+// kill(pid,0) 只回答「这个号码有没有人」,不回答「是不是当初拿锁的那个人」。持有者崩溃后
+// PID 被系统复用给无关进程时(同一次开机内就会发生),只查活性会把路人当成守护:界面显示已连
+// 而代理指向死端口,新守护静默让位,系统自愈被击穿。所以锁里记下持有者自己的启动时刻,
+// 判活时与该 PID **现在**的启动时刻对账——同一个号码、不是同一个人,当场现形。
+// (sweepOrphanXray 的「早于本次开机」判据只挡跨开机复用,挡不住同一次开机内的复用。)
+
+/** 本进程自己的启动时刻(ms):拿锁时写进锁里,给将来的判活者对账用。 */
+export function currentProcessStartedAt(now = Date.now) {
+  return now() - process.uptime() * 1_000
+}
+
+// mac/Linux 的 ps 只给到秒级,两侧读数各差半秒以内;Windows 的 GetProcessTimes 精确到 100ns。
+// 容差按最粗的一侧留:2.5 秒。
+const STARTED_AT_TOLERANCE_MS = 2_500
+// 启动时刻的短 TTL 记忆:alive() 挂在状态轮询上、设置锁等锁循环每 10ms 看一眼,
+// ⛔ 每次都起一个 ps/PowerShell 子进程。键含「锁里记的启动时刻」,守护换了人键就换,旧结论不会用到新守护身上。
+// 🔴 TTL 必须**明显大于调用它的最慢那个轮询周期**。5_000 是照着设置锁 10ms 循环定的,
+// 对那条路径挡得很好 —— 却与主进程状态轮询(runtime.ts 的 refreshTunnelStatus,5 秒一次)
+// **完全相等**:每次轮询缓存刚好过期,实测挡掉 **0%**(120 次调用起 120 次 PowerShell)。
+// 30 秒下同一节奏挡掉 83%。代价:PID 复用最多晚 30 秒被认出 —— 但首次询问仍是当场读、当场判,
+// ⛔ 改成「先答保守值、后台再读」:tests/tunnel/lock-holder-identity.test.ts 守的正是「路人顶用当场判死」。
+const startedAtCache = new Map()
+const STARTED_AT_CACHE_TTL_MS = 30_000
+const STARTED_AT_CACHE_LIMIT = 128
+
+// ---- Windows 启动时刻:koffi 直调 kernel32,一次子进程都不起(甲-1 返工 2026-09-16)----
+// 原实现 spawnSync('powershell', …) 查启动时刻:主进程状态轮询每 5 秒走到一次,PowerShell 冷启动
+// 几百毫秒起步、忙时拖满 5 秒超时 —— 真机实测窗口出现 1.8s → 15.4s,稳态 20 次点击 8 次 >1s。
+// TTL 缓存(上面的 30 秒)挡不住首问,首问必须仍然当场读当场判,所以探测本身必须便宜:
+// OpenProcess + GetProcessTimes 是微秒级同步调用,判活语义(含保守方向)一行不变。
+// koffi 拿不到(非打包/加载失败)→ 返回 undefined,判活按「读不出身份保守按在」处理,
+// ⛔ 回退起子进程 —— 那等于把卡顿请回主进程路径。
+const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+// FILETIME:1601-01-01 起 100ns 计数;与 Unix 纪元差 11_644_473_600 秒。
+const FILETIME_EPOCH_OFFSET_MS = 11_644_473_600_000
+
+/** FILETIME(100ns since 1601,拆 lo/hi 两个 32 位)→ Unix 毫秒;字段不齐返回 undefined。
+ *  double 在这个量级(≈2^57)的 100ns 位上损失 ≤16 个计数(≈1.6µs),对判活的 2.5 秒容差无关。 */
+export function filetimeToEpochMs(filetime) {
+  const low = filetime?.lo
+  const high = filetime?.hi
+  if (!Number.isInteger(low) || !Number.isInteger(high)) return undefined
+  return Math.round((high * 4_294_967_296 + low) / 10_000) - FILETIME_EPOCH_OFFSET_MS
+}
+
+// koffi 模块的解析落点与结果都记下(⛔ 每次判活都重试 require):主进程 bundle 在 app.asar 里,
+// require(import.meta.url) 找不到 extraResources 下的 koffi,要再从 resources/sidecar/win 试一次。
+let koffiProbe = { tried: false, module: undefined }
+function requireKoffi() {
+  if (koffiProbe.tried) return koffiProbe.module
+  koffiProbe.tried = true
+  const resolvers = [() => createRequire(import.meta.url)('koffi')]
+  if (typeof process.resourcesPath === 'string' && process.resourcesPath !== '') {
+    resolvers.push(() => createRequire(join(process.resourcesPath, 'sidecar', 'win', 'resolve-koffi.js'))('koffi'))
+  }
+  for (const resolve of resolvers) {
+    try {
+      koffiProbe.module = resolve()
+      return koffiProbe.module
+    } catch { /* 下一个落点;全落空就按「拿不到原生绑定」处理 */ }
+  }
+  return undefined
+}
+
+let windowsStartedAtBinding // undefined=还没试,null=试过拿不到,对象=可用
+function loadWindowsStartedAtBinding() {
+  if (windowsStartedAtBinding !== undefined) return windowsStartedAtBinding === null ? undefined : windowsStartedAtBinding
+  try {
+    const koffi = requireKoffi()
+    if (koffi === undefined) throw new Error('koffi 不可用')
+    const kernel32 = koffi.load('kernel32.dll')
+    // koffi 的类型名是进程级注册:同进程加载两份本文件副本(shared 被主进程 bundle、mac/win 副本并行)时
+    // 第二次定义会抛 Duplicate type name —— 同名同形,⛔ 让它炸掉整条绑定,忽略即可。
+    try { koffi.struct('LaixinFiletime', { lo: 'uint32', hi: 'uint32' }) } catch { /* 已定义:直接用 */ }
+    const open = kernel32.func('void* __stdcall OpenProcess(uint32 dwDesiredAccess, bool bInheritHandle, uint32 dwProcessId)')
+    const times = kernel32.func('bool __stdcall GetProcessTimes(void *hProcess, _Out_ LaixinFiletime *lpCreationTime, _Out_ LaixinFiletime *lpExitTime, _Out_ LaixinFiletime *lpKernelTime, _Out_ LaixinFiletime *lpUserTime)')
+    const close = kernel32.func('bool __stdcall CloseHandle(void *hObject)')
+    windowsStartedAtBinding = {
+      open: (pid) => open(PROCESS_QUERY_LIMITED_INFORMATION, false, pid),
+      creationTime: (handle) => {
+        const creation = {}
+        const exit = {}
+        const kernel = {}
+        const user = {}
+        if (times(handle, creation, exit, kernel, user) === false) return undefined
+        return { lo: creation.lo, hi: creation.hi }
+      },
+      close: (handle) => { close(handle) }
+    }
+  } catch {
+    windowsStartedAtBinding = null
+  }
+  return windowsStartedAtBinding === null ? undefined : windowsStartedAtBinding
+}
+
+/** 读某 PID 实际的启动时刻(ms)。读不出(进程刚好消失、无权打开、系统不支持)返回 undefined,调用方保守处理。
+ *  deps 可注入:{ platform }(默认 process.platform)、{ windowsBinding }(测试注入原生绑定;显式给 null = 模拟拿不到)。 */
+export function readProcessStartedAt(pid, now = Date.now, deps = {}) {
+  if (!Number.isInteger(pid) || pid <= 0) return undefined
+  try {
+    if ((deps.platform ?? process.platform) === 'win32') {
+      const binding = 'windowsBinding' in deps ? deps.windowsBinding : loadWindowsStartedAtBinding()
+      if (binding === undefined || binding === null) return undefined
+      const handle = binding.open(pid)
+      if (handle === undefined || handle === null) return undefined
+      try {
+        return filetimeToEpochMs(binding.creationTime(handle))
+      } finally {
+        try { binding.close(handle) } catch { /* 关不掉交给内核回收 */ }
+      }
+    }
+    // macOS/Linux:etime 是「至今活了多久」([[dd-]hh:]mm:ss),回推启动时刻,秒级精度
+    const probe = spawnSync('ps', ['-o', 'etime=', '-p', String(pid)], { encoding: 'utf8', timeout: 5_000 })
+    if (probe.status !== 0) return undefined
+    const match = /^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/.exec(probe.stdout.trim())
+    if (match === null) return undefined
+    const seconds = (match[1] !== undefined ? Number(match[1]) * 86_400 : 0) +
+      (match[2] !== undefined ? Number(match[2]) * 3_600 : 0) + Number(match[3]) * 60 + Number(match[4])
+    return Number.isFinite(seconds) ? now() - seconds * 1_000 : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 锁持有者是否仍是「当初拿锁的那个人」:pid 活着 **且** 启动时刻与锁内记录一致。
+ * 读不出身份(PID 刚消失前的窗口、系统不支持)时保守按「在」——误判会踢掉活守护,⛔ 朝那个方向错。
+ * 旧版锁(升级前写的,没有 startedAt)退回 sweepOrphanXray 的跨开机判据:锁的时刻早于本次开机即遗留。
+ */
+export function lockHolderAlive(record, { now = Date.now, uptimeSeconds = uptime, readStartedAt = readProcessStartedAt } = {}) {
+  if (record === undefined || !Number.isInteger(record.pid) || !processAlive(record.pid)) return false
+  const recorded = record.startedAt
+  if (!Number.isFinite(recorded)) {
+    return !(Number.isFinite(record.at) && record.at < now() - uptimeSeconds() * 1_000 - 60_000)
+  }
+  const cacheKey = `${String(record.pid)}:${String(recorded)}`
+  const at = now()
+  let actual
+  const cached = startedAtCache.get(cacheKey)
+  if (cached !== undefined && at - cached.readAt < STARTED_AT_CACHE_TTL_MS) {
+    actual = cached.value
+  } else {
+    actual = readStartedAt(record.pid, now)
+    if (startedAtCache.size >= STARTED_AT_CACHE_LIMIT) startedAtCache.clear()
+    startedAtCache.set(cacheKey, { value: actual, readAt: at })
+  }
+  if (actual === undefined) return true
+  return Math.abs(actual - recorded) <= STARTED_AT_TOLERANCE_MS
 }
 
 /** 读锁文件:{ holder, ino };文件不在返回 undefined;内容读不出(刚创建还没写完)holder 为 undefined 但 ino 有值。 */
@@ -118,7 +272,7 @@ export function takeOverStaleLock(dataDir, observed) {
   try { renameSync(path, bucket) } catch { return false }
   const moved = readLockFile(bucket)
   const sameFile = moved !== undefined && moved.ino === observed?.ino && moved.holder?.token === observed?.holder?.token
-  const deadHolder = moved !== undefined && moved.holder !== undefined && !processAlive(moved.holder.pid)
+  const deadHolder = moved !== undefined && moved.holder !== undefined && !lockHolderAlive(moved.holder)
   if (sameFile || deadHolder) {
     try { rmSync(bucket, { force: true }) } catch { /* 暂存删不掉不影响 */ }
     return true
@@ -128,15 +282,31 @@ export function takeOverStaleLock(dataDir, observed) {
   return false
 }
 
-function acquireSettingsLock(dataDir, { owner = '', timeoutMs = 20_000 } = {}) {
+// 等锁自旋的步进节奏(收拢轮 M10 小改「自旋分段让出」):这些等锁路径全是同步代码,同步等锁没法把事件循环
+// 让出来(那是彻底档「等锁异步化」,不在本条);能做的是把机器让给持锁方——自旋跑在守护唯一主线程上,
+// 前段 10ms 快抢,锁一放立刻接住(常态的短争抢,如复验撞上应用设置);持续被占就每秒翻倍拉长步进、100ms 封顶,
+// 每秒从 ~100 次锁文件折腾降到 ~10 次,持锁方(恢复/应用设置)少抢 I/O 早干完,整段冻结就短。
+export function settingsLockWaitStepMs(waitedMs) {
+  if (waitedMs < 1_000) return 10
+  return Math.min(100, 10 * 2 ** Math.floor(waitedMs / 1_000))
+}
+
+// 等锁默认上限(收拢轮 M10 小改「缩短默认上限」):自旋冻结的是唯一主线程,同线程上跑着本地桥客户流量——
+// 等锁多久,客户流量就停多久(这才是卡顿的真实代价;主进程对流量文件 10 秒不更新只是不显示流量行,
+// status-service.ts trafficSummary,⛔ 据此判守护不可用——2026-09-17 验收勘误)。20 秒上限等于每次争抢
+// 都能把客户流量整段卡死十几秒;5 秒封住单段冻结,留一半余量;等不到抛 SettingsBusyError 照旧是瞬时
+// 错误,调用方(恢复/重试梯子)本来就按稍后再试处理。
+const SETTINGS_LOCK_DEFAULT_TIMEOUT_MS = 5_000
+
+function acquireSettingsLock(dataDir, { owner = '', timeoutMs = SETTINGS_LOCK_DEFAULT_TIMEOUT_MS, now = Date.now, sleep = sleepSync, waitStepMs = settingsLockWaitStepMs } = {}) {
   mkdirSync(dataDir, { recursive: true })
   const path = settingsLockPath(dataDir)
   const token = `${String(process.pid)}-${randomBytes(4).toString('hex')}`
-  const deadline = Date.now() + timeoutMs
+  const deadline = now() + timeoutMs
   let unreadableSince
   for (;;) {
     try {
-      writeFileSync(path, JSON.stringify({ token, pid: process.pid, owner, at: Date.now() }), { flag: 'wx', mode: 0o600 })
+      writeFileSync(path, JSON.stringify({ token, pid: process.pid, owner, at: now(), startedAt: currentProcessStartedAt() }), { flag: 'wx', mode: 0o600 })
       let ino
       try { ino = statSync(path).ino } catch { ino = undefined }
       return { token, ino }
@@ -147,14 +317,14 @@ function acquireSettingsLock(dataDir, { owner = '', timeoutMs = 20_000 } = {}) {
     if (observed === undefined) continue // 刚被释放/挪走:马上再抢
     if (observed.holder === undefined) {
       // 刚创建还没写完内容(极短窗口),等一下;超过 2 秒仍读不出就当遗留锁
-      unreadableSince = unreadableSince ?? Date.now()
-      if (Date.now() - unreadableSince > 2_000) { takeOverStaleLock(dataDir, observed); unreadableSince = undefined; continue }
+      unreadableSince = unreadableSince ?? now()
+      if (now() - unreadableSince > 2_000) { takeOverStaleLock(dataDir, observed); unreadableSince = undefined; continue }
     } else {
       unreadableSince = undefined
-      if (!processAlive(observed.holder.pid)) { takeOverStaleLock(dataDir, observed); continue }
-      if (Date.now() > deadline) throw new SettingsBusyError(observed.holder)
+      if (!lockHolderAlive(observed.holder)) { takeOverStaleLock(dataDir, observed); continue }
+      if (now() > deadline) throw new SettingsBusyError(observed.holder)
     }
-    sleepSync(10)
+    sleep(waitStepMs(now() - (deadline - timeoutMs)))
   }
 }
 
@@ -463,6 +633,14 @@ export function markEntry(dataDir, entryId, { status, note }) {
 // 尚未终态的设置账目 = 崩溃或中断留下的待恢复项。
 export function pendingSettingEntries(dataDir) {
   return loadLedger(dataDir).filter(
+    (entry) => entry.kind === 'setting' && !isSettledSetting(entry)
+  )
+}
+
+// N-25:等待循环用的记忆化读——判据与 pendingSettingEntries 完全一致,改由 loadLedgerCached
+// 供数(mtime+size 失效)。恢复子进程改写账本后 mtime 变化,复核拿到的一定是新账。
+export function pendingSettingEntriesCached(dataDir) {
+  return loadLedgerCached(dataDir).filter(
     (entry) => entry.kind === 'setting' && !isSettledSetting(entry)
   )
 }

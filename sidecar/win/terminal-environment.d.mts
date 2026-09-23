@@ -14,6 +14,8 @@ export interface TerminalEnvironmentOptions {
   readonly run?: TerminalRun
   // 注入点(仅测试):跳过注册表读数,直接指定「文档」已知文件夹解析结果。
   readonly documentsDirectory?: string
+  // 注入点(仅测试):环境变量写入/删除后的 WM_SETTINGCHANGE 广播;生产走 koffi 原生 + PowerShell 回落。
+  readonly notifyEnvironmentChanged?: () => void
 }
 
 export interface TerminalEnvironmentAdapter {

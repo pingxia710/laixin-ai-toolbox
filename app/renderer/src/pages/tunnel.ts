@@ -6,6 +6,7 @@ import { revealSupport } from '../support-widget'
 import { requestTabNavigation } from '../navigation'
 import { accountSnapshot, onAccountChange } from '../account-state'
 import { idleNetworkRepair, type NetworkRepairStatus } from '../../../shared/network-repair'
+import { currentDiagnosticSession, forgetDiagnosticSession } from '../diagnostic-session'
 
 type Tone = 'neutral' | 'positive' | 'warning' | 'danger'
 type PrimaryAction = 'guide' | 'sync' | 'import' | 'start' | 'stop' | 'support' | 'none'
@@ -138,6 +139,14 @@ export function buildTunnelPresentation(status: TunnelStatusView | undefined): T
         tone: 'warning', headline: '正在连接', description: '正在等待通道建立和校验完成，请不要重复点击连接。',
         hint: '连接结果会自动更新，也可以随时取消。', primaryAction: 'stop', primaryLabel: '取消连接'
       }
+    case '正在接续':
+      // 甲-1 返工:常驻接续等待期(重开工具箱、校准未落定/正在叫醒守护)。标题如实说「正在接续」,
+      // ⛔ 曾在此窗口显示「已停止」并给「连接通道」,照点立即 spawn 非常驻守护 → 落定后双守护。
+      // 主按钮保留「连接通道」:此刻点击不再另起一份,而是并进同一轮,校准落定后走同一套判断接续。
+      return {
+        tone: 'warning', headline: '正在接续', description: '正在接续你上次的连接，稍候自动连上。',
+        hint: '等待期间也可以点击连接，会并进同一轮接续；不会重复启动通道。', primaryAction: 'start', primaryLabel: '连接通道'
+      }
     case '未配置':
       return {
         tone: 'neutral', headline: '国外AI需要配置网络', description: '登录账号后，按引导领取可用流量并连接。工具箱会为你准备网络设置。',
@@ -150,14 +159,17 @@ export function buildTunnelPresentation(status: TunnelStatusView | undefined): T
         primaryAction: status.currentConfig === '' ? 'import' : 'start', primaryLabel: status.currentConfig === '' ? '导入配置包' : '重新连接'
       }
     case '用户主动断开':
+      // N-26 轻暂停:用户断开就是暂停(共用同一意图),状态卡明说「已暂停」与开机不接续,
+      // ⛔ 让客户靠理解状态机猜按钮行为。动作不变:恢复仍走连接链路。
       return {
-        tone: 'neutral', headline: '已断开', description: '通道已按你的操作断开，原网络设置会由客户端恢复。',
-        hint: '需要时可重新连接当前已应用的配置。', primaryAction: status.currentConfig === '' ? 'import' : 'start', primaryLabel: status.currentConfig === '' ? '导入配置包' : '连接通道'
+        tone: 'neutral', headline: '已暂停使用', description: '通道已暂停，正在恢复你的原网络设置；开机不会自动连接。',
+        hint: '需要时点「恢复使用」即可继续。', primaryAction: status.currentConfig === '' ? 'import' : 'start', primaryLabel: status.currentConfig === '' ? '导入配置包' : '恢复使用'
       }
     case '已停止并恢复原设置':
       return {
-        tone: 'neutral', headline: '已停止并恢复原设置', description: '当前没有连接通道；可以使用已应用配置重新发起连接。',
-        hint: '退出工具箱时也会按此规则恢复原设置。', primaryAction: status.currentConfig === '' ? 'import' : 'start', primaryLabel: status.currentConfig === '' ? '导入配置包' : '连接通道'
+        tone: 'neutral', headline: '已暂停使用', description: '网络已暂停，原网络设置已恢复；开机不会自动连接。',
+        hint: '点「恢复使用」可随时继续；退出工具箱时也会按此规则恢复原设置。',
+        primaryAction: status.currentConfig === '' ? 'import' : 'start', primaryLabel: status.currentConfig === '' ? '导入配置包' : '恢复使用'
       }
     default:
       return {
@@ -325,24 +337,28 @@ function repairCard(): HTMLElement {
   const actions = document.createElement('div'); actions.className = 'network-repair-actions'
   const trigger = button(repair.running ? '正在修复' : '检测并修复连接', {
     iconName: 'refresh', disabled: busy || repair.running || !state.status || state.repairReadError,
-    onClick: () => void runAction(() => window.toolbox.tunnel.repair())
+    onClick: () => void runAction(() => { forgetDiagnosticSession(); return window.toolbox.tunnel.repair() })
   })
   trigger.dataset.networkAction = 'repair'
   const copy = button('复制诊断给客服', { disabled: busy || repair.running,
     onClick: () => void runAction(async () => {
-      await window.toolbox.diagnostics.run()
-      const result = JSON.parse((await window.toolbox.diagnostics.copy()).snapshot) as { copied?: boolean }
-      return result.copied ? { outcome: 'copied', code: '', message: '诊断信息已复制，可粘贴给来信客服。' }
-        : { outcome: 'rejected', code: '', message: '诊断未复制，请到帮助页重新生成诊断信息。' }
+      const session = currentDiagnosticSession()
+      const result = JSON.parse((await window.toolbox.diagnostics.copy({ id: session?.id ?? '' })).snapshot) as { copied?: boolean; stale?: boolean; message?: string }
+      if (!result.copied && session) forgetDiagnosticSession(session.id)
+      return result.copied ? { outcome: 'copied', code: '', message: session ? '本次诊断已复制，可粘贴给来信客服。' : '当前网络信息已复制，可粘贴给来信客服。' }
+        : { outcome: 'rejected', code: '', message: result.message ?? '结果已失效，请重新检查。' }
     }) })
   copy.dataset.networkAction = 'repair-copy'
   // 一键上报：客户不会复制诊断、也不一定发得出来（创始人 09-13：「复制诊断我不发哈」）。
   // 点一下，剩下的不用他管；发不出去也给同一个回执号和一份本机文件。
   const send = button('把情况报给来信', { disabled: busy || repair.running,
     onClick: () => void runAction(async () => {
-      const result = JSON.parse((await window.toolbox.diagnostics.report()).snapshot) as
-        { receipt: string; uploaded: boolean; filePath?: string; message: string }
-      state.reportReceipt = result.receipt
+      const session = currentDiagnosticSession()
+      const result = JSON.parse((await window.toolbox.diagnostics.report({ id: session?.id ?? '' })).snapshot) as
+        { receipt?: string; uploaded: boolean; stale?: boolean; filePath?: string; message: string }
+      if (result.stale && session) forgetDiagnosticSession(session.id)
+      if (result.stale) return { outcome: 'rejected', code: '', message: result.message }
+      state.reportReceipt = result.receipt ?? ''
       state.reportFile = result.uploaded ? '' : result.filePath ?? ''
       return { outcome: result.uploaded ? 'applied' : 'rejected', code: '', message: result.message }
     }) })
@@ -530,13 +546,22 @@ function actionSection(status: TunnelStatusView | undefined): HTMLElement {
   heading.dataset.networkAction = 'manual'
   const actions = document.createElement('div')
   actions.className = 'action-grid'
-  const stop = status !== undefined && (['已连', '连接中', '通道待确认'].includes(status.state) || Boolean(status.unrestored) ||
+  // N-26:启动与暂停拆两颗卡,两卡并存、各自禁用态正确——⛔ 一张卡按状态换脸让客户不敢点。
+  // 暂停 = 通道活动或待确认时可用,语义走既有 tunnel.stop() 链路(复用 user-disconnected 意图)。
+  const channelActive = status !== undefined && (['已连', '连接中', '通道待确认'].includes(status.state) ||
     ['等待重新确认账号权益', '保留先前连接，等待重新核验'].includes(status.authorization))
+  // 恢复进行中(用户主动断开)/落定(已停止并恢复原设置)都是暂停态:启动卡换「恢复使用」文案。
+  const paused = status !== undefined && ['用户主动断开', '已停止并恢复原设置'].includes(status.state)
   actions.append(
     actionCard('同步账号配置', '登录来信账号后，领取已开通的网络配置。', 'refresh', '同步配置', () => window.toolbox.tunnel.syncAccountConfig(), status === undefined),
     actionCard('导入配置包', '从本机选择来信签发的配置包；不会读取第三方订阅。', 'upload', '导入配置包', () => window.toolbox.tunnel.importConfig(), status === undefined),
     actionCard('应用待用配置', '仅在通道断开且原设置已恢复时可应用。', 'check', '应用新配置', () => window.toolbox.tunnel.applyPending(), status?.canApplyPending !== true),
-    actionCard(stop ? '断开与恢复' : '连接通道', stop ? '停止通道、取消自动恢复并重试恢复原设置。' : '使用当前配置重新连接并核验。', 'power', stop ? '断开并恢复' : '连接', () => stop ? window.toolbox.tunnel.stop() : window.toolbox.tunnel.start(), status === undefined || (!stop && status.currentConfig === ''))
+    // 启动/恢复一颗:暂停态换文案;通道活动中原设置未恢复时都不可发起(恢复入口在上方「重试恢复原设置」)。
+    actionCard(paused ? '恢复使用' : '连接通道', paused ? '回到暂停前的用法：重新连接并核验，随时可再暂停。' : '使用当前配置重新连接并核验。',
+      paused ? 'play' : 'power', paused ? '恢复' : '连接', () => window.toolbox.tunnel.start(),
+      status === undefined || channelActive || Boolean(status.unrestored) || status.currentConfig === ''),
+    actionCard('暂停使用', '断开通道并恢复你的原网络设置；开机不会自动连接。', 'pause', '暂停',
+      () => window.toolbox.tunnel.stop(), status === undefined || !channelActive)
   )
   section.append(heading, actions)
   return section

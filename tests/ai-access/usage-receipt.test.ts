@@ -399,7 +399,7 @@ function serviceWithRecorder(recorder: UsageReceiptRecorder, harness: ServiceHar
   })
 }
 
-function stubAccess(): Pick<AiAccessService, 'status' | 'saveProviderKey' | 'useProvider' | 'useOfficial'> {
+function stubAccess(): Pick<AiAccessService, 'status' | 'saveProviderKey' | 'useProvider' | 'useOfficial' | 'cancelTests'> {
   return { status: vi.fn(async () => ({ shells: {} })), saveProviderKey: vi.fn(), useProvider: vi.fn(), useOfficial: vi.fn() } as unknown as
-    Pick<AiAccessService, 'status' | 'saveProviderKey' | 'useProvider' | 'useOfficial'>
+    Pick<AiAccessService, 'status' | 'saveProviderKey' | 'useProvider' | 'useOfficial' | 'cancelTests'>
 }

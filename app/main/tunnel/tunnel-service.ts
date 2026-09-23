@@ -2,10 +2,12 @@
 // 守护监管、退出交接。renderer 传不进任何路径 / 节点 / 命令。
 import { existsSync, readFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
-import { generateSessionToken, ledgerFailure, pendingSettingEntries } from '../../../sidecar/mac/ledger.mjs'
-import { importAccountConfig, importConfig, readPackageEntries, type ImportOutcome } from './import-service'
+import { generateSessionToken, ledgerFailure, ledgerFailureCached, pendingSettingEntries } from '../../../sidecar/mac/ledger.mjs'
+import { unrestoredEntriesCached } from '../../../sidecar/mac/restore.mjs'
+import { readInstanceLockCached } from '../../../sidecar/shared/instance-lock.mjs'
+import { importAccountConfig, commitPickedConfig, readPackageEntries, type ImportOutcome } from './import-service'
 import { PackageReject, composeRoutes, packageDigest, sha256Hex, validatePackage, type RouteOverlay } from './package-format'
-import { readCurrentInfo, readPendingInfo } from './import-meta'
+import { readCurrentInfo, readPendingInfo, type CurrentInfo } from './import-meta'
 import { parseTarEntries } from './tar'
 import { NetworkAccountError, type AccountConfiguration, type NetworkAccountAccess } from './account-client'
 import { CONNECTION_LEASE_MS, verifyConnectionLease, type ConnectionLease } from './connection-lease'
@@ -15,19 +17,27 @@ import type { Platform } from '../precheck/software-platform'
 import type { FaultNoteId } from '../../shared/fault-log-types'
 import { ActionMutex, MUTEX_BUSY_CODE } from './mutex'
 import { KNOWN_FAILURE_CODES } from './failure-codes'
-import { layout, writeFileAtomic } from './paths'
+import { layout, statSignature, writeFileAtomic } from './paths'
 import { applyPending, currentBatchId, pendingBatchId, reconcilePointers, sweepStaging, hasInvalidPointers } from './transactions'
 import { TRUST_LINES, type TrustContext } from './trust'
 import { missingSidecarComponents, sshBinaryPresent } from './sidecar-path'
 import { computeStatus, readDaemonState, readTrafficObservation, type DaemonStateView, type TunnelStatus, DISPLAY_STATES, networkPathReady } from './status-service'
 import { DaemonSupervisor, RestoreInProgressError, type ResidentBridge, type SpawnedDaemon } from './supervisor'
+import { repairBudgetMs, REPAIR_BUDGET_PER_ENTRY_MS } from './repair-budget'
 import { explainRoute as explainRouteForHost, routeUnavailable, type RouteExplanation } from './route-explainer'
 import { idleNetworkRepair, type NetworkRepairStatus } from '../../shared/network-repair'
 
 export const DEFAULT_BRIDGE_PORT = 18080
+
+// N-23:修复复验预算随工作量伸缩(依据与常量见 repair-budget.ts;那里也被 supervisor 的恢复
+// deadline 共用,⛔ 两侧各造一套节奏)。此处再出口,现有引用面不变。
+export { repairBudgetMs, REPAIR_BUDGET_BASE_MS, REPAIR_BUDGET_PER_ENTRY_MS, REPAIR_BUDGET_MAX_MS } from './repair-budget'
 /** 入口端口候选:18080 在开发者机器上常被 Tomcat/Jenkins/别的代理占着,占了就换下一个,⛔ 直接报「端口占用」让客户自己找。 */
 export const BRIDGE_PORT_CANDIDATES: readonly number[] = Object.freeze([18080, 18180, 18280, 18380, 18480, 0]) // 0 = 兜底任选空闲口(硬标准:点了连接就要连上)
 export const DEFAULT_LOCAL_SOCKS_PORT = 18081
+
+// N-24:断开等锁的兜底期限。持锁段都是短事务,正常远快于此;挂死时点断开也要在这个期限内给结果。
+const STOP_LOCK_DEADLINE_MS = 10_000
 
 /** 账号模块告诉通道「账号没了」的原因:暂时问不到 / 登录过期(⛔ 当退出);缺省 = 用户明确退出或换账号。 */
 export type AccountAccessReason = 'temporary-unavailable' | 'login-expired'
@@ -64,16 +74,22 @@ export interface TunnelServiceDeps {
   readonly routesFile: string // routes.default.json 路径
   // 测试注入；生产从已验证的公司配置选择 SSH 或 VLESS/REALITY。
   readonly connectorOverride?: Record<string, unknown>
-  /** 测试可关闭真实 AI 直连探测；生产缺省启用。 */
-  readonly reuseDirect?: boolean
   /** D3:留一条故障经过(⛔ 正文)。缺省即不留痕,测试可注入。 */
   readonly recordFault?: (fault: { readonly network: string; readonly note?: FaultNoteId; readonly noteParams?: readonly string[] }) => void
+  /** Phase 1 ④:监管器失败留痕(UNKNOWN 归因);生产写 <userData>/logs/tunnel-daemon.log,测试注入收集。 */
+  readonly logFailure?: (event: string, detail?: string) => void
   /** 隔离故障用例可缩短修复等待；不从 renderer 接收。 */
   readonly repairTimeoutMs?: number
+  /** 测试注入:预算输入记账(生产走 repairBudgetMs 按账本待结算条数伸缩)。 */
+  readonly repairBudgetMs?: (pendingCount: number) => number
   /** 修复超时后等守护确认原设置恢复的宽限（有界）；默认 10 s。 */
   readonly repairRestoreGraceMs?: number
   /** 常驻接线；不给 = 主进程自己带守护的老路，一行行为都不变。 */
   readonly resident?: ResidentBridge
+  /** 甲-1:常驻校准落定通知(生产仅安装版给——开发态校准从不发生,给了会让开机接续永远等)。
+   *  给了它、常驻还没武装、席位也没人时,开机接续推迟到校准落定后再做:
+   *  马上会被常驻任务拉起来的机器上,抢跑 spawn = 两份守护并存。 */
+  readonly afterResidentCalibration?: (fn: () => void) => void
   /** FB-1 失败终态回传。不给 = 完全不回传（现有行为零变化）。
    * send 缺省时经当前账号会话直传（与 acknowledgement 同一鉴权）；无会话即放弃，⛔ 冒充已送达。 */
   readonly diagnosis?: {
@@ -90,8 +106,9 @@ const APPLY_ALLOWED_STATES: readonly string[] = [
   DISPLAY_STATES.userDisconnected
 ]
 
-/** 修复流程里客户能照做的失败原因；不在表里的码只报「尚不能确认」并留现场。 */
-const REPAIR_REASONS: Record<string, string> = {
+/** 修复流程里客户能照做的失败原因；不在表里的码只报「尚不能确认」并留现场。
+ *  导出只为让用例能直接钉住「每个码是否真的有可照做的一句」（同 connectionMessage 的先例）。 */
+export const REPAIR_REASONS: Record<string, string> = {
   '已有代理控制': '检测到其他代理或 PAC，请先在对应软件中断开代理，再点击检测并修复连接；来信没有覆盖它的设置。',
   '受管理环境': '系统代理受到组织策略或权限限制，请联系设备管理员；不会强行修改系统策略。',
   '端口占用': '来信需要的本机端口被占用，请关闭占用端口的代理软件后重试。',
@@ -101,7 +118,12 @@ const REPAIR_REASONS: Record<string, string> = {
   '授权失效': '网络授权已到期，请在我的账号查看流量与有效期；修复不会延长或购买套餐。',
   '配额或授权问题': '网络流量或授权不可用，请在我的账号核对权益。',
   'TUNNEL_SETTINGS_NOT_APPLIED': '本机接入设置没有生效。已停止连接，请关闭其他代理后重试；仍失败请复制诊断给客服。',
-  'TUNNEL_RESTORE_INCOMPLETE': '原设置仍未恢复：存在其他软件改动或读写失败。已保留现场，请关闭其他代理或 PAC 后重试；仍不行请复制诊断给客服。'
+  'TUNNEL_RESTORE_INCOMPLETE': '原设置仍未恢复：存在其他软件改动或读写失败。已保留现场，请关闭其他代理或 PAC 后重试；仍不行请复制诊断给客服。',
+  // N-23:一次性恢复的受控失败从守护/主进程落盘后,修复流程遇到同样要给客户可照做的一句。
+  'TUNNEL_RESTORE_TIMEOUT': '恢复原设置这一轮超时被中止。请再点一次「重试恢复原设置」；电脑很卡时请等它跑完，不要连续点击。',
+  'TUNNEL_RESTORE_SPAWN_FAILED': '恢复程序未能启动，原设置还没有恢复。请再点一次「重试恢复原设置」；仍不行请重启电脑后重试。',
+  // P0-1 TOP3(7/45):与 status-service instructions 表同一句可照做的话,⛔ 两头各说各的。
+  '上游不可达': '通道出口暂时不可达。请检查本机网络后重试；持续失败请换一个网络（如手机热点），仍不行请复制诊断给客服。'
 }
 
 // 组件缺失时给客户的一句话:**⛔ 把十几个文件名摊给他看**——他既看不懂也做不了什么,要的是「怎么办」。
@@ -113,6 +135,11 @@ export function componentMissingMessage(missing: readonly string[]): string {
   const rest = missing.length > 3 ? `等 ${String(missing.length)} 项` : ''
   return `工具箱网络组件缺失（缺 ${head}${rest}），请安装完整的最新版工具箱后重试；仍不行请复制诊断给客服。`
 }
+
+// N-25:意图文件的记忆化读(mtime+size 失效,loadLedgerCached 同一模式;⛔ TTL 时间窗)。
+// 等待循环与状态映射每轮都问意图,盘面没变就不必全量重读;本进程与测试的写入都走原子替换,
+// mtime 必变,缓存自失效。解析失败(缺文件/损坏)按无意图缓存,文件被重写后照常翻新。
+const intentCache = new Map<string, { key: string; intent: { desired: string; sessionToken?: string } | undefined }>()
 
 export class TunnelService {
   private readonly mutex = new ActionMutex()
@@ -139,6 +166,13 @@ export class TunnelService {
   private readonly diagnosisReporter?: DiagnosisReporter
   // 同一守护终态只回传一次的账(runId+code);cap 之外整表清空,防长驻进程无界增长。
   private reportedDaemonFailures = new Set<string>()
+  // 甲-9 返工:本轮 spawn 发出去的 runId(supervisor 每轮 ensureRunning/退避重启都新发一个)。
+  // 常驻轮不 spawn,一直是空串——state.json 错误码的「本轮归属」判据见 daemonStateIsCurrentRound。
+  private spawnedDaemonRunId = ''
+  // 甲-1 返工:开机接续被推迟到常驻校准落定(Windows 实测等待约 16s)。这扇窗口里:
+  //  · 界面必须如实说「正在接续」——席位是空的,⛔ 说「已停止」还摆一个连接按钮(点了就双守护);
+  //  · 客户点连接必须并进同一轮(挂到同一个校准落定回调),⛔ 立即 spawn。
+  private residentTakeoverWaiting = false
 
   private readonly platform: Platform
 
@@ -162,9 +196,11 @@ export class TunnelService {
     sweepStaging(deps.dataDir)
     this.supervisor = new DaemonSupervisor({
       dataDir: deps.dataDir,
-      spawnDaemon: (runId) => deps.spawnDaemon(deps.dataDir, runId),
+      // 记下本轮发给子进程的 runId:state.json 错误码只有带上它才算「本轮写的」(甲-9 返工)。
+      spawnDaemon: (runId) => { this.spawnedDaemonRunId = runId; return deps.spawnDaemon(deps.dataDir, runId) },
       spawnRestore: () => deps.spawnRestore(deps.dataDir),
-      resident: deps.resident
+      resident: deps.resident,
+      logFailure: deps.logFailure
     })
     const current = readCurrentInfo(deps.dataDir)
     if (current?.accountId && this.shouldResumeOnBoot(current)) {
@@ -176,10 +212,41 @@ export class TunnelService {
           writeFileAtomic(layout.intent(deps.dataDir), `${JSON.stringify(this.composeConnectIntent(current))}\n`)
         }
         this.markResumeOnLaunch(false)
-        this.supervisor.ensureRunning()
+        // 甲-1:校准完成前(Windows 开机校准 ~1 秒后才跑)接续 ⛔ 抢跑起守护:
+        // 席位上有在席常驻守护 → supervisor 自己认得,按常驻轮处理(不起第二份);
+        // 席位也没人时推迟到校准落定,再决定叫醒还是 spawn——
+        // 马上会被常驻任务拉起来的机器上,抢跑 spawn = 两份守护并存。
+        const resident = deps.resident
+        if (resident !== undefined && deps.afterResidentCalibration !== undefined && !resident.armed() && !resident.alive()) {
+          this.residentTakeoverWaiting = true
+          deps.afterResidentCalibration(() => this.completeResidentTakeover())
+        } else {
+          this.supervisor.ensureRunning()
+        }
       } catch { this.supervisor.recoverOnBoot() }
     } else if (current?.accountId) this.disconnect()
     else this.supervisor.recoverOnBoot()
+  }
+
+  /** 校准落定后的接续补做(开机接续与等待期手动连接共用):落定后走 supervisor 同一套判断——
+   *  武装了就叫醒常驻,没武装走 spawn 兜底。等待位在这里清除,⛔ 让「正在接续」显示过站不停。 */
+  private completeResidentTakeover(): void {
+    this.residentTakeoverWaiting = false
+    // 等待期里客户(或断开路径)把意图写成了 user-disconnected:落定后 ⛔ 再把守护拉起来。
+    // 意图文件是客户意愿的权威记录,落定时刻它说了算。
+    if (this.intentSnapshot()?.desired === 'user-disconnected') return
+    try { this.supervisor.ensureRunning() } catch { this.supervisor.recoverOnBoot() }
+  }
+
+  /** 连接路径的拉起入口。接续等待期内(常驻校准未落定)⛔ 立即 ensureRunning——此刻 armed、
+   *  席位都还是空的,会走 spawn 老路起非常驻守护,随后落定的叫醒再拉常驻 = 双守护(真机实测
+   *  TUNNEL_WRITE_RIGHT_HELD)。并进同一轮:挂到同一个校准落定队列,落定后走同一套判断。 */
+  private ensureRunningForConnection(): void {
+    if (!this.residentTakeoverWaiting || this.deps.afterResidentCalibration === undefined) {
+      this.supervisor.ensureRunning()
+      return
+    }
+    this.deps.afterResidentCalibration(() => this.completeResidentTakeover())
   }
 
   private shouldResumeOnBoot(current: NonNullable<ReturnType<typeof readCurrentInfo>>): boolean {
@@ -209,20 +276,26 @@ export class TunnelService {
   }
 
   async importConfig(): Promise<ImportResult> {
-    if (this.repairController) return { ...rejectedBusy(), authorizationId: '', nodeLabel: '', expiresAt: '', source: '', pendingAvailable: false }
+    if (this.repairController) return rejectedImportBusy()
+    // N-22:文件框在锁外。对话框非模态,客户盯着文件框多久,从前互斥锁就被攥多久——期间点
+    // 连接/断开/应用全吃「另一个通道操作正在进行」,刚点过「取消修复并断开」的还要进等锁自旋。
+    // 真正需要互斥的只有解析与提交;客户取消就不进锁。
+    const picked = await this.deps.picker()
+    if (picked === undefined) return mapImportOutcome({ outcome: 'cancelled' }, this.status().state)
+    // 对话框开着时修复可能已启动(从前沿锁挡住的那扇门现在开着):提交前复核,修复进行中不导入。
+    if (this.repairController) return rejectedImportBusy()
     const release = this.mutex.tryAcquire()
     if (release === undefined) {
-      return { ...rejectedBusy(), authorizationId: '', nodeLabel: '', expiresAt: '', source: '', pendingAvailable: false }
+      return rejectedImportBusy()
     }
     try {
-      const outcome = await importConfig({
+      const outcome = await commitPickedConfig({
         dataDir: this.deps.dataDir,
-        picker: this.deps.picker,
         trust: this.deps.trust,
         now: this.deps.now,
         runtimePlatform: this.platform,
         sourceLineOf: (validated) => TRUST_LINES[validated.trust.tier]
-      })
+      }, picked)
       return mapImportOutcome(outcome, this.status().state)
     } finally {
       release()
@@ -266,10 +339,13 @@ export class TunnelService {
     if (current?.accountId && current.accountId !== this.accountAccess?.session.accountId) {
       this.disconnect()
       if (access) {
+        // N-25:等待条件单次求值(一轮一份状态快照)+等待类轮询放宽到 200ms;判定语义不变——
+        // 出口仍是「状态落回可应用集且原设置已恢复」或超时。
         const deadline = Date.now() + 5000
-        while (this.accountAccess === next && Date.now() < deadline &&
-          (!APPLY_ALLOWED_STATES.includes(this.rawStatus().state) || this.rawStatus().unrestored)) {
-          await new Promise((resolve) => setTimeout(resolve, 50))
+        while (this.accountAccess === next && Date.now() < deadline) {
+          const status = this.rawStatus()
+          if (APPLY_ALLOWED_STATES.includes(status.state) && !status.unrestored) break
+          await new Promise((resolve) => setTimeout(resolve, 200))
         }
       }
     }
@@ -342,9 +418,12 @@ export class TunnelService {
             try { resume = JSON.parse(readFileSync(intentPath, 'utf8')).desired === 'connected' } catch { /* A malformed intent never requests reconnection. */ }
           }
           this.disconnect()
+          // N-25:同上——单次求值 + 200ms 等待节奏;assertSession 的会话闸保持每轮一查。
           const deadline = Date.now() + 5000
-          while (Date.now() < deadline && (!APPLY_ALLOWED_STATES.includes(this.rawStatus().state) || this.rawStatus().unrestored)) {
-            await new Promise((resolve) => setTimeout(resolve, 50)); assertSession()
+          while (Date.now() < deadline) {
+            const status = this.rawStatus()
+            if (APPLY_ALLOWED_STATES.includes(status.state) && !status.unrestored) break
+            await new Promise((resolve) => setTimeout(resolve, 200)); assertSession()
           }
         }
         const status = this.rawStatus()
@@ -364,7 +443,7 @@ export class TunnelService {
           assertSession()
           const intent = this.composeConnectIntent(readCurrentInfo(this.deps.dataDir)!)
           writeFileAtomic(layout.intent(this.deps.dataDir), `${JSON.stringify(intent)}\n`)
-          this.supervisor.ensureRunning()
+          this.ensureRunningForConnection()
           return { outcome: 'applied', code: '', message: '已切换可用权益，正在重新连接' }
         }
         await this.resumeAccountConnection(access, assertSession)
@@ -380,9 +459,12 @@ export class TunnelService {
       // ⛔ 把它说成「网络配置未通过核验」,更 ⛔ 顺手把通道断掉、把意图翻成 user-disconnected
       // ——暂停态下那等于取消了「权益恢复后自动接续」,客户得手动再点一次连接。
       if (!(error instanceof NetworkAccountError || error instanceof PackageReject)) {
-        // N-07:恢复在途是「本地一时忙」;其余本地故障(磁盘满/数据目录不可写)是写入失败,
-        // ⛔ 冒充「正在恢复」让客户白等一件永远不会发生的事。
-        return accountFailure(error instanceof RestoreInProgressError ? 'NETWORK_LOCAL_BUSY' : 'TUNNEL_LOCAL_WRITE_FAILED')
+        // N-07:恢复在途是「本地一时忙」;其余本地故障按 N-18 同一判据分开——真写入失败(带 fs
+        // 错误码)文案不变;程序错误(TypeError 等)⛔ 说成写入失败指使客户清磁盘/查目录权限,
+        // 清完照旧失败(甲-7:同步与连接同判据,客户那侧说一样的话)。
+        const localCode = error instanceof RestoreInProgressError ? 'NETWORK_LOCAL_BUSY'
+          : isLocalWriteFault(error) ? 'TUNNEL_LOCAL_WRITE_FAILED' : 'TUNNEL_LOCAL_UNEXPECTED'
+        return accountFailure(localCode)
       }
       if (this.accountAccess === access && !(error instanceof NetworkAccountError && error.message === 'NETWORK_SESSION_CHANGED')) {
         // 只有后台明确说「不能用了」才断客户的网;后台打不通、回包不对、新包校验不过、登录态 401,
@@ -549,7 +631,7 @@ export class TunnelService {
       }
       const intent = this.composeConnectIntent(current)
       writeFileAtomic(layout.intent(this.deps.dataDir), `${JSON.stringify(intent)}\n`)
-      this.supervisor.ensureRunning()
+      this.ensureRunningForConnection()
       return { outcome: 'started', code: '', message: '连接中' }
     } finally {
       release()
@@ -565,19 +647,49 @@ export class TunnelService {
     if (repairing) {
       // 修复正在核对配置时持有互斥：先中止它在途的账号请求（让核对立刻收尾），再等它让出互斥，
       // ⛔ 把「另一个通道操作正在进行」红字回给刚点了取消的客户。
-      // 锁也可能被别的操作长期占着（现实里是导入配置开着文件对话框）：按钮承诺的是「取消修复并断开」，
-      // ⛔ 等不到锁就提前返回谎称「正在停止连接」——断开意图没写、通道还在连（0.4.10 起）；
-      // 也不能指使客户「再点一次断开」去撞忙拒绝。一直等到锁让出，把断开真正做完。
+      // 锁也可能被别的操作占着：给 10 秒兜底（N-24）。正常情况锁是短事务，等它让出把断开真正做完；
+      // 但持锁段一旦挂死，⛔ 永久转圈——到点不抢锁，直接写断开意图（意图写不需要锁），守护按意图真停，
+      // 并如实说「不能确认已断开」：要么真停、要么如实说，⛔ 谎称已断开 ⛔ 回 TUNNEL_BUSY 让客户再点。
       this.accountRequest?.abort()
       await this.accountRequestDone
       let freed = false
+      const lockDeadline = Date.now() + STOP_LOCK_DEADLINE_MS
       while (!freed) {
         const release = this.mutex.tryAcquire()
         if (release) { release(); freed = true }
-        else await new Promise((resolve) => setTimeout(resolve, 50))
+        else if (Date.now() >= lockDeadline) {
+          this.pausedAccount = undefined
+          this.disconnect()
+          return { outcome: 'unknown', code: 'TUNNEL_STOP_TIMEOUT',
+            message: '已写入断开意图；通道停止确认超时，请重启工具箱后重试' }
+        }
+        else await new Promise((resolve) => setTimeout(resolve, 200)) // N-25:等待类轮询放宽到 200ms
       }
     }
-    return this.stopConnection()
+    const result = await this.stopConnection()
+    // N-26 轻暂停:客户断开就是暂停(共用 user-disconnected 意图)。落定后确保常驻任务禁用——
+    // 「开机不会自动连接」的主进程侧轻保证;守护自禁(settleResidentTask)仍是主机制,这里是补手。
+    if (result.outcome === 'stopped') this.ensureResidentDisabledAfterSettle()
+    return result
+  }
+
+  /** N-26:暂停落定(意图 user-disconnected 且账本结清)后一次幂等禁用检查。等待有界,预算与恢复
+   *  同账(repair-budget,⛔ 两侧另造节奏);没落定就不禁——恢复未完成时常驻任务还承担着崩溃拉回
+   *  的职责,提前禁用会让「恢复中崩溃」没人管。禁用失败不影响已落定的断开,⛔ 弹窗打扰客户。 */
+  private ensureResidentDisabledAfterSettle(): void {
+    const resident = this.deps.resident
+    if (resident?.ensureDisabled === undefined) return
+    const budgetInput = pendingSettingEntries(this.deps.dataDir).length
+    const deadline = Date.now() + (this.deps.repairBudgetMs?.(budgetInput) ?? repairBudgetMs(budgetInput))
+    void (async () => {
+      while (Date.now() < deadline) {
+        if (pendingSettingEntries(this.deps.dataDir).length === 0 && !this.supervisor.isRestoring()) {
+          try { await resident.ensureDisabled?.() } catch { /* 已尽力:守护自禁仍是主机制 */ }
+          return
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100))
+      }
+    })()
   }
 
   private async stopConnection(signal?: AbortSignal): Promise<ActionResult> {
@@ -601,6 +713,11 @@ export class TunnelService {
     }
   }
 
+  /** 常驻接续是否在途:开机接续还在等校准落定,或 supervisor 的叫醒周期正在跑。 */
+  private residentTakeoverInFlight(): boolean {
+    return this.residentTakeoverWaiting || this.supervisor.waking
+  }
+
   /** 断开意图写下之后，守护恢复原设置需要时间：在宽限内等它确认，再说恢复了 / 失败了 / 还没确认。 */
   private async awaitRestoreVerdict(graceMs: number): Promise<'restored' | 'failed' | 'pending'> {
     const stopToken = this.intentSnapshot()?.sessionToken
@@ -614,7 +731,7 @@ export class TunnelService {
         if (confirmed && status.unrestored) return 'failed'
       }
       if (Date.now() >= deadline) return 'pending'
-      await new Promise((resolve) => setTimeout(resolve, 100))
+      await new Promise((resolve) => setTimeout(resolve, 200)) // N-25:等待类轮询放宽到 200ms
     }
   }
 
@@ -649,12 +766,15 @@ export class TunnelService {
       try { this.pausedAccount = undefined; this.disconnect() }
       catch { stopFailed = true }
     }
+    // N-23:预算按此刻账本里真正待结算的条数伸缩(⛔ 固定 45 秒——慢机上一轮恢复就要 2-5 分钟)。
+    const budgetInput = pendingSettingEntries(this.deps.dataDir).length
+    const budget = this.deps.repairTimeoutMs ?? this.deps.repairBudgetMs?.(budgetInput) ?? repairBudgetMs(budgetInput)
     const timeout = setTimeout(() => {
       timedOut = true
       controller.abort()
       this.accountRequest?.abort()
       requestStop()
-    }, this.deps.repairTimeoutMs ?? 45_000)
+    }, budget)
     const check = () => { if (controller.signal.aborted) throw new Error('repair-interrupted') }
     const finish = (outcome: NetworkRepairStatus['outcome'], code: string, message: string) => {
       if (stopFailed) { outcome = 'unknown'; code = 'TUNNEL_REPAIR_LOCAL_FAILURE'; message = '未能写入停止连接指令，无法确认已经断开。请退出工具箱后重开；仍不行请联系来信客服。' }
@@ -671,7 +791,7 @@ export class TunnelService {
       while (true) {
         check()
         if (ready()) return
-        await new Promise((resolve) => setTimeout(resolve, 100))
+        await new Promise((resolve) => setTimeout(resolve, 200)) // N-25:等待类轮询放宽到 200ms
       }
     }
     try {
@@ -724,12 +844,17 @@ export class TunnelService {
         // （独立验收：慢适配器下曾误报「其他软件改动或权限限制」，3.5 s 后原设置其实已恢复）。等守护确认（有界）再说。
         this.repairView = { ...this.repairView, phase: 'restoring', message: '复验超时，正在恢复原设置并等待确认…' }
         const verdict = await this.awaitRestoreVerdict(this.deps.repairRestoreGraceMs ?? 10_000)
+        // N-23:超时文案按账本剩余条数给真实节奏(慢机单条上限),⛔ 在慢机上把「进行中」说成「超时」——
+        // 真机实证:客户 4 分钟里连点三次修复全部超时,而守护两分钟后自己恢复完了。
+        const remaining = pendingSettingEntries(this.deps.dataDir).length
+        const remainingMinutes = Math.max(1, Math.ceil(remaining * REPAIR_BUDGET_PER_ENTRY_MS / 60_000))
+        const paceHint = remaining > 0 ? `（还剩 ${String(remaining)} 项，按这台电脑的节奏预计还需约 ${String(remainingMinutes)} 分钟）` : ''
         if (verdict === 'failed') {
           finish('still_failing', 'TUNNEL_RESTORE_INCOMPLETE', '原设置仍未恢复：存在其他软件改动或读写失败。已保留现场，请关闭其他代理或 PAC 后重试；仍不行请复制诊断给客服。')
         } else if (verdict === 'restored') {
           finish('unknown', 'TUNNEL_REPAIR_TIMEOUT', '本次复验超时，尚不能确认恢复；已停止连接并恢复原设置。请检查网络，或换手机热点后重试。')
         } else {
-          finish('unknown', 'TUNNEL_REPAIR_TIMEOUT', '本次复验超时；本机仍在恢复原设置，尚不能确认。请稍后查看连接状态，或复制诊断给客服。')
+          finish('unknown', 'TUNNEL_REPAIR_TIMEOUT', `本次复验超时；本机仍在恢复原设置${paceHint}，不必反复点击修复。请稍后查看连接状态，或复制诊断给客服。`)
         }
       } else if (controller.signal.aborted) {
         // 取消按钮承诺的是「取消修复并断开」：收尾在这里就补写断开意图，⛔ 依赖 stop() 再补——
@@ -768,17 +893,31 @@ export class TunnelService {
 
   status(): TunnelStatus {
     if (this.accountTemporary && !this.localAuthorizationValid()) this.expireLocalContinuation()
-    const status = this.rawStatus()
+    // N-25:一次状态读只碰一次盘——配置信息在这里读一份,一路透传给 rawStatus/computeStatus
+    // 与本函数共用(现状是同一表达式读两三次)。
+    const currentInfo = readCurrentInfo(this.deps.dataDir)
+    const pendingInfo = readPendingInfo(this.deps.dataDir)
+    const status = this.rawStatus(currentInfo, pendingInfo)
+    // 甲-1 返工:常驻接续等待期(开机接续等校准落定 / supervisor 正在叫醒守护)界面必须如实说
+    // 「正在接续」。此刻席位是空的,computeStatus 只能算出「已停止并恢复原设置」——客户照着
+    // 旁边的「连接通道」按钮点下去,推迟的叫醒一执行就是双守护(Windows 真机实测)。
+    // 用独立的「正在接续」态而不是「连接中」:渲染层给「连接中」的主按钮是「取消连接」,
+    // 而这条验收线的要求恰是「等待期内点连接通道仍要并进同一轮、落定后能连上」。
+    // 客户明示断开时意图文件是权威,映射闸拦住,⛔ 把「刚取消」说成接续中。
+    if (status.state === DISPLAY_STATES.stoppedRestored && this.residentTakeoverInFlight() &&
+        this.intentSnapshot()?.desired !== 'user-disconnected') {
+      return { ...status, state: DISPLAY_STATES.resuming, message: '正在接续上次的连接，请稍候' }
+    }
     if (this.accountTemporary && !status.unrestored) return { ...status,
       message: '账号后台暂时问不到，按本地套餐有效期继续提供网络；恢复后自动核验',
       backend: '后台暂不可达，按本地有效期继续', authorization: '本地配置有效期内，等待重新核验' }
     if (this.pausedAccount && !status.unrestored) return { ...status, state: DISPLAY_STATES.error,
       message: '账号状态暂时无法确认，通道已暂停；有效权益恢复后会接续连接。可点击断开取消自动恢复',
       authorization: '等待重新确认账号权益', backend: '账号校验暂不可用', exitIp: '', lastVerifiedAt: '' }
-    const privateToAnotherSession = [readCurrentInfo(this.deps.dataDir), readPendingInfo(this.deps.dataDir)]
+    const privateToAnotherSession = [currentInfo, pendingInfo]
       .some((info) => info?.accountId && this.configForeignToSession(info.accountId))
     if (!privateToAnotherSession) {
-      if (readCurrentInfo(this.deps.dataDir)?.accountId) return { ...status,
+      if (currentInfo?.accountId) return { ...status,
         authorization: '配置由当前登录账号领取，期限以配置为准',
         backend: this.acknowledgementPending ? '配置已应用，设备回执待同步' : '后台：已接入账号配置领取' }
       return status
@@ -818,11 +957,15 @@ export class TunnelService {
     this.deps.recordFault?.({ network: 'AI_DIAG_STREAM_INTERRUPTED', note: 'stream_interrupted', noteParams: [String(interrupted)] })
   }
 
-  private rawStatus(): TunnelStatus {
+  // N-25:status() 已读的配置信息可作为入参透传(一次状态读只碰一次盘);其余调用点不传,
+  // 照旧自读(记忆化命中,只剩 stat)。
+  private rawStatus(preReadCurrent?: CurrentInfo, preReadPending?: CurrentInfo): TunnelStatus {
     this.recordInterruptedStreams()
     const daemonState = readDaemonState(this.deps.dataDir)
-    // ssh.exe 是按需组件:只有 SSH 稳定版分配才计入缺失;一键诊断对有无如实展示。
-    const info = readCurrentInfo(this.deps.dataDir) ?? readPendingInfo(this.deps.dataDir)
+    const currentInfo = preReadCurrent ?? readCurrentInfo(this.deps.dataDir)
+    const pendingInfo = preReadPending ?? readPendingInfo(this.deps.dataDir)
+    // ssh.exe 是按需组件:只有 SSH 稳定版分配才计入缺失;VLESS(升级版)不依赖它。
+    const info = currentInfo ?? pendingInfo
     const requireSshBinary = info !== undefined && info.protocol !== 'vless-reality'
     const unexpectedExitAt = this.supervisor.lastUnexpectedExitAt(daemonState)
     const status = computeStatus({
@@ -830,6 +973,7 @@ export class TunnelService {
       daemonState: this.supervisor.currentState(daemonState),
       daemonUnexpectedExitAt: unexpectedExitAt,
       daemonSurrendered: this.supervisor.surrendered,
+      preReadInfo: { current: currentInfo, pending: pendingInfo },
       componentMissing: missingSidecarComponents(this.platform, this.deps.sidecarDir, { requireSshBinary }),
       sshBinary: this.platform === 'windows' ? (sshBinaryPresent(this.platform, this.deps.sidecarDir) ? '有' : '无') : ''
     })
@@ -844,18 +988,56 @@ export class TunnelService {
     if (this.diagnosisReporter === undefined || this.repairController !== undefined) return
     if (displayState !== DISPLAY_STATES.error) return
     let code: string
-    if (unexpectedExitAt !== undefined || this.supervisor.surrendered) {
+    // 守护在本轮写下的 state.json error 带精确码的优先取它(甲-9):error 态与随后 exit(65) 并存时,
+    // ⛔ 让「意外退出」把精确码掩成 UNKNOWN——那正是 TUNNEL_RESTORE_INCOMPLETE / LEDGER_* 的死法,
+    // UNKNOWN 虚高会把「已知原因」误判成「说不出原因」,污染 FB-1 的排期数据。
+    // 但 rawStatus 递进来的是没按轮过滤的 state.json:上一轮的 error 会一直躺在盘上,新一轮守护
+    // 还没来得及写状态就被杀时,旧码还在 error 态——⛔ 拿它冒充这一轮的死因(甲-9 返工)。
+    // 判据见 daemonStateIsCurrentRound:只信本轮写下的码;判不出是陈货还是本轮的,照基线认,
+    // 可证是陈货且本轮正有崩溃要归因,就按意外退出如实 UNKNOWN。
+    if (daemonState?.state === 'error' && this.daemonStateIsCurrentRound(daemonState)) {
+      code = typeof daemonState.code === 'string' && daemonState.code !== '' ? daemonState.code : 'UNKNOWN'
+    } else if (unexpectedExitAt !== undefined || this.supervisor.surrendered) {
       code = 'UNKNOWN' // 现场随进程丢失,原因判不出
-    } else if (daemonState?.state === 'error') {
-      code = daemonState.code ?? 'UNKNOWN'
     } else {
-      return
+      // 挂钩三源都没命中时,补认显示层正凭以显示「异常」的本地可判源(甲-9):账本损坏/未恢复/配置指针损坏。
+      // 守护稳定已连期间不碰账本,账本被外部弄坏由主进程先发现的窗口,三源永远不会命中。
+      // ⛔ 再扩大到别的显示原因——源判读只加这些有现成精确码的;诊断读数坏了 ⛔ 弄坏状态读取。
+      try {
+        const failure = ledgerFailureCached(this.deps.dataDir)
+        if (failure) code = failure.code
+        else if (unrestoredEntriesCached(this.deps.dataDir).length > 0) code = 'TUNNEL_RESTORE_INCOMPLETE'
+        else if (hasInvalidPointers(this.deps.dataDir)) code = 'TUNNEL_POINTER_INVALID'
+        else return
+      } catch { return }
     }
-    const runKey = `${daemonState?.runId ?? ''}:${code}`
+    // 意外退出/放弃按死亡时刻记账:每次崩溃各有一笔,轮询重放同一笔死亡时去重;
+    // ⛔ 拿盘上陈旧的 runId 当账头——两轮「没写状态就被杀」会并进同一笔,下一轮崩溃又被吞掉。
+    const episodeKey = unexpectedExitAt !== undefined ? `exit:${String(unexpectedExitAt)}` : `${daemonState?.runId ?? ''}`
+    const runKey = `${episodeKey}:${code}`
     if (this.reportedDaemonFailures.has(runKey)) return
     if (this.reportedDaemonFailures.size >= 500) this.reportedDaemonFailures.clear()
     this.reportedDaemonFailures.add(runKey)
     this.reportFailure(code, 'connect-run')
+  }
+
+  // state.json 的 error 是不是「本轮守护」写下的(甲-9 返工)。state.json 没有按轮清场:
+  // 守护只在写出新状态时覆盖它,上一轮留下的 error 带旧码躺在盘上是常态。
+  //  · spawn 轮:比对主进程发给本轮子进程的 runId——ensureRunning/退避重启每轮新发,对得上才算本轮;
+  //  · 常驻轮:runId 是守护自己生成的,主进程不知道,改比席位锁:daemon.lock 的 at 是现任守护
+  //    抢到席位的时刻,daemon-core 每次写 state 都盖 updatedAt,本轮写出的必不早于本轮抢席,
+  //    上一轮写的码必早于本轮抢席,到这里现形。本进程 spawn 过就只认 spawn 的 runId——
+  //    常驻时代的遗留锁和它留下的 state 同属旧轮、会互相「印证」,⛔ 让它们合伙冒充本轮死因。
+  // 席位锁不在(夹具形态/本轮还没 spawn 过)就无从对账:按基线照认,⛔ 让返工把基线的回传弄丢。
+  private daemonStateIsCurrentRound(daemonState: DaemonStateView): boolean {
+    if (this.spawnedDaemonRunId !== '') return daemonState.runId === this.spawnedDaemonRunId
+    try {
+      // N-25:状态路径的席位锁读走记忆化(ino+mtime+size 失效);锁的抢/破/释放不在此列。
+      const acquiredAt = readInstanceLockCached(this.deps.dataDir)?.holder?.at
+      if (typeof acquiredAt !== 'number') return true
+      const writtenAt = (daemonState as { updatedAt?: unknown }).updatedAt
+      return typeof writtenAt === 'number' && writtenAt >= acquiredAt
+    } catch { return true }
   }
 
   /** 失败终态统一出口:补上授权 ID(空串=还没导入配置),异常就地吞掉,⛔ 影响连接动作本身。
@@ -899,7 +1081,7 @@ export class TunnelService {
       if (!this.supervisor.isRunning() && !this.supervisor.isRestoring() && !ledgerFailure(this.deps.dataDir) && pendingSettingEntries(this.deps.dataDir).length > 0) {
         this.supervisor.recoverOnBoot()
         const deadline = Date.now() + 5_000
-        while (this.supervisor.isRestoring() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50))
+        while (this.supervisor.isRestoring() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 200)) // N-25:等待类轮询放宽到 200ms
       }
     }
   }
@@ -916,7 +1098,7 @@ export class TunnelService {
     if (this.pausedAccount !== access.session.accountId) return
     const deadline = Date.now() + 5_000
     while (this.rawStatus().unrestored && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 50)); assertSession()
+      await new Promise((resolve) => setTimeout(resolve, 200)); assertSession() // N-25:等待类轮询放宽到 200ms
       if (this.pausedAccount !== access.session.accountId) return
     }
     assertSession()
@@ -924,7 +1106,7 @@ export class TunnelService {
     const current = readCurrentInfo(this.deps.dataDir)
     if (!current || this.validateStored(current.batchId, false)) return
     writeFileAtomic(layout.intent(this.deps.dataDir), `${JSON.stringify(this.composeConnectIntent(current))}\n`)
-    this.supervisor.ensureRunning()
+    this.ensureRunningForConnection()
     this.pausedAccount = undefined
   }
 
@@ -1057,6 +1239,17 @@ export class TunnelService {
   }
 
   private intentSnapshot(): { desired: string; sessionToken?: string } | undefined {
+    // N-25:记忆化读——盘面签名(mtime+size)没变就复用上次解析;写入都是原子替换,缓存自失效。
+    const path = layout.intent(this.deps.dataDir)
+    const key = statSignature(path)
+    const cached = intentCache.get(this.deps.dataDir)
+    if (cached !== undefined && cached.key === key) return cached.intent
+    const intent = this.readIntentFromDisk()
+    intentCache.set(this.deps.dataDir, { key, intent })
+    return intent
+  }
+
+  private readIntentFromDisk(): { desired: string; sessionToken?: string } | undefined {
     try {
       const parsed: unknown = JSON.parse(readFileSync(layout.intent(this.deps.dataDir), 'utf8'))
       if (parsed && typeof parsed === 'object' && typeof (parsed as { desired?: unknown }).desired === 'string') {
@@ -1068,6 +1261,8 @@ export class TunnelService {
   }
 
   private disconnect(): void {
+    // 等待位不在这里清:内部流程(账号切换等)也会走 disconnect,清掉会让「并进同一轮」失效。
+    // 客户意愿由意图文件表达,completeResidentTakeover 落定时看它;界面映射另有意图闸。
     this.markResumeOnLaunch(false)
     writeFileAtomic(layout.intent(this.deps.dataDir), `${JSON.stringify({ desired: 'user-disconnected', sessionToken: generateSessionToken(), updatedAt: this.deps.now() })}\n`)
     if (!this.supervisor.isRunning()) this.supervisor.recoverOnBoot()
@@ -1085,7 +1280,7 @@ export class TunnelService {
       bridgePortCandidates: [...BRIDGE_PORT_CANDIDATES],
       // 「客户这台电脑本来就能到 AI 服务就用它、不改他的设置」。判据与探测都在守护侧；
       // 这里给开关是因为真实探测 ⛔ 在用例里默认发生（开着专线的机器上会把用例集体带进复用分支）。
-      reuseDirect: this.deps.reuseDirect ?? true,
+      reuseDirect: true,
       // 隐藏多节点:这份授权带几个入口就给几个,守护把它们一起交给内核探活择路;单节点包这里就是一项,形状不变。
       ...(this.deps.connectorOverride === undefined && current.protocol === 'vless-reality' && current.nodes.length > 1
         ? { connectors: current.nodes.map((entry) => ({
@@ -1134,7 +1329,8 @@ function localContinuation(): ActionResult {
 // 是有用功;不带(TypeError/ReferenceError 等程序错误)→ 非预期程序错误,⛔ 指使客户清磁盘。
 const localWriteFaultCodes = new Set(['EACCES', 'EPERM', 'EROFS', 'ENOSPC', 'ENOENT', 'EIO'])
 
-function isLocalWriteFault(error: unknown): boolean {
+/** N-18 判据导出:桥层翻译 stop 异常时区分「真写入失败」与「未预期程序错误」。 */
+export function isLocalWriteFault(error: unknown): boolean {
   const candidates: readonly unknown[] = [error, (error as { readonly cause?: unknown } | undefined)?.cause]
   return candidates.some((candidate) => {
     const code = (candidate as NodeJS.ErrnoException | undefined)?.code
@@ -1142,18 +1338,21 @@ function isLocalWriteFault(error: unknown): boolean {
   })
 }
 
-function accountFailure(code: string): ActionResult {
+/** 受控失败码 → 客户可见 ActionResult。桥层(actions/tunnel)翻译动作异常时共用,⛔ 再漏给通用兜底。 */
+export function accountFailure(code: string): ActionResult {
   const messages: Record<string, string> = {
     NETWORK_LOGIN_REQUIRED: '请先登录来信账号', NETWORK_SESSION_CHANGED: '账号已变化，请重新获取配置',
     NETWORK_NO_APPLICATION: '当前账号尚未申请网络套餐', NETWORK_APPLICATION_PENDING: '网络申请正在处理中，批准后可自动获取配置',
-    NETWORK_AUTHORIZATION_UNAVAILABLE: '当前套餐不可使用，请查看额度、期限或开通状态',
+    NETWORK_AUTHORIZATION_UNAVAILABLE: '当前套餐不可使用，请打开「我的账号」页查看额度、期限或开通状态',
     NETWORK_LEASE_INVALID: '连接授权核验未通过，请重新同步来信配置',
     NETWORK_DISCONNECT_REQUIRED: '请先断开通道，原设置恢复后再获取新配置',
     NETWORK_SERVICE_UNAVAILABLE: '暂时无法获取网络配置，请稍后重试', NETWORK_RESPONSE_INVALID: '网络配置未通过核验，原配置保留',
     NETWORK_LOCAL_BUSY: '工具箱正在恢复原设置，还没完成，请稍后再试一次',
     TUNNEL_LOCAL_WRITE_FAILED: '工具箱写入本地数据失败（磁盘已满或目录不可写），请清理磁盘空间或检查数据目录后重试',
     // N-18:非预期程序错误。⛔ 把机器原文(可能带路径)写进文案;最终用词待创始人确认。
-    TUNNEL_LOCAL_UNEXPECTED: '连接没能完成，工具箱遇到一个未预期的问题。请退出工具箱后重开；仍不行请复制诊断给客服。'
+    // 甲-7:开头不再限定「连接」——同一码也归同步路径(配置变化同步/点连接后同步),措辞照
+    // TUNNEL_REPAIR_LOCAL_FAILURE 的中性写法,两种场景都说得通。
+    TUNNEL_LOCAL_UNEXPECTED: '工具箱遇到一个未预期的问题，刚才的操作没能完成。请退出工具箱后重开；仍不行请复制诊断给客服。'
   }
   return { outcome: 'rejected', code: Object.hasOwn(messages, code) ? code : 'NETWORK_RESPONSE_INVALID', message: messages[code] ?? messages.NETWORK_RESPONSE_INVALID }
 }
@@ -1164,6 +1363,10 @@ function rejectedBusy(): ActionResult {
     code: MUTEX_BUSY_CODE,
     message: '另一个通道操作正在进行,请稍候'
   }
+}
+
+function rejectedImportBusy(): ImportResult {
+  return { ...rejectedBusy(), authorizationId: '', nodeLabel: '', expiresAt: '', source: '', pendingAvailable: false }
 }
 
 function mapImportOutcome(outcome: ImportOutcome, displayState: string): ImportResult {

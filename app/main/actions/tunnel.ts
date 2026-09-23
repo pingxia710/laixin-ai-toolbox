@@ -5,20 +5,46 @@ import { spawn } from 'node:child_process'
 import { join } from 'node:path'
 import { app, dialog, powerMonitor } from 'electron'
 import type { BridgeRegistry } from '../bridge/bridge-registry'
+import { actionLocalFault } from '../bridge/local-fault'
 import { schema } from '../bridge/schema'
 import { recordFault } from '../diagnostics/context'
 import { FAILURE_REPORT_DEFAULT_ENABLED } from '../desktop/preferences'
 import { daemonLaunchFor } from '../tunnel/platform/launch'
 import { resolveTunnelDataDir } from '../tunnel/paths'
+import { createCalibrationGate } from '../tunnel/calibration-gate'
 import { initializeTunnelRuntime } from '../tunnel/runtime-owner'
 import { makeResidentRuntime, residentLogDir, residentSpecFor } from '../tunnel/resident-bridge'
 import { RESIDENT_TASK } from '../tunnel/platform/resident'
 import { setResidentRuntime } from '../tunnel/resident-owner'
 import { platformForRuntime, resolveSidecarDir } from '../tunnel/sidecar-path'
 import { loadTrustContext } from '../tunnel/trust'
-import { TunnelService } from '../tunnel/tunnel-service'
+import { createFailureLog, daemonLogPath } from '../tunnel/failure-log'
+import { TunnelService, accountFailure, isLocalWriteFault, type ActionResult } from '../tunnel/tunnel-service'
+import { NetworkAccountError } from '../tunnel/account-client'
+import { PackageReject } from '../tunnel/package-format'
 import type { SpawnedDaemon } from '../tunnel/supervisor'
 import type { Platform } from '../precheck/software-platform'
+
+/** 动作异常就地翻译成受控失败(⛔ 落到桥层「重新导入配置包」的通用兜底——那个兜底只留给
+ *  真正不可归因的情况)。受控账号/包异常按原码原话透传;stop 的本机异常按 N-18 判据分
+ *  「写入失败 / 未预期」两档,但都必须交代「通道可能仍在连接」——断开意图没写成,通道就没停。 */
+function translateActionError(action: 'start' | 'stop', error: unknown): ActionResult {
+  if (error instanceof NetworkAccountError) return accountFailure(error.message)
+  if (error instanceof PackageReject) return { outcome: 'rejected', code: error.code, message: error.message }
+  // 甲-6 报告 §五尾巴:走到这里的本机异常会翻成受控码,文案/FB-1 都在,缺的是本机故障记录里
+  // 的一笔——翻译的同时留证,归类与桥层兜底同源(actionLocalFault),⛔ 两处口径漂移、⛔ 原始消息。
+  const fault = actionLocalFault('ACTION_FAILED', `tunnel.${action}`, error)
+  if (fault !== undefined) recordFault(fault)
+  if (action === 'stop') {
+    const write = isLocalWriteFault(error)
+    return write
+      ? { outcome: 'rejected', code: 'TUNNEL_LOCAL_WRITE_FAILED',
+          message: '断开未完成：本机写入失败，通道可能仍在连接。请清理磁盘空间或检查数据目录后重试' }
+      : { outcome: 'rejected', code: 'TUNNEL_LOCAL_UNEXPECTED',
+          message: '断开没能完成，工具箱遇到一个未预期的问题；通道可能仍在连接。请退出工具箱后重开，仍不行请复制诊断给客服' }
+  }
+  return accountFailure('TUNNEL_LOCAL_UNEXPECTED')
+}
 
 export interface TunnelActionDeps {
   readonly service?: TunnelService
@@ -60,8 +86,9 @@ export const statusResultSchema = schema.object({
   configVersion: schema.string({ maxLength: 20 }),
   expiresAt: schema.string({ maxLength: 60 }),
   pendingAvailable: schema.boolean(),
-  currentConfig: schema.string(),
-  pendingConfig: schema.string(),
+  // 源头(configSummary)截断到 300;schema 上限是第二道闸——历史事故:组件清单变长把整个 status 顶成 ACTION_RESULT_INVALID。
+  currentConfig: schema.string({ maxLength: 300 }),
+  pendingConfig: schema.string({ maxLength: 300 }),
   canApplyPending: schema.boolean(),
   unrestored: schema.string({ maxLength: 600 }),
   componentMissing: schema.string({ maxLength: 400 }),
@@ -108,13 +135,13 @@ export function registerActions(registry: BridgeRegistry, deps: TunnelActionDeps
     name: 'tunnel.start',
     paramsSchema: schema.undefined(),
     resultSchema: actionResultSchema,
-    handler: () => service.start()
+    handler: () => service.start().catch((error: unknown) => translateActionError('start', error))
   })
   registry.registerAction({
     name: 'tunnel.stop',
     paramsSchema: schema.undefined(),
     resultSchema: actionResultSchema,
-    handler: () => service.stop()
+    handler: () => service.stop().catch((error: unknown) => translateActionError('stop', error))
   })
   registry.registerAction({ name: 'tunnel.repair', paramsSchema: schema.undefined(), resultSchema: actionResultSchema,
     handler: () => service.repair() })
@@ -152,12 +179,20 @@ function productionDeps(deps: TunnelActionDeps) {
       repoRoot
     })
   const launch = daemonLaunchFor(platform, sidecarDir)
+  // Phase 1 ④:失败留痕与守护/恢复子进程 stderr 同落 <userData>/logs/tunnel-daemon.log——
+  // 它已是常驻日志(mac launchd StandardErrorPath / win schtasks 重定向),诊断包既有通道收录。
+  const supervisorLog = createFailureLog(daemonLogPath(app.getPath('userData')))
   // 常驻运行时:装/卸/叫醒/探席位。⛔ 在这里按开关装——客户的选择存在桌面片的偏好里,
   // 由它调 calibrateResident;这边只负责把「怎么装」这件事装配好。
+  // 甲-1:校准落定前被推迟的开机接续排在闸门里,落定(含装上/没装上/卸下/抛错)后统一补做。
+  // 等待期手动点连接也并进同一个闸门(tunnel-service 经 afterResidentCalibration 登记)。
+  const calibrationGate = createCalibrationGate()
   const resident = makeResidentRuntime({
     dataDir,
     platform,
     supported: app.isPackaged,
+    onCalibrated: () => calibrationGate.markCalibrated(),
+    logFailure: supervisorLog,
     spec: () => residentSpecFor({
       executable: process.execPath,
       launch,
@@ -173,6 +208,10 @@ function productionDeps(deps: TunnelActionDeps) {
     platform,
     sidecarDir,
     resident: resident.bridge,
+    // 开发态校准从不发生(desktop 片直接 return):给了通知反而让开机接续永远等,⛔ 给。
+    ...(app.isPackaged
+      ? { afterResidentCalibration: (fn: () => void) => calibrationGate.afterCalibration(fn) }
+      : {}),
     // FB-1:失败终态回传(设置页可关,默认开)。开关读的是桌面片偏好文件——⛔ 不再 new 一个
     // DesktopStore:那会跟 desktop.runtime 的实例各持一份内存态互相漂移;惰性读,失败终态本身低频。
     diagnosis: {
@@ -202,6 +241,8 @@ function productionDeps(deps: TunnelActionDeps) {
     now: () => Date.now(),
     // D3:通道中断打断了正在回数据的连接时留一条经过,客服看得到「那次是回答到一半断的」。
     recordFault,
+    // Phase 1 ④:UNKNOWN 归因——监管器的意外退出/叫醒耗尽/恢复失败第一现场进常驻日志。
+    logFailure: supervisorLog,
     spawnDaemon:
       deps.spawnDaemon ??
       ((dir: string, runId?: string) => {
@@ -209,8 +250,10 @@ function productionDeps(deps: TunnelActionDeps) {
         const child = spawn(process.execPath, [launch.daemonPath, 'start', '--data-dir', dir, '--adapter', launch.adapterPath,
           '--parent-ipc', '1', '--run-id', runId ?? ''], {
           env: { ...process.env, ...launch.env }, detached: true, windowsHide: true,
-          stdio: ['ignore', 'ignore', 'inherit', 'ipc']
+          // Phase 1 ④:spawn 路径守护的 stderr 基线走 inherit(打包后无处可去)——接流进常驻日志。
+          stdio: ['ignore', 'ignore', 'pipe', 'ipc']
         })
+        child.stderr?.on('data', (chunk) => supervisorLog('daemon-stderr', String(chunk).trim()))
         const resume = () => { if (child.connected) child.send({ type: 'network-event', event: 'wake' }, () => {}) }
         powerMonitor.on('resume', resume)
         const cleanup = () => powerMonitor.removeListener('resume', resume)
@@ -220,10 +263,15 @@ function productionDeps(deps: TunnelActionDeps) {
       }),
     spawnRestore:
       deps.spawnRestore ??
-      ((dir: string) => spawn(process.execPath, [launch.daemonPath, 'restore', '--data-dir', dir, '--adapter', launch.adapterPath], {
-        env: { ...process.env, ...launch.env }, detached: true, windowsHide: true,
-        stdio: ['ignore', 'ignore', 'inherit']
-      })),
+      ((dir: string) => {
+        const child = spawn(process.execPath, [launch.daemonPath, 'restore', '--data-dir', dir, '--adapter', launch.adapterPath], {
+          env: { ...process.env, ...launch.env }, detached: true, windowsHide: true,
+          // Phase 1 ④:恢复子进程的梯子进度/写权原因都在 stderr,基线 inherit 打包后丢失——接流留痕。
+          stdio: ['ignore', 'ignore', 'pipe']
+        })
+        child.stderr?.on('data', (chunk) => supervisorLog('restore-stderr', String(chunk).trim()))
+        return child
+      }),
     routesFile: join(sidecarDir, 'routes.default.json')
   }
 }

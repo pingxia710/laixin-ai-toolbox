@@ -20,6 +20,14 @@ export interface ShellInventoryEntry {
   readonly method: 'npm' | 'script' | 'app' | 'none'
   readonly location: string
   readonly officialPage: string
+  /** Claude Code only: the Claude desktop app is present. It signs in to a Claude account and cannot use model API Keys. */
+  readonly claudeDesktop?: boolean
+}
+
+/** Which Claude editions are on this computer, from file presence only: nothing is executed or fetched. */
+export interface ClaudeEditions {
+  readonly cli: boolean
+  readonly desktop: boolean
 }
 
 export interface ShellInventoryDeps {
@@ -253,8 +261,18 @@ export async function trustedCliCommandCandidates(shell: TrustedCliShell, platfo
  * checks must never turn a PATH wrapper (or a symlink to one) into executable code.
  */
 export async function trustedCliExecutable(shell: TrustedCliShell, platform: string, home: string, env: NodeJS.ProcessEnv): Promise<string | undefined> {
+  return (await trustedCliExecutables(shell, platform, home, env))[0]
+}
+
+/**
+ * Every candidate that passes the fixed-location trust checks, in probe order. Readers that can
+ * fail per-binary (an app-bundled codex whose quota endpoint cannot connect on some machines)
+ * walk this list instead of dying with the first accepted binary.
+ */
+export async function trustedCliExecutables(shell: TrustedCliShell, platform: string, home: string, env: NodeJS.ProcessEnv): Promise<string[]> {
   const path = platformPath(platform)
   const candidates = await trustedCliCommandCandidates(shell, platform, home, env)
+  const accepted: string[] = []
   for (const candidate of candidates) {
     const info = await lstat(candidate).catch(() => undefined)
     if (!info?.isFile() || info.isSymbolicLink()) continue
@@ -263,9 +281,9 @@ export async function trustedCliExecutable(shell: TrustedCliShell, platform: str
     if (shell === 'hermes') {
       if (!await trustedHermesExecutable(candidate, platform)) continue
     } else if (path.resolve(resolved) !== path.resolve(candidate) || !await nativeExecutable(candidate)) continue
-    return candidate
+    accepted.push(candidate)
   }
-  return undefined
+  return accepted
 }
 
 export interface TrustedCliVersion {
@@ -398,7 +416,58 @@ export class ShellInventory {
     if (!installed && !recipe.command && !(recipe.macApps && this.deps.platform === 'darwin')) installed = null
     const latest = await this.latest(id)
     const updatable = installed === true && !!version && !!latest && compareVersions(latest, version) > 0
-    return { ...base, installed, version, versionUnknown, latest, updatable, method, location }
+    const desktop = id === 'claude-code' ? { claudeDesktop: await this.claudeDesktopPresent() } : {}
+    return { ...base, installed, version, versionUnknown, latest, updatable, method, location, ...desktop }
+  }
+
+  /**
+   * Customers reach the official download page and often install the Claude desktop app instead
+   * of the Claude Code CLI. Only the CLI reads the Toolbox model API configuration, so the model
+   * API page needs to tell the two apart without running either program.
+   */
+  async claudeEditions(): Promise<ClaudeEditions> {
+    const [cli, desktop] = await Promise.all([this.claudeCliPresent(), this.claudeDesktopPresent()])
+    return { cli, desktop }
+  }
+
+  private async claudeCliPresent(): Promise<boolean> {
+    for (const candidate of await trustedCliCommandCandidates('claude-code', this.deps.platform, this.deps.home, this.deps.env)) {
+      if (await this.exists(candidate)) return true
+    }
+    return await this.claudePathHit() !== undefined
+  }
+
+  /**
+   * A Store-packaged Claude desktop can register an app execution alias named Claude.exe in
+   * `%LOCALAPPDATA%\Microsoft\WindowsApps`, which is on PATH. That alias launches the desktop app,
+   * not Claude Code, so it must never count as the CLI.
+   */
+  private async claudePathHit(): Promise<string | undefined> {
+    for (const candidate of commandCandidates('claude', this.deps.platform, this.deps.home, this.deps.env)) {
+      // Per-user and machine alias folders are both named Microsoft\WindowsApps; only aliases live there.
+      if (this.deps.platform === 'win32' && /[\\/]microsoft[\\/]windowsapps[\\/][^\\/]+$/i.test(candidate)) continue
+      if (await this.exists(candidate)) return candidate
+    }
+    return undefined
+  }
+
+  private async claudeDesktopPresent(): Promise<boolean> {
+    const path = platformPath(this.deps.platform)
+    if (this.deps.platform === 'darwin') {
+      for (const root of ['/Applications', path.join(this.deps.home, 'Applications')]) {
+        if (await this.exists(path.join(root, 'Claude.app', 'Contents', 'Info.plist'))) return true
+      }
+      return false
+    }
+    if (this.deps.platform === 'win32') {
+      const local = this.deps.env.LOCALAPPDATA !== undefined && path.isAbsolute(this.deps.env.LOCALAPPDATA)
+        ? this.deps.env.LOCALAPPDATA : path.join(this.deps.home, 'AppData', 'Local')
+      // The Store/MSIX package registers this per-user folder at install; the older Squirrel
+      // installer used AnthropicClaude. The package family name is fixed by Anthropic's signature.
+      return await this.exists(path.join(local, 'Packages', 'Claude_pzs8sxrjxfjjc')) ||
+        await this.exists(path.join(local, 'AnthropicClaude', 'claude.exe'))
+    }
+    return false
   }
 
   async latest(id: ShellId): Promise<string> {
@@ -449,7 +518,7 @@ export class ShellInventory {
     for (const candidate of await trustedCliCommandCandidates(shell, this.deps.platform, this.deps.home, this.deps.env)) {
       if (await this.exists(candidate)) { fixedHit = candidate; break }
     }
-    const pathHit = await findCommandPath(command, this.deps.platform, this.deps.home, this.deps.env, this.exists)
+    const pathHit = shell === 'claude-code' ? await this.claudePathHit() : await findCommandPath(command, this.deps.platform, this.deps.home, this.deps.env, this.exists)
     const location = fixedHit ?? pathHit
     return location === undefined ? undefined : { version: '', location, versionUnknown: true }
   }

@@ -4,7 +4,8 @@ import { join } from 'node:path'
 export const expectedFailure = '生产构建缺少官网群码清单 CSP'
 
 export function mutateVerificationProject(tempRoot) {
-  replaceFileContent(join(tempRoot, 'app/renderer/src/csp.ts'), "connect-src https://laixin.net.cn", "connect-src 'none'")
+  replaceFileContent(join(tempRoot, 'app/renderer/src/csp.ts'),
+    "const groupEntryOrigin = 'https://laixin.work'", "const groupEntryOrigin = \"'none'\"")
 }
 
 function replaceFileContent(path, expected, replacement) {

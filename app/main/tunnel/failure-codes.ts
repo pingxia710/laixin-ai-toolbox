@@ -48,6 +48,8 @@ export const KNOWN_FAILURE_CODES: ReadonlySet<string> = new Set([
   'PACKAGE_SIGNATURE_INVALID',
   'PACKAGE_SIGNATURE_NO_KEY',
   'PACKAGE_SSH_USER_MISSING',
+  // 甲-8:读取前尺寸闸——超大文件不是来信的配置包,⛔ 与「读失败」(TUNNEL_LOCAL_READ_FAILED)混同一归因。
+  'PACKAGE_TOO_LARGE',
   'PACKAGE_UNSIGNED_UNTRUSTED',
   'PACKAGE_VERSION_CONFLICT',
   'PACKAGE_VERSION_REGRESSION',
@@ -58,6 +60,9 @@ export const KNOWN_FAILURE_CODES: ReadonlySet<string> = new Set([
   // N-07:本地写入失败(磁盘满/数据目录不可写)的细分码,与「恢复在途」的 NETWORK_LOCAL_BUSY 分开,
   // ⛔ 让磁盘满以已知「本地忙」的身份污染归因。
   'TUNNEL_LOCAL_WRITE_FAILED',
+  // 甲-6返工(④):读客户选的配置包失败(被移走/没有读取权限)与写数据目录失败分开归因——
+  // ⛔ 让「请重新选择包」的读失败在后台被聚合成「清磁盘」的写失败。
+  'TUNNEL_LOCAL_READ_FAILED',
   // N-18:非预期程序错误(TypeError 等,不带 fs 错误码)的细分码,与真写入失败 TUNNEL_LOCAL_WRITE_FAILED
   // 分开——⛔ 让程序错误冒充「写入失败」指使客户清磁盘、后台分不开两类归因。
   'TUNNEL_LOCAL_UNEXPECTED',
@@ -71,6 +76,10 @@ export const KNOWN_FAILURE_CODES: ReadonlySet<string> = new Set([
   'TUNNEL_REPAIR_TIMEOUT',
   'TUNNEL_REPAIR_UNCONFIRMED',
   'TUNNEL_RESTORE_INCOMPLETE',
+  // N-23:一次性恢复子进程的两类受控失败(supervisor 落盘 state.json)。基线静默吞掉,
+  // 客户对着「未完成(进程中断)」永远转圈;给独立码,后台才分得清「超时」和「没起来」。
+  'TUNNEL_RESTORE_TIMEOUT',
+  'TUNNEL_RESTORE_SPAWN_FAILED',
   'TUNNEL_SETTINGS_NOT_APPLIED',
   // 连接争抢止损(2026-09-15)。这四个码本身就是「点名冲突方」的载体:后台按码聚合即可分出
   // 「另一份来信」「其他软件」「认不出」三类,⛔ 上传路径/命令行来说明是谁。

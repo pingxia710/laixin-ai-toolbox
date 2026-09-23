@@ -13,6 +13,8 @@ export interface UpdateView {
   progress: number
   message: string
 }
+/** 「更新成功」弹窗的内容。version=装上的新版;previous=升级前的版本(空=旧 pending 没记);notes=那次更新的说明。 */
+export interface UpdateSuccessNotice { version: string; previous: string; notes: string }
 export interface DesktopView {
   preferences: DesktopPreferences
   backgroundAvailable: boolean

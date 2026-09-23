@@ -48,6 +48,14 @@ export function startPowerEvents({ platform = process.platform, emit, log, creat
   return create({ emit, onGiveUp: (reason) => log?.(reason) })
 }
 const VERIFY_CONFIRM_MS = 1_000
+// traffic 空闲心跳(Phase 1 ②):内容无变化时也按这个节奏补一笔,保住 UI 速率行的新鲜窗口
+// (status-service trafficSummary 45s 门槛,⛔ 两侧只改一侧)。观察节奏(2s)与它无关。
+const TRAFFIC_HEARTBEAT_MS = 30_000
+// 设置锁被别的进程占着(旧守护慢恢复、别的窗口在应用设置)时,「检查」类拿锁用短上限:
+// 复查撞锁是可等待的常态事件,⛔ 拿默认 5 秒去撞——每 2 秒一次 5 秒自旋等于把主线程大半时间
+// 又冻回去(甲-5 刚拆掉的形态)。撞锁后按 SETTINGS_BUSY_RETRY_MS 一拍顺延,锁放开即补做。
+const SETTINGS_BUSY_LOCK_WAIT_MS = 250
+const SETTINGS_BUSY_RETRY_MS = 2_000
 
 // 致命受控码:配置 / 权限 / 身份问题,自动重连无意义,直接停。
 // componentMissing(如随包 OpenSSH 缺失)在列:缺组件永远连不上,低频重试只会让客户
@@ -221,6 +229,17 @@ export function createDaemon(options) {
   return new DaemonCore(options)
 }
 
+// 甲-6:守护失败路径留证的形状——错误名/码＋截断首行。⛔ 整段转储(可能带路径长文);
+// 守护日志进诊断包时逐行过 redact(report-bundle),首行截断让它在该闸内也保持短。
+function errorNameOf(error) {
+  return error !== null && typeof error === 'object' && typeof error.name === 'string' && error.name !== '' ? error.name : 'Error'
+}
+
+function firstLineOf(error) {
+  const message = error instanceof Error ? error.message : String(error)
+  return message.split('\n')[0].slice(0, 160)
+}
+
 class DaemonCore {
   constructor(options) {
     const {
@@ -263,7 +282,9 @@ class DaemonCore {
     this.verifyTimer = undefined
     this.trafficTimer = undefined
     this.lastTraffic = undefined
+    this.lastTrafficWritten = undefined
     this.confirmationTimer = undefined
+    this.settingsBusyTimer = undefined
     this.lastVerification = undefined
     this.verifyingConnector = undefined
     this.transitioning = false
@@ -352,29 +373,61 @@ class DaemonCore {
   async run() {
     mkdirSync(this.dataDir, { recursive: true })
     let recoveryBlocked = false
+    // 甲-2 返工:启动梯子的意图基线(若本轮有启动恢复)。此刻 this.intent 还没装进来,先留空,
+    // 读入启动意图后回填(见下);基线一换(this.intent 被意图轮询换成新对象 = 客户点了连接或断开),
+    // 梯子必须停——新意图自己的 connect()/restoreAfterDisconnect 接手恢复与写入,⛔ 醒来再
+    // restoreSettings 把新连接写下的 ProxyServer 当旧账删掉。意图没变(引用相同)时照旧还账、照旧接续。
+    const startupLadder = { intent: undefined }
     const failure = ledgerFailure(this.dataDir)
     if (failure) { await this.failLedger(failure); return }
     // 任一进程再次启动时先读账本:有未恢复项先按规则处理,再做别的(判据 3③)。
-    if (pendingSettingEntries(this.dataDir).length > 0) {
-      const recovered = this.restoreSettings()
-      if (this.exited) return
-      if (recovered) this.log(`启动恢复:已恢复 ${recovered.restored.length} 项`)
-      else {
-        // 恢复没做完就 ⛔ 继续连接(P1):connect() 开头会把 fatalStopped 清掉,于是在**没还干净的设置**上
-        // 又写一层——退出时再也还不回客户原来的样子。判据用「恢复是否成功」,⛔ 用 pendingSettingEntries:
-        // 还原写失败的条目会转成 restore-failed,不再计入 pending,那条判据拦不住这一幕。
-        //
-        // ⛔ 在这里 return(第二轮 P1):那样意图轮询还没装,而外层 keepalive 让进程继续活着、
-        // 监管器又认为守护在跑 —— 客户点「重新连接」只改了 intent 文件,守护永远不会读它,
-        // 界面卡在「连接中」,客户只能退出重开工具箱。改成:本轮不连,但**照常装上轮询**,
-        // 客户显式重试时 tickIntent 接得住,connect() 里会再试一次恢复。
-        this.log('启动恢复未完成:本次不建立连接,继续监听意图等待客户重试')
-        recoveryBlocked = true
-      }
+    const startupRestoreNeeded = pendingSettingEntries(this.dataDir).length > 0
+    if (startupRestoreNeeded) {
+      // 甲-2:启动恢复接上断开/授权到期/退出同款的恢复重试梯子。基线是裸调一次 restoreSettings,
+      // 杀软短暂锁注册表这类暂时性失败一次就置 recoveryBlocked 等客户点「重试恢复原设置」——
+      // 而重启后守护被系统拉起、客户根本没开界面的无人值守窗口正是这条,不点永远不好。
+      // 梯子**后台跑**,⛔ 堵住意图轮询的安装(上一轮修过的「恢复失败守护失聪」回归就靠轮询在,
+      // 内联等梯子会把它再踩出来)。落定前不连接:recoveryBlocked 守住下面的自动接续与 connect(),
+      // 连接动作里的 restoreSettings 复查是兜底。
+      // ⛔ 开 checkHandover:此刻 state.json 多半还是上一任守护写的,拿它判「已交接」
+      // 会把正常的接替恢复误判成让位——启动恢复恰恰是替上一任还账的人。
+      recoveryBlocked = true
+      void this.restoreWithRetryLadder('启动恢复未完成', {
+        shouldContinue: () => !this.exited && this.shutdownTask === undefined && this.intent === startupLadder.intent
+      }).then((recovered) => {
+        if (this.exited) return
+        if (!recovered) {
+          // 恢复没做完就 ⛔ 继续连接(P1):connect() 开头会把 fatalStopped 清掉,于是在**没还干净的设置**上
+          // 又写一层——退出时再也还不回客户原来的样子。判据用「恢复是否成功」,⛔ 用 pendingSettingEntries:
+          // 还原写失败的条目会转成 restore-failed,不再计入 pending,那条判据拦不住这一幕。
+          //
+          // ⛔ 在这里 return(第二轮 P1):那样意图轮询还没装,而外层 keepalive 让进程继续活着、
+          // 监管器又认为守护在跑 —— 客户点「重新连接」只改了 intent 文件,守护永远不会读它,
+          // 界面卡在「连接中」,客户只能退出重开工具箱。改成:本轮不连,但**照常装上轮询**,
+          // 客户显式重试时 tickIntent 接得住,connect() 里会再试一次恢复。
+          this.log('启动恢复未完成:本次不建立连接,继续监听意图等待客户重试')
+          return
+        }
+        this.log(`启动恢复:已恢复 ${recovered.restored.length} 项`)
+        // 梯子落定后按意图落定状态:要连就现在接上(⛔ 等客户再点一次);不连就把待命状态落盘。
+        // 这两个出口都归这里;run() 尾段看见 startupRestoreNeeded 一律不动笔(⛔ 抢写盖掉在途连接)。
+        // (落定后 ⛔ 回写 recoveryBlocked:它是 run() 的局部量,尾段已过,读了也没人看。)
+        if (this.shutdownTask !== undefined) return
+        if (this.intent?.desired === 'connected' && this.state !== 'connected' && this.state !== 'degraded') {
+          void this.connect().catch(() => this.requestShutdown())
+        } else if (this.intent?.desired !== 'connected' && unrestoredEntries(this.dataDir).length === 0) {
+          this.writeStateNow(this.intent?.desired === 'user-disconnected' ? 'user-disconnected' : 'idle')
+        }
+      }).catch(() => {
+        // 与断开路径同风格:梯子/落定回调意外抛错只记日志;顶层崩溃兜底仍在(恢复+退出+常驻重拉)。
+        if (!this.exited) this.log('启动恢复的重试中断')
+      })
     }
     const persistedIntent = lastIntent(this.dataDir)
     const { intent: fileIntent, corrupted } = readIntentChecked(this.dataDir)
     this.intent = fileIntent ?? (persistedIntent === undefined ? undefined : { desired: persistedIntent })
+    // 启动梯子的意图基线回填:从此刻起,意图轮询每次换新意图对象都会让梯子在下一次醒来复查时停下。
+    startupLadder.intent = this.intent
     // 意图文件损坏已隔离:状态里留一句可见证据(收敛包3·件1)。
     if (corrupted && !this.intentCorruptionNoted) {
       this.intentCorruptionNoted = true
@@ -388,12 +441,14 @@ class DaemonCore {
     this.authorizationTimer = this.clock.setInterval(() => this.tickAuthorization(), this.intentPollMs)
     this.intentTimer = this.clock.setInterval(() => this.tickIntent(), this.intentPollMs)
     this.parentTimer = this.clock.setInterval(() => this.tickParent(), this.parentPollMs)
-    if (this.intent?.desired === 'connected' && !recoveryBlocked) {
+    if (this.intent?.desired === 'connected' && !recoveryBlocked && !startupRestoreNeeded) {
+      // startupRestoreNeeded 为真时,接续归上面的梯子落定回调独有(⛔ 两处各点一次火 = 双连接)。
       await this.connect()
     } else if (this.intent?.desired === 'shutdown') {
       this.shutdown()
       return
-    } else if (!recoveryBlocked) {
+    } else if (!recoveryBlocked && !startupRestoreNeeded) {
+      // 启动梯子在场的轮次,idle 落笔也归梯子的落定回调——⛔ 这里抢着写 idle 盖掉它正在进行的连接。
       if (unrestoredEntries(this.dataDir).length === 0) this.writeStateNow(this.intent?.desired === 'user-disconnected' ? 'user-disconnected' : 'idle')
     }
     // recoveryBlocked 时什么都不写:保留 restoreSettings 已写明的真因,⛔ 被 idle 盖掉。
@@ -439,8 +494,58 @@ class DaemonCore {
     this.authorizationStopped = true
     this.state = 'error'
     await this.stopConnection()
-    if (!this.restoreSettings()) return
-    if (!this.exited) this.writeStateNow('error', { code, message: code === 'TUNNEL_AUTHORIZATION_EXPIRED'
+    // 同一重试梯子(退出路径同款):恢复失败 ⛔ 一次就走——整机断网正等着这套设置还回去。
+    const stoppedIntent = this.intent
+    void this.restoreAfterAuthorization(code, stoppedIntent).catch(() => {
+      if (!this.exited) this.log('授权停止后的恢复重试中断')
+    })
+  }
+
+  /** 断开/授权到期/退出共用的恢复重试梯子:中继已关而恢复未完成时,代理还指着死端口就是整机断网,
+   *  ⛔ 一次失败丢掉恢复责任。只有「写/读失败」(restore-failed)与「锁被别人占着」是暂时性的,按快速梯子
+   *  →慢速梯子的节奏重试;第三方改过的(kept-modified)在恢复时已结成 preserved 终态,不会把梯子带进空等;
+   *  写权在别的进程手里也不是暂时性(另一份安装接管着),restoreSettings 自会写明真因并就地放弃。
+   *  shouldContinue 在每次再试前问调用方(意图已变/已交接/已退出就停);甲-2 返工:**每一格醒来后、
+   *  执行恢复前也要再问一次**——睡的那一格里客户可能已经点了连接/断开,⛔ 醒来不看就把新连接写下的
+   *  设置当旧账还一遍(它恢复的正是活连接刚记的账,ProxyServer 当场被删,直到下个复验周期才写回)。 */
+  async restoreWithRetryLadder(label, { checkHandover = false, shouldContinue = () => true } = {}) {
+    let recovered = this.restoreSettings({ checkHandover })
+    const transientFailure = () => this.settingsBusy || loadLedger(this.dataDir).some((entry) => entry.kind === 'setting' && entry.status === ENTRY_STATUS.restoreFailed)
+    for (const delay of SHUTDOWN_RESTORE_RETRY_MS) {
+      if (recovered || !transientFailure() || !shouldContinue()) break
+      this.log(`${label},${String(delay / 1000)} 秒后再试`)
+      await new Promise((resolve) => this.clock.setTimeout(resolve, delay))
+      if (!shouldContinue()) break
+      this.fatalStopped = false
+      recovered = this.restoreSettings({ checkHandover })
+    }
+    // 快速梯子用尽仍是暂时性写失败:留下来慢节奏继续还;有上限,到点交给主进程的修复或下次启动。
+    for (let round = 1; !recovered && transientFailure() && round <= SHUTDOWN_RESTORE_SLOW_ROUNDS && shouldContinue(); round += 1) {
+      this.log(`${label},${String(SHUTDOWN_RESTORE_SLOW_MS / 1000)} 秒后再试(慢节奏第 ${String(round)} 轮)`)
+      await new Promise((resolve) => this.clock.setTimeout(resolve, SHUTDOWN_RESTORE_SLOW_MS))
+      if (!shouldContinue()) break
+      this.fatalStopped = false
+      recovered = this.restoreSettings({ checkHandover })
+    }
+    return recovered
+  }
+
+  async restoreAfterDisconnect(intent) {
+    const recovered = await this.restoreWithRetryLadder('断开通道后原设置恢复未完成', {
+      shouldContinue: () => this.intent === intent && !this.exited && !this.handedOver
+    })
+    if (!recovered || this.intent !== intent || this.exited || this.handedOver) return
+    this.writeStateNow('stopped-restored')
+  }
+
+  async restoreAfterAuthorization(code, stoppedIntent) {
+    const recovered = await this.restoreWithRetryLadder('授权停止后原设置恢复未完成', {
+      shouldContinue: () => !this.exited && !this.handedOver && this.intent === stoppedIntent
+    })
+    // 授权到期场景意图仍是 connected(到期的只是授权,不是客户的意愿),⛔ 用 desired 判断;
+    // 认「意图对象没换」:客户换了新意图(续费后重连)时由连接流程写状态,才不用旧授权的 error 覆盖。
+    if (!recovered || this.exited || this.handedOver || this.intent !== stoppedIntent) return
+    this.writeStateNow('error', { code, message: code === 'TUNNEL_AUTHORIZATION_EXPIRED'
       ? '网络授权已到期，已断开通道；请查看有效套餐或更新来信配置'
       : '网络授权期限缺失或无效，请重新连接或更新来信配置' })
   }
@@ -463,8 +568,11 @@ class DaemonCore {
     if (next.desired === 'user-disconnected') {
       this.writeStateNow('user-disconnected')
       await this.stopConnection()
-      if (!this.restoreSettings()) return
-      this.writeStateNow('stopped-restored')
+      // 恢复失败 ⛔ 一次就走(与退出路径同一重试梯子):中继已关,代理还指着它就是整机断网。
+      // 后台慢慢还;⛔ 不占 transitioning 闸——期间客户点连接,新意图要能立刻接手(connect 自带恢复)。
+      void this.restoreAfterDisconnect(next).catch(() => {
+        if (!this.exited) this.log('断开后的恢复重试中断')
+      })
       return
     }
     if (next.desired === 'shutdown') {
@@ -508,14 +616,30 @@ class DaemonCore {
     }
   }
 
+  /** 连接路径撞设置锁的等待位:记「连接中」+锁忙码(界面经 connectionMessage 出人话),短轮询等锁放开后
+   * 原路重走 connect(恢复→连接→写设置)。⛔ 写失败态、⛔ 停连接、⛔ 出现「连接中断,自动重连中」——
+   * 锁忙说明不了通道好坏,而且此时客户多半还没连上过。 */
+  waitOutSettingsLock(code) {
+    if (this.exited || this.shutdownTask || this.intent?.desired !== 'connected') return
+    this.log(`设置锁被别的进程占着(${String(code)}):连接顺延,${String(SETTINGS_BUSY_RETRY_MS / 1000)} 秒后再试`)
+    this.writeStateNow('connecting', { code })
+    if (this.settingsBusyTimer !== undefined) return
+    this.settingsBusyTimer = this.clock.setTimeout(() => {
+      this.settingsBusyTimer = undefined
+      void this.connect()
+    }, SETTINGS_BUSY_RETRY_MS)
+  }
+
   async connect() {
     if (this.shutdownTask || this.exited || this.intent?.desired !== 'connected') return
     const failure = ledgerFailure(this.dataDir)
     if (failure) { await this.failLedger(failure); return }
     await this.stopConnection()
     if (this.shutdownTask || this.exited || this.intent?.desired !== 'connected') return
-    if (!this.restoreSettings()) {
-      if (this.settingsBusy) await this.handleConnectFailure(Object.assign(new Error('系统设置正被另一恢复任务占用'), { code: 'TUNNEL_SETTINGS_BUSY' }))
+    // 检查性拿锁用短上限:锁忙=另一项设置任务在进行,与通道无关。客户往往还没连上过,
+    // ⛔ 走 handleConnectFailure——那会写失败态、停连接、显示「连接中断,自动重连中」。
+    if (!this.restoreSettings({ timeoutMs: SETTINGS_BUSY_LOCK_WAIT_MS })) {
+      if (this.settingsBusy) this.waitOutSettingsLock('TUNNEL_SETTINGS_BUSY')
       return
     }
     this.authorizationStopped = false
@@ -937,10 +1061,10 @@ class DaemonCore {
     return Object.assign(new Error(message), { code: 'TUNNEL_WRITE_RIGHT_HELD', holder, peerState: word })
   }
 
-  applySettings() {
+  applySettings(options = {}) {
     const right = this.ensureWriteRight()
     if (!right.ok) throw this.writeRightConflict(right)
-    withSettingsLock(this.dataDir, () => this.applySettingsLocked(), { owner: `apply:${this.runId}` })
+    withSettingsLock(this.dataDir, () => this.applySettingsLocked(), { owner: `apply:${this.runId}`, ...options })
   }
 
   applySettingsLocked() {
@@ -997,8 +1121,8 @@ class DaemonCore {
     }
   }
 
-  verifySettings(repair = false) {
-    withSettingsLock(this.dataDir, () => this.verifySettingsLocked(repair), { owner: `verify:${this.runId}` })
+  verifySettings(repair = false, options = {}) {
+    withSettingsLock(this.dataDir, () => this.verifySettingsLocked(repair), { owner: `verify:${this.runId}`, ...options })
   }
 
   verifySettingsLocked(repair = false) {
@@ -1126,16 +1250,18 @@ class DaemonCore {
       return
     }
     if (this.exited || !['connected', 'degraded'].includes(this.state) || this.connector === undefined ||
-        this.verifyingConnector === this.connector || this.confirmationTimer !== undefined) {
+        this.verifyingConnector === this.connector || this.confirmationTimer !== undefined ||
+        this.settingsBusyTimer !== undefined) {
       return
     }
     const connector = this.connector
     this.verifyingConnector = connector
     const stillCurrent = () => !this.exited && ['connected', 'degraded'].includes(this.state) && this.intent?.desired === 'connected' && this.connector === connector
     try {
-      this.verifySettings(true)
+      // 复查的拿锁用短上限(撞锁就顺延,见 catch):复查不是要紧着拿锁的路径,⛔ 用默认上限把主线程冻住。
+      this.verifySettings(true, { timeoutMs: SETTINGS_BUSY_LOCK_WAIT_MS })
       const { exitIp } = await this.verifyConnection(connector, confirming)
-      if (stillCurrent()) { this.applySettings(); this.verifySettings() }
+      if (stillCurrent()) { this.applySettings({ timeoutMs: SETTINGS_BUSY_LOCK_WAIT_MS }); this.verifySettings(false, { timeoutMs: SETTINGS_BUSY_LOCK_WAIT_MS }) }
       if (stillCurrent()) {
         this.lastVerification = { exitIp, lastVerifiedAt: this.clock.now() }
         const contested = this.lastSettingsRepairAt !== undefined && this.clock.now() - this.lastSettingsRepairAt <= SETTINGS_CONTEST_NOTE_MS
@@ -1147,6 +1273,13 @@ class DaemonCore {
       }
     } catch (error) {
       if (!stillCurrent()) return
+      if (error instanceof SettingsBusyError) {
+        // 锁被占(含确认轮)只说明「设置这会儿动不了」,说明不了通道好坏:⛔ 降级、⛔ 拆连接、⛔「连接中断」。
+        // 这一轮设置检查顺延,锁放开后补做——占锁期间系统代理被人改了,补做的 verifySettings(repair)
+        // 照样发现并按原有争抢规则处理;补做没做成前一直排下一拍,⛔ 吞掉锁忙就不再检查。
+        this.deferReverifyForSettingsLock(confirming)
+        return
+      }
       if (error?.code && FATAL_CODES.has(error.code)) { this.onConnectionLost(error); return }
       if (!confirming) {
         this.writeStateNow('degraded', { ...this.lastVerification, code: 'TUNNEL_VERIFY_UNCONFIRMED', message: '通道暂未确认，正在复查' })
@@ -1161,6 +1294,15 @@ class DaemonCore {
     } finally {
       if (this.verifyingConnector === connector) this.verifyingConnector = undefined
     }
+  }
+
+  /** 复查撞设置锁的顺延位:一拍之后重跑同一轮复查(确认轮保持确认轮),锁放开即补做;⛔ 吞掉不再查。 */
+  deferReverifyForSettingsLock(confirming) {
+    if (this.settingsBusyTimer !== undefined) return
+    this.settingsBusyTimer = this.clock.setTimeout(() => {
+      this.settingsBusyTimer = undefined
+      void this.reverify(confirming)
+    }, SETTINGS_BUSY_RETRY_MS)
   }
 
   onConnectionLost(error) {
@@ -1183,6 +1325,17 @@ class DaemonCore {
     }
     if (this.authorizationStopped || this.exited || this.intent?.desired !== 'connected' || error?.code === 'TUNNEL_CONNECTION_CANCELLED') return
     const code = error?.code ?? CONTROL_CODES.upstreamUnreachable
+    // 设置锁忙(establish 中途撞上等):另一项设置任务在进行,与通道无关。⛔ 按连接失败处理——
+    // 那会写失败态、停连接、进「连接中断,自动重连中」,而此时客户多半还没连上过。记「连接中」+锁忙码
+    // (界面经 connectionMessage 出人话),短轮询后原路重走 connect。
+    if (code === 'SETTINGS_LOCK_BUSY' || code === 'TUNNEL_SETTINGS_BUSY') {
+      this.waitOutSettingsLock(code)
+      return
+    }
+    // 甲-6:失败路径在最后一环留证——错误名/码＋截断首行进守护日志(诊断包收集时逐行 redact)。
+    // 此前这里一行不写:连接器保留的细节(ssh 退出码、stderrTail、spawn 原文)全在这丢;
+    // ssh 被拒/杀软删组件/程序 bug 三种病在客服和数据里长一个样。
+    this.log(`连接失败[${errorNameOf(error)}] code=${String(code)}:${firstLineOf(error)}`)
     // message 仍写 code(界面按码查文案表,是既有架构)。但「对方当前是什么状态」是**动态**的,
     // 查不了静态表 —— 单独落一个白名单状态词,由界面拼进那句话。
     // ⛔ 把它塞进 message:那样文案表就查不到、客户又会看到裸码。
@@ -1459,26 +1612,11 @@ class DaemonCore {
       // 新守护会先按账本还掉我们的旧账、再连上并写它自己的账;这时我们再动设置/账本/状态,等于把客户刚连上的通路拆掉。
       // 所以每次恢复动作前都先看一眼:意图文件里已经是别的会话要连接、或状态文件已由别的守护写过 → 交权,什么都不碰,直接走。
       // 判交接与恢复在同一把跨进程锁里(restoreSettings checkHandover):判完别人 ⛔ 还能插进来接手并被旧快照覆盖
-      let recovered = this.restoreSettings({ checkHandover: true })
+      let recovered = await this.restoreWithRetryLadder('退出时原设置恢复未完成', {
+        checkHandover: true,
+        shouldContinue: () => !this.handedOver && !this.exited
+      })
       if (this.handedOver) { this.exitAfterHandover(); return }
-      // 只有「写/读失败」(restore-failed)与「锁被别人占着」值得等着再试;第三方改过的(kept-modified)是定论,重试也不会变,⛔ 空等一分钟。
-      const transientFailure = () => this.settingsBusy || loadLedger(this.dataDir).some((entry) => entry.kind === 'setting' && entry.status === ENTRY_STATUS.restoreFailed)
-      for (const delay of SHUTDOWN_RESTORE_RETRY_MS) {
-        if (recovered || !transientFailure()) break
-        this.log(`退出时原设置恢复未完成,${String(delay / 1000)} 秒后再试`)
-        await new Promise((resolve) => this.clock.setTimeout(resolve, delay))
-        this.fatalStopped = false
-        recovered = this.restoreSettings({ checkHandover: true })
-        if (this.handedOver) { this.exitAfterHandover(); return }
-      }
-      // 快速梯子用尽仍是暂时性写失败:守护留下来慢节奏继续还(主进程早已退出,没有别人会做这件事);有上限,到点交给下次启动。
-      for (let round = 1; !recovered && transientFailure() && round <= SHUTDOWN_RESTORE_SLOW_ROUNDS; round += 1) {
-        this.log(`退出时原设置恢复仍未完成,${String(SHUTDOWN_RESTORE_SLOW_MS / 1000)} 秒后再试(慢节奏第 ${String(round)} 轮)`)
-        await new Promise((resolve) => this.clock.setTimeout(resolve, SHUTDOWN_RESTORE_SLOW_MS))
-        this.fatalStopped = false
-        recovered = this.restoreSettings({ checkHandover: true })
-        if (this.handedOver) { this.exitAfterHandover(); return }
-      }
       // 收尾写状态也在锁里判一次归属:新守护可能刚在我们还完账后起来
       let finalHandover = false
       try {
@@ -1554,11 +1692,12 @@ class DaemonCore {
     }
     try {
       // 归属判定与恢复同一把锁(退出流程用 checkHandover):判完别人 ⛔ 还能插进来接手
+      // options 可带 timeoutMs(连接入口的检查性拿锁用短上限);checkHandover/keepWriteRight 不是锁参数,锁层忽略。
       const result = withSettingsLock(this.dataDir, () => {
         if (options.checkHandover && this.recoveryHandedOver()) return 'handed-over'
         this.flushPendingIntent()
         return restoreLedger(this.dataDir, this.adapter)
-      }, { owner: `restore:${this.runId}` })
+      }, { owner: `restore:${this.runId}`, ...options })
       this.settingsBusy = false
       // 已明确移交给同目录的新守护:设置归它管,权也不该攥在我们手里。
       if (result === 'handed-over') { this.handedOver = true; this.releaseWriteRight(); return undefined }
@@ -1594,6 +1733,10 @@ class DaemonCore {
       this.clock.clearTimer(this.confirmationTimer)
       this.confirmationTimer = undefined
     }
+    if (this.settingsBusyTimer !== undefined) {
+      this.clock.clearTimer(this.settingsBusyTimer)
+      this.settingsBusyTimer = undefined
+    }
     if (this.verifyTimer !== undefined) {
       this.clock.clearTimer(this.verifyTimer)
       this.verifyTimer = undefined
@@ -1619,10 +1762,24 @@ class DaemonCore {
     const uploadBytesPerSecond = elapsedSeconds === 0 ? 0 : Math.floor(Math.max(0, current.uploadBytes - previous.uploadBytes) / elapsedSeconds)
     const downloadBytesPerSecond = elapsedSeconds === 0 ? 0 : Math.floor(Math.max(0, current.downloadBytes - previous.downloadBytes) / elapsedSeconds)
     this.lastTraffic = current
+    // Phase 1 ②(M5 长跑证实 4.3 万次/日):观察保持 2s 一档(速率精度、断线结算不受影响),
+    // 落盘条件化——内容有变化才写,外加空闲心跳保 UI。活动流量每次观察累计值都在变,节奏与
+    // 基线相同;空闲挂机从 43,200 次/日 降到 ≈2,880 次/日,杀软/同步盘不再被零流量写盘狂醒。
+    // 心跳 30s 必须短于主进程状态行的新鲜窗口(status-service trafficSummary 45s,两侧同改),
+    // ⛔ 丢已积累的速率统计:停写超过窗口会把速率图的历史断档清零。
+    const payload = { source: 'local-proxy-entry', uploadBytes: current.uploadBytes, downloadBytes: current.downloadBytes,
+      uploadBytesPerSecond, downloadBytesPerSecond, activeStreams: current.activeStreams ?? 0,
+      interruptedStreams: this.interruptedStreams, torndownStreams: this.torndownStreams }
+    const last = this.lastTrafficWritten
+    const unchanged = last !== undefined && last.uploadBytes === payload.uploadBytes && last.downloadBytes === payload.downloadBytes &&
+      last.uploadBytesPerSecond === payload.uploadBytesPerSecond && last.downloadBytesPerSecond === payload.downloadBytesPerSecond &&
+      last.activeStreams === payload.activeStreams && last.interruptedStreams === payload.interruptedStreams &&
+      last.torndownStreams === payload.torndownStreams
+    const heartbeatDue = last === undefined || this.clock.now() - last.writtenAtClock >= TRAFFIC_HEARTBEAT_MS
+    if (unchanged && !heartbeatDue) return
+    this.lastTrafficWritten = { ...payload, writtenAtClock: this.clock.now() }
     try {
-      writeTraffic(this.dataDir, { source: 'local-proxy-entry', uploadBytes: current.uploadBytes, downloadBytes: current.downloadBytes,
-        uploadBytesPerSecond, downloadBytesPerSecond, activeStreams: current.activeStreams ?? 0,
-        interruptedStreams: this.interruptedStreams, torndownStreams: this.torndownStreams, updatedAt: current.observedAt })
+      writeTraffic(this.dataDir, { ...payload, updatedAt: current.observedAt })
     } catch {
       // 本地汇总遥测只是可选证据，写入失败不得影响已建立的连接或后续重连。
     }
@@ -1634,6 +1791,7 @@ class DaemonCore {
       this.trafficTimer = undefined
     }
     this.lastTraffic = undefined
+    this.lastTrafficWritten = undefined
     if (remove) {
       try { rmSync(trafficPath(this.dataDir), { force: true }) } catch { /* Stale telemetry never blocks connection teardown. */ }
     }

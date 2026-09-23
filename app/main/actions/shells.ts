@@ -16,6 +16,8 @@ function readShell(value: string): ShellId {
 export function registerActions(registry: BridgeRegistry): void {
   registry.registerAction({ name: 'shells.inventory', paramsSchema: schema.undefined(), resultSchema,
     handler: async () => { await recipeStore().load(); return respond(shellInventory().list()) } })
+  registry.registerAction({ name: 'shells.claudeEditions', paramsSchema: schema.undefined(), resultSchema,
+    handler: () => respond(shellInventory().claudeEditions()) })
   registry.registerAction({ name: 'shells.install', paramsSchema: shellSchema, resultSchema,
     handler: (params) => respond(shellInstaller().start(readShell((params as { shell: string }).shell))) })
   registry.registerAction({ name: 'shells.installStatus', paramsSchema: schema.undefined(), resultSchema,

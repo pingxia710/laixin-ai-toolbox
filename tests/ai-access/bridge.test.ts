@@ -11,6 +11,7 @@ describe('AI 接入后台桥', () => {
     expect(Object.keys(aiAccessApi.api).sort()).toEqual([
       'cancelClaudeOfficialLogin',
       'cancelCodexOfficialLogin',
+      'cancelServiceTests',
       'claudeOfficialStatus',
       'codexOfficialStatus',
       'configureProvider',
@@ -38,6 +39,7 @@ describe('AI 接入后台桥', () => {
       'usageReceiptSave',
       'useOfficial',
       'useProvider',
+      'useProviderWithKey',
       'verifyConfiguration'
     ])
   })
@@ -47,7 +49,7 @@ describe('AI 接入后台桥', () => {
     const restart = vi.fn(async () => ({ shell: 'codex' as const, process: 'running' as const, message: secret, pid: 99 }))
     const service = {
       status: vi.fn(async () => ({ shells: {} })), saveProviderKey: vi.fn(), useProvider: vi.fn(), useOfficial: vi.fn()
-    } as unknown as Pick<AiAccessServiceType, 'status' | 'saveProviderKey' | 'useProvider' | 'useOfficial'>
+    } as unknown as Pick<AiAccessServiceType, 'status' | 'saveProviderKey' | 'useProvider' | 'useOfficial' | 'cancelTests'>
     const registry = new BridgeRegistry()
     registerAiAccessActions(registry, service, undefined, undefined, undefined, { restartGuidance: { read: restart } })
 
@@ -63,7 +65,7 @@ describe('AI 接入后台桥', () => {
   it('27 条环境清单是固定公开说明，桥上不带能力实现细节或客户状态', async () => {
     const service = {
       status: vi.fn(async () => ({ shells: {} })), saveProviderKey: vi.fn(), useProvider: vi.fn(), useOfficial: vi.fn()
-    } as unknown as Pick<AiAccessServiceType, 'status' | 'saveProviderKey' | 'useProvider' | 'useOfficial'>
+    } as unknown as Pick<AiAccessServiceType, 'status' | 'saveProviderKey' | 'useProvider' | 'useOfficial' | 'cancelTests'>
     const registry = new BridgeRegistry()
     registerAiAccessActions(registry, service)
 
@@ -82,7 +84,7 @@ describe('AI 接入后台桥', () => {
       status: vi.fn(async () => ({ shells: {} })),
       saveProviderKey: vi.fn(async () => ({ shells: {} })),
       useProvider: vi.fn(async () => ({ shells: {} }))
-    } as unknown as Pick<AiAccessServiceType, 'status' | 'saveProviderKey' | 'useProvider' | 'useOfficial'>
+    } as unknown as Pick<AiAccessServiceType, 'status' | 'saveProviderKey' | 'useProvider' | 'useOfficial' | 'cancelTests'>
     const registry = new BridgeRegistry()
     registerAiAccessActions(registry, service)
 
@@ -98,7 +100,7 @@ describe('AI 接入后台桥', () => {
     const service = {
       status: vi.fn(async () => ({ shells: {} })),
       saveProviderKey: vi.fn(), useProvider: vi.fn()
-    } as unknown as Pick<AiAccessServiceType, 'status' | 'saveProviderKey' | 'useProvider' | 'useOfficial'>
+    } as unknown as Pick<AiAccessServiceType, 'status' | 'saveProviderKey' | 'useProvider' | 'useOfficial' | 'cancelTests'>
     const registry = new BridgeRegistry()
     registerAiAccessActions(registry, service)
 
@@ -116,7 +118,7 @@ describe('AI 接入后台桥', () => {
     const service = {
       status: vi.fn(async () => ({ shells: {} })),
       saveProviderKey: vi.fn(), useProvider: vi.fn()
-    } as unknown as Pick<AiAccessServiceType, 'status' | 'saveProviderKey' | 'useProvider' | 'useOfficial'>
+    } as unknown as Pick<AiAccessServiceType, 'status' | 'saveProviderKey' | 'useProvider' | 'useOfficial' | 'cancelTests'>
     const login = {
       status: vi.fn(() => ({ status: 'idle' as const })),
       start: vi.fn(async () => ({ status: 'pending' as const })),
@@ -132,7 +134,7 @@ describe('AI 接入后台桥', () => {
 
   it('模型 API 页可通过受限动作恢复官方配置', async () => {
     const service = {
-      status: vi.fn(), saveProviderKey: vi.fn(), useProvider: vi.fn(),
+      status: vi.fn(), saveProviderKey: vi.fn(), useProvider: vi.fn(), cancelTests: vi.fn(() => 0),
       useOfficial: vi.fn(async () => ({ shells: {
         codex: { selected: null, officialAvailable: true, providerKeys: { deepseek: false, 'zhipu-api': false, zhipu: false, moonshot: false, kimi: false } },
         claude: { selected: 'official' as const, officialAvailable: true, providerKeys: { deepseek: false, 'zhipu-api': false, zhipu: false, moonshot: false, kimi: false } },

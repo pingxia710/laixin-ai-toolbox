@@ -65,6 +65,11 @@ it('代理冲突归到固定类别:守护写的裸码漏到界面上也认得出
     .toContain('NETWORK_PROXY_CONFLICT')
 })
 
+it('意外退出终态改说「未预期的问题」后仍归到进程退出类别(Phase 2 ⑥同款文案),⛔ 退化为通用未识别', async () => {
+  expect((await readCopiedContext({ state: '异常', message: '来信遇到一个未预期的问题，连接已停止。请点击重新连接；若反复出现，请复制诊断给客服' })).reasonCodes)
+    .toContain('NETWORK_PROCESS_EXIT')
+})
+
 it('未识别故障仅复制通用类别，读取失败仍是未知且不会报未连', async () => {
   const state = await readCopiedContext({ state: '异常', message: 'secret-fixture /Users/private/config.json' })
   expect(state.reasonCodes).toContain('NETWORK_CONNECTION_ERROR')

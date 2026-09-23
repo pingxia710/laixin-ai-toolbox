@@ -20,6 +20,7 @@ export const REMEDY_LINGER_MS = 8_000
 import { icon } from '../icons'
 import { openProviderEditor } from './provider-editor'
 import { measureProviderLatency } from './provider-latency'
+import { openOfficialDownloadPage } from './install-card'
 
 function node<K extends keyof HTMLElementTagNameMap>(tag: K, text = '', className = ''): HTMLElementTagNameMap[K] {
   return Object.assign(document.createElement(tag), { textContent: text, className })
@@ -149,8 +150,24 @@ export function currentSelection(shell: AiAccessShell | null, status: AiAccessSt
  * 选中来源的按钮文案走配置口径：只说明客户已选中它、配置已写。
  * ⛔ 用「使用中」冒充软件已验通——刚保存就显示使用中，客户会把选中来源当成整条接入已经通过。
  */
-export function selectionActionLabel(current: boolean): '已配置' | '启用' {
-  return current ? '已配置' : '启用'
+/** `clientMissing`：Key 配给的是 Claude Code 命令行版，但这台电脑只有 Claude 桌面版——配置没有软件会读，⛔ 说「已配置」。 */
+export function selectionActionLabel(current: boolean, clientMissing = false): '已配置' | '启用' | '未生效' {
+  return current ? clientMissing ? '未生效' : '已配置' : '启用'
+}
+
+export interface ClaudeEditionsView { readonly cli: boolean; readonly desktop: boolean }
+
+/** 只装了 Claude 桌面版时给的说明；读不到版本情况或装了命令行版都不说，⛔ 误报。 */
+export function claudeDesktopOnlyNotice(editions: ClaudeEditionsView | null): string | undefined {
+  if (editions === null || editions.cli || !editions.desktop) return undefined
+  return '这台电脑装的是 Claude 桌面版，还没有装 Claude Code 命令行版。Claude 桌面版只能登录 Claude 账号使用，不能用 DeepSeek、智谱、Kimi 的 Key（这是 Anthropic 的限制）。要用这些 Key，请安装 Claude Code 命令行版，装好后在终端（Windows 上是 PowerShell）里输入 claude 使用。'
+}
+
+export function readClaudeEditions(snapshot: string): ClaudeEditionsView | null {
+  try {
+    const value = JSON.parse(snapshot) as { cli?: unknown; desktop?: unknown }
+    return typeof value.cli === 'boolean' && typeof value.desktop === 'boolean' ? { cli: value.cli, desktop: value.desktop } : null
+  } catch { return null }
 }
 
 function codexOfficialDescription(status: AiAccessStatus | null, login: ReturnType<typeof readCodexLoginStatus>): string {
@@ -218,6 +235,7 @@ export function mountModelApi(element: HTMLElement, platform: UsagePlatformId, a
   let closeProviderServices: (() => void)[] = []
   let closeEditor = (): void => undefined
   let receiptResult: UsageReceiptResult | null = null
+  let claudeEditions: ClaudeEditionsView | null = null
   const stopPoll = (): void => { if (poll !== undefined) clearInterval(poll); poll = undefined }
   const action = (text: string, run: () => void, primary = false): HTMLButtonElement => {
     const button = node('button', text, primary ? 'primary-action' : 'secondary-action')
@@ -227,10 +245,11 @@ export function mountModelApi(element: HTMLElement, platform: UsagePlatformId, a
   }
   const startAction = (mode: 'official' | AiAccessProvider): HTMLButtonElement => {
     const current = currentSelection(shell, status, mode)
-    const button = action(selectionActionLabel(current), () => { void switchProvider(mode) }, !current)
+    const clientMissing = mode !== 'official' && shell === 'claude' && claudeDesktopOnlyNotice(claudeEditions) !== undefined
+    const button = action(selectionActionLabel(current, clientMissing), () => { void switchProvider(mode) }, !current)
     button.classList.add('api-enable')
-    button.classList.toggle('is-current', current)
-    button.prepend(icon(current ? 'check' : 'play'))
+    button.classList.toggle('is-current', current && !clientMissing)
+    if (!(current && clientMissing)) button.prepend(icon(current ? 'check' : 'play'))
     button.disabled ||= current
     return button
   }
@@ -269,7 +288,7 @@ export function mountModelApi(element: HTMLElement, platform: UsagePlatformId, a
     const caret = focusedSelector ? (active as HTMLInputElement).selectionStart : null
     const root = node('div', '', 'model-api')
     if (!shell) {
-      const native = provider('official', `${label} 官方`, '使用平台原生的模型与账号。工具箱只提供官方下载安装，不接管它的 API 配置。', platform)
+      const native = provider('official', `${label} 官方`, '使用平台原生的模型与账号。工具箱提供官方获取入口与版本检测，不接管它的 API 配置。', platform)
       root.append(native.row); element.replaceChildren(root); return
     }
     closeProviderServices.forEach(close => close()); closeProviderServices = []
@@ -286,6 +305,15 @@ export function mountModelApi(element: HTMLElement, platform: UsagePlatformId, a
       : ''
     const notice = node('p', message || failure || (!status ? '正在读取模型配置…' : ''), 'platform-notice')
     notice.setAttribute('role', 'status'); notice.setAttribute('aria-live', 'polite'); root.append(notice)
+    const desktopOnly = shell === 'claude' ? claudeDesktopOnlyNotice(claudeEditions) : undefined
+    if (desktopOnly) {
+      const row = node('div', '', 'platform-actions claude-desktop-only-notice')
+      row.append(node('p', desktopOnly, 'platform-notice'))
+      const install = action('打开命令行版安装页', () => { void openClaudeCliInstallPage() }, true)
+      install.disabled = busy
+      row.append(install)
+      root.append(row)
+    }
     if (suspended) {
       root.append(node('p', `历史 ${modelProviders[suspended.provider].title} ${label} 接入已暂停，当前不再使用工具箱 API。请选择已验收入口或解除工具箱接管。`, 'platform-notice'))
     }
@@ -546,9 +574,51 @@ export function mountModelApi(element: HTMLElement, platform: UsagePlatformId, a
     form.onsubmit = event => {
       event.preventDefault()
       const key = input.value.trim(); input.value = ''; keyDraft = null
-      void switchProvider(provider, key)
+      void saveKeyFlow(provider, key)
     }
     return form
+  }
+/**
+ * API-06（复核返工）：快捷表单换 Key 走主进程**单次原子动作** useProviderWithKey——
+ * 候选 Key 先探测，探测、写入、配置任一步失败都回到原 Key、原模型、原路由，
+ * ⛔ 未启用来源先把 Key 写进本地再验证（旧返工的两步 saveProviderKey→useProvider 有此回归）。
+ * 模型由主进程内部沿用该来源已存选择，⛔ 表单把默认模型写死。
+ */
+const saveKeyFlow = async (provider: AiAccessProvider, key: string): Promise<void> => {
+  if (!api || !shell || !status || busy || login === 'pending' || claudeBusy()) return
+  busy = true; message = '正在验证并切换，请稍候…'; render()
+  try {
+    status = readAccessStatus((await api.useProviderWithKey({ shell, provider, key })).snapshot)
+    if (!mounted) return
+    const attempt = status?.attempt
+    editing = null
+    if (attempt?.shell === shell && attempt.provider === provider && !attempt.ok) {
+      if (attempt.code === 'key_product_mismatch' && attempt.suggestedProvider !== undefined) {
+        suggestedKey = { from: provider, to: attempt.suggestedProvider, value: key }
+      }
+      message = `${modelProviders[provider].title} 尚未完成接入。${apiFailureMessage(attempt.code ?? 'invalid_reply', provider)}${attempt.notice ? ` ${attempt.notice}` : ''}`
+    } else {
+      message = `${modelProviders[provider].title} 的 Key 已验证并更新，模型选择保持不变。服务面板将记录实际调用。`
+    }
+  } catch {
+    message = '切换未完成，工具箱没有用这次输入覆盖已有配置。请检查软件安装及已有配置后重试。'
+  } finally { busy = false; if (mounted) render() }
+}
+  // API-11：登录等待/输登录码期间只轻量轮询官方登录态端点，不刷配置目标、不读用量——
+  // 每轮全量 status 会让主进程 spawn profiles＋ps 读 7 个 shell 文件，把登录页的电脑拖卡。
+  // 登录态没有变化就不重绘整页；出结果后停轮询并全量刷一次，把配置目标与用量一起对齐。
+  const pollLogin = async (): Promise<void> => {
+    if (!mounted || !api) return
+    try {
+      const nextLogin = shell === 'codex' ? readCodexLoginStatus((await api.codexOfficialStatus()).snapshot) : 'idle'
+      const nextClaude: ClaudeOfficialLoginStatus = shell === 'claude' && api.claudeOfficialStatus ? readClaudeLoginStatus((await api.claudeOfficialStatus()).snapshot) : 'idle'
+      if (!mounted || (nextLogin === login && nextClaude === claudeLogin)) return
+      login = nextLogin; claudeLogin = nextClaude
+      if (login === 'pending' || claudeBusy()) { render(); return }
+      stopPoll()
+      render()
+      void refresh()
+    } catch { /* 单次登录态读失败按兵不动，下个周期再问；⛔ 把登录等待误报成页面故障 */ }
   }
   const refresh = async (): Promise<void> => {
     if (!mounted || busy || !api) return
@@ -565,15 +635,31 @@ export function mountModelApi(element: HTMLElement, platform: UsagePlatformId, a
       } catch { nextUsage = []; nextStartupError = null }
       const nextLogin = shell === 'codex' ? readCodexLoginStatus((await api.codexOfficialStatus()).snapshot) : 'idle'
       const nextClaude: ClaudeOfficialLoginStatus = shell === 'claude' && api.claudeOfficialStatus ? readClaudeLoginStatus((await api.claudeOfficialStatus()).snapshot) : 'idle'
+      // 只看文件在不在，不运行软件；客户装上命令行版后下一次刷新说明就会消失。
+      const editionsApi = shell === 'claude' ? (window.toolbox as { shells?: { claudeEditions?: () => Promise<{ snapshot: string }> } } | undefined)?.shells?.claudeEditions : undefined
+      const nextEditions = editionsApi === undefined ? null : await editionsApi().then(result => readClaudeEditions(result.snapshot), () => null)
       if (!mounted || busy) return
-      status = next; login = nextLogin; claudeLogin = nextClaude; usage = nextUsage; startupError = nextStartupError
-      if ((login === 'pending' || claudeBusy()) && poll === undefined) poll = setInterval(() => { void refresh() }, 1500)
+      status = next; login = nextLogin; claudeLogin = nextClaude; usage = nextUsage; startupError = nextStartupError; claudeEditions = nextEditions
+      if ((login === 'pending' || claudeBusy()) && poll === undefined) poll = setInterval(() => { void pollLogin() }, 1500)
       if (login !== 'pending' && !claudeBusy()) stopPoll()
     } catch {
       if (!mounted) return
       status = null; startupError = null; message = '模型配置暂时无法读取，请重试。'; stopPoll()
     }
     render()
+  }
+  const openClaudeCliInstallPage = async (): Promise<void> => {
+    if (busy) return
+    busy = true; message = '正在检查官方站点是否可达…'; render()
+    const result = await openOfficialDownloadPage({
+      shell: 'claude-code',
+      resourceId: 'claude-code-official-install',
+      opened: '已打开 Claude Code 命令行版官方安装页。装好后回到这里，提示会自动消失。',
+      failed: '暂时无法打开官方安装页，请稍后重试。'
+    })
+    message = result.message
+    busy = false
+    if (mounted) { render(); void refresh() }
   }
   const restartHint = async (): Promise<string> => {
     if (!api?.restartGuidance || !shell) return shell ? fallbackRestartGuidanceMessage(shell) : ''

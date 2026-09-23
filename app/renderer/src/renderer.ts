@@ -15,6 +15,7 @@ import './styles.css'
 import './brand.css'
 import './platform-layout.css'
 import { mountDesktopStatus } from './desktop-status'
+import { showUpdateSuccessNotice } from './update-success'
 import './dashboard.css'
 import './network.css'
 import './account.css'
@@ -416,10 +417,6 @@ document.addEventListener(TAB_NAVIGATION_EVENT, (event) => {
   else tabButtons[index].focus()
 })
 
-document.querySelector('#account-shortcut')?.addEventListener('click', () => {
-  selectTab(skeletonTabs.findIndex((tab) => tab.id === 'account'))
-})
-
 selectTab(activeIndex)
 void window.toolbox.app.info().then((info) => {
   platform = info.platform
@@ -427,6 +424,9 @@ void window.toolbox.app.info().then((info) => {
   selectTab(activeIndex, activeUsagePlatform, activePlatformSection, undefined, activeModelApiProvider)
   mountDesktopStatus(headerAppState)
   void window.toolbox.desktop?.ready().catch(() => { /* An ordinary launch has no pending update. */ })
+  // 「更新成功」弹窗:推送为主(回执可能晚于启动才写好),ready 后再拉一次兜底;弹窗模块自己去重。
+  window.toolbox.desktop?.onUpdateSucceeded((notice) => showUpdateSuccessNotice(notice))
+  window.toolbox.desktop?.updateSuccess().then((notice) => showUpdateSuccessNotice(notice)).catch(() => { /* Ordinary launch. */ })
   const stopAccountRefresh = startAccountRefreshLoop()
   void window.toolbox.subscription?.catalog().then((response) => {
     if (response.error || !response.data) return

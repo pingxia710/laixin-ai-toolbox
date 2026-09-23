@@ -3,7 +3,8 @@ import { createHash, generateKeyPairSync, sign } from 'node:crypto'
 import { createServer } from 'node:http'
 import { cp, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
-import { spawn } from 'node:child_process'
+import { spawn, type ChildProcess } from 'node:child_process'
+import { EventEmitter } from 'node:events'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { displayReleaseVersion } from '../../app/release-version'
@@ -34,13 +35,67 @@ describe('更新信任边界', () => {
   })
   it('只有发布密钥签名的清单和同源更新包才能被接受', () => {
     expect(readUpdateManifest(envelope(release), publicKey, origin, 'darwin-arm64', '0.4.1-unified.12')).toEqual(release)
+    const intel = { ...release, assets: { ...release.assets, 'darwin-x64': asset } }
+    expect(readUpdateManifest(envelope(intel), publicKey, origin, 'darwin-x64', '0.4.1-unified.12')).toEqual(intel)
     const tampered = JSON.parse(envelope(release)); tampered.payload = Buffer.from(JSON.stringify({ ...release, notes: 'tampered' })).toString('base64')
     expect(() => readUpdateManifest(JSON.stringify(tampered), publicKey, origin, 'darwin-arm64', '0.4.1-unified.12')).toThrow('UPDATE_SIGNATURE_INVALID')
-    for (const url of ['https://other.example/AI-tools/updates/toolbox.zip', 'https://updates.example/other/toolbox.zip', 'https://updates.example/AI-tools/updates/../../toolbox.zip']) {
+    for (const url of ['https://other.example/AI-tools/updates/toolbox.zip', 'https://laixin.work/updates/toolbox.zip', 'https://updates.example/other/toolbox.zip', 'https://updates.example/AI-tools/updates/../../toolbox.zip']) {
       const changed = { ...release, assets: { 'darwin-arm64': { ...asset, url } } }
       expect(() => readUpdateManifest(envelope(changed), publicKey, origin, 'darwin-arm64', '0.4.1-unified.12')).toThrow('UPDATE_SOURCE_INVALID')
     }
     expect(() => readUpdateManifest(envelope(release), publicKey, origin, 'win32-x64', '0.4.1-unified.12')).toThrow('UPDATE_PLATFORM_UNAVAILABLE')
+  })
+
+  it('域名迁移兼容清单仍被旧客户端按旧前缀接受', () => {
+    const legacy = { ...release, assets: { 'darwin-arm64': {
+      ...asset, url: 'https://laixin.net.cn/AI-tools/updates/toolbox.zip'
+    } } }
+    expect(readUpdateManifest(envelope(legacy), publicKey, new URL('https://laixin.net.cn/AI-tools/'), 'darwin-arm64', '0.4.1-unified.12')).toEqual(legacy)
+  })
+
+  // 2026-09-20 Intel Mac 客户实障(IM-01):线上清单停在 0.5.10(只有 darwin-arm64/win32-x64,
+  // 无 darwin-x64),装 0.5.11+ 的 Intel 客户点「检查更新」永远报「暂时无法检查更新」——
+  // 资产检查跑在版本比较之前,把「清单没有更新可推」误判成「检查失败」。清单不比已装新
+  // (更旧或同版)时直接放行,调用方走既有「已是最新」;清单真有新版时缺平台仍要如实抛(上一条守卫)。
+  it('清单不比已装新时缺本平台资产不算检查失败(Intel 客户对线上 0.5.10 清单)', () => {
+    const noIntel = { version: '0.5.10', notes: '· 常规修复', assets: { 'darwin-arm64': asset, 'win32-x64': asset } }
+    expect(readUpdateManifest(envelope(noIntel), publicKey, origin, 'darwin-x64', '0.5.11')).toEqual(noIntel)
+    expect(readUpdateManifest(envelope(noIntel), publicKey, origin, 'darwin-x64', '0.5.10')).toEqual(noIntel)
+  })
+
+  // 2026-09-16:国内客户连不上 GitHub(无代理真机实测直接超时),官网单机实测 72.7 KB/s、123MB 要 29 分钟。
+  // 故新增国内 CDN 镜像通道。安全上不放任:主机必须来自构建时注入的白名单,路径与扩展名规则与官网源一致,
+  // 所以它只能指向同名的那个更新包。⛔ 让清单里随便一个主机都能当下载源。
+  it('CDN 镜像只接受白名单主机、且路径规则与官网源一致', () => {
+    const hosts = ['dl.laixin.net.cn']
+    const good = { ...release, assets: { 'darwin-arm64': { ...asset,
+      mirrors: ['https://dl.laixin.net.cn/AI-tools/updates/toolbox.zip'] } } }
+    expect(readUpdateManifest(envelope(good), publicKey, origin, 'darwin-arm64', '0.4.1-unified.12',
+      'pingxia710/laixin-ai-toolbox', hosts)).toEqual(good)
+
+    // CDN 与 GitHub 可以并存,顺序即优先级(客户端按 [...mirrors, url] 依次尝试)
+    const both = { ...release, assets: { 'darwin-arm64': { ...asset, mirrors: [
+      'https://dl.laixin.net.cn/AI-tools/updates/toolbox.zip',
+      'https://github.com/pingxia710/laixin-ai-toolbox/releases/download/v0.4.1-unified.13/toolbox.zip'] } } }
+    expect(readUpdateManifest(envelope(both), publicKey, origin, 'darwin-arm64', '0.4.1-unified.12',
+      'pingxia710/laixin-ai-toolbox', hosts)).toEqual(both)
+
+    for (const [why, mirror] of [
+      ['主机不在白名单', 'https://evil.example/AI-tools/updates/toolbox.zip'],
+      ['白名单主机但路径越界', 'https://dl.laixin.net.cn/somewhere/toolbox.zip'],
+      ['白名单主机但扩展名不符', 'https://dl.laixin.net.cn/AI-tools/updates/toolbox.exe'],
+      ['明文 http', 'http://dl.laixin.net.cn/AI-tools/updates/toolbox.zip']
+    ] as const) {
+      const changed = { ...release, assets: { 'darwin-arm64': { ...asset, mirrors: [mirror] } } }
+      expect(() => readUpdateManifest(envelope(changed), publicKey, origin, 'darwin-arm64', '0.4.1-unified.12',
+        'pingxia710/laixin-ai-toolbox', hosts), why).toThrow('UPDATE_SOURCE_INVALID')
+    }
+
+    // 没注入白名单时,CDN 地址一律不认(默认行为与从前一致)
+    const noHosts = { ...release, assets: { 'darwin-arm64': { ...asset,
+      mirrors: ['https://dl.laixin.net.cn/AI-tools/updates/toolbox.zip'] } } }
+    expect(() => readUpdateManifest(envelope(noHosts), publicKey, origin, 'darwin-arm64', '0.4.1-unified.12',
+      'pingxia710/laixin-ai-toolbox')).toThrow('UPDATE_SOURCE_INVALID')
   })
 
   it('GitHub 镜像只接受指定公开仓库当前版本的 Release 文件', () => {
@@ -234,4 +289,125 @@ it('新程序启动失败时还原原文件，更新助手自己的进程不阻�
   expect(await readFile(join(target, inside), 'utf8')).toBe('old-version')
   expect(JSON.parse(await readFile(job.result, 'utf8'))).toMatchObject({ state: 'error', stage: 'launch' })
   expect(commands.mock.calls.filter(([name]) => name === '/usr/bin/open')).toHaveLength(2)
+})
+
+
+describe('更新成功信息随任务交给新版', () => {
+  it('安装把「从哪版升上来、这版改了什么」写进 pending.json,新版启动才有的说', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'toolbox-update-pending-'))
+    cleanups.push(() => rm(directory, { recursive: true, force: true }))
+    const winContent = Buffer.from('win-update-package')
+    const winRelease: UpdateRelease = { version: '0.5.8', notes: '· 网络修复\n· 模型 API',
+      assets: { 'win32-x64': { url: 'https://updates.example/AI-tools/updates/toolbox.exe', size: winContent.length,
+        sha256: createHash('sha256').update(winContent).digest('hex'), asarSha256: 'a'.repeat(64) } } }
+    const fetchStub = (async (url: unknown) => new Response(String(url).endsWith('latest.json') ? envelope(winRelease) : winContent, { status: 200 })) as unknown as typeof fetch
+    const installed = join(directory, 'installed')
+    await mkdir(installed, { recursive: true })
+    const updater = new ToolboxUpdater({ version: '0.5.7', platform: 'win32-x64', origin: 'https://updates.example/AI-tools/',
+      publicKey, directory, executable: join(installed, '来信AI工具箱统一版.exe'), helperPath: 'C:\\x\\update-helper.ps1',
+      packaged: true, quit: vi.fn(), fetch: fetchStub })
+    cleanups.push(async () => updater.dispose())
+    expect(await updater.check()).toMatchObject({ state: 'available', version: '0.5.8' })
+    expect(await updater.download()).toMatchObject({ state: 'ready' })
+    // 本机没有 powershell.exe ⇒ 安装在 spawn 处失败走既有还原路;pending.json 在那之前已写好,
+    // 这里只认「成功信息必须随任务交给新版」。
+    await updater.install()
+    expect(JSON.parse(await readFile(join(directory, 'pending.json'), 'utf8'))).toMatchObject({
+      version: '0.5.8', previous: '0.5.7', notes: '· 网络修复\n· 模型 API', requireConnected: false })
+  })
+})
+
+it('助手用 PS5.1 写的带 BOM 回执也读得出来,⛔ 让一个 BOM 把失败记录变成不存在', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'toolbox-update-bom-'))
+  cleanups.push(() => rm(directory, { recursive: true, force: true }))
+  const receipt = JSON.stringify({ version: '0.4.1-unified.13', state: 'error', code: 'UPDATE_STARTUP_UNCONFIRMED' })
+  await writeFile(join(directory, 'result.json'), Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(receipt, 'utf8')]))
+  const restored = new ToolboxUpdater({ version: '0.4.1-unified.12', platform: 'darwin-arm64', origin: 'https://updates.example/AI-tools/',
+    publicKey, directory, executable: '/does-not-exist', helperPath: '/does-not-exist', packaged: false, quit: vi.fn() })
+  cleanups.push(async () => restored.dispose())
+  expect(restored.status()).toMatchObject({ state: 'error', version: '0.4.1-unified.13', message: expect.stringContaining('新版未能正常启动') })
+})
+
+// 2026-09-16 客户真机故障的守门测试(点完更新又回到重新下载):原先这里只做源码字面匹配,
+// 常量换个写法就红、真把等待改坏反而绿。现在换成行为测试:假时钟+假助手,钉住三格——
+// ① 29 秒才 ready 要放行(5 秒时代就死在这一格);② 超过 30 秒没 ready 要判死,且文案区分
+// 「更新程序没能启动」;③ 立即 ready 不白等。时钟/等待由 updater 注入出来,生产走默认值。
+describe('助手 ready 等待(行为:29 秒放行 / 30 秒判死 / 立即不白等)', () => {
+  function fakeClock() {
+    const start = 1_000_000
+    let now = start
+    let hook: (() => Promise<void>) | undefined
+    return {
+      now: () => now,
+      wait: async (ms: number) => { now += ms; if (hook) await hook() },
+      /** 从起点 msFromStart 毫秒后(按假时钟)执行一次 action,模拟助手此刻才写出 ready。 */
+      at(msFromStart: number, action: () => Promise<void>) {
+        const fire = start + msFromStart
+        hook = async () => { if (now >= fire) { hook = undefined; await action() } }
+      },
+      elapsed: () => now - start
+    }
+  }
+
+  async function readyFixture(clock: ReturnType<typeof fakeClock>) {
+    const directory = await mkdtemp(join(tmpdir(), 'toolbox-update-ready-'))
+    cleanups.push(() => rm(directory, { recursive: true, force: true }))
+    const winContent = Buffer.from('win-update-package')
+    const winRelease: UpdateRelease = { version: '0.5.8', notes: '助手等待',
+      assets: { 'win32-x64': { url: 'https://updates.example/AI-tools/updates/toolbox.exe', size: winContent.length,
+        sha256: createHash('sha256').update(winContent).digest('hex'), asarSha256: 'a'.repeat(64) } } }
+    const fetchStub = (async (url: unknown) => new Response(String(url).endsWith('latest.json') ? envelope(winRelease) : winContent, { status: 200 })) as unknown as typeof fetch
+    const installed = join(directory, 'installed')
+    await mkdir(installed, { recursive: true })
+    // 真 Windows 上助手由系统目录里的 cmd.exe 起(绝对路径,见 update-helper-launch.ts),本机没有;
+    // 注入一个只报「起来了」的假 spawn,只为真正跑进 ready 等待循环。ready 何时出现完全由假时钟决定,不吃真实等待。
+    const spawned = ((): ChildProcess => {
+      const child = new EventEmitter() as ChildProcess
+      child.unref = () => undefined
+      setImmediate(() => child.emit('spawn'))
+      return child
+    }) as unknown as typeof spawn
+    const quit = vi.fn()
+    const updater = new ToolboxUpdater({ version: '0.5.7', platform: 'win32-x64', origin: 'https://updates.example/AI-tools/',
+      publicKey, directory, executable: join(installed, '来信AI工具箱统一版.exe'), helperPath: 'C:\\x\\update-helper.ps1',
+      packaged: true, quit, fetch: fetchStub, now: clock.now, wait: clock.wait, spawn: spawned })
+    cleanups.push(async () => updater.dispose())
+    expect(await updater.check()).toMatchObject({ state: 'available' })
+    expect(await updater.download()).toMatchObject({ state: 'ready' })
+    const folder = (await readdir(directory)).find((name) => name.startsWith('download-'))
+    if (!folder) throw new Error('夹具:下载目录不存在')
+    return { updater, quit, ready: join(directory, folder, 'helper-ready') }
+  }
+
+  it('助手 29 秒才 ready → 继续更新不判失败(5 秒时代这一格被误杀)', async () => {
+    const clock = fakeClock()
+    const f = await readyFixture(clock)
+    clock.at(29_000, () => writeFile(f.ready, ''))
+    await f.updater.install()
+    await vi.waitFor(() => expect(f.quit).toHaveBeenCalledTimes(1))
+    expect(clock.elapsed()).toBeLessThan(30_000)
+    expect(f.updater.status()).toMatchObject({ state: 'installing' })
+    expect(f.updater.status().message).not.toContain('更新程序没能启动')
+  })
+
+  it('超过 30 秒还没 ready → 判失败,文案区分「更新程序没能启动」', async () => {
+    const clock = fakeClock()
+    const f = await readyFixture(clock)
+    await f.updater.install()
+    expect(f.quit).not.toHaveBeenCalled()
+    // 下界钉「不许提前放弃」(5 秒时代死在这),上界钉「也不许拖到远超 30 秒才放弃」。
+    expect(clock.elapsed()).toBeGreaterThanOrEqual(30_000)
+    expect(clock.elapsed()).toBeLessThanOrEqual(31_000)
+    expect(f.updater.status()).toMatchObject({ state: 'error', message: expect.stringContaining('更新程序没能启动') })
+  })
+
+  it('助手立即 ready → 第一次轮询就放行,不白等', async () => {
+    const clock = fakeClock()
+    const f = await readyFixture(clock)
+    clock.at(0, () => writeFile(f.ready, ''))
+    await f.updater.install()
+    await vi.waitFor(() => expect(f.quit).toHaveBeenCalledTimes(1))
+    expect(clock.elapsed()).toBeLessThanOrEqual(100)
+    expect(f.updater.status().state).toBe('installing')
+  })
 })

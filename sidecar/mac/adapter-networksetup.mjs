@@ -229,12 +229,19 @@ function absentTargetError(service) {
   return Object.assign(new Error(`网络服务「${service}」已不存在`), { code: 'TUNNEL_SETTING_TARGET_ABSENT' })
 }
 
+// networksetup 自己的错误只有「行首 ** Error: 」一种形状(本机 macOS 实测:服务不存在/参数
+// 错误/用法错误全部如此,错误文本走标准输出且伴随非零退出);走到这里的是「退出码 0 的输出里
+// 仍有错误行」的兜底。⛔ 回到全文嗅探 error/failed 等英文词:-listallnetworkservices 逐字
+// 回显客户起的网卡名,-get*proxy/-getautoproxyurl 逐字回显 Server/PAC 地址——那些是客户的
+// 正常数据,不是失败(候选甲-3)。失败判定回到退出码(catch 路径)与结构化解析(parseProxy 等)。
+const KNOWN_ERROR_LINE = /^\*\* Error:/m
+
 function run(executable, args) {
   const service = args[1]
   try {
     const output = execFileSync(executable, args, { encoding: 'utf8', timeout: 4_000, env: { ...process.env, LC_ALL: 'C' } })
     if (isAbsentService(output, service)) throw absentTargetError(service)
-    if (/\b(?:error|failed|not authorized)\b/i.test(output)) throw settingsError('系统代理设置被拒绝')
+    if (KNOWN_ERROR_LINE.test(output)) throw settingsError('系统代理设置被拒绝')
     return output
   } catch (error) {
     if (error?.code === 'TUNNEL_SETTINGS_NOT_APPLIED' || error?.code === 'TUNNEL_SETTING_TARGET_ABSENT') throw error

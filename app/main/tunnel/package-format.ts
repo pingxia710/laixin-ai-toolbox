@@ -33,6 +33,7 @@ export const REJECT_REASONS = {
   PACKAGE_SIGNATURE_NO_KEY: '配置包拒绝:有签名但无验签公钥',
   PACKAGE_SIGNATURE_INVALID: '配置包拒绝:签名校验失败',
   PACKAGE_UNSIGNED_UNTRUSTED: '配置包拒绝:未签名且不在测试白名单',
+  PACKAGE_TOO_LARGE: '这个文件太大，不是来信发放的配置包，请确认选对了文件',
   PACKAGE_PROTOCOL_INVALID: '配置包无效:本版不支持此连接配置'
 } as const
 
@@ -146,6 +147,15 @@ export function packageDigest(entries: readonly PackageEntry[]): string {
 const VLESS_CREDENTIAL_FILE = /^credentials\/vless(?:-[A-Za-z0-9_-]{1,32})?\.json$/
 /** 一份授权里最多几个入口。够用即可——⛔ 让一份配置把探测流量放大到无边。 */
 export const MAX_PACKAGE_NODES = 8
+
+// 读取前尺寸闸(甲-8):读包(readFileSync)→ 解包 → 逐项 sha256 全在主进程同步跑,耗时与内存
+// 随文件大小线性涨,超限文件要先在这里拒掉。真实签发包是 KB 级:清单、凭据、hostkey 都远小于
+// 1KB;包内最大的合法条目是 overlay.json,另有 64KB 上限(parseOverlay)。
+//  · 单条目 1 MiB = 16 × overlay 上限,给将来的条目留足余量;
+//  · 总量 8 MiB:条目集合封闭(manifest + ≤8 入口凭据 + hostkey + overlay),真实签发包的
+//    百倍以上余量——误伤真实签发包不可能,而客户误选的安装包 / 视频等 GB 级文件进不来。
+export const MAX_PACKAGE_ENTRY_BYTES = 1024 * 1024
+export const MAX_PACKAGE_TOTAL_BYTES = 8 * 1024 * 1024
 
 /** 多入口清单的校验:每项地址端口合法;第一项必须与 `node` 同址(单一事实源);数量有上限;⛔ 重复入口。 */
 function validateNodeList(manifest: TunnelPackageManifest): void {

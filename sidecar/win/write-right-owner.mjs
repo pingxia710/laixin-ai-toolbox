@@ -75,14 +75,16 @@ export function clearWriteRightOwner(pid = process.pid, path = writeRightOwnerPa
  * 这些路径两份安装都会走到,不纳进同一把权,前面修的东西等于漏了一半。
  *
  * 拿不到权就**整段不执行**(⛔ 让它写一半):系统代理此刻归持权那一方管。
+ * options.timeoutMs:等待持权方交出的有界时长(N-23);缺省 0 = 立即返回。
  * 平台不提供这把权(mac 现阶段)时原样执行,⛔ 顺手改掉另一个平台的语义。
  */
-export function withWriteRight(adapter, fn, log = () => undefined) {
+export function withWriteRight(adapter, fn, log = () => undefined, options = {}) {
   if (typeof adapter?.acquireWriteRight !== 'function') return { ok: true, value: fn() }
+  const requested = Number.isFinite(options.timeoutMs) ? Math.max(0, Math.trunc(options.timeoutMs)) : 0
   let outcome
-  try { outcome = adapter.acquireWriteRight({ timeoutMs: 0 }) } catch { outcome = undefined }
+  try { outcome = adapter.acquireWriteRight({ timeoutMs: requested }) } catch { outcome = undefined }
   if (outcome?.acquired !== true) {
-    log(`系统代理写入权不在本进程(${outcome?.reason ?? 'unavailable'}):本次不改动系统设置`)
+    log(`系统代理写入权不在本进程(${outcome?.reason ?? 'unavailable'},等待 ${String(requested)} ms):本次不改动系统设置`)
     return { ok: false, reason: outcome?.reason ?? 'unavailable' }
   }
   try { return { ok: true, value: fn() } } finally {

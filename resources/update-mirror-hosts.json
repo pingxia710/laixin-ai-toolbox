@@ -1,0 +1,7 @@
+{
+  "_why": "客户端接受的镜像主机白名单。构建时读这个文件写死进安装包(app.asar),改服务器改不动。",
+  "_why2": "⛔ 改回环境变量:白名单决定「清单里挂了这个主机,已装客户端认不认」,认不出就整份清单被拒。事后必须能查出哪一版带了什么,而环境变量不留痕。门禁靠 git show v<版本>:resources/update-mirror-hosts.json 核这件事。",
+  "_why3": "加一个主机名**不等于**清单就能挂它 —— 要等到带这个白名单的版本成了服役中最老的版本。见 scripts/verify-mirrors-ready.mjs。",
+  "_why4": "域名迁移后新清单的镜像路径固定为 /updates/；旧 /AI-tools/ 镜像只能通过 TOOLBOX_LEGACY_UPDATE_MIRROR 写入旧兼容清单，不能混进新清单。",
+  "hosts": ["dl.laixin.net.cn"]
+}

@@ -79,7 +79,7 @@ function mountPlatformUsage(element: HTMLElement, platform: Exclude<UsagePlatfor
       return
     }
     const empty = node('div', '', 'usage-empty')
-    const state = planUsageEmptyState(status, label)
+    const state = planUsageEmptyState(status, label, report?.reason)
     empty.append(node('h3', state.title), node('p', state.description))
     if (report && api) {
       const open = node('button', '打开官方页面', 'primary-action')
@@ -322,7 +322,8 @@ function windowView(window: UsageWindow | null, fallback: string): HTMLElement {
   const row = node('div', '', 'usage-window')
   const label = windowLabel(window, fallback)
   row.append(node('h4', label))
-  if (window === null) { row.append(node('p', '厂商暂未提供此周期的额度', 'usage-muted')); return row }
+  // 厂商没提供的周期打上标记：总览卡按 Cockpit 的紧凑样式整行隐藏，用量专页照旧显示说明。
+  if (window === null) { row.classList.add('usage-window-empty'); row.append(node('p', '厂商暂未提供此周期的额度', 'usage-muted')); return row }
   const remaining = window.remainingPercent
   const summary = node('div', '', 'usage-numbers')
   summary.append(node('strong', remaining === null ? '剩余额度未知' : `剩余 ${percentText(remaining)}`), node('span', `已用 ${percentText(window.usedPercent)}`))

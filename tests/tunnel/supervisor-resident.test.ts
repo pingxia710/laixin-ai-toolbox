@@ -19,7 +19,7 @@ function makeChild() {
 }
 
 /** 可编排的常驻:叫醒次数、席位是否有活人都由用例说了算。 */
-function makeResident(options: { active?: boolean; alive?: boolean; wakeSucceeds?: boolean } = {}) {
+function makeResident(options: { active?: boolean; alive?: boolean; wakeSucceeds?: boolean; staleCarry?: boolean; unmanagedStale?: boolean } = {}) {
   const state = { active: options.active ?? true, alive: options.alive ?? false }
   let wakes = 0
   const bridge: ResidentBridge = {
@@ -30,7 +30,9 @@ function makeResident(options: { active?: boolean; alive?: boolean; wakeSucceeds
       // 「叫醒就起来」的常驻:叫过之后席位上就有活人了。
       if (options.wakeSucceeds === true) state.alive = true
       return options.wakeSucceeds ?? false
-    }
+    },
+    ...(options.staleCarry === undefined ? {} : { staleCarry: () => options.staleCarry === true }),
+    ...(options.unmanagedStale === undefined ? {} : { unmanagedStale: () => options.unmanagedStale === true })
   }
   return { bridge, state, wakes: () => wakes }
 }
@@ -103,13 +105,29 @@ describe('常驻接入 · 主进程侧', () => {
     h.cleanup()
   })
 
-  it('本轮不归常驻管时 ⛔ 读席位锁:上一任守护没退干净不该让开机接续跳过 spawn', () => {
-    // 席位上确实有活人(上一任还没退),但本轮不是常驻承载
+  it('校准完成前(armed 还假)席位上是在席常驻守护:认得它,⛔ 再起第二份守护(甲-1)', async () => {
+    // Windows 开机校准有 ~1 秒延迟,而 TunnelService 构造器的开机接续确定性地抢跑:
+    // armed() 还是假的,但席位锁上身份对账确认的在席守护只会是常驻形态起的
+    // (非常驻守护按设计不取实例锁)——按常驻轮处理,而不是 spawn 第二份并存
+    // (双守护并存 → 界面卡「连接中」/「另一个后台在管理」,个别时序退出工具箱即断网)。
     const resident = makeResident({ active: false, alive: true })
+    const h = makeHarness(resident.bridge)
+    expect(h.supervisor.isRunning()).toBe(true)
+    h.supervisor.ensureRunning()
+    await settle()
+    expect(h.spawned.length).toBe(0)
+    expect(resident.wakes()).toBe(0)
+    // 状态如实:在席守护的 connected 不被抹成「连接中」(它的 runId 主进程本来就该不认识)
+    expect(h.supervisor.currentState({ state: 'connected', runId: '常驻守护自己发的' })?.state).toBe('connected')
+    h.cleanup()
+  })
+
+  it('席位没人且常驻未武装(装不上/开发态):仍旧走 spawn 老路兜底', () => {
+    const resident = makeResident({ active: false, alive: false })
     const h = makeHarness(resident.bridge)
     expect(h.supervisor.isRunning()).toBe(false)
     h.supervisor.ensureRunning()
-    // 正向证据:走的是 spawn 老路,客户开机连得上
+    // 正向证据:确实走了 spawn 老路,客户开机连得上
     expect(h.spawned.length).toBe(1)
     h.cleanup()
   })
@@ -129,6 +147,30 @@ describe('常驻接入 · 主进程侧', () => {
     expect(h.restoreSpawned()).toBe(1)
     expect(h.supervisor.surrendered).toBe(true)
     expect(h.supervisor.isRunning()).toBe(false)
+    h.cleanup()
+  })
+
+  it('普通存量任务叫不醒:仍走既有 staleCarry 自起，保住点连接兜底', async () => {
+    const resident = makeResident({ alive: false, wakeSucceeds: false, staleCarry: true, unmanagedStale: false })
+    const h = makeHarness(resident.bridge)
+    h.supervisor.ensureRunning()
+    await settle()
+    expect(resident.wakes()).toBe(3)
+    expect(h.spawned.length).toBe(1)
+    expect(h.restoreSpawned()).toBe(0)
+    expect(h.supervisor.surrendered).toBe(false)
+    h.cleanup()
+  })
+
+  it('无法停用的旧任务叫不醒:⛔ staleCarry 自起与它争抢设置，必须还原并停下', async () => {
+    const resident = makeResident({ alive: false, wakeSucceeds: false, staleCarry: true, unmanagedStale: true })
+    const h = makeHarness(resident.bridge)
+    h.supervisor.ensureRunning()
+    await settle()
+    expect(resident.wakes()).toBe(3)
+    expect(h.spawned.length).toBe(0)
+    expect(h.restoreSpawned()).toBe(1)
+    expect(h.supervisor.surrendered).toBe(true)
     h.cleanup()
   })
 

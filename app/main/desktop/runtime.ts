@@ -1,6 +1,6 @@
 import { app, type BrowserWindow, dialog, Menu, nativeImage, Notification, powerMonitor, screen, shell, Tray } from 'electron'
 import { join } from 'node:path'
-import type { DesktopAlert, DesktopView, UpdateView } from '../../desktop-types'
+import type { DesktopAlert, DesktopView, UpdateSuccessNotice, UpdateView } from '../../desktop-types'
 import type { AccountView } from '../../account-types'
 import type { UsageReport } from '../codex-usage/types'
 import type { BridgeRegistry } from '../bridge/bridge-registry'
@@ -25,7 +25,9 @@ import { asTrayNetworkStatus, TRAY_NETWORK_OPERATION_INCOMPLETE, trayNetworkFail
 declare const __TOOLBOX_UPDATE_PUBLIC_KEY__: string
 declare const __TOOLBOX_UPDATE_ORIGIN__: string
 declare const __TOOLBOX_GITHUB_REPOSITORY__: string
+declare const __TOOLBOX_UPDATE_MIRROR_HOSTS__: readonly string[]
 export const DESKTOP_NAVIGATION = 'toolbox:desktop-navigation'
+export const UPDATE_SUCCEEDED = 'toolbox:update-succeeded'
 
 const electronLoginItem: LoginItemController = {
   get: () => app.getLoginItemSettings(),
@@ -48,6 +50,8 @@ export class DesktopRuntime {
   private tunnelActionPending = false
   private trayNetworkNotification?: Notification
   private alerts: DesktopAlert[] = []
+  // 更新成功待展示的信息(仅装完后的第一次启动有值;拉取式,见 updateSuccess())。
+  private successNotice?: UpdateSuccessNotice
   private notifications = new Map<string, Notification>()
   private timers: ReturnType<typeof setInterval>[] = []
   private startupTimers: ReturnType<typeof setTimeout>[] = []
@@ -64,7 +68,8 @@ export class DesktopRuntime {
     if (app.isPackaged) Menu.setApplicationMenu(Menu.buildFromTemplate(applicationMenuTemplate(process.platform)))
     const resources = app.isPackaged ? process.resourcesPath : join(app.getAppPath(), 'resources')
     this.updater = new ToolboxUpdater({ version: app.getVersion(), platform: `${process.platform}-${process.arch}`,
-      origin: __TOOLBOX_UPDATE_ORIGIN__, githubRepository: __TOOLBOX_GITHUB_REPOSITORY__, publicKey: __TOOLBOX_UPDATE_PUBLIC_KEY__, directory: this.updateDirectory,
+      origin: __TOOLBOX_UPDATE_ORIGIN__, githubRepository: __TOOLBOX_GITHUB_REPOSITORY__,
+      mirrorHosts: __TOOLBOX_UPDATE_MIRROR_HOSTS__, publicKey: __TOOLBOX_UPDATE_PUBLIC_KEY__, directory: this.updateDirectory,
       executable: process.execPath, helperPath: join(resources, process.platform === 'win32' ? 'update-helper.ps1' : 'update-helper.cjs'),
       packaged: app.isPackaged, quit: () => app.quit() })
     this.autoUpdate = new AutoUpdateCoordinator(this.updater,
@@ -116,11 +121,24 @@ export class DesktopRuntime {
   async ready(): Promise<void> {
     // 回执可能要等网络连上(更新前客户是连着的那种),⛔ 卡住 ready ——界面还等着它返回。
     // 放到后台盯;盯到「已连」或「客户自己不要连了」就写回执,到点没连上就记下这一版并退出让台。
+    // 写回执成功 ⇒ 这次启动就是「更新装好了」的第一眼,把成功信息留给界面拉(updateSuccess),
+    // 客户要能看到「从哪版升上来、这版改了什么」,⛔ 让更新成功这件事悄无声息。
     void acknowledgeUpdate(this.updateDirectory, app.getVersion(), {
       outcome: () => updateConnectOutcome(),
       giveUp: () => { this.quitting = true; app.quit() }
+    }).then((success) => {
+      if (!success) return
+      this.successNotice = { version: app.getVersion(), ...success }
+      // 推送为主(回执可能等网络连上才写好,渲染层启动时拉取会扑空),拉取兜底,两边都有去重。
+      this.window?.webContents.send(UPDATE_SUCCEEDED, this.successNotice)
     }).catch(() => undefined)
     await recipeStore().load().catch(() => undefined)
+  }
+
+  // 拉取式而不是推送:发送可能早于渲染层注册监听(桥 ready 与渲染层初始化是两次握手),
+  // 弹窗由渲染层启动时主动问一次。这份信息只在装完后的第一次启动存在,天然只弹一次。
+  updateSuccess(): UpdateSuccessNotice {
+    return this.successNotice ?? { version: '', previous: '', notes: '' }
   }
 
   show(tab?: string): void {

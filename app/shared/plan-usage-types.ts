@@ -33,6 +33,12 @@ export type PlanUsageStatus =
   | 'unreadable'
   | 'official-unavailable'
 
+/**
+ * Claude 官方用量这次为什么没读到(Phase 2 ④):没装好 / 登录过期 / 接口变化 / 超时。
+ * ⛔ 全部归一成一句「官方暂未读到」——登录过期的客户会被引去重装软件。
+ */
+export type ClaudeUsageFailureReason = 'not-installed' | 'auth-required' | 'protocol-changed' | 'timeout'
+
 export interface PlanQuotaWindow {
   readonly id: string
   readonly name: string
@@ -76,6 +82,8 @@ export interface PlanUsageReport {
   readonly officialPage: string
   /** 官方那一头这次是什么结局；只读到本机记录时，屏幕上靠它说清原因。 */
   readonly officialStatus?: OfficialUsageStatus
+  /** Claude 官方用量没读到的具体原因(没装好/登录过期/接口变化/超时);屏幕按它分说。 */
+  readonly reason?: ClaudeUsageFailureReason
   /** 本机记录只读到一部分（有文件太大或读不动被跳过）：数字偏小，界面要说出来。 */
   readonly partial?: boolean
 }

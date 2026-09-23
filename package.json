@@ -1,6 +1,6 @@
 {
   "name": "laixin-ai-toolbox",
-  "version": "0.5.6",
+  "version": "0.5.16",
   "productName": "来信AI工具箱统一版",
   "private": false,
   "description": "来信AI工具箱桌面客户端骨架",
@@ -13,7 +13,7 @@
     "prepare:sidecar": "node scripts/prepare-sidecar.mjs",
     "prepare:xray": "node scripts/prepare-xray.mjs",
     "prepare:koffi": "node scripts/prepare-koffi.mjs",
-    "build": "npm run prepare:sidecar && npm run lint && npm run typecheck && npm run prepare:xray && electron-vite build && electron-builder --mac --arm64 --publish never",
+    "build": "npm run build:mac",
     "build:pilot": "npm run prepare:sidecar && npm run lint && npm run typecheck && node scripts/prepare-xray.mjs mac-arm64 win-x64 && npm run prepare:koffi && electron-vite build && electron-builder --mac --arm64 --publish never && electron-builder --win --x64 --publish never",
     "verify:release-account-origin": "node scripts/verify-release-account-origin.mjs",
     "postinstall": "node node_modules/electron/install.js"
@@ -62,6 +62,7 @@
       }
     ],
     "mac": {
+      "artifactName": "${productName}-${version}-${arch}.${ext}",
       "target": [
         "dmg",
         "dir"
@@ -136,6 +137,7 @@
     "eslint": "10.10.0",
     "typescript": "6.0.3",
     "typescript-eslint": "8.69.0",
+    "undici": "^7.29.1",
     "vitest": "5.0.0"
   },
   "dependencies": {
@@ -146,7 +148,7 @@
     "type": "git",
     "url": "https://github.com/pingxia710/laixin-ai-toolbox.git"
   },
-  "homepage": "https://laixin.net.cn/AI-tools/",
+  "homepage": "https://laixin.work/",
   "bugs": {
     "url": "https://github.com/pingxia710/laixin-ai-toolbox/issues"
   }

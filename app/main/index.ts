@@ -11,6 +11,8 @@ import { installNavigationGuards } from './bridge/window-security'
 import { DesktopRuntime } from './desktop/runtime'
 import { registerDesktopActions } from './desktop/bridge'
 import { createMainCrashLog, createRendererRecovery } from './desktop/renderer-recovery'
+import { actionLocalFault } from './bridge/local-fault'
+import { recordFault } from './diagnostics/context'
 
 // 主进程顶层异常落盘(收敛包3·件3):⛔ 静默丢失。
 const logMainCrash = createMainCrashLog((line) => {
@@ -115,6 +117,11 @@ app.on('window-all-closed', () => {
   app.quit()
 })
 
-function logBridgeDiagnostic(code: string, subject: string): void {
+function logBridgeDiagnostic(code: string, subject: string, error?: unknown): void {
   console.error(`[toolbox-bridge] ${code}:${subject}`)
+  // 甲-6:兜底的原始错误落进本机故障记录(诊断包收集);⛔ 只进 console.error(打包 GUI 下 stderr 蒸发)。
+  // 甲-6返工:按动作归类——tunnel.* 照旧记通道码;其余模块不再冒充网络问题,记模块+动作维度。
+  // 参数形状仍只有受控枚举/受控形状(错误名:fs码);⛔ 原始消息(可能带路径)。
+  const fault = actionLocalFault(code, subject, error)
+  if (fault !== undefined) recordFault(fault)
 }

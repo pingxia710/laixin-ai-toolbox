@@ -1,17 +1,17 @@
 import { execFile as execFileCallback } from 'node:child_process'
 import { promisify } from 'node:util'
 import { codexAccountKey, label, maskAccount, record } from '../codex-usage/normalize'
-import { readCodexUsage, UsageReadError } from '../codex-usage/client'
+import { readCodexUsageWithFallback, UsageReadError } from '../codex-usage/client'
 import type { CodexCommand } from '../codex-usage/runtime'
 import type { OfficialAccount, OfficialAccountState } from '../../shared/official-account'
 
 const execFile = promisify(execFileCallback)
 const empty = (state: OfficialAccountState): OfficialAccount => ({ state, accountLabel: null, plan: null })
 
-export async function readCodexOfficialAccount(command: CodexCommand | null, cwd: string, env?: NodeJS.ProcessEnv): Promise<OfficialAccount> {
-  if (!command) return empty('not-installed')
+export async function readCodexOfficialAccount(commands: readonly CodexCommand[] | null, cwd: string, env?: NodeJS.ProcessEnv): Promise<OfficialAccount> {
+  if (!commands || commands.length === 0) return empty('not-installed')
   try {
-    const { account } = await readCodexUsage(command, { cwd, env, signal: new AbortController().signal, accountOnly: true })
+    const { account } = await readCodexUsageWithFallback(commands, { cwd, env, signal: new AbortController().signal, accountOnly: true })
     return { state: 'signed-in', accountKey: codexAccountKey(account), accountLabel: maskAccount(account.email), plan: label(account.planType, 40) }
   } catch (error) {
     return empty(error instanceof UsageReadError && (error.status === 'signed-out' || error.status === 'unsupported') ? error.status : 'unavailable')

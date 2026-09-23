@@ -254,14 +254,101 @@ describe('真实适配器的命令与读数协议（系统调用已封闭替换�
     expect(result).toEqual({ missing: null, original: { type: 'REG_SZ', data: ' old.proxy:8080 ' }, operations: ['read', 'read', 'notify'] })
   })
 
+  // networksetup 自己的错误行只有「行首 ** Error: 」一种形状(本机 macOS 实测,见适配器注释);
+  // 夹具从裸「Error: 」改为真实形状——裸前缀在真机上不存在,且正是旧判据误伤客户数据的口子。
   it('Mac 拒绝成功退出但报错的写入，以及无法解释的读取内容', () => {
     expect(probe('mac', `
-      execute = () => 'Error: Authorization failed.'
+      execute = () => '** Error: Authorization failed.'
       const refusedWrite = rejected(() => adapter.write({ service: 'Wi-Fi', item: 'socks-proxy' }, { enabled: true, host: '127.0.0.1', port: 18080 }))
       execute = () => 'unknown response'
       const refusedRead = rejected(() => adapter.read({ service: 'Wi-Fi', item: 'socks-proxy' }))
       console.log(JSON.stringify({ refusedWrite, refusedRead }))
     `)).toEqual({ refusedWrite: true, refusedRead: true })
+  })
+
+  // 候选甲-3(2026-09-16):-listallnetworkservices 逐字回显客户起的网卡名(真机实测),
+  // 里面含独立英文词 error/failed/not authorized 是客户的正常数据,⛔ 当失败嗅探。
+  // 旧判据在成功输出里嗅这几个词 → managedItems(daemon-core applySettings 入口)必抛
+  // 「系统代理设置被拒绝」→ 非致命码无限重试,客户永远连不上(真机已复现该抛出)。
+  it('macOS 网卡名含 error/failed/not authorized 词:列出、读值、写入全链路照常,⛔ 误判「被拒绝」', () => {
+    const services = ['Wi-Fi', '公司 error 专线', 'backup failed 链路', 'not authorized 网卡']
+    const result = probe('mac', `
+      const services = ${JSON.stringify(services)}
+      const kinds = ${JSON.stringify(macProxyKinds)}
+      const settings = {}
+      for (const service of services) for (const kind of kinds) settings[service + '/' + kind.item] = { enabled: false, host: '', port: 0 }
+      execute = (file, args) => {
+        if (file !== 'networksetup') throw new Error('UNEXPECTED_SYSTEM_COMMAND')
+        if (args[0] === '-listallnetworkservices') return 'An asterisk (*) denotes that a network service is disabled.\\n' + services.join('\\n') + '\\n'
+        if (args[0] === '-getautoproxyurl') return 'URL: (null)\\nEnabled: No\\n'
+        if (args[0] === '-setautoproxystate' || args[0] === '-setautoproxyurl') return ''
+        const kind = kinds.find((candidate) => [candidate.read, candidate.write, candidate.state].includes(args[0]))
+        if (kind === undefined) throw new Error('UNEXPECTED_SYSTEM_COMMAND')
+        const key = args[1] + '/' + kind.item
+        if (args[0] === kind.read) { const value = settings[key]; return 'Enabled: ' + (value.enabled ? 'Yes' : 'No') + '\\nServer: ' + value.host + '\\nPort: ' + value.port + '\\nAuthenticated Proxy Enabled: 0\\n' }
+        if (args[0] === kind.write) { settings[key] = { enabled: true, host: args[2], port: Number(args[3]) }; return '' }
+        settings[key] = { ...settings[key], enabled: args[2] === 'on' }
+        return ''
+      }
+      const outcome = (fn) => { try { return { ok: fn() } } catch (error) { return { code: error?.code ?? null, message: error?.message ?? String(error) } } }
+      const managed = outcome(() => adapter.managedItems(${JSON.stringify(managedProxy)}))
+      const applied = Array.isArray(managed.ok)
+        ? outcome(() => managed.ok.map(({ ref, value }) => { adapter.read(ref); adapter.write(ref, value); return adapter.read(ref) }))
+        : null
+      console.log(JSON.stringify({ managed, applied }))
+    `)
+    expect(result.managed).toEqual({ ok: services.flatMap((service) => [
+      ...macProxyKinds.map(({ item }) => ({ ref: { service, item }, value: managedProxy })),
+      { ref: { service, item: 'auto-proxy' }, value: { enabled: false, url: '' } }
+    ]) })
+    const pacOff = { enabled: false, url: '' }
+    expect(result.applied).toEqual({ ok: services.flatMap(() => [managedProxy, managedProxy, managedProxy, pacOff]) })
+  })
+
+  // 候选甲-3 触发面之二:已有代理的 Server 主机名含独立 error 词,-get*proxy 逐字回显。
+  // 旧判据把它当「被拒绝」:守护读不出已有代理、接管前的读原值也必抛。
+  it('macOS 已有代理主机名含 error 词:如实读出交守护判复用,接管列项照常', () => {
+    const result = probe('mac', `
+      execute = (file, args) => {
+        if (file !== 'networksetup') throw new Error('UNEXPECTED_SYSTEM_COMMAND')
+        if (args[0] === '-listallnetworkservices') return 'An asterisk (*) denotes that a network service is disabled.\\nWi-Fi\\n'
+        if (args[0] === '-getautoproxyurl') return 'URL: (null)\\nEnabled: No\\n'
+        if (args[0] === '-getwebproxy') return 'Enabled: Yes\\nServer: proxy.error.corp.local\\nPort: 8080\\nAuthenticated Proxy Enabled: 0\\n'
+        return 'Enabled: No\\nServer: \\nPort: 0\\nAuthenticated Proxy Enabled: 0\\n'
+      }
+      const outcome = (fn) => { try { return { ok: fn() } } catch (error) { return { code: error?.code ?? null } } }
+      console.log(JSON.stringify({
+        existing: outcome(() => adapter.existingProxy({ host: '127.0.0.1', port: 18080 }) ?? null),
+        original: outcome(() => adapter.read({ service: 'Wi-Fi', item: 'web-proxy' })),
+        managed: outcome(() => adapter.managedItems(${JSON.stringify(managedProxy)}).length)
+      }))
+    `)
+    expect(result.existing).toEqual({ ok: { kind: 'http', host: 'proxy.error.corp.local', port: 8080, source: 'Wi-Fi/web-proxy' } })
+    expect(result.original).toEqual({ ok: { enabled: true, host: 'proxy.error.corp.local', port: 8080 } })
+    expect(result.managed).toEqual({ ok: 4 })
+  })
+
+  // 候选甲-3 触发面之三:PAC 地址含独立 error 词,-getautoproxyurl 逐字回显。
+  // managedItems 对每个服务都读 PAC(记下原地址) → 旧判据必抛。
+  it('macOS PAC 地址含 error 词:报成 pac 交守护处理,接管列项照常并记下原地址', () => {
+    const result = probe('mac', `
+      execute = (file, args) => {
+        if (file !== 'networksetup') throw new Error('UNEXPECTED_SYSTEM_COMMAND')
+        if (args[0] === '-listallnetworkservices') return 'An asterisk (*) denotes that a network service is disabled.\\nWi-Fi\\n'
+        if (args[0] === '-getautoproxyurl') return 'URL: http://error.corp.local/x.pac\\nEnabled: Yes\\n'
+        return 'Enabled: No\\nServer: \\nPort: 0\\nAuthenticated Proxy Enabled: 0\\n'
+      }
+      const outcome = (fn) => { try { return { ok: fn() } } catch (error) { return { code: error?.code ?? null } } }
+      console.log(JSON.stringify({
+        existing: outcome(() => adapter.existingProxy({ host: '127.0.0.1', port: 18080 }) ?? null),
+        managed: outcome(() => adapter.managedItems(${JSON.stringify(managedProxy)}))
+      }))
+    `)
+    expect(result.existing).toEqual({ ok: { kind: 'pac', url: 'http://error.corp.local/x.pac', source: 'Wi-Fi' } })
+    expect(result.managed).toEqual({ ok: [
+      ...macProxyKinds.map(({ item }) => ({ ref: { service: 'Wi-Fi', item }, value: managedProxy })),
+      { ref: { service: 'Wi-Fi', item: 'auto-proxy' }, value: { enabled: false, url: 'http://error.corp.local/x.pac' } }
+    ] })
   })
 
   it('Mac 将 HTTP、HTTPS、SOCKS 分别读取、写入并保留各自关闭时的原主机和端口', () => {
@@ -411,7 +498,7 @@ describe('真实适配器的命令与读数协议（系统调用已封闭替换�
             return ''
           }
           if (args[0] === ${JSON.stringify(kind.state)}) {
-            if (rejectState) return 'Error: Authorization failed.'
+            if (rejectState) return '** Error: Authorization failed.'
             proxy.enabled = args[2] === 'on'
             return ''
           }

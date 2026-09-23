@@ -1,10 +1,14 @@
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, it, vi, afterEach } from 'vitest'
 import {
   AiAccessService,
+  aiAccessShells,
   type AiAccessAdapter,
   type AiAccessState,
   type AiAccessStateStore
 } from '../../app/main/ai-access/service'
+
+const services: AiAccessService[] = []
+afterEach(async () => { await Promise.all(services.splice(0).map(service => service.stop())) })
 
 function fixture(initial: AiAccessState = { version: 1, selected: {} }) {
   let state = initial
@@ -156,5 +160,27 @@ describe('AI 接入核心', () => {
     await f.service.saveProviderKey('claude', 'deepseek', 'sk-toolbox-fixture-claude-1234567890')
     await f.service.useProvider('claude', 'deepseek')
     expect(f.state().selected).toEqual({ codex: 'deepseek', claude: 'deepseek' })
+  })
+
+  it('取消检查中止堵着队列的测速：检查记 client_aborted 并交代计费，⛔ 不进故障记录（API-10）', async () => {
+    const faults: unknown[] = []
+    let upstreamCalled = false
+    const fetcher: typeof fetch = (_url, init) => new Promise<Response>((_resolve, reject) => {
+      upstreamCalled = true
+      init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true })
+    })
+    const adapters: AiAccessAdapter[] = aiAccessShells.map(shell => ({ shell, applyDeepSeek: vi.fn(async () => undefined), applyProvider: vi.fn(async () => undefined) }))
+    const store: AiAccessStateStore = {
+      read: async () => ({ version: 1, selected: {}, shellKeys: { claude: { deepseek: 'sk-test-key-1234567890' } } }),
+      write: async () => undefined
+    }
+    const { AiGateway } = await import('../../app/main/ai-access/gateway')
+    const service = new AiAccessService(store, adapters, new AiGateway({ fetch: fetcher, timeoutMs: 5_000 }), { recordFault: fault => { faults.push(fault) } })
+    services.push(service)
+    const pending = service.testProvider('claude', 'deepseek')
+    await vi.waitFor(() => expect(upstreamCalled).toBe(true))
+    expect(service.cancelTests()).toBe(1)
+    await expect(pending).resolves.toMatchObject({ checks: [{ shell: 'claude', provider: 'deepseek', ok: false, code: 'client_aborted', notice: expect.stringContaining('已取消') }] })
+    expect(faults).toEqual([])
   })
 })

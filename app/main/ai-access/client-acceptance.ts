@@ -19,6 +19,7 @@ export interface ClientRouteAcceptance {
   readonly model: string
   readonly revision: string
   readonly at: string
+  readonly lastAt: string
 }
 
 export class ClientAcceptanceTracker {
@@ -37,10 +38,14 @@ export class ClientAcceptanceTracker {
   record(route: ClientAcceptanceRoute, at: string): boolean {
     const active = this.active.get(route.shell)
     if (!active || !sameRouteRevision(active, route)) return false
-    if (!this.accepted.has(route.shell)) {
+    const accepted = this.accepted.get(route.shell)
+    if (!accepted) {
       this.accepted.set(route.shell, {
-        shell: route.shell, provider: route.provider, model: route.model, revision: route.revision, at
+        shell: route.shell, provider: route.provider, model: route.model, revision: route.revision, at, lastAt: at
       })
+    } else if (Date.parse(at) > Date.parse(accepted.lastAt)) {
+      // Keep first acceptance and previously read snapshots intact; only fresh success moves forward.
+      this.accepted.set(route.shell, { ...accepted, lastAt: at })
     }
     return true
   }

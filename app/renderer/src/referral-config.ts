@@ -2,8 +2,8 @@
 // 客户端只读取固定的来信官网清单，不能被任意远程地址替换。
 import wecomGroupQr from './assets/referral/wecom-group-qr.png'
 
-export const groupQrManifestUrl = 'https://laixin.net.cn/AI-tools/group-entry/manifest.json'
-const groupQrImagePath = '/AI-tools/group-entry/qr/'
+export const groupQrManifestUrl = 'https://laixin.work/group-entry/manifest.json'
+const groupQrImagePath = '/group-entry/qr/'
 const groupLiveCodeKind = 'wecom-group-live-code'
 
 export interface WeComGroupConfig {

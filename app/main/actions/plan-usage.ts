@@ -50,15 +50,15 @@ export function registerActions(registry: BridgeRegistry): void {
       const tunnel = downloadTunnelSnapshot()
       const environment = tunnel.state === 'connected' && tunnel.localProxyUrl ? { ...env, HTTP_PROXY: tunnel.localProxyUrl, HTTPS_PROXY: tunnel.localProxyUrl } : env
       const executable = await trustedCliExecutable('claude-code', process.platform, home, environment)
-      if (executable === undefined) return { status: 'official-unavailable', plan: null }
+      if (executable === undefined) return { status: 'official-unavailable', plan: null, reason: 'not-installed' }
       const before = await readClaudeOfficialAccount(executable, home, environment)
-      if (before.state !== 'signed-in') return { status: 'official-unavailable', plan: null }
+      if (before.state !== 'signed-in') return { status: 'official-unavailable', plan: null, reason: 'auth-required' }
       const controller = new AbortController(); requests.add(controller)
       let result
       try { result = await readClaudeQuota({ executable }, home, environment, 30_000, controller.signal) }
       finally { requests.delete(controller) }
       const after = await readClaudeOfficialAccount(executable, home, environment)
-      return after.state === 'signed-in' && before.accountKey === after.accountKey ? result : { status: 'official-unavailable', plan: null }
+      return after.state === 'signed-in' && before.accountKey === after.accountKey ? result : { status: 'official-unavailable', plan: null, reason: 'auth-required' }
     },
     readQuota: (source, key) => quota.read(source, key),
     // Key 按壳分开存，客户填在哪个壳下都算数：挨个问，谁先有用谁的。

@@ -11,7 +11,7 @@ import type { ResidentOutcome, ResidentSpec } from '../../app/main/tunnel/platfo
 // 那把钥匙有一道闸管着它只许出现在 platform/{mac,win}.ts 与适配器本体,测试也没有理由扩散它。
 const launch = { daemonPath: '/app/sidecar/tunnel-daemon.mjs', adapterPath: '/app/sidecar/managed-adapter.mjs', env: { TOOLBOX_FAKE_GUARD_KEY: '1', ELECTRON_RUN_AS_NODE: '1' } }
 
-function makeRuntime(options: { supported?: boolean; installOutcome?: ResidentOutcome; alivePid?: number } = {}) {
+function makeRuntime(options: { supported?: boolean; installOutcome?: ResidentOutcome; installRejects?: boolean; uninstallRejects?: boolean; alivePid?: number; onCalibrated?: () => void } = {}) {
   const dataDir = mkdtempSync(join(tmpdir(), 'resident-wiring-'))
   if (options.alivePid !== undefined) {
     writeFileSync(join(dataDir, 'daemon.lock'), JSON.stringify({ token: 't', pid: options.alivePid, runId: 'r', at: Date.now() }))
@@ -23,9 +23,10 @@ function makeRuntime(options: { supported?: boolean; installOutcome?: ResidentOu
     supported: options.supported ?? true,
     probeInstalled: () => false,
     spec: () => residentSpecFor({ executable: '/Applications/工具箱.app/Contents/MacOS/工具箱', launch, dataDir, logDir: '/logs' }),
-    install: async (spec) => { calls.push({ op: 'install', spec }); return options.installOutcome ?? { installed: true } },
-    uninstall: async () => { calls.push({ op: 'uninstall' }) },
-    wake: async () => { calls.push({ op: 'wake' }); return { woken: true } }
+    install: async (spec) => { calls.push({ op: 'install', spec }); if (options.installRejects === true) throw new Error('目录不可写'); return options.installOutcome ?? { installed: true } },
+    uninstall: async () => { calls.push({ op: 'uninstall' }); if (options.uninstallRejects === true) throw new Error('任务删除失败') },
+    wake: async () => { calls.push({ op: 'wake' }); return { woken: true } },
+    ...(options.onCalibrated === undefined ? {} : { onCalibrated: options.onCalibrated })
   })
   return { runtime, calls, dataDir, cleanup: () => rmSync(dataDir, { recursive: true, force: true }) }
 }
@@ -64,7 +65,8 @@ describe('常驻接线', () => {
     // 正向证据:确实试过装(⛔ 只断言 armed 是 false——根本没试也长这样)
     expect(h.calls.map((c) => c.op)).toEqual(['install'])
     expect(outcome.installed).toBe(false)
-    // armed 为假 → 守护监管走 spawn 老路,最坏不比上一版差
+    // armed 为假且席位无人 → 守护监管走 spawn 老路兜底(装不上 ⛔ 因此不给客户连网);
+    // 席位上有在席常驻守护时(校准完成前的盲区)按常驻轮处理,不再走老路起第二份(甲-1)
     expect(h.runtime.bridge.armed()).toBe(false)
     h.cleanup()
   })
@@ -111,5 +113,40 @@ describe('常驻接线', () => {
     await calibrateResident(true)
     expect(h.calls.map((c) => c.op)).toEqual(['install'])
     h.cleanup()
+  })
+
+  it('校准落定(装上/没装上/抛错)都打一发 onCalibrated:被推迟的开机接续靠它补做(甲-1)', async () => {
+    let fired = 0
+    const h = makeRuntime({ onCalibrated: () => { fired += 1 } })
+    await h.runtime.calibrate(true)
+    expect(fired).toBe(1)
+    h.cleanup()
+    // 装不上也照打——接续等的是「落定」这个时机,⛔ 只有成功才打会让它永远等
+    const failing = makeRuntime({ installOutcome: { installed: false, reason: '目录不可写' }, onCalibrated: () => { fired += 1 } })
+    await failing.runtime.calibrate(true)
+    expect(fired).toBe(2)
+    failing.cleanup()
+    // install 自己抛错同样照打(校准的失败不允许变成接续的永远等待)
+    const throwing = makeRuntime({ installRejects: true, onCalibrated: () => { fired += 1 } })
+    await throwing.runtime.calibrate(true).catch(() => undefined)
+    expect(fired).toBe(3)
+    throwing.cleanup()
+  })
+
+  it('关开关的校准(calibrate(false))落定也打 onCalibrated:正常卸载与卸载抛错都照打(甲-1 返工)', async () => {
+    // 验收线变异:try { deps.onCalibrated?.() } → try { if (enabled) deps.onCalibrated?.() }
+    // 客户关掉「后台保持连接」走 calibrate(false) —— 等待期的接续照样挂在落定回调上,⛔ 只有开才打。
+    let fired = 0
+    const h = makeRuntime({ onCalibrated: () => { fired += 1 } })
+    await h.runtime.calibrate(false)
+    expect(h.calls.map((c) => c.op)).toEqual(['uninstall']) // 正向证据:确实走了卸载,不是空转
+    expect(fired).toBe(1)
+    h.cleanup()
+    // 卸载自己抛错同样照打(校准的失败不允许变成接续的永远等待)
+    const throwing = makeRuntime({ uninstallRejects: true, onCalibrated: () => { fired += 1 } })
+    await throwing.runtime.calibrate(false).catch(() => undefined)
+    expect(throwing.calls.map((c) => c.op)).toEqual(['uninstall'])
+    expect(fired).toBe(2)
+    throwing.cleanup()
   })
 })

@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import { record } from './normalize'
+import { codexAccountKey, record } from './normalize'
 import type { CodexCommand } from './runtime'
 import type { UsageStatus } from './types'
 
@@ -113,4 +113,48 @@ export function readCodexUsage(command: CodexCommand, options: {
     })
     send('initialize', { clientInfo: { name: 'laixin_usage_monitor', title: '来信 AI 用量监测', version: '0.1.0' }, capabilities: null })
   })
+}
+
+const authoritativeUsageStatuses: readonly UsageStatus[] = ['signed-out', 'unsupported', 'account-changed']
+
+/**
+ * 依次尝试每个受信 codex 二进制。账号结论（未登录/不支持/换了账号）是权威答案，
+ * ⛔ 换个二进制重试把它盖掉；读不到、超时、二进制太旧这类传输级失败才换下一个——
+ * 装 ChatGPT.app 的机器上自带 codex 可能拉不到额度接口，同机 npm 全局包里的正式版往往可用。
+ */
+export async function readCodexUsageWithFallback(commands: readonly CodexCommand[], options: {
+  readonly cwd: string
+  readonly signal: AbortSignal
+  readonly timeoutMs?: number
+  readonly env?: NodeJS.ProcessEnv
+  /** Read identity without making a quota request. */
+  readonly accountOnly?: boolean
+}): Promise<CodexReadResult> {
+  if (commands.length === 0) throw new UsageReadError('not-installed')
+  let lastError: unknown = new UsageReadError('unavailable')
+  for (const command of commands) {
+    try {
+      return await readCodexUsage(command, options)
+    } catch (error) {
+      lastError = error
+      if (error instanceof UsageReadError && authoritativeUsageStatuses.includes(error.status)) throw error
+    }
+  }
+  throw lastError
+}
+
+/**
+ * 只为「已在工具箱登记的账号」读取用量：读到手的账号指纹必须与登记一致，
+ * 机器上换了号就按换号处理，⛔ 把别人账号的额度当当前账号显示。
+ */
+export async function readCodexUsageForAddedAccount(commands: readonly CodexCommand[], options: {
+  readonly cwd: string
+  readonly signal: AbortSignal
+  readonly timeoutMs?: number
+  readonly env?: NodeJS.ProcessEnv
+  readonly addedAccountKey: string
+}): Promise<CodexReadResult> {
+  const data = await readCodexUsageWithFallback(commands, options)
+  if (codexAccountKey(data.account) !== options.addedAccountKey) throw new UsageReadError('account-changed')
+  return data
 }

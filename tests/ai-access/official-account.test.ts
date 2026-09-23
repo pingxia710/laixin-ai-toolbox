@@ -11,16 +11,23 @@ describe('官方套餐账号确认', () => {
   it('只确认 Codex 身份，不查询用量；只返回脱敏身份', async () => {
     const root = await mkdtemp(join(tmpdir(), 'official-account-'))
     const requests = join(root, 'requests.jsonl')
-    const account = await readCodexOfficialAccount({ executable: process.execPath, args: [resolve('tests/codex-usage/fixtures/server.mjs')] }, root,
+    const account = await readCodexOfficialAccount([{ executable: process.execPath, args: [resolve('tests/codex-usage/fixtures/server.mjs')] }], root,
       { ...process.env, USAGE_FIXTURE_REQUESTS: requests })
     expect(account).toEqual({ state: 'signed-in', accountLabel: 'de***@example.test', plan: 'plus', accountKey: expect.stringMatching(/^[a-f0-9]{64}$/) })
     expect((await readFile(requests, 'utf8')).trim().split('\n').map(line => JSON.parse(line).method)).toEqual(['initialize', 'initialized', 'account/read'])
   })
+  it('候选二进制按顺序回退：装 ChatGPT.app 的机器上自带 codex 拉不到额度时，退到 npm 全局包的正式版', async () => {
+    const broken = { executable: process.execPath, args: [resolve('tests/codex-usage/fixtures/server.mjs'), 'exit'] }
+    const working = { executable: process.execPath, args: [resolve('tests/codex-usage/fixtures/server.mjs')] }
+    expect(await readCodexOfficialAccount([broken, working], tmpdir()).then(account => account.state)).toBe('signed-in')
+    expect(await readCodexOfficialAccount([broken], tmpdir()).then(account => account.state)).toBe('unavailable')
+  })
   it.each([['signed-out', 'signed-out'], ['api-key', 'unsupported'], ['malformed', 'unavailable']] as const)('Codex %s 与其他状态区分', async (mode, state) => {
-    expect(await readCodexOfficialAccount({ executable: process.execPath, args: [resolve('tests/codex-usage/fixtures/server.mjs'), mode] }, tmpdir())).toEqual({ state, accountLabel: null, plan: null })
+    expect(await readCodexOfficialAccount([{ executable: process.execPath, args: [resolve('tests/codex-usage/fixtures/server.mjs'), mode] }], tmpdir())).toEqual({ state, accountLabel: null, plan: null })
   })
   it('未安装不能当成已经登录', async () => {
     expect((await readCodexOfficialAccount(null, tmpdir())).state).toBe('not-installed')
+    expect((await readCodexOfficialAccount([], tmpdir())).state).toBe('not-installed')
   })
   it('Claude 只认官方套餐登录，不把 API 登录或坏数据当成功', () => {
     expect(parseClaudeOfficialAccount(JSON.stringify({ loggedIn: true, authMethod: 'claude.ai', email: 'demo@example.test', subscriptionType: 'max', accessToken: 'fixture-secret' })))
@@ -31,7 +38,8 @@ describe('官方套餐账号确认', () => {
   })
   it('桥只允许 Codex 和 Claude，拒绝任意路径与多余参数', async () => {
     const registry = new BridgeRegistry()
-    registerOfficialAccountActions(registry, async () => ({ state: 'signed-out', accountLabel: null, plan: null }))
+    registerOfficialAccountActions(registry, async () => ({ state: 'signed-out', accountLabel: null, plan: null }),
+      { key: async () => 'a'.repeat(64) })
     await expect(registry.execute('officialaccount.read', { shell: 'codex' })).resolves.toHaveProperty('snapshot')
     await expect(registry.execute('officialaccount.read', { shell: '../private' })).rejects.toMatchObject({ code: 'ACTION_FAILED' })
     await expect(registry.execute('officialaccount.read', { shell: 'claude', path: '/private' })).rejects.toMatchObject({ code: 'ACTION_PARAMS_INVALID' })

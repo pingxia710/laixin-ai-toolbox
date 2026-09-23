@@ -37,6 +37,22 @@ describe('国内三壳与套餐用量的显示', () => {
     expect(planUsageEmptyState('network-error', 'Kimi Code').description).toContain('不代表额度用完了')
   })
 
+  // Phase 2 ④:Claude 官方用量读不到的具体原因要上屏——没装好/登录过期/接口变化/超时各说各的话,
+  // ⛔ 让登录过期的客户对着「请确认已更新且能联网」去重装软件。
+  it('Claude 官方没读到的四种原因分说,各给客户能做的那件事', () => {
+    expect(planUsageEmptyState('official-unavailable', 'Claude Code', 'not-installed').title).toContain('还没装 Claude Code')
+    expect(planUsageEmptyState('official-unavailable', 'Claude Code', 'not-installed').description).toContain('装好')
+    expect(planUsageEmptyState('official-unavailable', 'Claude Code', 'auth-required').title).toContain('登录')
+    expect(planUsageEmptyState('official-unavailable', 'Claude Code', 'auth-required').description).toContain('刷新')
+    expect(planUsageEmptyState('official-unavailable', 'Claude Code', 'protocol-changed').description).toContain('更新')
+    expect(planUsageEmptyState('official-unavailable', 'Claude Code', 'timeout').description).toContain('不代表')
+    // 没带原因时保持原有通用文案,⛔ 旧报告在升级后变成空白。
+    expect(planUsageEmptyState('official-unavailable', 'Claude Code').title).toBe('官方套餐用量暂未读到')
+    // 四种说法互不相同。
+    const states = (['not-installed', 'auth-required', 'protocol-changed', 'timeout'] as const).map(reason => planUsageEmptyState('official-unavailable', 'Claude Code', reason).title)
+    expect(new Set(states).size).toBe(4)
+  })
+
   // 官方额度这次没读到、却有本机记录时，屏幕上原来一律写「官方没有提供用量接口」：
   // Key 填错或断网的客户以为永远看不到官方额度，不会回去修 Key。
   it('只读到本机记录时按官方那一头的结局分说，只有真没接口才说「官方不提供」', () => {

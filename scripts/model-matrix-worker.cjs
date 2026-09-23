@@ -67,7 +67,7 @@ async function main() {
   const recipes = new RecipeStore({
     file: recipeFile(userData),
     publicKey: readFileSync(join(__dirname, '..', 'resources/update-public-key.pem'), 'utf8'),
-    origin: 'https://laixin.net.cn/AI-tools/' // 只用于联网取新配方，本脚本不取，只读本机缓存。
+    origin: 'https://laixin.work/' // 只用于联网取新配方，本脚本不取，只读本机缓存。
   })
   await recipes.load()
   const matrixStore = new ModelMatrixStore(createModelMatrixFiles(join(userData, 'model-matrix.json')))

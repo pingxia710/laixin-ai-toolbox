@@ -108,7 +108,7 @@ export function mountAccountOverview(element: HTMLElement, platform: UsagePlatfo
       if (!mounted || currentApi !== provider || request !== balanceRequest) return
       if (!value.supported) { balanceValue.textContent = '以控制台为准'; balanceNote.textContent = '这家服务商没有余额查询接口，余额和账单请在它的控制台查看。' }
       else if (value.total !== null) { balanceValue.textContent = `${value.total.toFixed(2)} ${value.currency || ''}`.trim(); balanceNote.textContent = value.total <= 5 ? '余额偏低，用完会提示 402，请及时充值。' : '来自服务商余额接口，官方套餐与 API 用量分别计算。' }
-      else { balanceValue.textContent = '余额未读到'; balanceNote.textContent = value.error === 'key_missing' ? '先添加这个入口的 Key。' : value.error === 'key_rejected' ? 'Key 未通过服务商认证，请检查后重新添加。' : value.error === 'network_error' ? '未连上服务商，请检查网络后刷新。' : '服务商没有返回有效余额。' }
+      else { balanceValue.textContent = '余额未读到'; balanceNote.textContent = value.error === 'key_missing' ? '先添加这个入口的 Key。' : value.error === 'key_rejected' ? 'Key 未通过服务商认证，请检查后重新添加。' : value.error === 'network_error' ? '未连上服务商，请检查网络后刷新。' : value.error === 'provider_busy' ? '服务商暂时限流或维护，稍等片刻再刷新。' : '服务商没有返回有效余额，请稍后刷新再试。' }
       peakNote.textContent = value.peak ? value.peak.label : ''
       peakNote.hidden = !value.peak
     } catch { if (mounted && currentApi === provider && request === balanceRequest) { balanceValue.textContent = '余额未读到'; balanceNote.textContent = '暂时无法读取余额。' } }

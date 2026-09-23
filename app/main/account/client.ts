@@ -58,6 +58,8 @@ export const accountMessages: Record<string, string> = {
   INVITE_CODE_INVALID: '邀请码无效，请核对后重试；不需要邀请码可清空后直接注册。',
   INVITE_REWARD_LIMIT: '该邀请码的本月邀请奖励已达上限，暂时无法使用；可清空邀请码直接注册。'
 }
+const canonicalAccountOrigin = 'https://laixin.work/'
+const migratedAccountOrigins = new Set(['https://laixin.net.cn/', 'https://laixin.net.cn/AI-tools/'])
 const signedOut = (code = '', message = ''): AccountView => ({ state: 'signed-out', account: null, code, message, overview: null })
 
 export function validSession(value: unknown): value is AccountSession {
@@ -89,14 +91,14 @@ export class AccountClient {
     private readonly setNetwork: (access: NetworkAccountAccess | undefined, reason?: 'temporary-unavailable' | 'login-expired') => Promise<unknown>,
     private readonly collectDevice?: () => Promise<DeviceFacts>) {
     this.base = origin ? new URL(origin) : null
-    // 允许挂在单个路径前缀下（如 https://laixin.net.cn/AI-tools/）；请求一律相对解析。
+    // 允许挂在单个路径前缀下；当前正式账号服务使用 https://laixin.work/。
     const basePathOk = this.base !== null && (this.base.pathname === '/' || /^\/[A-Za-z0-9_-]+\/$/.test(this.base.pathname))
     if (this.base && (!basePathOk ||
       (this.base.protocol !== 'https:' && !(this.base.protocol === 'http:' && ['127.0.0.1', '[::1]'].includes(this.base.hostname))) ||
       this.base.username || this.base.password || this.base.hash || this.base.search)) throw new AccountClientError('ACCOUNT_NOT_CONFIGURED')
   }
 
-  /** 相对解析：'/v1/x' 归一成 'v1/x'，保住基础路径前缀（如 /AI-tools/）。 */
+  /** 相对解析：'/v1/x' 归一成 'v1/x'，保住自定义基础路径前缀。 */
   private resolve(path: string): URL {
     return new URL(path.replace(/^\/+/, ''), this.base!)
   }
@@ -200,8 +202,35 @@ export class AccountClient {
     if (!this.restored) {
       try {
         const saved = await this.store.read() as (AccountSession & { serviceOrigin?: string }) | null
-        if (saved && saved.serviceOrigin !== this.base.href) throw new AccountClientError('ACCOUNT_STORAGE_UNAVAILABLE')
-        current(); this.session = saved; this.restored = true
+        // 地址对不上要分两种,⛔ 一律当作废:
+        //  · 同一个服务、只是记录格式旧了(0.4.x 记 origin,0.5.x 起记含路径的 href)——这条记录永远对不上,
+        //    清掉当未登录、客户重登一次即可。⛔ 抛 ACCOUNT_STORAGE_UNAVAILABLE:它显示成「本机无法安全保存
+        //    登录状态，请稍后重试」,既指错方向(钥匙串与本机存储都好着),又给假希望(等多久都不会好)。
+        //    2026-09-16 在创始人机器上实证过这一卡死。
+        //  · 真换了服务地址(origin 都不同)——保持原样报存储不可用且 ⛔ 删记录:客户端在配错的地址下启动过
+        //    一次就把人家登录态清掉,配置改回来还得重登。安全要求(⛔ 把旧凭据发给新地址)由 session=null 保证,
+        //    ⛔ 靠删文件。tests/account/account.test.ts「更换服务地址不发送旧凭据」钉的就是这一条。
+        // write(null) 只删文件、⛔ 碰钥匙串,所以钥匙串真坏时它照样清得掉;read()/write() 里的
+        // available() 仍会如实报存储不可用,真故障不会被吞成未登录。
+        const mismatched = saved !== null && saved.serviceOrigin !== this.base.href
+        const sameService = (): boolean => {
+          if (saved?.serviceOrigin === undefined) return false
+          try { return new URL(saved.serviceOrigin).origin === this.base!.origin } catch { return false }
+        }
+        const migratedService = (): boolean => {
+          if (this.base!.href !== canonicalAccountOrigin || saved?.serviceOrigin === undefined) return false
+          try { return migratedAccountOrigins.has(new URL(saved.serviceOrigin).href) } catch { return false }
+        }
+        if (mismatched && migratedService()) {
+          // 域名迁移是已知的服务替换：不把旧 token 发给新域名，清掉旧会话并明确要求重登。
+          // 其他未知地址仍走下面的 ACCOUNT_STORAGE_UNAVAILABLE，避免把安全边界变成“一律清会话”。
+          await this.store.write(null)
+          current(); this.session = null; this.restored = true
+          return this.withTerms(signedOut('ACCOUNT_LOGIN_REQUIRED', '来信服务地址已更新，请重新登录。'))
+        }
+        if (mismatched && !sameService()) throw new AccountClientError('ACCOUNT_STORAGE_UNAVAILABLE')
+        if (mismatched) await this.store.write(null)
+        current(); this.session = mismatched ? null : saved; this.restored = true
       }
       catch { throw new AccountClientError('ACCOUNT_STORAGE_UNAVAILABLE') }
     }
@@ -593,6 +622,7 @@ export class AccountClient {
     if (!session || this.view.state !== 'signed-in') throw new AccountClientError('ACCOUNT_LOGIN_REQUIRED')
     const orderId = /^lx-[a-f0-9]{32}$/
     const postId = /^sp-[a-f0-9]{32}$/
+    const responseId = /^sr-[a-f0-9]{32}$/
     const requestId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
     const integer = (value: string | undefined, nullable = false): number | null => {
       if (nullable && value === '') return null
@@ -627,6 +657,27 @@ export class AccountClient {
     else if (operation === 'closePost') {
       if (!postId.test(input.postId ?? '')) throw new AccountClientError('SHARING_NOT_FOUND')
       path = `/v1/sharing/posts/${input.postId}/close`; body = {}
+    }
+    else if (operation === 'respond') {
+      if (!postId.test(input.demandPostId ?? '') || !postId.test(input.supplyPostId ?? '')) throw new AccountClientError('SHARING_NOT_FOUND')
+      if (!requestId.test(input.requestId ?? '')) throw new AccountClientError('SHARING_INVALID')
+      path = `/v1/sharing/posts/${input.demandPostId}/responses`
+      body = { supplyPostId: input.supplyPostId, requestId: input.requestId }
+    }
+    else if (operation === 'demandResponses') {
+      if (!postId.test(input.demandPostId ?? '')) throw new AccountClientError('SHARING_NOT_FOUND')
+      path = `/v1/sharing/posts/${input.demandPostId}/responses`
+    }
+    else if (operation === 'myResponses') { path = '/v1/sharing/responses/mine' }
+    else if (operation === 'selectResponse') {
+      if (!responseId.test(input.responseId ?? '')) throw new AccountClientError('SHARING_NOT_FOUND')
+      if (!requestId.test(input.requestId ?? '')) throw new AccountClientError('SHARING_INVALID')
+      path = `/v1/sharing/responses/${input.responseId}/select`
+      body = { channel: input.channel, requestId: input.requestId }
+    }
+    else if (operation === 'confirmResponse' || operation === 'declineResponse' || operation === 'withdrawResponse') {
+      if (!responseId.test(input.responseId ?? '')) throw new AccountClientError('SHARING_NOT_FOUND')
+      path = `/v1/sharing/responses/${input.responseId}/${operation === 'confirmResponse' ? 'confirm' : operation === 'declineResponse' ? 'decline' : 'withdraw'}`; body = {}
     }
     else if (operation === 'share') {
       if (!['codex', 'claude'].includes(input.software ?? '') || !requestId.test(input.requestId ?? '')) throw new AccountClientError('SHARING_INVALID')

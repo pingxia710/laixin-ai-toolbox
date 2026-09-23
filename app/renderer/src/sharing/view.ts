@@ -1,4 +1,4 @@
-import type { SharingCatalog, SharingDelivery, SharingIntentionStatus, SharingIssue, SharingListing, SharingOrderView, SharingPayment, SharingPostSide, SharingPostView, SharingProductId, SharingSoftware, SharingStandardProduct, SharingStatus } from '../../../sharing-types'
+import type { SharingCandidateView, SharingCatalog, SharingDelivery, SharingIntentionStatus, SharingIssue, SharingListing, SharingMyResponseView, SharingOrderView, SharingPayment, SharingPostSide, SharingPostView, SharingProductId, SharingResponseView, SharingSoftware, SharingStandardProduct, SharingStatus } from '../../../sharing-types'
 import type { SharingPublishInput, SharingResult } from '../../../preload/api/sharing'
 import { accountSnapshot, onAccountChange, requireAccount } from '../account-state'
 import { markServiceAvailability } from '../navigation'
@@ -10,6 +10,7 @@ import './style.css'
 
 export const statusLabels: Record<SharingStatus, string> = { pending_payment: '等待付款', queued: '已付款 · 等待办理', processing: '正在办理', ready: '账号已备好 · 待领取核对', active: '租用中', expired: '租期已满 · 已收回', problem: '租单问题处理中', cancel_requested: '取消申请处理中', refund_pending: '等待人工退款', refunded: '已记录退款', cancelled: '已取消' }
 export const intentionStatusLabels: Record<SharingIntentionStatus, string> = { pending: '待客服对接', contacted: '客服对接中', listed: '已上架出租', closed: '已关闭' }
+const softwareLabels: Record<SharingSoftware, string> = { codex: 'Codex', claude: 'Claude Code' }
 const money = (n: number) => `¥${(n / 100).toFixed(2)}`
 const date = (n: number | null) => n ? new Date(n).toLocaleString('zh-CN') : '尚未确定'
 const yuanToCents = (value: string): number | null => {
@@ -29,17 +30,20 @@ async function result<T>(request: Promise<SharingResult>): Promise<T> {
 export function mountSharing(root: HTMLElement): () => void {
   const api = window.toolbox.sharing
   let active = true; let busy = false; let generation = 0; let accountId = accountSnapshot().account?.id
-  let section: 'home' | 'rent' | 'market' | 'publish' | 'myPosts' | 'orders' = 'home'
+  let section: 'market' | 'publish' | 'mine' = 'market'
   let software: SharingSoftware = 'codex'
   let catalog: SharingCatalog | undefined; let orders: SharingOrderView[] = []; let nextCursor = ''
   let selected: SharingOrderView | undefined; let checkout: SharingListing | undefined
   let payment: SharingPayment | undefined; let secret: SharingDelivery | undefined
   let standards: SharingStandardProduct[] | undefined; let posts: SharingPostView[] | undefined; let myPosts: SharingPostView[] | undefined
+  let myResponses: SharingMyResponseView[] | undefined; let candidates: { demandPostId: string; items: SharingCandidateView[] } | undefined; let expandedDemand = ''
+  let pendingRespondDemand = ''
   let publishSide: SharingPostSide = 'demand'; let publishProductId: SharingProductId = 'account-rental'
   let publishSoftware: SharingSoftware = 'codex'; let publishProvider = ''
   let message = ''
   let qrStop: (() => void) | undefined
   const requests = new Map<string, string>()
+  const resetTransient = () => { selected = undefined; checkout = undefined; payment = undefined; secret = undefined; generation++ }
   const clearSecret = () => { secret = undefined; generation++; if (active) render() }
   const hideOnBlur = () => { generation++; if (secret) { secret = undefined; if (active) render() } }
   const run = async (action: () => Promise<void>) => {
@@ -70,9 +74,15 @@ export function mountSharing(root: HTMLElement): () => void {
     const response = await result<{ posts: SharingPostView[] }>(api.myPosts())
     if (active && identity === accountSnapshot().account?.id) myPosts = response.posts
   }
+  const refreshMyResponses = async () => {
+    const identity = accountSnapshot().account?.id
+    if (!identity) { myResponses = []; return }
+    const response = await result<{ responses: SharingMyResponseView[] }>(api.myResponses())
+    if (active && identity === accountSnapshot().account?.id) myResponses = response.responses
+  }
   const open = async (id: string) => {
     const response = await result<SharingOrderView>(api.detail({ orderId: id }))
-    if (active && accountSnapshot().account) { selected = response; checkout = undefined; section = 'orders'; secret = undefined; generation++; payment = undefined }
+    if (active && accountSnapshot().account) { selected = response; checkout = undefined; section = 'mine'; secret = undefined; generation++; payment = undefined }
   }
   const pay = async () => {
     if (!selected) return
@@ -106,10 +116,10 @@ export function mountSharing(root: HTMLElement): () => void {
       const order = await result<SharingOrderView>(api.create({ listingId: listing.id, channel: select.value, requestId }))
       requests.delete(key)
       if (!active || !accountSnapshot().account) return
-      selected = order; checkout = undefined; section = 'orders'; await refresh()
+      selected = order; checkout = undefined; section = 'mine'; await refresh()
       if (order.channel !== 'manual' && order.status === 'pending_payment') await pay()
     }) }
-    block.append(form); return block
+    block.append(form, el('p', '共享账号可能违反部分厂商的服务条款，请自行判断后下单。', 'share-boundary')); return block
   }
   function renderOrder(order: SharingOrderView): HTMLElement {
     const block = el('section', '', 'share-detail')
@@ -176,17 +186,117 @@ export function mountSharing(root: HTMLElement): () => void {
     parts.push(choiceLabel(product.termDays, post.termDays))
     return parts.filter(Boolean).join(' · ')
   }
+  const specText = (spec: { productId: SharingProductId; accountPlan: string | null; apiProvider: string | null; apiModel: string | null; termDays: number; quotaAmount: number | null; quotaUnit: string | null; usageTier: string | null }): string => {
+    const product = findProduct(spec.productId)
+    if (!product) return spec.productId
+    const parts: string[] = []
+    if (spec.productId === 'account-rental') parts.push(choiceLabel(product.accountPlans, spec.accountPlan))
+    else {
+      parts.push(choiceLabel(product.apiProviders, spec.apiProvider), spec.apiModel ?? '')
+      if (spec.productId === 'api-quota') parts.push(`${spec.quotaAmount} ${choiceLabel(product.quotaUnits, spec.quotaUnit)}`)
+      else parts.push(choiceLabel(product.usageTiers, spec.usageTier))
+    }
+    parts.push(choiceLabel(product.termDays, spec.termDays))
+    return parts.filter(Boolean).join(' · ')
+  }
+  const activeResponseFor = (demandPostId: string) => myResponses?.find((item) => item.demandPostId === demandPostId && ['responded', 'presented', 'selected', 'confirmed'].includes(item.status))
+  const respondStatusLabels: Record<string, string> = { responded: '已回应 · 等待客服核查', presented: '已入围 · 等待需求方选择', selected: '需求方已选中 · 待你确认', confirmed: '已成交', declined: '你确认了没货，回应已失效', rejected: '未通过核查', withdrawn: '已撤回' }
+  const startRespond = (demand: SharingPostView): void => {
+    if (!gate()) return
+    void run(async () => {
+      const mine = await result<{ posts: SharingPostView[] }>(api.myPosts())
+      const match = mine.posts.filter((item) => item.side === 'supply' && item.status === 'published' &&
+        item.productId === demand.productId && item.software === demand.software).sort((a, b) => b.createdAt - a.createdAt)[0]
+      if (match) {
+        await result<SharingResponseView>(api.respond({ demandPostId: demand.id, supplyPostId: match.id, requestId: crypto.randomUUID() }))
+        await refreshMyResponses(); message = '回应成功，等待来信客服核查；有进展会在「我的发布」显示。'
+      } else {
+        pendingRespondDemand = demand.id
+        publishSide = 'supply'; publishProductId = demand.productId; publishSoftware = demand.software; publishProvider = demand.apiProvider ?? ''
+        section = 'publish'; resetTransient(); message = ''
+        render()
+      }
+    })
+  }
+  const fetchCandidates = async (demandPostId: string): Promise<SharingCandidateView[]> => {
+    const response = await result<{ candidates: SharingCandidateView[] }>(api.demandResponses({ demandPostId }))
+    return response.candidates
+  }
+  const toggleCandidates = (demandPostId: string): void => {
+    if (expandedDemand === demandPostId) { expandedDemand = ''; candidates = undefined; render(); return }
+    expandedDemand = demandPostId; candidates = undefined; render()
+    void run(async () => {
+      const items = await fetchCandidates(demandPostId)
+      if (active && expandedDemand === demandPostId) { candidates = { demandPostId, items }; render() }
+    })
+  }
   function renderPost(post: SharingPostView, mine = false): HTMLElement {
     const product = findProduct(post.productId)
     const card = el('article', '', 'share-market-card')
-    const role = post.side === 'demand' ? '需求' : '供给'
-    card.append(el('span', role, `share-side share-side-${post.side}`), el('h3', product?.label ?? post.productId),
-      el('p', postDescription(post)), el('p', `${post.side === 'demand' ? '愿付价格' : '供给报价'} ${money(post.priceCents)}`, 'share-price'))
-    if (post.side === 'supply') card.append(el('p', `可提供 ${post.availableCount} 份 · ${post.deliveryHours} 小时内交付`))
-    card.append(el('p', `${post.status === 'published' ? '发布中' : '已关闭'} · ${date(post.createdAt)}`, 'share-muted'))
-    if (mine && post.status === 'published') card.append(button('关闭发布', () => run(async () => {
-      await result<SharingPostView>(api.closePost({ postId: post.id })); await Promise.all([refreshPosts(), refreshMyPosts()]); message = '发布已关闭。'
-    })))
+    const demand = post.side === 'demand'
+    card.append(el('span', demand ? '求' : '供', `share-badge share-badge-${post.side}`), el('h3', product?.label ?? post.productId),
+      el('p', postDescription(post)), el('p', `${demand ? '愿付' : '报价'} ${money(post.priceCents)}`, 'share-price'))
+    if (!demand) card.append(el('p', `可提供 ${post.availableCount} 份 · ${post.deliveryHours} 小时内交付`))
+    if (mine && !demand && myResponses) {
+      for (const response of myResponses.filter((item) => item.supplyPostId === post.id && !['withdrawn', 'rejected'].includes(item.status))) {
+        const demandSpec = response.demand ? specText(response.demand) : response.demandPostId
+        card.append(el('p', `回应「${demandSpec}」：${respondStatusLabels[response.status] ?? response.status}`, 'share-response-line'))
+        if (response.status === 'selected') card.append(button('确认成交，为对方生成租单', () => run(async () => {
+          await result<SharingOrderView>(api.confirmResponse({ responseId: response.id }))
+          await Promise.all([refreshMyResponses(), refreshMyPosts()]); message = '已确认成交，已为对方生成租单，等待对方付款。'
+        }), true), button('没货了，通知对方', () => run(async () => {
+          await result<SharingResponseView>(api.declineResponse({ responseId: response.id }))
+          await refreshMyResponses(); message = '已通知对方该候选失效。'
+        })))
+      }
+    }
+    card.append(el('p', post.status === 'published' ? (mine ? '已发布 · 等待客服对接' : '等待客服对接') : '已关闭', 'share-muted'))
+    if (mine) {
+      if (post.status === 'published') {
+        if (demand) card.append(button(expandedDemand === post.id ? '收起回应' : '查看回应', () => toggleCandidates(post.id)))
+        card.append(button('关闭发布', () => run(async () => {
+          await result<SharingPostView>(api.closePost({ postId: post.id })); await Promise.all([refreshPosts(), refreshMyPosts(), refreshMyResponses()]); message = '发布已关闭。'
+        })))
+      }
+    } else if (demand) {
+      const responded = activeResponseFor(post.id)
+      if (responded) card.append(el('p', respondStatusLabels[responded.status] ?? '已回应', 'share-response-line'))
+      else if (signedIn()) card.append(button('回应这个需求', () => startRespond(post), true))
+      card.append(button('有疑问？联系客服', () => { void revealSupport() }))
+    } else {
+      card.append(button('想要类似的，发布需求', () => {
+        publishSide = 'demand'; publishProductId = post.productId; publishSoftware = post.software; publishProvider = post.apiProvider ?? ''
+        section = 'publish'; resetTransient(); render()
+      }))
+    }
+    if (mine && demand && expandedDemand === post.id) {
+      const box = el('div', '', 'share-candidates')
+      box.append(el('h3', '回应候选（按契合自行选择；看不到对方身份）'))
+      const items = candidates?.demandPostId === post.id ? candidates.items : undefined
+      if (items === undefined) box.append(el('p', '正在读取回应…', 'share-muted'))
+      else if (!items.length) box.append(el('p', '还没有入围的回应。客服核查通过后会出现在这里。', 'share-muted'))
+      else {
+        for (const candidate of items) {
+          const row = el('div', '', 'share-candidate')
+          row.append(el('p', specText(candidate), 'share-candidate-spec'),
+            el('p', `报价 ${money(candidate.priceCents)} · 可提供 ${candidate.availableCount} 份 · ${candidate.deliveryHours} 小时内交付`))
+          if (candidate.status === 'selected') row.append(el('p', '已选择 · 等待对方确认有货', 'share-response-line'))
+          else {
+            const channels = catalog?.channels?.length ? catalog.channels : (['manual'] as const)
+            const label = el('label', '付款方式'); const select = el('select'); select.name = 'channel'
+            for (const channel of channels) { const option = el('option', ({ alipay: '支付宝', wechat: '微信支付', manual: '人工办理' })[channel] ?? channel); option.value = channel; select.append(option) }
+            label.append(select)
+            row.append(label, button('选择这个报价', () => run(async () => {
+              await result<SharingResponseView>(api.selectResponse({ responseId: candidate.responseId, channel: select.value, requestId: crypto.randomUUID() }))
+              await refreshMyResponses(); message = '已选择，等待对方确认有货；确认后租单会出现在「我的租单」。'
+              candidates = { demandPostId: post.id, items: await fetchCandidates(post.id) }; render()
+            })))
+          }
+          box.append(row)
+        }
+      }
+      card.append(box)
+    }
     return card
   }
   const selectField = (labelText: string, name: string, choices: { value: string; label: string }[], value?: string) => {
@@ -196,19 +306,37 @@ export function mountSharing(root: HTMLElement): () => void {
     label.append(select); return { label, select }
   }
   function renderPublish(): HTMLElement {
-    const wrapper = el('section', '', 'share-detail'); wrapper.append(el('h3', '发布标准需求或供给'),
-      el('p', '先选择标准产品和规格。需求者填写愿付价格，供给者填写自己的报价；当前价格由发布者自主决定。'))
-    if (!standards?.length) { wrapper.append(el('p', '正在读取标准模板…')); return wrapper }
+    const wrapper = el('section', '', 'share-detail'); wrapper.append(el('h3', '发布需求或供给'),
+      el('p', '选一种租法，把规格、期限和你的价格说清楚；客服据此帮你对接。'))
+    if (!standards?.length) { wrapper.append(el('p', '正在读取模板…')); return wrapper }
     const product = findProduct(publishProductId) ?? standards[0]!
     publishProductId = product.id
+    const sideRow = el('div', '', 'share-side-switch'); sideRow.setAttribute('role', 'group'); sideRow.setAttribute('aria-label', '发布身份')
+    for (const [id, label] of [['demand', '我要租'], ['supply', '我要出']] as const) {
+      const item = button(label, () => { if (publishSide !== id) { publishSide = id; render() } })
+      item.className = `share-side-button${publishSide === id ? ' is-active' : ''}`
+      item.setAttribute('aria-pressed', String(publishSide === id))
+      sideRow.append(item)
+    }
+    wrapper.append(sideRow)
+    const templateRow = el('div', '', 'share-template-row')
+    const templates: [SharingProductId, string, string][] = [
+      ['account-rental', '租账号', '按套餐和租期，如「Claude 套餐 × 1 个月」'],
+      ['api-quota', '租 API 额度', '按用量包，如「10 万 Tokens × 有效期」'],
+      ['api-period', '包月 API', '按用量强度包周期，如「高频使用 × 1 个月」']
+    ]
+    for (const [id, title, example] of templates) {
+      const cell = el('div', '', `share-template-choice${publishProductId === id ? ' is-active' : ''}`)
+      const item = button(title, () => { if (publishProductId !== id) { publishProductId = id; render() } })
+      item.className = 'share-template-choice-button'
+      cell.append(item, el('span', example, 'share-template-choice-example'))
+      templateRow.append(cell)
+    }
+    wrapper.append(templateRow)
     const form = el('form')
-    const side = selectField('发布身份', 'side', [{ value: 'demand', label: '我是需求者' }, { value: 'supply', label: '我是供给者' }], publishSide)
-    side.select.onchange = () => { publishSide = side.select.value as SharingPostSide; render() }
-    const productField = selectField('标准产品', 'productId', standards.map((item) => ({ value: item.id, label: item.label })), product.id)
-    productField.select.onchange = () => { publishProductId = productField.select.value as SharingProductId; render() }
     const softwareField = selectField('使用软件', 'software', product.software, publishSoftware)
     publishSoftware = softwareField.select.value as SharingSoftware
-    const fields: HTMLElement[] = [side.label, productField.label, softwareField.label]
+    const fields: HTMLElement[] = [softwareField.label]
     let accountPlanField: ReturnType<typeof selectField> | undefined; let providerField: ReturnType<typeof selectField> | undefined
     let modelField: ReturnType<typeof selectField> | undefined; let quotaUnitField: ReturnType<typeof selectField> | undefined
     let tierField: ReturnType<typeof selectField> | undefined; let quotaAmountInput: HTMLInputElement | undefined
@@ -221,7 +349,6 @@ export function mountSharing(root: HTMLElement): () => void {
       const models = product.apiProviders.find((item) => item.value === selectedProvider.select.value)?.models ?? []
       modelField = selectField('模型', 'apiModel', models)
       selectedProvider.select.onchange = () => { publishProvider = selectedProvider.select.value; render() }
-      softwareField.select.onchange = () => { publishSoftware = softwareField.select.value as SharingSoftware }
       fields.push(providerField.label, modelField.label)
       if (product.id === 'api-quota') {
         const amountLabel = el('label', '额度数量'); const amount = el('input'); amount.type = 'number'; amount.name = 'quotaAmount'; amount.required = true; amount.placeholder = '请输入整数'; amountLabel.append(amount)
@@ -254,141 +381,145 @@ export function mountSharing(root: HTMLElement): () => void {
       }
       void run(async () => {
         const key = JSON.stringify(payload); const requestId = requests.get(key) ?? crypto.randomUUID(); requests.set(key, requestId)
-        await result<SharingPostView>(api.publish({ ...payload, requestId }))
-        await Promise.all([refreshPosts(), refreshMyPosts()]); requests.delete(key); section = 'myPosts'; message = publishSide === 'demand' ? '需求发布成功。' : '供给发布成功。'
+        const published = await result<SharingPostView>(api.publish({ ...payload, requestId }))
+        await Promise.all([refreshPosts(), refreshMyPosts()]); requests.delete(key); section = 'mine'
+        if (pendingRespondDemand) {
+          const demandPostId = pendingRespondDemand; pendingRespondDemand = ''
+          try {
+            await result<SharingResponseView>(api.respond({ demandPostId, supplyPostId: published.id, requestId: crypto.randomUUID() }))
+            await refreshMyResponses(); message = (publishSide === 'demand' ? '需求发布成功。' : '供给发布成功。') + '回应已提交，等待客服核查。'
+          } catch (error) {
+            message = (publishSide === 'demand' ? '需求发布成功。' : '供给发布成功。') + (error instanceof Error ? error.message : '')
+          }
+        } else message = publishSide === 'demand' ? '需求发布成功。' : '供给发布成功。'
       })
     }
-    wrapper.append(form); return wrapper
+    wrapper.append(form)
+    const expectBox = el('div', '', 'share-expect'); expectBox.append(el('h3', '发布后会发生什么'))
+    const steps = el('ol', '', 'share-expect-steps')
+    steps.append(el('li', '客服核对你的发布内容。'), el('li', '有匹配对象时，客服通过企业微信联系你，确认成交与付款。'), el('li', '随时可以在「我的」里关闭发布。'))
+    expectBox.append(steps, el('p', '发布不收集账号密码、API Key 和联系方式。共享账号可能违反部分厂商的服务条款，请自行判断后发布。', 'share-boundary'))
+    wrapper.append(expectBox)
+    return wrapper
   }
-  function renderHome(): HTMLElement {
-    const home = el('section', '', 'share-home')
-    const hero = el('section', '', 'share-hero')
-    const copy = el('div', '', 'share-hero-copy')
-    copy.append(el('p', '账号与 API 服务', 'share-kicker'), el('h3', '找服务，或发布一份服务。'),
-      el('p', '需求和供给都用同一套标准模板表达，先把服务范围、期限和价格说清楚。'))
-    const roles = el('div', '', 'share-role-grid')
-    const demand = el('section', '', 'share-role')
-    demand.append(el('p', '我是需求者', 'share-role-label'), el('h3', '我想找一份可用服务'),
-      el('p', '先看大厅里已经发布的需求和供给；没有合适的，再填写自己的需求与愿付价格。'))
-    demand.append(button('查看供需大厅', () => { section = 'market'; selected = undefined; checkout = undefined; clearSecret(); void run(refreshPosts) }, true),
-      button('发布需求', () => { publishSide = 'demand'; publishProductId = 'account-rental'; section = 'publish'; selected = undefined; checkout = undefined; clearSecret() }))
-    const supply = el('section', '', 'share-role')
-    supply.append(el('p', '我是供给者', 'share-role-label'), el('h3', '我有服务可以提供'),
-      el('p', '选择一个标准模板，写明你能提供的规格、报价、数量和交付时限。'))
-    supply.append(button('发布供给', () => { publishSide = 'supply'; publishProductId = 'account-rental'; section = 'publish'; selected = undefined; checkout = undefined; clearSecret() }, true))
-    roles.append(demand, supply); copy.append(roles)
-    const templates = el('aside', '', 'share-templates')
-    templates.append(el('p', '三种标准产品', 'share-kicker'), el('h3', '只选规格，不填敏感信息'))
-    const templateList = el('div', '', 'share-template-list')
-    const addTemplate = (title: string, description: string, productId: SharingProductId) => {
-      const item = button('', () => { publishProductId = productId; section = 'publish'; selected = undefined; checkout = undefined; clearSecret() })
-      item.className = 'share-template'
-      item.append(el('strong', title), el('span', description))
-      templateList.append(item)
+  const groupHead = (title: string, note: string): HTMLElement => {
+    const head = el('div', '', 'share-group-head'); head.append(el('h3', title), el('span', note, 'share-group-note')); return head
+  }
+  function renderMarket(): HTMLElement {
+    const market = el('section', '', 'share-market-page')
+    const trust = el('div', '', 'share-trust')
+    for (const item of ['人工核对交付', '到期收回换密', '交付资料仅本人可见', '售后走客服']) trust.append(el('span', item, 'share-trust-item'))
+    market.append(trust)
+    const switcher = el('div', '', 'plan-switch'); switcher.setAttribute('role', 'tablist'); switcher.setAttribute('aria-label', '共享账号软件')
+    ;(['codex', 'claude'] as const).forEach((id) => {
+      const tab = el('button', softwareLabels[id]); tab.type = 'button'; tab.dataset.planSoftware = id
+      tab.setAttribute('role', 'tab'); tab.setAttribute('aria-selected', String(software === id)); tab.tabIndex = software === id ? 0 : -1
+      tab.onclick = () => { software = id; checkout = undefined; render() }
+      switcher.append(tab)
+    })
+    switcher.onkeydown = (event) => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return
+      event.preventDefault()
+      const index = event.key === 'Home' ? 0 : event.key === 'End' ? 1 : software === 'codex' ? 1 : 0
+      software = index === 0 ? 'codex' : 'claude'; checkout = undefined; render()
+      root.querySelector<HTMLButtonElement>(`.plan-switch [data-plan-software="${software}"]`)?.focus()
     }
-    addTemplate('账号租用', '按套餐与租期发布', 'account-rental')
-    addTemplate('API 额度包', '按额度、单位与有效期发布', 'api-quota')
-    addTemplate('API 周期包', '按使用强度与周期发布', 'api-period')
-    templates.append(templateList, el('p', '未登录也能查看全部模板。发布、下单和管理自己的记录时再登录。共享账号可能违反部分厂商的服务条款，发布中不要填写账号密码或 API Key。', 'share-boundary'))
-    hero.append(copy, templates); home.append(hero)
-    const direct = el('section', '', 'share-direct')
-    const directCopy = el('div', '', 'share-direct-copy')
-    directCopy.append(el('h3', '已有可直接租用的账号？'), el('p', '直接租用与供需大厅是两条入口。前者按现有档位下单，后者用于浏览或发布标准供需。'))
-    direct.append(directCopy, button('查看账号租用', () => { section = 'rent'; selected = undefined; checkout = undefined; clearSecret() }))
-    home.append(direct)
-    return home
+    market.append(switcher)
+    const direct = el('section', '', 'share-group')
+    direct.append(groupHead('来信直租', '下单即办理 · 来信托管交接与回收'))
+    if (!catalog) direct.append(el('p', message ? '暂时无法读取可租账号。' : '正在读取可租的共享账号…', 'share-muted'),
+      button('重新读取', () => run(async () => { catalog = await result<SharingCatalog>(api.catalog()) })))
+    else {
+      const listings = catalog.listings.filter((item) => item.software === software && item.enabled)
+      if (!listings.length) direct.append(el('p', `${softwareLabels[software]}暂无直租档位，可看下方市场发布，或发布需求让客服对接。`, 'share-muted'))
+      else {
+        const cards = el('div', '', 'plan-cards')
+        for (const item of listings) {
+          cards.append(planCard({
+            name: item.name, description: item.description, price: money(item.priceCents), termSuffix: ` · ${item.term}`,
+            cta: '查看并下单', disabled: busy,
+            onChoose: () => { checkout = item; render() },
+            features: [`付款后 ${item.deliveryHours} 小时内人工办理交接`, `已含账号分享服务费 ${money(item.serviceFeeCents)}，网络费用另计`, '租期届满账号由来信收回', '使用约定、取消与退款见办理说明']
+          }))
+        }
+        direct.append(cards)
+      }
+    }
+    market.append(direct)
+    const hall = el('section', '', 'share-group')
+    hall.append(groupHead('市场发布', '客服对接成交 · 暂不在线下单'))
+    if (!posts) hall.append(el('p', '正在读取市场发布…', 'share-muted'))
+    else {
+      const visible = posts.filter((post) => post.software === software)
+      if (!visible.length) hall.append(el('p', `${softwareLabels[software]}暂无市场发布。没找到合适的？发布需求，客服对接后供给会来找你。`, 'share-muted'))
+      else {
+        const demandCards = el('div', '', 'share-market-grid'); const supplyCards = el('div', '', 'share-market-grid')
+        for (const post of visible) (post.side === 'demand' ? demandCards : supplyCards).append(renderPost(post))
+        if (demandCards.children.length) hall.append(el('p', '他们在求租', 'share-sublabel'), demandCards)
+        if (supplyCards.children.length) hall.append(el('p', '他们在出租', 'share-sublabel'), supplyCards)
+      }
+    }
+    market.append(hall)
+    const fallback = el('section', '', 'share-fallback')
+    const wantRent = el('div', '', 'share-fallback-item')
+    wantRent.append(el('h3', '没找到合适的？'), el('p', '发布需求，客服 1 个工作日内对接，有匹配就通知你。'),
+      button('发布需求', () => { publishSide = 'demand'; publishProductId = 'account-rental'; section = 'publish'; resetTransient(); render() }))
+    const wantShare = el('div', '', 'share-fallback-item')
+    wantShare.append(el('h3', '有账号或额度想出租？'), el('p', '发布供给，来信客服帮你对接租客，交付与回收由来信办理。'),
+      button('发布供给', () => { publishSide = 'supply'; publishProductId = 'account-rental'; section = 'publish'; resetTransient(); render() }, true))
+    fallback.append(wantRent, wantShare)
+    market.append(fallback)
+    return market
+  }
+  function renderMine(): HTMLElement {
+    const wrap = el('section', '', 'share-mine')
+    const ordersGroup = el('section', '', 'share-group')
+    ordersGroup.append(groupHead('我的租单', '下单、付款、交付与售后进度'))
+    if (!signedIn()) ordersGroup.append(el('p', '登录后显示你的租单。', 'share-muted'), button('登录后查看租单', () => { gate() }, true))
+    else {
+      ordersGroup.append(button('刷新', () => run(refresh)))
+      if (!orders.length) ordersGroup.append(el('p', '还没有租单。', 'share-muted'))
+      for (const order of orders) { const row = el('article', '', 'share-order-row'); row.append(el('strong', order.listing.name), el('span', statusLabels[order.status]), el('span', money(order.listing.priceCents)), button('查看租单', () => run(() => open(order.id)))); ordersGroup.append(row) }
+      if (nextCursor) ordersGroup.append(button('查看更早的租单', () => run(() => refresh(nextCursor))))
+    }
+    wrap.append(ordersGroup)
+    const postsGroup = el('section', '', 'share-group')
+    postsGroup.append(groupHead('我的发布', '你发布的需求与供给'))
+    if (!signedIn()) postsGroup.append(el('p', '登录后显示你的记录。', 'share-muted'), button('登录后管理发布', () => { gate() }, true))
+    else {
+      postsGroup.append(button('刷新我的发布', () => run(refreshMyPosts)))
+      if (!myPosts) postsGroup.append(el('p', '正在读取我的发布…', 'share-muted'))
+      else if (!myPosts.length) postsGroup.append(el('p', '你还没有发布需求或供给。', 'share-muted'))
+      else { const cards = el('div', '', 'share-market-grid'); for (const post of myPosts) cards.append(renderPost(post, true)); postsGroup.append(cards) }
+    }
+    wrap.append(postsGroup)
+    return wrap
   }
   function render(): void {
     if (!active) return
     qrStop?.(); qrStop = undefined
     root.classList.add('sharing-page')
-    const nav = el('nav', '', 'share-nav')
     const hasEnabled = catalog?.listings.some((listing) => listing.enabled) === true
     if (catalog && standards) markServiceAvailability('sharing', !(hasEnabled || standards.length))
-    const navButton = (label: string, next: typeof section, refreshAfter = false) => {
-      const item = button(label, () => { section = next; selected = undefined; checkout = undefined; clearSecret(); if (refreshAfter) void run(next === 'market' ? refreshPosts : next === 'myPosts' ? refreshMyPosts : refresh) })
+    const nav = el('nav', '', 'share-nav')
+    const navButton = (label: string, next: typeof section, loader?: () => Promise<void>) => {
+      const item = button(label, () => { section = next; resetTransient(); render(); if (loader) void run(loader) })
       item.className = `share-nav-button${section === next ? ' is-active' : ''}`
       return item
     }
-    nav.append(navButton('开始', 'home'), navButton('账号租用', 'rent'), navButton('供需大厅', 'market', true),
-      button('发布', () => {
-        section = 'publish'; selected = undefined; checkout = undefined; clearSecret()
-      }, section === 'publish'), navButton('我的发布', 'myPosts', signedIn()), navButton('我的租单', 'orders', signedIn()))
+    nav.append(navButton('租用市场', 'market', async () => { await Promise.all([refreshPosts(), refreshMyResponses()]) }), navButton('发布', 'publish'), navButton('我的', 'mine', async () => { await Promise.all([refresh(), refreshMyPosts(), refreshMyResponses()]) }))
     const notice = el('p', message); notice.setAttribute('role', 'status')
     const header = el('header', '', 'share-header')
-    header.append(el('h2', section === 'home' ? '账号分享' : section === 'rent' ? '账号租用' : section === 'market' ? '供需大厅' : section === 'publish' ? '发布' : section === 'myPosts' ? '我的发布' : '我的租单'))
-    if (section === 'home') header.append(el('p', '账号租用和 API 租用均可发布。API 服务分为额度包、周期包；需求者和供给者都按标准模板发布，并填写自己的价格。'))
+    header.append(el('h2', section === 'market' ? '账号与 API 租用' : section === 'publish' ? '发布' : '我的'))
+    if (section === 'market') header.append(el('p', '租用 Codex / Claude 账号与 API 额度；来信人工办理交接，客服全程对接。'))
     root.replaceChildren(header, nav, notice)
-    if (section === 'home') { root.append(renderHome()); return }
-    if (section === 'rent' && checkout) { root.append(renderCheckout(checkout)); return }
-    if (section === 'orders' && selected) { root.append(renderOrder(selected)); return }
-    if (section === 'rent') {
-      if (!catalog) root.append(el('p', message ? '暂时无法读取可租账号。' : '正在读取可租的共享账号…'), button('重新读取', () => run(async () => { catalog = await result<SharingCatalog>(api.catalog()) })))
-      else if (!catalog.listings.length) {
-        const empty = el('section', '', 'share-detail')
-        empty.append(el('h3', '暂时无可直接下单的账号'), el('p', '你可以到供需大厅查看发布，或用标准模板发布账号需求或供给。'),
-          button('联系来信客服', revealSupport), button('发布账号供需', () => {
-            publishProductId = 'account-rental'; section = 'publish'; clearSecret()
-          }))
-        root.append(empty)
-      } else {
-        const switcher = el('div', '', 'plan-switch'); switcher.setAttribute('role', 'tablist'); switcher.setAttribute('aria-label', '共享账号软件')
-        const entries: [SharingSoftware, string][] = [['codex', 'Codex'], ['claude', 'Claude Code']]
-        entries.forEach(([id, label]) => {
-          const tab = el('button', label); tab.type = 'button'; tab.dataset.planSoftware = id
-          tab.setAttribute('role', 'tab'); tab.setAttribute('aria-selected', String(software === id)); tab.tabIndex = software === id ? 0 : -1
-          tab.onclick = () => { software = id; checkout = undefined; render() }
-          switcher.append(tab)
-        })
-        switcher.onkeydown = (event) => {
-          if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return
-          event.preventDefault()
-          const index = event.key === 'Home' ? 0 : event.key === 'End' ? 1 : software === 'codex' ? 1 : 0
-          software = entries[index]![0]; checkout = undefined; render()
-          root.querySelector<HTMLButtonElement>(`.plan-switch [data-plan-software="${software}"]`)?.focus()
-        }
-        root.append(switcher)
-        const listings = catalog.listings.filter((listing) => listing.software === software)
-        if (!listings.length) root.append(el('p', software === 'codex' ? 'Codex 共享账号暂时无可直接下单档位，可到供需大厅查看。' : 'Claude Code 共享账号暂时无可直接下单档位，可到供需大厅查看。', 'share-muted'))
-        const cards = el('div', '', 'plan-cards')
-        for (const listing of listings) {
-          cards.append(planCard({
-            name: listing.name, description: listing.description, price: money(listing.priceCents), termSuffix: ` · ${listing.term}`,
-            cta: listing.enabled ? '查看租约与办理说明' : '暂未开放', disabled: busy || !listing.enabled,
-            onChoose: () => { checkout = listing; render() },
-            features: [`付款后 ${listing.deliveryHours} 小时内人工办理交接`, `已含账号分享服务费 ${money(listing.serviceFeeCents)}，网络费用另计`, '租期届满账号由来信收回', '使用约定、取消与退款见办理说明']
-          }))
-        }
-        if (listings.length) root.append(cards)
-      }
-    } else if (section === 'market') {
-      root.append(button('刷新大厅', () => run(refreshPosts)))
-      if (!posts) root.append(el('p', '正在读取供需发布…'))
-      else if (!posts.length) root.append(el('p', '当前还没有发布中的需求或供给。'))
-      else { const cards = el('div', '', 'share-market-grid'); for (const post of posts) cards.append(renderPost(post)); root.append(cards) }
-    } else if (section === 'publish') {
-      root.append(renderPublish())
-    } else if (section === 'myPosts') {
-      if (!signedIn()) {
-        root.append(el('h3', '我的发布'), el('p', '这里用于查看和关闭自己发布过的需求与供给。登录后显示你的记录。'), button('登录后管理发布', () => { gate() }, true))
-      } else {
-        root.append(button('刷新我的发布', () => run(refreshMyPosts)))
-        if (!myPosts) root.append(el('p', '正在读取我的发布…'))
-        else if (!myPosts.length) root.append(el('p', '你还没有发布需求或供给。'))
-        else { const cards = el('div', '', 'share-market-grid'); for (const post of myPosts) cards.append(renderPost(post, true)); root.append(cards) }
-      }
-    } else if (section === 'orders') {
-      if (!signedIn()) {
-        root.append(el('h3', '我的租单'), el('p', '这里用于查看下单、付款、交付和售后进度。登录后显示你的租单。'), button('登录后查看租单', () => { gate() }, true))
-      } else {
-        root.append(button('刷新', () => run(refresh)))
-        if (!orders.length) root.append(el('p', '还没有租单。'))
-        for (const order of orders) { const row = el('article', '', 'share-order-row'); row.append(el('strong', order.listing.name), el('span', statusLabels[order.status]), el('span', money(order.listing.priceCents)), button('查看租单', () => run(() => open(order.id)))); root.append(row) }
-        if (nextCursor) root.append(button('查看更早的租单', () => run(() => refresh(nextCursor))))
-      }
-    }
+    if (section === 'market' && checkout) { root.append(renderCheckout(checkout)); return }
+    if (section === 'mine' && selected) { root.append(renderOrder(selected)); return }
+    if (section === 'market') root.append(renderMarket())
+    else if (section === 'publish') root.append(renderPublish())
+    else root.append(renderMine())
   }
-  const stopAccount = onAccountChange((view) => { if (view.account?.id !== accountId || view.state !== 'signed-in') { accountId = view.account?.id; orders = []; nextCursor = ''; selected = undefined; checkout = undefined; payment = undefined; myPosts = undefined; requests.clear(); clearSecret() } })
+  const stopAccount = onAccountChange((view) => { if (view.account?.id !== accountId || view.state !== 'signed-in') { accountId = view.account?.id; orders = []; nextCursor = ''; selected = undefined; checkout = undefined; payment = undefined; myPosts = undefined; myResponses = undefined; requests.clear(); clearSecret() } })
   const visibility = () => { if (document.visibilityState === 'hidden') hideOnBlur() }
   document.addEventListener('visibilitychange', visibility); window.addEventListener('blur', hideOnBlur)
   const timer = setInterval(() => {
@@ -396,11 +527,14 @@ export function mountSharing(root: HTMLElement): () => void {
     const id = selected.id
     void run(async () => { const response = await result<SharingOrderView>(api.detail({ orderId: id })); if (active && selected?.id === id) selected = response })
   }, 5000)
-  render(); void run(async () => {
+  // 先启动首屏加载再渲染：busy 状态让导航在加载期保持禁用，避免「切走了分区但数据加载被丢弃」。
+  void run(async () => {
     const [catalogResult, standardsResult, postsResult] = await Promise.all([
       result<SharingCatalog>(api.catalog()), result<{ products: SharingStandardProduct[] }>(api.standards()), result<{ posts: SharingPostView[] }>(api.posts())
     ])
     catalog = catalogResult; standards = standardsResult.products; posts = postsResult.posts
+    if (signedIn()) await refreshMyResponses()
   })
+  render()
   return () => { active = false; qrStop?.(); qrStop = undefined; secret = undefined; generation++; clearInterval(timer); stopAccount(); document.removeEventListener('visibilitychange', visibility); window.removeEventListener('blur', hideOnBlur); root.replaceChildren(); root.classList.remove('sharing-page') }
 }

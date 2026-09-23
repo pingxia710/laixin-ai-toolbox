@@ -11,7 +11,7 @@ describe('真实客户端调用验收', () => {
     tracker.replaceRoutes([deepseek])
     tracker.record(deepseek, '2026-09-13T08:00:00.000Z')
     expect(tracker.acceptances()).toEqual({
-      codex: { shell: 'codex', provider: 'deepseek', model: 'deepseek-flash', revision: 'route-deepseek-1', at: '2026-09-13T08:00:00.000Z' }
+      codex: { shell: 'codex', provider: 'deepseek', model: 'deepseek-flash', revision: 'route-deepseek-1', at: '2026-09-13T08:00:00.000Z', lastAt: '2026-09-13T08:00:00.000Z' }
     })
 
     const kimi: ClientAcceptanceRoute = { ...deepseek, provider: 'kimi', model: 'kimi-for-coding', endpoint: 'https://api.kimi.com/coding/v1/responses', revision: 'route-kimi-2' }
@@ -24,7 +24,7 @@ describe('真实客户端调用验收', () => {
 
     tracker.record(kimi, '2026-09-13T08:00:02.000Z')
     expect(tracker.acceptances()).toEqual({
-      codex: { shell: 'codex', provider: 'kimi', model: 'kimi-for-coding', revision: 'route-kimi-2', at: '2026-09-13T08:00:02.000Z' }
+      codex: { shell: 'codex', provider: 'kimi', model: 'kimi-for-coding', revision: 'route-kimi-2', at: '2026-09-13T08:00:02.000Z', lastAt: '2026-09-13T08:00:02.000Z' }
     })
   })
 
@@ -35,6 +35,36 @@ describe('真实客户端调用验收', () => {
     tracker.record(deepseek, '2026-09-13T08:00:01.000Z')
     tracker.replaceRoutes([{ ...deepseek }])
     expect(tracker.acceptances().codex?.at).toBe('2026-09-13T08:00:00.000Z')
+    expect(tracker.acceptances().codex?.lastAt).toBe('2026-09-13T08:00:01.000Z')
+  })
+
+  it('最近成功只向前更新，首次验收和已读快照不随后续调用改变', () => {
+    const tracker = new ClientAcceptanceTracker()
+    tracker.replaceRoutes([deepseek])
+    tracker.record(deepseek, '2026-09-13T08:00:00.000Z')
+    const first = tracker.acceptances().codex
+    tracker.record(deepseek, '2026-09-13T08:11:00.000Z')
+    tracker.record(deepseek, '2026-09-13T08:10:00.000Z')
+    expect(tracker.acceptances().codex).toMatchObject({ at: '2026-09-13T08:00:00.000Z', lastAt: '2026-09-13T08:11:00.000Z' })
+    expect(first).toMatchObject({ at: '2026-09-13T08:00:00.000Z', lastAt: '2026-09-13T08:00:00.000Z' })
+  })
+
+  it('同服务商换绑定后旧请求不刷新新证据，失效与退出清除最近成功', () => {
+    const tracker = new ClientAcceptanceTracker()
+    tracker.replaceRoutes([deepseek])
+    tracker.record(deepseek, '2026-09-13T08:00:00.000Z')
+    const next = { ...deepseek, revision: 'route-deepseek-2' }
+    tracker.replaceRoutes([next])
+    expect(tracker.acceptances()).toEqual({})
+    tracker.record(next, '2026-09-13T08:11:00.000Z')
+    expect(tracker.record(deepseek, '2026-09-13T08:12:00.000Z')).toBe(false)
+    expect(tracker.acceptances().codex?.lastAt).toBe('2026-09-13T08:11:00.000Z')
+    tracker.invalidate('codex')
+    expect(tracker.acceptances()).toEqual({})
+    tracker.record(next, '2026-09-13T08:13:00.000Z')
+    tracker.clear()
+    expect(tracker.acceptances()).toEqual({})
+    expect(tracker.record(next, '2026-09-13T08:14:00.000Z')).toBe(false)
   })
 
   it('Claude 的已白名单小模型仍归入同一条当前路由，并记录实际调用模型', () => {

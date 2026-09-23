@@ -207,3 +207,30 @@ it('兜底只在还原没成功时开火，且认整个回环而不是只认 18 
   // 只关开关，⛔ 删客户的 ProxyServer 值（他的代理软件下次启动会自己写回去）
   expect(script).not.toMatch(/DeleteRegValue.*ProxyServer/)
 })
+
+// 2026-09-15 客户实测「连着网点更新重启,又换回旧版」:0.5.5 客户端的更新助手调安装器前不停
+// 守护/内核,旧卸载器的 taskkill 之后常驻任务还开着,每 1 分钟重入可能在「杀掉 → 新文件落盘」
+// 窗口里把守护拉回来占住文件,静默安装失败 → 助手整目录还原。customInit 让安装器自己兜底:
+// 先禁任务(升级 ⛔ 删任务,那会把常驻整个丢掉)再杀进程,早于一切文件操作。
+it('安装器 customInit:先禁新旧两个常驻任务再杀守护与内核,升级链路早于卸载钩子兜底', async () => {
+  const script = await readFile(join(__dirname, '..', '..', 'build', 'installer.nsh'), 'utf8')
+  const initMacro = script.indexOf('!macro customInit')
+  const uninstallMacro = script.indexOf('!macro customUnInstall')
+  expect(initMacro).toBeGreaterThan(-1)
+  expect(uninstallMacro).toBeGreaterThan(-1)
+
+  const initBody = script.slice(initMacro)
+  // 顺序钉死:禁 \Laixin\ 新任务 → 禁根路径旧任务 → 杀守护 → 杀内核,⛔ 反了会被任务重入钻空子
+  const disableNew = initBody.indexOf('schtasks.exe /change /tn "\\Laixin\\cn.laixin.toolbox.tunnel" /disable')
+  const disableLegacy = initBody.indexOf('schtasks.exe /change /tn "cn.laixin.toolbox.tunnel" /disable')
+  const killDaemon = initBody.indexOf('taskkill.exe /f /im "${APP_EXECUTABLE_FILENAME}"')
+  const killKernel = initBody.indexOf('taskkill.exe /f /im "xray.exe"')
+  expect(disableNew).toBeGreaterThan(-1)
+  expect(disableLegacy).toBeGreaterThan(disableNew)
+  expect(killDaemon).toBeGreaterThan(disableLegacy)
+  expect(killKernel).toBeGreaterThan(killDaemon)
+  // 升级链路只禁 ⛔ 删:删任务属于真卸载分支(customUnInstall),customInit 里不许出现
+  expect(initBody).not.toContain('/delete')
+  // customInit 是安装器(.onInit)的钩子,与卸载钩子并存:两道保险缺一不可
+  expect(uninstallMacro).toBeGreaterThan(-1)
+})

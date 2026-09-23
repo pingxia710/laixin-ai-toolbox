@@ -76,7 +76,11 @@ async function realSetup(timeoutMs = 5_000) {
     home, platform: 'darwin', file: createManagedTextFile(), findHermesCommand: async () => 'hermes',
     runHermes: async (_command, args) => {
       if (args[0] === 'config' && args[1] === 'set') hermes.set(args[2], args[3])
-      if (args[0] === 'config' && args[1] === 'unset') hermes.delete(args[2])
+      // 真实 hermes ≥0.21 语义：unset 本就未设置的键以非零退出（"Config key not set"）。
+      if (args[0] === 'config' && args[1] === 'unset') {
+        if (!hermes.has(args[2])) throw new Error(`Config key not set: ${args[2]}`)
+        hermes.delete(args[2])
+      }
     },
     readHermesConfig: async (_command, key) => hermes.get(key)
   })

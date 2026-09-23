@@ -1,14 +1,27 @@
 // 守护监管(主进程侧):spawn / 意外退出检测 / 一次性恢复。
 // 判据 3②:守护突然退出 → 主进程状态进「异常」并列未恢复项;3③:再启动先处理未恢复项。
-import { pendingSettingEntries, ledgerFailure } from '../../../sidecar/mac/ledger.mjs'
+import { pendingSettingEntries, pendingSettingEntriesCached, ledgerFailure, ledgerFailureCached } from '../../../sidecar/mac/ledger.mjs'
 import { randomUUID } from 'node:crypto'
 import { readDaemonState, type DaemonStateView } from './status-service'
+import { layout, writeFileAtomic } from './paths'
+import { restoreDeadlineMs } from './repair-budget'
+import { firstLineOf } from './failure-log'
 
 export interface SpawnedDaemon {
   readonly pid?: number | undefined
   on(event: 'exit', callback: (code: number | null, signal: string | null) => void): void
   once?(event: 'error', callback: (error: Error) => void): void
+  /** N-23:deadline 到点杀掉楔死的一次性恢复子进程;真实 ChildProcess 本就带 kill。 */
+  kill?(signal?: NodeJS.Signals): unknown
 }
+
+/**
+ * N-23:一次性恢复子进程的 deadline 保底值。客户在案形态(0.5.11):恢复子进程被杀软拦住 PowerShell
+ * 可以无限挂,restoring 永置位,后续恢复全部早退,界面永远「原设置尚未恢复」。给一轮有界机会:
+ * 到点杀掉、写明原因(TUNNEL_RESTORE_TIMEOUT),restoring 必须可清。
+ * 实际 deadline 按账本条数伸缩(restoreDeadlineMs),账本大时高于此保底——⛔ 固定 60s 杀掉慢机上合法的慢恢复。
+ */
+export { RESTORE_DEADLINE_FLOOR_MS as RESTORE_DEADLINE_MS } from './repair-budget'
 
 // 收敛包3·件1:守护非预期退出后按此序列有限重启;三次都失败则放弃并恢复系统代理。
 export const DAEMON_RESTART_BACKOFF_MS = Object.freeze([2_000, 10_000, 30_000])
@@ -29,6 +42,15 @@ export interface ResidentBridge {
   wake(): Promise<boolean>
   /** daemon.lock 里的持有者还活着吗——常驻模式下这是「守护在不在」的唯一事实来源。 */
   alive(): boolean
+  /** 甲-10 补刀:最近一次校准落在「注册被拒、由存量管理员任务承载」上(armed 照答「在」,
+   *  但那份任务与本版定义对不上)。supervisor 的叫醒周期耗尽而席位仍空时,据此回落到
+   *  主进程自己 spawn——任务拉不起守护,就不会冒出第二份;网络硬标准:⛔ 放弃式处理。 */
+  staleCarry?(): boolean
+  /** 当前用户无法停用的旧任务仍可能被系统再次调度。叫醒失败时 ⛔ 自起守护，否则会并存两份。 */
+  unmanagedStale?(): boolean
+  /** N-26 轻暂停:暂停落定后确保常驻任务处于禁用态(win schtasks /change /disable;mac 无需动作)。
+   *  操作本身幂等;不给 = 0.5.12 前的接线(无此补手)。 */
+  ensureDisabled?(): Promise<boolean>
 }
 
 // N-07:「恢复在途」专用类型。恢复子进程在途时连接动作拿到的失败,配置完好、本地一时忙;
@@ -52,6 +74,11 @@ export interface SupervisorDeps {
   readonly resident?: ResidentBridge
   /** 测试注入;缺省真实等待。 */
   readonly wait?: (ms: number) => Promise<void>
+  /** N-23:一次性恢复子进程的 deadline;测试注入短值,生产用 RESTORE_DEADLINE_MS。 */
+  readonly restoreDeadlineMs?: number
+  /** Phase 1 ④:结构化失败日志(进 <userData>/logs/tunnel-daemon.log,诊断包收录)。
+   *  FB-1 的 UNKNOWN 多来自「现件随进程丢失」——意外退出/叫醒耗尽/恢复非正常退,这里留第一现场。 */
+  readonly logFailure?: (event: string, detail?: string) => void
 }
 
 export class DaemonSupervisor {
@@ -65,14 +92,22 @@ export class DaemonSupervisor {
   private restartHandle: unknown
   private quitting = false
   private surrenderedFlag = false
-  private waking = false
-  private residentRound = false
+  private wakingFlag = false
+  // 甲-10 补刀:存量承载模式下,一轮叫醒周期确认「叫不醒」后锁存——同一次运行里客户再点连接,
+  // 直接自起,⛔ 再耗一轮叫醒(点连接到连上的额外等待就此封顶)。存量承载态消失即清零。
+  private staleCarryWakeDead = false
 
   constructor(private readonly deps: SupervisorDeps) {}
 
   // 收敛包3·件1:放弃位。置位后状态层显示「网络守护已停止,点连接重试」。
   get surrendered(): boolean {
     return this.surrenderedFlag
+  }
+
+  /** 常驻叫醒周期在途(守护不在,正在叫它回来)。状态层据此如实显示「正在接续」——
+   *  这个窗口里席位是空的,⛔ 让界面说「已停止/未连接」引客户去点连接(真机实测点了就双守护)。 */
+  get waking(): boolean {
+    return this.wakingFlag
   }
 
   ensureRunning(): void {
@@ -84,14 +119,25 @@ export class DaemonSupervisor {
     if (this.restoring) throw new RestoreInProgressError()
     const resident = this.deps.resident
     if (resident && this.residentActive()) {
+      // 存量承载态消失(重装成功/开关重置):同轮叫不醒的锁存随之清零。
+      if (resident.staleCarry?.() !== true) this.staleCarryWakeDead = false
+      // 甲-10 补刀:存量任务对不上、且同一轮里已确认叫不醒——⛔ 再走叫醒(白等一轮),
+      // 直接自起。此刻任务已证拉不起守护,不会冒出第二份。
+      if (resident.staleCarry?.() === true && this.staleCarryWakeDead) {
+        this.spawnOwnDaemon()
+        return
+      }
       // 常驻模式:⛔ 自己 spawn(会和系统拉起的那个抢客户的设置,单实例锁只是兜底不是设计)。
       // 已经在跑就什么都不用做;不在就叫醒它——客户上次点过断开,守护还原后正常退出了,
       // 系统按设计不会拉它,得有人立刻叫,⛔ 等下次登录。
-      this.residentRound = true
       if (!resident.alive()) this.beginWake()
       return
     }
-    this.residentRound = false
+    this.spawnOwnDaemon()
+  }
+
+  /** 主进程自己起一份守护(spawn 老路;含退出检测与退避重启的接线)。 */
+  private spawnOwnDaemon(): void {
     this.runId = randomUUID()
     const child = this.deps.spawnDaemon(this.runId)
     this.daemon = child
@@ -110,19 +156,22 @@ export class DaemonSupervisor {
 
   isRunning(): boolean {
     if (this.daemon !== undefined) return true
-    // 常驻守护不归本进程管,句柄永远是空的:问席位锁。⛔ 无条件读锁——非常驻模式下
-    // 主进程刚重启时上一任守护可能还没退干净,那一瞬的「有活人」会让开机接续跳过 spawn,客户开机连不上。
+    // 常驻守护不归本进程管,句柄永远是空的:问席位锁。席位上身份对账确认的活人只会是常驻守护
+    // (非常驻守护按设计不取实例锁),所以校准完成前也可以放心按常驻轮处理(甲-1)。
     return this.residentActive() && this.deps.resident?.alive() === true
   }
 
   /** 本轮守护归不归常驻管。⛔ 直接用 armed():客户运行中把开关拨到关会当场卸掉常驻项,
    *  但这一轮常驻守护还在跑(交界约定:关开关不断当前连接)——只看 armed() 会把连着的界面抹成未连接。
-   *  守护一退出(客户点断开、关机),下面这条自然失效,下一轮回到 spawn 老路。 */
+   *  校准完成前同理(Windows 开机校准有 ~1 秒延迟,开机接续确定性地抢跑):armed() 还是假的,
+   *  但席位锁上身份对账确认的在席守护只会是常驻形态起的——非常驻守护按设计不取实例锁——
+   *  认出它按常驻轮处理,⛔ 走 spawn 老路起第二份(双守护并存:界面卡「连接中」/「另一个后台在管理」)。
+   *  守护一退出(客户点断开、关机),这两条自然失效,下一轮回到 spawn 老路。 */
   private residentActive(): boolean {
     const resident = this.deps.resident
     if (!resident) return false
     if (resident.armed()) return true
-    return this.residentRound && resident.alive()
+    return resident.alive()
   }
 
   isRestoring(): boolean {
@@ -145,7 +194,10 @@ export class DaemonSupervisor {
   // 仍退出则放弃:停止重启、派发按账本恢复(把系统代理放回原状),置 surrendered。
   private scheduleNextRestart(): void {
     if (this.surrenderedFlag || this.quitting) return
+    // Phase 1 ④:意外退出正是 FB-1 记 UNKNOWN 的那类现件丢失,先留痕再排重启。
+    this.deps.logFailure?.('daemon-unexpected-exit', `attempt=${String(this.restartAttempts + 1)}`)
     if (this.restartAttempts >= DAEMON_RESTART_BACKOFF_MS.length) {
+      this.deps.logFailure?.('daemon-restart-surrendered', `attempts=${String(DAEMON_RESTART_BACKOFF_MS.length)}`)
       this.surrenderAndRestore()
       return
     }
@@ -184,9 +236,9 @@ export class DaemonSupervisor {
   // ---- 常驻:叫醒周期 ----
   // 叫一次 → 探席位 → 没起来就退避再叫,三轮都没人则放弃并把系统代理还给客户(与 spawn 路径同一个出口)。
   private beginWake(): void {
-    if (this.waking) return
-    this.waking = true
-    void this.wakeCycle().finally(() => { this.waking = false })
+    if (this.wakingFlag) return
+    this.wakingFlag = true
+    void this.wakeCycle().finally(() => { this.wakingFlag = false })
   }
 
   private async wakeCycle(): Promise<void> {
@@ -197,18 +249,38 @@ export class DaemonSupervisor {
       // 客户中途点了退出/断开,或一次性恢复接管了:立刻收手,⛔ 把守护叫回来打断客户明示的意愿。
       if (this.quitting || this.restoring !== undefined || !this.residentActive()) return
       // 叫醒失败也要探:kickstart 可能报错而守护其实已经起来了(⛔ 拿返回值当结论)。
-      try { await resident.wake() } catch { /* 叫不动就靠下一轮 */ }
+      // Phase 1 ④:抛错/被拒都留痕——基线「叫不动就靠下一轮」把 reason 全吞了。
+      try { await resident.wake() } catch (error) { this.deps.logFailure?.('wake-error', firstLineOf(error)) }
       if (await this.probeAlive(resident, wait)) {
         this.resetRestartState()
         this.unexpectedExit = undefined
         return
       }
+      this.deps.logFailure?.('wake-miss', `attempt=${String(attempt + 1)}`)
       const backoff = RESIDENT_WAKE_BACKOFF_MS[attempt]
       if (attempt < RESIDENT_WAKE_BACKOFF_MS.length - 1) await wait(backoff)
     }
     if (this.quitting || this.restoring !== undefined) return
+    // 当前用户无法停用的旧任务仍可能在下一分钟自己启动。即使本轮叫不醒，也 ⛔ 自起守护，
+    // 否则将和它争抢网络设置；交回原设置并让客户按设置页的管理员自救处理。
+    if (resident.unmanagedStale?.() === true) {
+      this.unexpectedExit = { at: Date.now() }
+      this.surrenderAndRestore()
+      return
+    }
+    // 甲-10 补刀:存量承载(任务与本版定义对不上)三轮叫不醒 = 它指向的程序不在/属于别的账号,
+    // 而系统代理可能还指着死端口。⛔ 置放弃位——「点连接重试」重试的还是只叫醒,永远连不上
+    // (违反网络硬标准:点了连接必须连上)。回落到主进程自己 spawn:任务拉不起守护,就不会
+    // 冒出第二份;拉得起的场合在上面探席位时早就成功了。锁存后同一次运行里再点连接直接自起。
+    if (resident.staleCarry?.() === true) {
+      this.deps.logFailure?.('wake-fallback-stale-carry', '存量任务三轮叫不醒,回落主进程自起')
+      this.staleCarryWakeDead = true
+      this.spawnOwnDaemon()
+      return
+    }
     // 三轮叫不醒:守护起不来,而系统代理可能还指着它的死端口。把代理还回去并置放弃位,
     // 状态层会显示「网络守护已停止,点连接重试」——⛔ 让客户对着一个看不出问题的界面断网。
+    this.deps.logFailure?.('wake-exhausted', `attempts=${String(RESIDENT_WAKE_BACKOFF_MS.length)},放弃并恢复系统代理`)
     this.unexpectedExit = { at: Date.now() }
     this.surrenderAndRestore()
   }
@@ -245,6 +317,9 @@ export class DaemonSupervisor {
   // 收敛包3:损坏账本由 restore 子命令执行恢复流程,不再直接放弃)。
   recoverOnBoot(): void {
     if (this.daemon || this.restoring) return
+    // N-23:自家常驻守护在席时,恢复归它按意图结算(它先拿写权、逐项还账,界面从账本与状态转呈真实进展)。
+    // ⛔ 再派一次性恢复子进程跟它抢:基线写权 0 秒探测失败即退 65,账本没机会被碰,客户看「未完成(进程中断)」永远转圈。
+    if (this.isRunning()) return
     if (ledgerFailure(this.deps.dataDir) || pendingSettingEntries(this.deps.dataDir).length > 0) {
       this.watchRestore(this.deps.spawnRestore())
     }
@@ -254,11 +329,13 @@ export class DaemonSupervisor {
   async runRecoveryOnce(timeoutMs = 15_000): Promise<boolean> {
     if (this.restoring !== undefined) {
       const deadline = Date.now() + timeoutMs
+      // N-25:等待类轮询放宽到 200ms(循环本身只看内存位,无 IO);
+      // 退出复核按规划增补走记忆化账本读——恢复子进程改写账本后 mtime 变化,拿到的必是新账。
       while (this.restoring !== undefined && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 25))
+        await new Promise((resolve) => setTimeout(resolve, 200))
       }
-      return this.restoring === undefined && !ledgerFailure(this.deps.dataDir) &&
-        pendingSettingEntries(this.deps.dataDir).length === 0
+      return this.restoring === undefined && !ledgerFailureCached(this.deps.dataDir) &&
+        pendingSettingEntriesCached(this.deps.dataDir).length === 0
     }
     if (!ledgerFailure(this.deps.dataDir) && pendingSettingEntries(this.deps.dataDir).length === 0) return true
     const child = this.deps.spawnRestore()
@@ -271,17 +348,60 @@ export class DaemonSupervisor {
   private watchRestore(child: SpawnedDaemon | void): void {
     if (!child) return
     this.restoring = child
-    const done = (code: number | null) => {
-      if (this.restoring !== child) return
+    let settled = false
+    // deadline 与修复预算同源伸缩(N-23):慢机上一轮合法的恢复就要 2-5 分钟,固定 60s 会把它
+    // 拦腰杀掉——那正是「把进行中说成失败」的翻版。按账本待结算条数放大,60s 保底。
+    // 条数读不出来(损坏账本正是恢复要处理的现场,读数会抛)就按 0 条取保底——⛔ 让 deadline 计算把恢复路径本身炸掉。
+    let deadlineCount: number
+    try { deadlineCount = pendingSettingEntries(this.deps.dataDir).length } catch { deadlineCount = 0 }
+    const deadlineMs = this.deps.restoreDeadlineMs ?? restoreDeadlineMs(deadlineCount)
+    const done = (code: number | null, failure?: { code: string; message: string }) => {
+      if (settled || this.restoring !== child) return
+      settled = true
+      clearTimeout(timer)
       this.restoring = undefined
+      // 失败必须有名字(N-23 三条静默分支的教训):写权被占/启动失败/超时各有独立码落 state.json,
+      // ⛔ done(null) 吞掉 spawn error 让界面永远停在「进程中断」。席位上有活守护时 ⛔ 盖它的状态。
+      if (failure !== undefined) {
+        this.deps.logFailure?.('restore-failed', failure.code)
+        this.recordRestoreFailure(failure)
+      } else if (code !== 0) {
+        // 恢复子命令自己的退出码(65=未结算/写权被占):state.json 由子命令写过,这里补一行现场。
+        this.deps.logFailure?.('restore-exit', `exit=${String(code)}`)
+      }
       // 一次性恢复也可清理旧崩溃；否则新权益的配置替换会永远被旧异常挡住。
-      const complete = code === 0 && !ledgerFailure(this.deps.dataDir) && pendingSettingEntries(this.deps.dataDir).length === 0 &&
+      const complete = failure === undefined && code === 0 && !ledgerFailure(this.deps.dataDir) &&
+        pendingSettingEntries(this.deps.dataDir).length === 0 &&
         readDaemonState(this.deps.dataDir)?.state === 'stopped-restored'
       if (complete) this.unexpectedExit = undefined
       for (const watcher of this.restoreWatchers.splice(0)) watcher(complete)
     }
+    const timer = setTimeout(() => {
+      try { child.kill?.('SIGKILL') } catch { /* 杀不掉也不改「这轮没跑完」的事实 */ }
+      done(null, { code: 'TUNNEL_RESTORE_TIMEOUT',
+        message: '恢复原设置的操作没能在限定时间内完成，已中止这一轮。请再点一次「重试恢复原设置」；电脑很卡时请等它跑完，不要连续点击' })
+    }, deadlineMs)
     child.on('exit', (code) => done(code))
-    child.once?.('error', () => done(null))
+    child.once?.('error', () => done(null, { code: 'TUNNEL_RESTORE_SPAWN_FAILED',
+      message: '恢复程序未能启动，原设置还没有恢复。请再点一次「重试恢复原设置」；仍不行请重启电脑后重试' }))
+  }
+
+  /** 一次性恢复的失败结论落 state.json(带原因);席位有活守护或守护正带着活跃状态时不覆盖。 */
+  private recordRestoreFailure(failure: { code: string; message: string }): void {
+    if (this.isRunning()) {
+      this.deps.logFailure?.('restore-failure-suppressed', `${failure.code} 席位有活守护,不覆盖`)
+      return
+    }
+    const current = readDaemonState(this.deps.dataDir)
+    if (current !== undefined && ['connected', 'connecting', 'degraded'].includes(current.state)) {
+      this.deps.logFailure?.('restore-failure-suppressed', `${failure.code} 守护带着活跃状态,不覆盖`)
+      return
+    }
+    try {
+      writeFileAtomic(layout.state(this.deps.dataDir), `${JSON.stringify({
+        state: 'error', code: failure.code, message: failure.message, updatedAt: Date.now()
+      })}\n`)
+    } catch { /* 状态写不进也不改「这一轮没跑完」的事实;账本与修复流程仍在 */ }
   }
 
   async waitForExit(timeoutMs = 4_000): Promise<void> {

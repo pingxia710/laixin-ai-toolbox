@@ -100,7 +100,6 @@ describe('五动作与桥注册(判据 3②③主进程侧、6 IPC 负向、12 �
         spawnedChildren.push(child)
       },
       routesFile: join(SIDECAR_DIR, 'routes.default.json'),
-      reuseDirect: false,
       connectorOverride: {
         kind: 'loopback-probe',
         host: '127.0.0.1',
@@ -169,7 +168,7 @@ describe('五动作与桥注册(判据 3②③主进程侧、6 IPC 负向、12 �
     expect(((await registry.execute('tunnel.importConfig', undefined)) as { outcome: string }).outcome).toBe('imported')
     expect(((await registry.execute('tunnel.applyPending', undefined)) as { outcome: string }).outcome).toBe('applied')
     expect(((await registry.execute('tunnel.start', undefined)) as { outcome: string }).outcome).toBe('started')
-    await waitFor(() => service.status().state === '已连' && service.status().exitIp === EXIT_IP, 10_000)
+    await waitFor(() => service.status().state === '已连', 10_000)
     expect(service.status().exitIp).toBe(EXIT_IP)
 
     const appliedWhileConnected = (await registry.execute('tunnel.applyPending', undefined)) as {
@@ -184,7 +183,7 @@ describe('五动作与桥注册(判据 3②③主进程侧、6 IPC 负向、12 �
     process.kill(daemonPid ?? 0, 'SIGKILL')
     await waitFor(() => service.status().state === '异常', 10_000)
     const afterCrash = service.status()
-    expect(afterCrash.message).toContain('守护进程意外退出')
+    expect(afterCrash.message).toContain('未预期的问题') // Phase 2 ⑥:意外退出终态给可照做的一句,⛔ 只给状态词
     expect(afterCrash.unrestored).toContain('Wi-Fi/socks-proxy')
     process.stdout.write(`\n[判据3② 守护 kill -9 后 status]\n${JSON.stringify(afterCrash, null, 2)}\n`)
 
@@ -230,7 +229,7 @@ describe('五动作与桥注册(判据 3②③主进程侧、6 IPC 负向、12 �
     expect(started.message).toContain('组件缺失')
   })
 
-  it('判据 17 服务级:导入持锁时并发 start → 后者 TUNNEL_BUSY,指针与账本无交错写入', async () => {
+  it('判据 17 服务级(N-22 修订):文件框开着时并发 start 照常走到业务判断(未修前是 TUNNEL_BUSY),指针与账本无交错写入', async () => {
     const built = buildPackageEntries({ configVersion: 1 })
     const dir = writeFixturePackage(built, 'pkg')
     let releasePicker: (() => void) | undefined
@@ -243,8 +242,10 @@ describe('五动作与桥注册(判据 3②③主进程侧、6 IPC 负向、12 �
 
     const importPromise = registry.execute('tunnel.importConfig', undefined)
     await waitFor(() => releasePicker !== undefined)
+    // N-22:文件框(picker)在锁外,此刻 start ⛔ 吃「另一个通道操作正在进行」;
+    // 回 TUNNEL_NOT_CONFIGURED 说明请求穿过互斥门走到了业务判断(尚无配置)。
     const startResult = (await registry.execute('tunnel.start', undefined)) as { code: string }
-    expect(startResult.code).toBe('TUNNEL_BUSY')
+    expect(startResult.code).toBe('TUNNEL_NOT_CONFIGURED')
     expect(existsSync(layout.currentPointer(dataDir))).toBe(false)
     expect(existsSync(layout.pendingPointer(dataDir))).toBe(false)
 
@@ -272,13 +273,9 @@ describe('五动作与桥注册(判据 3②③主进程侧、6 IPC 负向、12 �
     expect(((await actions.execute('tunnel.importConfig', undefined)) as { outcome: string }).outcome).toBe('imported')
     expect(((await actions.execute('tunnel.applyPending', undefined)) as { outcome: string }).outcome).toBe('applied')
     expect(((await actions.execute('tunnel.start', undefined)) as { outcome: string }).outcome).toBe('started')
-    await waitFor(() => {
-      const snapshot = readTunnelSnapshot()
-      return snapshot.state === 'connected' && snapshot.localProxyUrl !== undefined
-    }, 10_000)
-    const bridgePort = readJsonFile<{ bridgePort: number }>(layout.state(dataDir)).bridgePort
-    expect(bridgePort).toBeGreaterThan(0)
-    expect(readTunnelSnapshot()).toEqual({ state: 'connected', localProxyUrl: `http://127.0.0.1:${bridgePort}` })
+    await waitFor(() => readTunnelSnapshot().state === 'connected', 10_000)
+
+    expect(readTunnelSnapshot()).toEqual({ state: 'connected', localProxyUrl: 'http://127.0.0.1:18080' })
     expect(((await anotherMainModule.execute('tunnel.status', undefined)) as { state: string }).state).toBe('已连')
 
     expect(((await anotherMainModule.execute('tunnel.stop', undefined)) as { outcome: string }).outcome).toBe('stopped')

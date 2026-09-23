@@ -1,4 +1,4 @@
-const groupEntryOrigin = 'https://laixin.net.cn'
+const groupEntryOrigin = 'https://laixin.work'
 
 export const productionCsp =
   `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: ${groupEntryOrigin}; connect-src ${groupEntryOrigin}`

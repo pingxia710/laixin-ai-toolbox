@@ -11,7 +11,8 @@ const read = async <T>(method: string, params?: unknown): Promise<T> => JSON.par
 const call = <T>(method: string, params?: unknown): Promise<T> => ipcRenderer.invoke(IPC_CHANNEL, `desktop.${method}`, params) as Promise<T>
 type ToggleStatus = { enabled: boolean; supported: boolean }
 // active = 常驻此刻真的武装着。enabled && !active = 客户选了开、这次没生效。
-type ResidentStatus = ToggleStatus & { active: boolean }
+// staleResidentTask = 没生效且是存量管理员任务对不上(甲-10 返工):重试永远不会成功,设置页换自救文案。
+type ResidentStatus = ToggleStatus & { active: boolean; staleResidentTask: boolean }
 export const api = {
   ready: (): Promise<boolean> => ipcRenderer.invoke(IPC_CHANNEL, 'desktop.ready', undefined),
   status: () => read<DesktopView>('status'),
@@ -32,6 +33,18 @@ export const api = {
     const handler = (_event: Electron.IpcRendererEvent, tab: unknown) => { if (typeof tab === 'string') listener(tab) }
     ipcRenderer.on('toolbox:desktop-navigation', handler)
     return () => { ipcRenderer.removeListener('toolbox:desktop-navigation', handler) }
+  },
+  // 「更新成功」弹窗内容:装完后的第一次启动返回非空 version,其余启动返回空串三件套。
+  updateSuccess: (): Promise<{ version: string; previous: string; notes: string }> => call('updateSuccess'),
+  // 回执写好的那一刻的推送(它可能晚于渲染层启动,所以 updateSuccess 拉取也要在)。
+  onUpdateSucceeded: (listener: (notice: { version: string; previous: string; notes: string }) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, notice: unknown) => {
+      if (typeof notice === 'object' && notice !== null && typeof (notice as { version?: unknown }).version === 'string') {
+        listener(notice as { version: string; previous: string; notes: string })
+      }
+    }
+    ipcRenderer.on('toolbox:update-succeeded', handler)
+    return () => { ipcRenderer.removeListener('toolbox:update-succeeded', handler) }
   }
 }
 declare global { interface ToolboxApi { readonly desktop: typeof api } }

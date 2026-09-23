@@ -116,7 +116,7 @@ it('企业微信官方群活码直接平铺在卡片上，游客无需登录即�
 it('官网群活码读取成功后显示线上码，图片读取失败仍回退到随包备用码', () => {
   const activeConfig = { ...wecomGroupConfig, ready: true, qrImageSrc: 'bundled-live-code.png' }
   const remote = buildGroupCard(activeConfig, {
-    source: 'remote', imageUrl: 'https://laixin.net.cn/AI-tools/group-entry/qr/20260915T020000Z.png'
+    source: 'remote', imageUrl: 'https://laixin.work/group-entry/qr/20260915T020000Z.png'
   }) as unknown as Element
   const image = remote.all().find((node) => node.tag === 'img')!
   expect(image.src).toContain('/group-entry/qr/')
@@ -127,7 +127,7 @@ it('官网群活码读取成功后显示线上码，图片读取失败仍回退�
 
 it('线上群活码图片失效且没有随包备用码时，不留空白二维码位', () => {
   const remote = buildGroupCard({ ...wecomGroupConfig, qrImageSrc: undefined, ready: false }, {
-    source: 'remote', imageUrl: 'https://laixin.net.cn/AI-tools/group-entry/qr/20260915T020000Z.png'
+    source: 'remote', imageUrl: 'https://laixin.work/group-entry/qr/20260915T020000Z.png'
   }) as unknown as Element
   const image = remote.all().find((node) => node.tag === 'img')!
   image.handlers.get('error')?.()

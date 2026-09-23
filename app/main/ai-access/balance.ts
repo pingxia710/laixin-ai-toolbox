@@ -8,7 +8,12 @@ export interface ProviderBalance {
   readonly total: number | null
   readonly currency: string
   readonly at: string
-  readonly error?: 'key_missing' | 'key_rejected' | 'network_error' | 'invalid_reply' | 'unsupported'
+  /**
+   * 判类三分(Phase 2 ③):provider_busy(429/5xx,服务商限流或故障,客户能做的等一会再刷)、
+   * network_error(超时/DNS,客户能做的查本机网络)、invalid_reply(格式问题,稍后重试)——
+   * ⛔ 把 429/5xx 折进 invalid_reply,让限流的客户对着「返回看不懂」无所适从。
+   */
+  readonly error?: 'key_missing' | 'key_rejected' | 'provider_busy' | 'network_error' | 'invalid_reply' | 'unsupported'
 }
 
 const endpoints: Partial<Record<ModelProviderId, string>> = {
@@ -26,6 +31,7 @@ export async function readProviderBalance(provider: ModelProviderId, key: string
   try {
     const response = await fetchImpl(endpoint, { headers: { Authorization: `Bearer ${key}`, Accept: 'application/json' }, signal: controller.signal, redirect: 'error' })
     if (response.status === 401 || response.status === 403) return { provider, supported: true, total: null, currency: '', at, error: 'key_rejected' }
+    if (response.status === 429 || response.status >= 500) return { provider, supported: true, total: null, currency: '', at, error: 'provider_busy' }
     if (!response.ok) return { provider, supported: true, total: null, currency: '', at, error: 'invalid_reply' }
     const data = await readJsonBody(response, controller.signal)
     const parsed = data && (provider === 'deepseek' ? parseDeepSeek(data) : parseMoonshot(data))

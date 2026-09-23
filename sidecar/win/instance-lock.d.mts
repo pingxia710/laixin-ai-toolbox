@@ -4,4 +4,6 @@ export declare function readInstanceLock(dataDir: string): { holder: { token?: s
 export declare function acquireInstanceLock(dataDir: string, options?: { runId?: string; maxAttempts?: number }):
   | { acquired: true; token: string; release: () => void }
   | { acquired: false; holder: { pid?: number; runId?: string } | undefined }
+export declare function readInstanceLockCached(dataDir: string): { holder: { token?: string; pid?: number; runId?: string; at?: number } | undefined; ino: number } | undefined
+export declare function instanceLockDiskReads(): number
 export declare function takeOverStaleInstanceLock(dataDir: string, observed: NonNullable<ReturnType<typeof readInstanceLock>>): boolean

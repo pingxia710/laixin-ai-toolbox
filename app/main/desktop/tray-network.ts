@@ -13,6 +13,9 @@ export interface TrayNetworkPresentation {
 
 export const TRAY_NETWORK_OPERATION_INCOMPLETE = '本次 AI网络操作未完成，请打开状态页查看后重试。'
 
+// N-26 轻暂停:这两个显示态都是「客户暂停」(共用 user-disconnected 意图),托盘与网络页同口径明说「已暂停使用」。
+const TRAY_PAUSED_STATES = ['用户主动断开', '已停止并恢复原设置']
+
 /** 托盘菜单内容签名:签名未变就不重建菜单,⛔ 每 30 秒无条件重建。 */
 export function trayMenuSignature(update: { readonly state: string; readonly version: string }, network: TrayNetworkPresentation): string {
   return JSON.stringify([update.state, update.version, network.statusLabel, network.action, network.actionLabel, network.actionEnabled])
@@ -22,7 +25,8 @@ export function trayNetworkPresentation(status: TrayNetworkStatus | undefined, a
   if (status === undefined) {
     return { statusLabel: 'AI网络 · 状态读取中', action: 'show', actionLabel: '查看 AI网络状态', actionEnabled: true }
   }
-  const statusLabel = `AI网络 · ${status.state || '状态未知'}`
+  const paused = TRAY_PAUSED_STATES.includes(status.state)
+  const statusLabel = paused ? 'AI网络 · 已暂停使用' : `AI网络 · ${status.state || '状态未知'}`
   if (status.unrestored) {
     return { statusLabel, action: 'show', actionLabel: '查看 AI网络状态', actionEnabled: true }
   }
@@ -34,7 +38,7 @@ export function trayNetworkPresentation(status: TrayNetworkStatus | undefined, a
     return { statusLabel, action: 'show', actionLabel: '查看 AI网络状态', actionEnabled: true }
   }
   if (status.currentConfig) {
-    return { statusLabel, action: 'start', actionLabel: '连接 AI网络', actionEnabled: !actionPending }
+    return { statusLabel, action: 'start', actionLabel: paused ? '恢复 AI网络' : '连接 AI网络', actionEnabled: !actionPending }
   }
   return { statusLabel, action: 'show', actionLabel: '打开 AI网络设置', actionEnabled: true }
 }

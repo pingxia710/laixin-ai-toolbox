@@ -16,5 +16,7 @@ export interface ExistingProxy { kind: 'http' | 'socks' | 'pac'; host?: string; 
 export declare const AI_SERVICE_PROBE_URLS: readonly string[]
 export declare function probeDirectReachability(urls?: readonly string[], timeoutMs?: number): Promise<{ direct: true }>
 export declare function probeExistingProxy(existing: ExistingProxy, urls?: readonly string[], timeoutMs?: number): Promise<{ url: string }>
+/** 甲-4 补强:AI 探测的响应判据(按探测地址的真实响应特征分形)。 */
+export declare function aiProbeResponseAcceptable(target: URL, statusCode: number | undefined, headers: Record<string, string | string[] | undefined> | undefined): boolean
 
 export declare function verifyWithFallback(port: number, primary: string, fallback?: string, timeoutMs?: number, probe?: typeof verifyThroughProxy): Promise<{ exitIp: string }>

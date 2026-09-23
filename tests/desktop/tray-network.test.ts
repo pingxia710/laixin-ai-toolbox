@@ -10,9 +10,10 @@ describe('菜单栏 AI网络控制', () => {
     }
   })
 
-  it('已有配置且已停止时可直接连接，未配置或需要恢复时只打开状态页', () => {
+  it('暂停态恢复入口换「恢复」措辞，未配置或需要恢复时只打开状态页', () => {
+    // N-26:已停止并恢复原设置 = 暂停落定,托盘恢复入口明说「恢复」。
     expect(trayNetworkPresentation({ state: '已停止并恢复原设置', currentConfig: '版本 2', unrestored: '' }, false)).toMatchObject({
-      action: 'start', actionLabel: '连接 AI网络'
+      action: 'start', actionLabel: '恢复 AI网络'
     })
     expect(trayNetworkPresentation({ state: '未配置', currentConfig: '', unrestored: '' }, false)).toMatchObject({
       action: 'show', actionLabel: '打开 AI网络设置'
@@ -25,6 +26,15 @@ describe('菜单栏 AI网络控制', () => {
   it('异常但仍保持已连接意图时可以从菜单栏断开，停止自动恢复', () => {
     expect(trayNetworkPresentation({ state: '异常', currentConfig: '版本 2', unrestored: '' }, false)).toEqual({
       statusLabel: 'AI网络 · 异常', action: 'stop', actionLabel: '断开 AI网络', actionEnabled: true
+    })
+  })
+
+  it('暂停态托盘明说「已暂停使用」,恢复入口换「恢复」措辞(N-26 轻暂停)', () => {
+    expect(trayNetworkPresentation({ state: '已停止并恢复原设置', currentConfig: '版本 2', unrestored: '' }, false)).toEqual({
+      statusLabel: 'AI网络 · 已暂停使用', action: 'start', actionLabel: '恢复 AI网络', actionEnabled: true
+    })
+    expect(trayNetworkPresentation({ state: '用户主动断开', currentConfig: '版本 2', unrestored: '' }, false)).toEqual({
+      statusLabel: 'AI网络 · 已暂停使用', action: 'start', actionLabel: '恢复 AI网络', actionEnabled: true
     })
   })
 

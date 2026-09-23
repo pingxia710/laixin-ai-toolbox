@@ -4,9 +4,10 @@ import { requestTabNavigation } from '../navigation'
 import { icon } from '../icons'
 import { platformIcon } from '../platform-icons'
 import type { UsagePlatformId } from '../tabs'
+import { isIntelMac, macIntelCompatibility, type InstallPlatformId } from './mac-intel-compatibility'
 
 export interface OfficialInstallPlatform {
-  readonly id: 'codex' | 'claude-code' | 'hermes' | 'deepseek-harness' | 'zcode' | 'kimi-code'
+  readonly id: InstallPlatformId
   readonly label: string
   readonly description: string
   readonly resourceId: string
@@ -16,7 +17,7 @@ export interface OfficialInstallPlatform {
 
 export const officialInstallPlatforms: readonly OfficialInstallPlatform[] = [
   { id: 'codex', label: 'Codex', description: '官方桌面应用或命令行。装好后可在工具箱接入 DeepSeek，或登录自己的 ChatGPT 账号。', resourceId: 'codex-official-download', githubResourceId: 'codex-github', connectsInToolbox: true },
-  { id: 'claude-code', label: 'Claude Code', description: '官方命令行 Agent。装好后可在工具箱接入 DeepSeek。官方下载页只有英文，浏览器可一键翻译。', resourceId: 'claude-code-official-install', githubResourceId: 'claude-code-github', connectsInToolbox: true },
+  { id: 'claude-code', label: 'Claude Code', description: '官方命令行版，在终端里使用（不是 Claude 桌面版）。装好后可在工具箱接入 DeepSeek 等 Key。官方安装页有中文。', resourceId: 'claude-code-official-install', githubResourceId: 'claude-code-github', connectsInToolbox: true },
   { id: 'hermes', label: 'Hermes', description: '官方桌面或命令行 Agent。装好后可在工具箱接入 DeepSeek。', resourceId: 'hermes-official-download', githubResourceId: 'hermes-github', connectsInToolbox: true },
   { id: 'deepseek-harness', label: 'DeepSeek Harness', description: 'DeepSeek 官方编码 Agent。工具箱提供官方下载入口。', resourceId: 'deepseek-harness-official-install', githubResourceId: 'deepseek-harness-github', connectsInToolbox: false },
   { id: 'zcode', label: '智谱 ZCode', description: '智谱官方 Agent。工具箱提供官方下载入口。', resourceId: 'zcode-official-download', connectsInToolbox: false },
@@ -31,6 +32,8 @@ export interface ShellInventoryView {
   readonly updatable: boolean
   readonly method: 'npm' | 'script' | 'app' | 'none'
   readonly location: string
+  /** Claude Code 页：这台电脑装着 Claude 桌面版。 */
+  readonly claudeDesktop?: boolean
 }
 
 export function accessFailureText(error: unknown, fallback: string): string {
@@ -67,6 +70,12 @@ export async function openOfficialDownloadPage(options: {
   }
 }
 
+/** 检测结果是「命令行版没装、桌面版装着」时，说清两者的区别；其余情况返回空串。 */
+export function claudeDesktopOnlyInstallText(platform: UsagePlatformId, inventory: ShellInventoryView | undefined): string {
+  if (platform !== 'claude-code' || inventory?.installed !== false || inventory.claudeDesktop !== true) return ''
+  return '检测到这台电脑装的是 Claude 桌面版。桌面版只能登录 Claude 账号使用，不能用 DeepSeek、智谱、Kimi 的 Key；要用这些 Key，请点「官方下载」安装 Claude Code 命令行版。'
+}
+
 /** 各 Agent 页「下载/版本信息」：只检测本机版本，并交接到官方入口。 */
 export function mountInstallCard(element: HTMLElement, platform: UsagePlatformId): () => void {
   const entry = officialInstallPlatforms.find(item => item.id === platform)!
@@ -75,6 +84,7 @@ export function mountInstallCard(element: HTMLElement, platform: UsagePlatformId
   let inventory: ShellInventoryView | undefined
   let inventoryFailed = false
   let system = '本机'
+  let intelMac = false
   let message = ''
   let networkHint = false
   const shells = (): (typeof window.toolbox)['shells'] | undefined => (window.toolbox as { shells?: (typeof window.toolbox)['shells'] }).shells
@@ -92,7 +102,9 @@ export function mountInstallCard(element: HTMLElement, platform: UsagePlatformId
     const title = document.createElement('h2'); title.textContent = entry.label
     brand.append(platformIcon(platform), title)
     const headerActions = document.createElement('div'); headerActions.className = 'platform-header-actions'
-    headerActions.append(button('官方下载', 'secondary-action', () => { void openDownload() }, !window.toolbox.download))
+    const compatibility = intelMac ? macIntelCompatibility(entry.id) : undefined
+    const downloadLabel = compatibility?.status === 'unsupported' ? '查看兼容说明' : '官方下载'
+    headerActions.append(button(downloadLabel, 'secondary-action', () => { void openDownload() }, !window.toolbox.download))
     if (entry.githubResourceId) headerActions.append(button('查看 GitHub', 'secondary-action', () => { void openGithub() }, !window.toolbox.download, 'github'))
     const badge = document.createElement('span'); badge.className = 'platform-badge'; badge.textContent = system
     header.append(brand, headerActions, badge)
@@ -116,13 +128,15 @@ export function mountInstallCard(element: HTMLElement, platform: UsagePlatformId
       const latest = document.createElement('span'); latest.className = 'platform-muted'
       latest.classList.add('platform-latest-version')
       latest.textContent = `最新版本：${inventory.latest || '以官方发布页为准'}`
-      actions.append(button(inventory.latest ? `下载最新版 ${inventory.latest}` : '下载最新版', 'button primary-action', () => { void openDownload() }, !window.toolbox.download))
+      actions.append(button(inventory.latest ? `${downloadLabel} ${inventory.latest}` : downloadLabel, 'button primary-action', () => { void openDownload() }, !window.toolbox.download))
       actions.append(latest)
     }
     const notice = document.createElement('p'); notice.className = 'platform-muted platform-notice'; notice.setAttribute('role', 'status')
-    notice.textContent = message || (inventory ? `已读取版本。点击「下载最新版${inventory.latest ? ` ${inventory.latest}` : ''}」打开官方下载页。${entry.githubResourceId ? 'GitHub 用于查看官方源码与发行说明。' : ''}` : '点「检测版本」查看装没装上、装的哪版。下载安装可直接用上方「官方下载」。')
+    notice.textContent = message || compatibility?.message || (inventory ? `已读取版本。点击「下载最新版${inventory.latest ? ` ${inventory.latest}` : ''}」打开官方下载页。${entry.githubResourceId ? 'GitHub 用于查看官方源码与发行说明。' : ''}` : '点「检测版本」查看装没装上、装的哪版。下载安装可直接用上方「官方下载」。')
     if (networkHint) { const go = document.createElement('button'); go.type = 'button'; go.className = 'primary-action'; go.textContent = '去 AI网络'; go.onclick = () => requestTabNavigation('tunnel'); notice.append(document.createTextNode(' '), go) }
-    element.replaceChildren(header, subtitle, facts, actions, notice)
+    const desktopOnly = document.createElement('p'); desktopOnly.className = 'platform-notice claude-desktop-only-notice'
+    desktopOnly.textContent = claudeDesktopOnlyInstallText(platform, inventory)
+    element.replaceChildren(header, subtitle, facts, actions, notice, ...(desktopOnly.textContent ? [desktopOnly] : []))
   }
 
   const readInventory = async (): Promise<void> => {
@@ -142,10 +156,11 @@ export function mountInstallCard(element: HTMLElement, platform: UsagePlatformId
     if (busy) return
     // 占位在 await 之前，双击只会真打开一次。
     busy = true; message = '正在检查官方站点是否可达…'; networkHint = false; render()
+    const compatibility = intelMac ? macIntelCompatibility(entry.id) : undefined
     const result = await openOfficialDownloadPage({
       shell: platform,
       resourceId: entry.resourceId,
-      opened: '已打开官方下载页。安装或更新完成后，点「检测版本」确认。',
+      opened: compatibility?.status === 'unsupported' ? '已打开官方兼容说明。该 AI 不能安装在 Intel Mac 上；来信 AI 工具箱网络功能仍可使用。' : '已打开官方下载页。安装或更新完成后，点「检测版本」确认。',
       failed: '暂时无法打开官方下载页，请稍后重试。'
     })
     message = result.message; networkHint = result.networkHint
@@ -166,7 +181,8 @@ export function mountInstallCard(element: HTMLElement, platform: UsagePlatformId
   render()
   void window.toolbox.app.info().then(info => {
     if (!mounted) return
-    system = info.platform === 'darwin' ? 'macOS' : info.platform === 'win32' ? 'Windows' : '本机'; render()
+    intelMac = isIntelMac(info.platform, info.architecture)
+    system = intelMac ? 'Intel Mac' : info.platform === 'darwin' ? 'macOS' : info.platform === 'win32' ? 'Windows' : '本机'; render()
   }).catch(() => undefined)
   // 进页面不自动检测（创始人 09-12 定）。
   return () => { mounted = false; element.replaceChildren() }

@@ -14,6 +14,13 @@ export interface SharingApi {
   myPosts(): Promise<SharingResult>
   publish(input: SharingPublishInput): Promise<SharingResult>
   closePost(input: { postId: string }): Promise<SharingResult>
+  respond(input: { demandPostId: string; supplyPostId: string; requestId: string }): Promise<SharingResult>
+  demandResponses(input: { demandPostId: string }): Promise<SharingResult>
+  myResponses(): Promise<SharingResult>
+  selectResponse(input: { responseId: string; channel: string; requestId: string }): Promise<SharingResult>
+  confirmResponse(input: { responseId: string }): Promise<SharingResult>
+  declineResponse(input: { responseId: string }): Promise<SharingResult>
+  withdrawResponse(input: { responseId: string }): Promise<SharingResult>
   list(input?: { cursor: string }): Promise<SharingResult>
   create(input: { listingId: string; channel: string; requestId: string }): Promise<SharingResult>
   detail(input: { orderId: string }): Promise<SharingResult>
@@ -33,6 +40,13 @@ export const api: SharingApi = {
   myPosts: () => ipcRenderer.invoke(IPC_CHANNEL, 'sharing.myPosts', undefined),
   publish: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'sharing.publish', input),
   closePost: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'sharing.closePost', input),
+  respond: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'sharing.respond', input),
+  demandResponses: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'sharing.demandResponses', input),
+  myResponses: () => ipcRenderer.invoke(IPC_CHANNEL, 'sharing.myResponses', undefined),
+  selectResponse: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'sharing.selectResponse', input),
+  confirmResponse: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'sharing.confirmResponse', input),
+  declineResponse: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'sharing.declineResponse', input),
+  withdrawResponse: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'sharing.withdrawResponse', input),
   list: (input = { cursor: '' }) => ipcRenderer.invoke(IPC_CHANNEL, 'sharing.list', input),
   create: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'sharing.create', input),
   detail: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'sharing.detail', input),

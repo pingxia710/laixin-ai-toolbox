@@ -7,10 +7,10 @@
 .platform-overview { display: grid; grid-template-columns: minmax(0, .9fr) minmax(0, 1.25fr); gap: 22px; align-items: start; }
 .platform-card { min-width: 0; min-height: 275px; padding: 24px; border: 1px solid var(--line); border-radius: 16px; background: var(--surface); }
 .platform-card h2 { font-size: 18px; }
-.platform-account-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: stretch; }
+.platform-account-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 html:has(.platform-account-overview) { scrollbar-gutter: stable; }
-.platform-overview-notice { margin: 0 0 20px; }
-.platform-account-card { display: flex; flex-direction: column; min-height: 390px; }
+.platform-overview-notice { margin: 0 0 12px; }
+.platform-account-card { display: flex; flex-direction: column; }
 .platform-account-card.is-selected { border-color: var(--accent); }
 .account-card-header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
 .account-card-brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
@@ -31,16 +31,16 @@ html:has(.platform-account-overview) { scrollbar-gutter: stable; }
 #tab-panel .account-api-trigger:focus-visible, #tab-panel .account-api-choice:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
 @media (hover: hover) { #tab-panel .account-api-trigger:hover, #tab-panel .account-api-choice:hover { background: var(--surface-soft); } }
 .account-card-identity { margin: -10px 0 20px; }
-.account-card-subtitle { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 16px 0 22px; }
+.account-card-subtitle { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 12px 0 16px; }
 .account-card-body { min-width: 0; }
-.account-api-facts { margin: 0 0 24px; }
-.account-api-balance { display: grid; gap: 12px; padding: 20px; border-radius: 10px; background: var(--surface-soft); }
-.account-api-balance strong { font-size: 21px; font-weight: 600; }
+.account-api-facts { margin: 0 0 16px; }
+.account-api-balance { display: grid; gap: 8px; padding: 16px; border-radius: 10px; background: var(--surface-soft); }
+.account-api-balance strong { font-size: 18px; font-weight: 600; }
 .account-api-balance p { margin: 0; }
 .account-card-eyebrow { color: var(--muted); font-size: 12px; }
 .account-card-stages { margin-top: 20px; }
 .account-card-stages[hidden] { display: none; }
-.account-card-footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 16px; margin-top: auto; padding-top: 22px; }
+.account-card-footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 16px; margin-top: auto; padding-top: 14px; }
 .account-card-footer > p { flex-basis: 100%; margin: 0; }
 .account-card-footer button { min-height: 40px; }
 .platform-account-card .usage-header h2 { font-size: 14px; font-weight: 600; }
@@ -48,7 +48,7 @@ html:has(.platform-account-overview) { scrollbar-gutter: stable; }
 .platform-account-card .usage-progress::-webkit-progress-value { background: var(--positive); }
 .platform-account-card .usage-progress[data-level='low']::-webkit-progress-value { background: var(--warning); }
 .platform-version-card { max-width: 680px; }
-.official-account-empty { min-height: 290px; display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 18px; text-align: center; padding: 24px 12px; }
+.official-account-empty { display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 18px; text-align: center; padding: 24px 12px; }
 .official-account-empty h3, .official-account-empty p { margin: 0; }
 .official-account-empty > button { display: inline-flex; align-items: center; gap: 8px; }
 .official-account-symbol { width: 44px; height: 44px; color: var(--muted); }
@@ -76,8 +76,31 @@ html:has(.platform-account-overview) { scrollbar-gutter: stable; }
 .platform-notice:empty { display: none; }
 .platform-usage-card > .platform-muted { margin-top: 20px; }
 .platform-usage-card .usage-header { gap: 12px; }
+.platform-usage-card .usage-notice { margin: 10px 0; }
 .platform-usage-card .usage-header h2 { font-size: 18px; }
 .platform-usage-card .usage-content { grid-template-columns: minmax(0, 1fr); }
+/* 额度行按 Cockpit 的排法压紧：周期名和「剩余」百分比同一行（已用不单列，看进度条），
+   细进度条整宽，重置时间一行小字，组标题压到行标签同级；百分比按余量着色（充足绿、
+   偏低橙），厂商没给的周期整行不显示。Cockpit 的用量卡不靠滚动条控高度——它把每条
+   额度做成一行，内容本身就短；我们原来一条额度占两行还带个大号数字，才把卡片撑到几屏外。 */
+.platform-usage-card .usage-window { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: baseline; column-gap: 12px; margin-top: 0; }
+.platform-usage-card .usage-window > h4 { grid-column: 1; font-size: 12px; }
+.platform-usage-card .usage-numbers { grid-column: 2; grid-row: 1; margin: 0; }
+.platform-usage-card .usage-numbers strong { font-size: 13px; font-weight: 600; }
+.platform-usage-card .usage-numbers span { display: none; }
+.platform-usage-card .usage-window:has(.usage-progress) .usage-numbers strong { color: var(--positive); }
+.platform-usage-card .usage-window:has(.usage-progress[data-level='low']) .usage-numbers strong { color: var(--warning); }
+.platform-usage-card .usage-progress { grid-column: 1 / -1; height: 5px; margin-top: 5px; }
+.platform-usage-card .usage-reset { grid-column: 1 / -1; margin-top: 4px; }
+.platform-usage-card .usage-window > .usage-muted { grid-column: 1 / -1; margin-top: 4px; }
+.platform-usage-card .usage-window + .usage-window { padding-top: 12px; }
+.platform-usage-card .usage-bucket h3 { margin: 0 0 8px; font-size: 13px; }
+.platform-usage-card .usage-window-empty { display: none; }
+/* 压紧之后常见额度已经装得下，这条只是兜底：账号额度桶特别多时才滚，⛔ 让卡片再长到几屏外。
+   高度按 1180×820 默认窗口留够卡片其余部分（页头、页签、账号信息、底部按钮），默认数据不出现内滚。
+   滚动条常驻显示（照 .update-dialog-notes 的做法）：macOS 的悬浮滚动条静止时不可见，
+   列表又是齐平切断的，不给提示客户会把「被切掉的额度」当成「额度就这些」。 */
+.platform-usage-card .usage-quotas { gap: 12px; max-height: clamp(220px, calc(100dvh - 568px), 720px); overflow-y: auto; scrollbar-color: color-mix(in srgb, var(--muted) 45%, transparent) transparent; }
 .platform-usage-card .usage-account { padding: 0 0 16px; border-radius: 0; border-bottom: 1px solid var(--line); background: none; }
 .platform-usage-card .usage-account p { margin-top: 8px; }
 .platform-usage-card .usage-bucket, .platform-usage-card .usage-empty { padding: 0; border: 0; background: none; }

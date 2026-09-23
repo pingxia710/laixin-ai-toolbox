@@ -36,7 +36,8 @@ export function openPaymentDialog(plan: NetworkPlan, channel: PaymentChannelName
     holder.replaceChildren()
     actions.replaceChildren(closeButton)
     if (!order) return
-    const redirect = order.cancelPending || (order.expiresAt != null && order.expiresAt <= Date.now()) ? null : order.redirect
+    const canPay = !order.cancelPending && (order.expiresAt == null || order.expiresAt > Date.now())
+    const redirect = canPay ? order.redirect : null
     if (order.status === 'open') {
       const cancel = el('button', '取消此订单', 'secondary-action'); cancel.type = 'button'
       cancel.addEventListener('click', () => {
@@ -48,7 +49,7 @@ export function openPaymentDialog(plan: NetworkPlan, channel: PaymentChannelName
     if (order.status === 'open' && redirect?.kind === 'qrcode') {
       status.textContent = '请用手机微信扫码支付，完成后本窗口自动确认。'
       holder.append(buildQr(redirect.data))
-    } else if (order.status === 'open' && redirect?.kind === 'url') {
+    } else if (order.status === 'open' && order.channel === 'alipay' && canPay) {
       status.textContent = openedBrowser ? '已在浏览器打开支付宝付款页，请在浏览器中完成支付；完成后回到本窗口自动确认。' : '未能自动打开支付宝付款页。请关闭窗口后，在原套餐选择“支付宝继续付款”重试。'
     } else if (order.status === 'open') {
       status.textContent = order.cancelPending ? '已申请取消，等待渠道确认；确认后可以更换支付方式。' : '付款入口已过期或暂未返回，正在向渠道核对。'
@@ -113,7 +114,8 @@ export function openPaymentDialog(plan: NetworkPlan, channel: PaymentChannelName
       })
       if (closed) return
       if (view.code === 'ACCOUNT_LOGIN_REQUIRED') { status.textContent = '请先登录来信账号再付款。'; return }
-      if (view.code) { status.textContent = view.message; return }
+      // A failed entitlement refresh must not hide an already-created order.
+      if (view.code && !(order && view.state === 'signed-in' && view.code === 'ACCOUNT_SERVICE_UNAVAILABLE')) { status.textContent = view.message; return }
       if (!order) { status.textContent = '暂时无法创建订单，请稍后重试或联系客服。'; return }
       render(); startPolling()
     } catch {

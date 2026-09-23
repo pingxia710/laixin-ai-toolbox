@@ -58,7 +58,9 @@ export class FaultLog {
       const at = this.options.now()
       const record = sanitizeFaultRecord({ ...input, at: input.at ?? new Date(at).toISOString(), version: this.options.version() })
       if (!record) return Promise.resolve()
-      const signature = [record.shell, record.provider, record.code, record.action, record.outcome, record.network].join('|')
+      // 甲-6返工:动作维度(bridgeAction)进签名——account.snapshot 与 account.sessions 先后失败
+      // 是两条记录,⛔ 同模块的不同动作在去重窗口里互相顶掉。
+      const signature = [record.shell, record.provider, record.code, record.action, record.outcome, record.network, record.bridgeAction].join('|')
       if (signature === this.lastSignature && at - this.lastAt < this.options.dedupeMs) return Promise.resolve()
       this.lastSignature = signature
       this.lastAt = at

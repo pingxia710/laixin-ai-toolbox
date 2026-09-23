@@ -87,6 +87,27 @@ export class NetworkAccountClient {
 
   private async request(path: string, session: NetworkAccountSession, signal: AbortSignal, limit: number, contentType: string, etag?: string, post?: unknown): Promise<NetworkResponse> {
     if (!session.accountId || !/^[\x21-\x7e]{1,4096}$/.test(session.accessToken)) throw new NetworkAccountError('NETWORK_LOGIN_REQUIRED')
+    // Phase 1:幂等 GET 的瞬时网络抖动重试(3 次尝试,250/750ms)。抖动基线直接变「服务不可用」,
+    // 界面误报、接续流程误判;梯子吸收掉。⛔ POST(回执/诊断)不重试——重复提交;服务器给过
+    // 答案的(NetworkAccountError:401/404/409/410 等)不重试——那是结论不是抖动。
+    const attempts = post === undefined ? 3 : 1
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await this.attempt(path, session, signal, limit, contentType, etag, post)
+      } catch (error) {
+        const retryable = post === undefined && attempt < attempts && !(error instanceof NetworkAccountError) && !signal.aborted
+        if (retryable) {
+          await new Promise((resolve) => setTimeout(resolve, attempt === 1 ? 250 : 750))
+          continue
+        }
+        if (error instanceof NetworkAccountError) throw error
+        if (signal.aborted) throw new NetworkAccountError('NETWORK_SESSION_CHANGED')
+        throw new NetworkAccountError('NETWORK_SERVICE_UNAVAILABLE')
+      }
+    }
+  }
+
+  private async attempt(path: string, session: NetworkAccountSession, signal: AbortSignal, limit: number, contentType: string, etag?: string, post?: unknown): Promise<NetworkResponse> {
     try {
       const response = await fetch(new URL(path, this.base), { redirect: 'error', cache: 'no-store',
         ...(post === undefined ? {} : { method: 'POST', body: JSON.stringify(post) }),
@@ -137,7 +158,7 @@ export class NetworkAccountClient {
     } catch (error) {
       if (signal.aborted) throw new NetworkAccountError('NETWORK_SESSION_CHANGED')
       if (error instanceof NetworkAccountError) throw error
-      throw new NetworkAccountError('NETWORK_SERVICE_UNAVAILABLE')
+      throw error // 原样上抛给 request 分诊:幂等 GET 抖动重试,重试用尽再包「服务不可用」
     }
   }
 }

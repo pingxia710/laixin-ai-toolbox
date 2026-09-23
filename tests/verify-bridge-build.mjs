@@ -37,7 +37,7 @@ try {
   }
   assertContains(readOutput(tempRoot), 'alpha.echo', '验证构建缺少 alpha 动作')
   assertContains(readOutput(tempRoot), 'beta.echo', '验证构建缺少 beta 动作')
-  assertContains(readOutput(tempRoot), 'connect-src https://laixin.net.cn', '生产构建缺少官网群码清单 CSP')
+  assertContains(readOutput(tempRoot), 'connect-src https://laixin.work', '生产构建缺少官网群码清单 CSP')
   evidence.push('验证构建: alpha.echo=命中, beta.echo=命中, production-CSP=laixin-group-entry-only')
   verifySourceGuardContrafactual()
   evidence.push('来源守卫反向探针: 守卫在位=rc:0, 移除守卫=rc:1')

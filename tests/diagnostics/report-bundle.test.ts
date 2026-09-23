@@ -6,6 +6,7 @@ import { buildReportBody, seal } from '../../app/main/diagnostics/report-bundle'
 import { collectLocalFiles, daemonLogCandidates, nodeReportFiles } from '../../app/main/diagnostics/report-collect'
 import { credentialFindings } from '../../app/main/diagnostics/report-redact'
 import { makeTempDir, removeTempDir } from '../tunnel/helpers'
+import type { SupportDiagnosis } from '../../app/main/diagnostics/support-snapshot'
 
 const roots: string[] = []
 afterEach(() => { for (const root of roots.splice(0)) removeTempDir(root) })
@@ -163,6 +164,39 @@ it('组件缺失的完整清单要原样进包——那是客服判「客户这�
   const carried = (body.network as { status: Record<string, unknown> }).status.componentMissing
   expect(carried).toBe(full)
   expect(String(carried).split('、')).toHaveLength(19)
+})
+
+it('上报包携带同一次结构化诊断，补充读数另记采集时间，额外敏感字段进不去', () => {
+  const diagnosis = {
+    id: 'DG-ABC123',
+    report: {
+      software: 'hermes', checkedAt: 1_800_000_000_000, validUntil: 1_800_000_600_000,
+      target: { label: 'DeepSeek API', route: 'direct' },
+      conclusion: {
+        status: 'clear', scope: 'none', ruleId: 'DG01_NO_BLOCKER_FOUND', title: '本次未发现明确阻断',
+        summary: '目标本次有响应。', nextStep: '回到 Hermes 重试原操作。',
+        evidence: [{ checkId: 'service', code: 'AI_DIAG_SERVICE_REACHABLE', statement: '目标有响应。' }],
+        leakedKey: 'sk-ant-api03-THIS-MUST-NOT-LEAVE-THE-MACHINE'
+      },
+      checks: [
+        { id: 'internet', label: '基础网络', state: 'passed', code: 'AI_DIAG_INTERNET_OK', message: '基础网络可用。' },
+        { id: 'tunnel', label: '通道出口', state: 'not-checked', code: 'AI_DIAG_DIRECT_SERVICE', message: '不需要通道。' },
+        { id: 'service', label: '目标服务', state: 'passed', code: 'AI_DIAG_SERVICE_REACHABLE', message: '目标有响应。' },
+        { id: 'account', label: '登录与额度', state: 'not-checked', code: 'AI_DIAG_ACCOUNT_PROVIDER', message: '未验证账号。' },
+        { id: 'application', label: '应用接入', state: 'passed', code: 'AI_DIAG_APPLICATION_OBSERVED', message: '观察到调用。' }
+      ]
+    },
+    attempts: [{ at: '2027-01-15T08:00:01.000Z', software: 'Hermes', action: '重新测试', outcome: '已恢复', detail: '复验通过', token: 'secret-fixture-token-value' }],
+    attemptsComplete: true
+  } as unknown as SupportDiagnosis
+  const body = buildReportBody({ diagnosis, supplementalCollectedAt: '2027-01-15T08:00:05.000Z' })
+  expect(body.diagnosis).toMatchObject({ id: 'DG-ABC123', software: 'hermes', checkedAt: 1_800_000_000_000,
+    target: { label: 'DeepSeek API', route: 'direct' }, conclusion: { ruleId: 'DG01_NO_BLOCKER_FOUND' } })
+  expect(body.supplemental).toEqual({ collectedAt: '2027-01-15T08:00:05.000Z' })
+  const serialized = JSON.stringify(body)
+  expect(serialized).toContain('重新测试')
+  expect(serialized).not.toContain('THIS-MUST-NOT-LEAVE')
+  expect(serialized).not.toContain('secret-fixture-token-value')
 })
 
 it('「日志读不出来」⛔ 说成「日志没生成」——后者会让客服以为这台机器一切正常', async () => {

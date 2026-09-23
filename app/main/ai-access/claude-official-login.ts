@@ -153,6 +153,35 @@ export function startClaudeLogin(command: ClaudeLoginCommand, options: StartClau
   }
 }
 
+/** 从 text 的 start 起取出第一个完整的 JSON 对象;后面跟着的尾随输出不算错(Phase 2 ⑦)。
+ *  CLI 常在 --json 结果后再打一行人类可读的话,整段 JSON.parse 会炸,把成功登录判成失败。 */
+function parseLeadingJsonObject(text: string, start: number): Record<string, unknown> | undefined {
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let index = start; index < text.length; index += 1) {
+    const character = text[index]
+    if (inString) {
+      if (escaped) escaped = false
+      else if (character === '\\') escaped = true
+      else if (character === '"') inString = false
+      continue
+    }
+    if (character === '"') inString = true
+    else if (character === '{') depth += 1
+    else if (character === '}') {
+      depth -= 1
+      if (depth === 0) {
+        try {
+          const parsed: unknown = JSON.parse(text.slice(start, index + 1))
+          return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined
+        } catch { return undefined }
+      }
+    }
+  }
+  return undefined
+}
+
 /** `claude auth status --json`：只认明确的已登录字段；任何异常都当未登录。 */
 export async function readClaudeAuthStatus(command: ClaudeLoginCommand, env: NodeJS.ProcessEnv = process.env, exec = execFile): Promise<boolean> {
   try {
@@ -160,7 +189,8 @@ export async function readClaudeAuthStatus(command: ClaudeLoginCommand, env: Nod
     const text = String(stdout)
     const start = text.indexOf('{')
     if (start >= 0) {
-      const data = JSON.parse(text.slice(start)) as Record<string, unknown>
+      const data = parseLeadingJsonObject(text, start)
+      if (!data) return false
       for (const key of ['loggedIn', 'authenticated', 'isAuthenticated', 'isLoggedIn']) if (data[key] === true) return true
       if (data.status === 'authenticated' || data.status === 'logged_in') return true
       return false

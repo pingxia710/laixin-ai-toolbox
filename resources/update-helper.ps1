@@ -3,7 +3,10 @@ $ErrorActionPreference = 'Stop'
 $job = Get-Content -LiteralPath $JobPath -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($job.platform -ne 'win' -or $job.parentPid -lt 1 -or $job.asarSha256 -notmatch '^[a-f0-9]{64}$' -or $job.assetSha256 -notmatch '^[a-f0-9]{64}$') { exit 1 }
 function Write-Result($state, $message) {
-  @{version=$job.version;state=$state;message=$message} | ConvertTo-Json -Compress | Set-Content -LiteralPath $job.result -Encoding UTF8
+  # ⛔ Set-Content -Encoding UTF8:PowerShell 5.1 写出的是带 BOM 的 UTF-8,主进程 JSON.parse 对 BOM 直接抛,
+  # 等于把失败回执写成「没有回执」(客户端永远读不到上次为什么失败)。用 WriteAllText + 无 BOM UTF-8。
+  $text = @{version=$job.version;state=$state;message=$message} | ConvertTo-Json -Compress
+  [IO.File]::WriteAllText($job.result, $text, (New-Object System.Text.UTF8Encoding($false)))
 }
 Remove-Item -LiteralPath $job.acknowledgement -Force -ErrorAction SilentlyContinue
 Set-Content -LiteralPath $job.ready -Value 'ready' -Encoding UTF8
@@ -12,6 +15,45 @@ while (Get-Process -Id $job.parentPid -ErrorAction SilentlyContinue) {
   if ((Get-Date) -ge $deadline) { Write-Result 'error' '工具箱尚未完成退出，更新已取消。'; exit 1 }
   Start-Sleep -Milliseconds 100
 }
+# 换文件前先让网络进程退场。这一步 mac 侧 update-helper.cjs 有(handOffResident:写接续标记 + bootout
+# 等守护真停),Windows 这份此前一直缺——2026-09-15 客户实测:连着 AI 网络点「更新并重启」,主进程退出
+# 只等守护 4 秒(supervisor.waitForExit),守护停内核、还原系统代理、自禁任务常常超过 4 秒;助手在守护
+# (主程序当 node 跑)和 xray.exe 还活着时就 NSIS 覆盖被占用的文件,失败后按设计整目录还原旧版,
+# 客户看到的就是「点了更新重启,又换回旧版」。另有雪上加霜的一刀:常驻任务每 1 分钟重入,守护没来得及
+# 自禁时会在换文件窗口里把守护再拉起来。
+# 顺序:先禁常驻任务(新旧两个任务名都禁);再给守护自然收尾的宽限——主进程退出前已写 shutdown 意图,
+# 守护会自己退,到点还在才强杀,⛔ 一上来就杀会把客户的系统代理留在指向死端口的位置。
+# ⛔ 按进程名一律杀:只清「从安装目录跑起来的」那几个——主程序名且可执行路径(或命令行)落在 target 下、
+# xray.exe 同理(xray.exe 名字见 app/main/tunnel/sidecar-path.ts,别处不存在第二个来源)。
+$label = [string]$job.residentLabel
+if ($label -ne '') {
+  foreach ($task in @('\Laixin\' + $label, $label)) {
+    try { & schtasks.exe /change /tn $task /disable | Out-Null } catch { } # 没装常驻或已停:都不是失败
+  }
+}
+$targetPrefix = $job.target.TrimEnd('\') + '\'
+$mainName = [IO.Path]::GetFileName($job.executable)
+$left = @()
+$settleDeadline = (Get-Date).AddSeconds(12)
+do {
+  # -ErrorAction SilentlyContinue ⛔ 省:脚本第 2 行是 $ErrorActionPreference='Stop',而这一段在下面那个
+  # 大 try 之外(try 从「校验安装包」才开始)。CIM 在 WMI 库损坏/服务停用的机器上会抛 CimException,
+  # 抛在这里 = 脚本当场终止、连 result.json 都不写,客户端收不到任何回执——客户看到的还是「点了更新
+  # 重启又是旧版」,而且这次连句说明都没有,比修之前更难查(2026-09-16 Windows 真机实测确认)。
+  # 读不到进程表就当作「没枚举到」:$left 为空会立刻 break,直接进备份和 NSIS,退回修复前的行为——
+  # 那条路占用失败会走 catch,有还原也有回执。⛔ 让一次读不到进程表把整个更新变成静默失败。
+  $left = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    if ($_.Name -ne $mainName -and $_.Name -ne 'xray.exe') { return $false }
+    $fromTarget = $false
+    if ($_.ExecutablePath) { $fromTarget = $_.ExecutablePath.StartsWith($targetPrefix, [System.StringComparison]::OrdinalIgnoreCase) }
+    if (-not $fromTarget -and $_.CommandLine) { $fromTarget = $_.CommandLine.ToLowerInvariant().Contains($job.target.ToLowerInvariant()) }
+    $fromTarget
+  })
+  if ($left.Count -eq 0) { break }
+  Start-Sleep -Milliseconds 250
+} while ((Get-Date) -lt $settleDeadline)
+foreach ($process in $left) { Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue }
+if ($left.Count -gt 0) { Start-Sleep -Milliseconds 500 }
 $asar = Join-Path $job.target 'resources\app.asar'
 $backup = $null
 $backupReady = $false

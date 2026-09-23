@@ -285,6 +285,11 @@ describe('本地队列 · 后台不可达攒住,恢复后补传', () => {
       f.reporter.report({ code: `CODE_${index}`, stage: 'connect-run', authorizationId: '' })
       await vi.waitFor(() => expect((JSON.parse(readFileSync(f.queuePath, 'utf8')) as DiagnosisPayload[]).length).toBe(Math.min(index + 1, DIAGNOSIS_QUEUE_LIMIT)))
     }
+    // 第 51 条落盘后长度仍是 50(裁最旧),长度闸分不出「还没到」——等尾条出现再断言。
+    await vi.waitFor(() => {
+      const queue = JSON.parse(readFileSync(f.queuePath, 'utf8')) as DiagnosisPayload[]
+      expect(queue[queue.length - 1]?.code).toBe(`CODE_${DIAGNOSIS_QUEUE_LIMIT}`)
+    })
     const queued = JSON.parse(readFileSync(f.queuePath, 'utf8')) as DiagnosisPayload[]
     expect(queued).toHaveLength(DIAGNOSIS_QUEUE_LIMIT)
     expect(queued[0].code).toBe('CODE_1') // 51 进 50 出,丢的是最旧的 CODE_0
@@ -315,5 +320,89 @@ describe('本地队列 · 后台不可达攒住,恢复后补传', () => {
     await new Promise((resolve) => setTimeout(resolve, 20))
     expect(f.sent).toHaveLength(0)
     expect(existsSync(f.queuePath)).toBe(false)
+  })
+})
+
+describe('本地队列 · 补传在途与入队并发(候选甲-11)', () => {
+  // 复现「旧快照整体覆盖」:flush 持本地快照在 await send 挂起期间,新失败经 report→enqueue
+  // 落盘;flush 恢复后若用旧快照写回,中途入队的条目从未发送就从盘上消失——无日志无报错,
+  // 丢的偏是补传窗口内时效性最强的失败样本。
+  function concurrentReporter(send: (payload: DiagnosisPayload) => Promise<void>) {
+    const queuePath = join(tempDir('laixin-diagnosis-queue-'), 'diagnosis-pending.json')
+    const sent: DiagnosisPayload[] = []
+    const reporter = new DiagnosisReporter({
+      send: async (payload) => { await send(payload); sent.push(payload) },
+      enabled: () => true,
+      platform: 'macos',
+      version: () => '9.9.9-test',
+      now: () => 1_000_000,
+      queuePath
+    })
+    return { reporter, sent, queuePath }
+  }
+
+  function seedQueue(queuePath: string, codes: string[]): void {
+    writeFileSync(queuePath, JSON.stringify(codes.map((code) => ({
+      code, stage: 'connect-run', platform: 'macos', clientVersion: '9.9.9-test', authorizationId: '', timestamp: 999_000
+    }))))
+  }
+
+  function readQueueCodes(queuePath: string): string[] {
+    return (JSON.parse(readFileSync(queuePath, 'utf8')) as DiagnosisPayload[]).map((entry) => entry.code)
+  }
+
+  it('补传在途(send 挂起)时新失败入队:A 照常发出,B 留在盘上,下趟按序补传', async () => {
+    let releaseA: (() => void) | undefined
+    const attempts = new Map<string, number>()
+    const f = concurrentReporter(async (payload) => {
+      const attempt = (attempts.get(payload.code) ?? 0) + 1
+      attempts.set(payload.code, attempt)
+      if (payload.code === 'CODE_A' && attempt === 1) {
+        await new Promise<void>((resolve) => { releaseA = resolve }) // 可控慢 send:补传挂在这条上
+      }
+      if (payload.code === 'CODE_B' && attempt === 1) throw new Error('ECONNREFUSED') // B 直传失败转入队
+    })
+    seedQueue(f.queuePath, ['CODE_A'])
+    const flushing = f.reporter.flushPending()
+    await vi.waitFor(() => expect(releaseA).toBeDefined()) // flush 已持快照 [A] 挂在网络往返上
+    f.reporter.report({ code: 'CODE_B', stage: 'connect-run', authorizationId: '' })
+    await new Promise((resolve) => setTimeout(resolve, 20)) // 让 B 的失败处理与入队落定
+    releaseA?.()
+    await flushing
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(readQueueCodes(f.queuePath)).toEqual(['CODE_B']) // A 已发出;B ⛔ 被旧快照整体覆盖
+    expect(f.sent.map((payload) => payload.code)).toEqual(['CODE_A'])
+    expect(attempts.get('CODE_A')).toBe(1) // A 只发一次,⛔ 重发
+
+    await f.reporter.flushPending() // 下一趟补传:B 按序发出,队列清空
+    expect(f.sent.map((payload) => payload.code)).toEqual(['CODE_A', 'CODE_B'])
+    expect(readQueueCodes(f.queuePath)).toEqual([])
+  })
+
+  it('补传失败整批保留时,中途入队的条目一起留下,下趟按序补传', async () => {
+    let rejectA: (() => void) | undefined
+    const attempts = new Map<string, number>()
+    const f = concurrentReporter(async (payload) => {
+      const attempt = (attempts.get(payload.code) ?? 0) + 1
+      attempts.set(payload.code, attempt)
+      if (attempt > 1) return // 通道恢复后的补传正常发出
+      if (payload.code === 'CODE_A') {
+        await new Promise<void>((_resolve, reject) => { rejectA = () => reject(new Error('ECONNREFUSED')) })
+      }
+      throw new Error('ECONNREFUSED') // 各码首趟都失败:B 直传失败入队;A 补传失败整批保留
+    })
+    seedQueue(f.queuePath, ['CODE_A'])
+    const flushing = f.reporter.flushPending()
+    await vi.waitFor(() => expect(rejectA).toBeDefined())
+    f.reporter.report({ code: 'CODE_B', stage: 'connect-run', authorizationId: '' })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    rejectA?.()
+    await flushing
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(readQueueCodes(f.queuePath)).toEqual(['CODE_A', 'CODE_B']) // 整批保留 ⛔ 把 B 覆盖掉
+
+    await f.reporter.flushPending()
+    expect(f.sent.map((payload) => payload.code)).toEqual(['CODE_A', 'CODE_B'])
+    expect(readQueueCodes(f.queuePath)).toEqual([])
   })
 })

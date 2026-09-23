@@ -1,5 +1,6 @@
 import { afterEach, expect, it, vi } from 'vitest'
 import type { UpdateView } from '../../app/desktop-types'
+import type { DiagnosticSoftware, NetworkDiagnosticReport } from '../../app/network-diagnostics-types'
 
 class Element {
   textContent = ''; className = ''; type = ''; id = ''; htmlFor = ''; value = ''
@@ -32,7 +33,7 @@ afterEach(() => { stop(); vi.unstubAllGlobals(); vi.resetModules() })
 
 const current: UpdateView = { state: 'current', version: '', notes: '', progress: 0, message: '当前已是最新可用版本。' }
 
-async function mountSettings(desktop: Record<string, unknown>) {
+async function mountSettings(desktop: Record<string, unknown>, diagnostics: Record<string, unknown> = {}) {
   const body = new Element('body')
   vi.stubGlobal('document', {
     visibilityState: 'visible',
@@ -49,7 +50,8 @@ async function mountSettings(desktop: Record<string, unknown>) {
       desktop: { status: async () => ({ preferences: { zoom: 1, quotaNotifications: true, autoUpdate: true }, backgroundAvailable: true, alerts: [], update: current }),
         // FB-1 新开关的缺省读数;个别用例可传入同名方法覆盖。
         failureReportEnabled: async () => ({ enabled: true, supported: true }), ...desktop },
-      app: { info: async () => ({ version: '0.4.9' }) }
+      app: { info: async () => ({ version: '0.4.9' }) },
+      diagnostics
     }
   })
   const { page } = await import('../../app/renderer/src/pages/settings')
@@ -61,6 +63,74 @@ async function mountSettings(desktop: Record<string, unknown>) {
   const findDialog = (label: string) => body.all().find((node) => node.tag === 'button' && node.label() === label)!
   return { root, body, find, findDialog, text: () => root.all().map((node) => node.textContent) }
 }
+
+function diagnosticReport(software: DiagnosticSoftware): NetworkDiagnosticReport {
+  const checkedAt = Date.now()
+  return {
+    software, checkedAt, validUntil: checkedAt + 600_000, target: { label: software === 'hermes' ? 'DeepSeek API' : '官方服务', route: software === 'hermes' ? 'direct' : 'tunnel' },
+    conclusion: { status: 'unknown', scope: 'application', ruleId: 'DG01_APPLICATION_UNCONFIRMED', title: '只能定位到应用验证这一步',
+      summary: '目标有响应，但应用结果未知。', nextStep: '回到软件重试一次。',
+      evidence: [{ checkId: 'application', code: 'AI_DIAG_APPLICATION_UNCONFIRMED', statement: '尚未观察到应用请求。' }] },
+    checks: [
+      { id: 'internet', label: '基础网络', state: 'passed', code: 'AI_DIAG_INTERNET_OK', message: '基础网络可用。' },
+      { id: 'tunnel', label: '通道出口', state: 'not-checked', code: 'AI_DIAG_DIRECT_SERVICE', message: '不需要通道。' },
+      { id: 'service', label: '目标服务', state: 'passed', code: 'AI_DIAG_SERVICE_REACHABLE', message: '目标有响应。' },
+      { id: 'account', label: '登录与额度', state: 'not-checked', code: 'AI_DIAG_ACCOUNT_MANUAL', message: '未验证账号。' },
+      { id: 'application', label: '应用接入', state: 'not-checked', code: 'AI_DIAG_APPLICATION_UNCONFIRMED', message: '尚未观察到应用请求。' }
+    ]
+  }
+}
+
+function diagnosticSnapshot(software: DiagnosticSoftware): string {
+  const network = diagnosticReport(software)
+  return JSON.stringify({ id: 'DG-ABCDEF-123456', software, text: `本次客服诊断 ${software}`, collectedAt: '2027/1/15 16:00:00', errors: [], faults: [], network, attempts: [], attemptsTotal: 0, attemptsComplete: true })
+}
+
+it('全局诊断先选软件，界面、复制和上报共用同一快照；换软件立即作废旧结果', async () => {
+  const run = vi.fn(async ({ software }: { software: DiagnosticSoftware }) => ({ snapshot: diagnosticSnapshot(software) }))
+  const copy = vi.fn(async () => ({ snapshot: JSON.stringify({ copied: true }) }))
+  const report = vi.fn(async () => ({ snapshot: JSON.stringify({ uploaded: true, receipt: 'LX-7K3M-9QZP', message: '已上报' }) }))
+  const x = await mountSettings({}, { run, copy, report })
+  const software = x.root.all().find((node) => node.id === 'support-diagnostic-software')!
+  software.value = 'hermes'; software.change()
+  x.find('一键诊断').click(); await flush()
+
+  expect(run).toHaveBeenCalledWith({ software: 'hermes' })
+  expect(x.text()).toContain('本次客服诊断 hermes')
+  x.find('复制诊断信息').click(); x.find('把本次情况报给来信').click(); await flush()
+  expect(copy).toHaveBeenCalledWith({ id: 'DG-ABCDEF-123456' })
+  expect(report).toHaveBeenCalledWith({ id: 'DG-ABCDEF-123456' })
+
+  software.value = 'codex'; software.change()
+  expect(x.find('复制诊断信息').disabled).toBe(true)
+  expect(x.find('把本次情况报给来信').disabled).toBe(true)
+  expect(x.text()).not.toContain('本次客服诊断 hermes')
+  expect(x.text()).toContain('已切换软件，请重新诊断。')
+})
+
+it('切换软件后忽略旧诊断迟到的上报回执，不能把旧材料显示成当前结果', async () => {
+  let finishReport: (value: { snapshot: string }) => void = () => undefined
+  const report = vi.fn(() => new Promise<{ snapshot: string }>((resolve) => { finishReport = resolve }))
+  const x = await mountSettings({}, {
+    run: async ({ software }: { software: DiagnosticSoftware }) => ({ snapshot: diagnosticSnapshot(software) }),
+    copy: async () => ({ snapshot: JSON.stringify({ copied: true }) }),
+    report
+  })
+  const software = x.root.all().find((node) => node.id === 'support-diagnostic-software')!
+  software.value = 'codex'; software.change()
+  x.find('一键诊断').click(); await flush()
+  x.find('把本次情况报给来信').click(); await flush()
+  expect(report).toHaveBeenCalledWith({ id: 'DG-ABCDEF-123456' })
+
+  software.value = 'hermes'; software.change()
+  finishReport({ snapshot: JSON.stringify({ uploaded: true, receipt: 'LX-OLD1-OLD2', message: '旧诊断已上报' }) })
+  await flush()
+
+  expect(x.text()).toContain('已切换软件，请重新诊断。')
+  expect(x.text()).not.toContain('旧诊断已上报')
+  expect(x.find('复制诊断信息').disabled).toBe(true)
+  expect(x.find('把本次情况报给来信').disabled).toBe(true)
+})
 
 // 桥本身失败时主进程没机会返回 error 视图，渲染层得自己把「检查更新」放开，
 // 否则文案说「请重试」却要等 15 秒轮询才点得动（核实 C2）。

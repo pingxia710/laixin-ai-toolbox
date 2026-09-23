@@ -81,14 +81,16 @@ export interface Recipes {
 
 export const defaultRecipes: Recipes = {
   version: 4,
-  updatedAt: '2026-09-13',
+  // 同版本按日期取新：内置配方晚于线上 09-13 那份，客户端升级后不会被旧缓存顶回旧安装页。
+  updatedAt: '2026-09-16',
   shells: {
     codex: { label: 'Codex', latest: '', npmPackage: '@openai/codex', command: 'codex', macApps: ['Codex.app', 'ChatGPT.app'],
       install: { darwin: ['npm', 'install', '-g', '@openai/codex'], win32: ['npm', 'install', '-g', '@openai/codex'] },
       officialPage: 'https://chatgpt.com/download/' },
     'claude-code': { label: 'Claude Code', latest: '', npmPackage: '@anthropic-ai/claude-code', command: 'claude',
       install: { darwin: ['bash', '-lc', 'curl -fsSL https://claude.ai/install.sh | bash'], win32: ['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', 'irm https://claude.ai/install.ps1 | iex'] },
-      officialPage: 'https://claude.com/download?utm_source=claude_code&utm_medium=docs' },
+      // 命令行版中文安装页：claude.com/download 首推桌面版，桌面版不能用模型 API Key（2026-09-16 两例客户装错）。
+      officialPage: 'https://code.claude.com/docs/zh-CN/setup' },
     hermes: { label: 'Hermes', latest: '', command: 'hermes', macApps: ['Hermes.app'],
       officialPage: 'https://hermes-agent.nousresearch.com/desktop' },
     'deepseek-harness': { label: 'DeepSeek Harness', latest: '', npmPackage: '@deepseek-ai/dsh', command: 'dsh',

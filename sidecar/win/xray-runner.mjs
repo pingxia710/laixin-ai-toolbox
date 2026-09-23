@@ -15,7 +15,8 @@ export function startXrayRunner(options) {
     spawnImpl = spawn,
     getPpid = () => process.ppid,
     exit = (code) => process.exit(code),
-    timers = { setInterval, clearInterval, setTimeout, clearTimeout }
+    timers = { setInterval, clearInterval, setTimeout, clearTimeout },
+    stderr = process.stderr
   } = options
   if (!executable || !config || !Number.isSafeInteger(parent) || ppid !== parent) {
     exit(64)
@@ -23,7 +24,22 @@ export function startXrayRunner(options) {
   }
   const child = spawnImpl(executable, ['run', '-config', config], {
     env: { ...process.env, XRAY_LOCATION_ASSET: dirname(executable) },
-    stdio: 'ignore', windowsHide: true
+    // 甲-6:内核 stderr 不再丢——它正常时按配置(loglevel none)没话,崩溃/panic 时这是唯一现场。
+    // 截断(200/行)+限量(50 行)后转进 runner 自己的 stderr → 守护日志链 → 诊断包(逐行 redact)。
+    stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true
+  })
+  let stderrForwarded = 0
+  let stderrPending = ''
+  const forwardStderrLine = (line) => {
+    if (stderrForwarded >= 50) return
+    stderrForwarded += 1
+    try { stderr.write(`[xray] ${line.slice(0, 200)}\n`) } catch { /* 日志口坏了不挡主流程 */ }
+  }
+  child.stderr?.on('data', (chunk) => {
+    stderrPending += chunk.toString('utf8')
+    const lines = stderrPending.split('\n')
+    stderrPending = lines.pop() ?? ''
+    for (const line of lines) forwardStderrLine(line)
   })
   // xray pid 落盘:bridge 停止兜底与下一次启动的孤儿清扫都按它找内核进程。
   // 记档带启动时刻与映像名:PID 会被系统复用,只凭 pid 强杀可能误杀无关进程。
@@ -55,6 +71,7 @@ export function startXrayRunner(options) {
   }
   child.on('error', () => { process.exitCode = 70 })
   child.on('close', (code) => {
+    if (stderrPending !== '') forwardStderrLine(stderrPending) // 没有换行收尾的遗言也要转出去
     if (pollTimer !== undefined) timers.clearInterval(pollTimer)
     timers.clearTimeout(killTimer)
     try { rmSync(pidPath, { force: true }) } catch { /* 残留 pid 文件无危害:重启会覆写。 */ }

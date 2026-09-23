@@ -112,6 +112,17 @@ describe('Claude 官方登录', () => {
     expect(await readClaudeAuthStatus({ executable: 'claude', args: [] }, {}, boom)).toBe(false)
   })
 
+  // Phase 2 ⑦:CLI 在 JSON 后面再打一行人类可读的尾随输出时,⛔ 把成功登录判成失败——
+  // 登录刚成功,状态核对却说没登录,客户面对「登录失败」重试循环。
+  it('JSON 带尾随输出时仍以其中的已登录字段为准', async () => {
+    const trailing = (async () => ({ stdout: '{"loggedIn":true,"email":"x"}\nLogged in as x@example.com\n', stderr: '' })) as never
+    expect(await readClaudeAuthStatus({ executable: 'claude', args: [] }, {}, trailing)).toBe(true)
+    const trailingFalse = (async () => ({ stdout: '{"loggedIn":false}\nNot logged in, run /login\n', stderr: '' })) as never
+    expect(await readClaudeAuthStatus({ executable: 'claude', args: [] }, {}, trailingFalse)).toBe(false)
+    const trailingGarbage = (async () => ({ stdout: '{"loggedIn":true}\n>>> 安装向导已退出,代码 0 <<<\n{', stderr: '' })) as never
+    expect(await readClaudeAuthStatus({ executable: 'claude', args: [] }, {}, trailingGarbage)).toBe(true)
+  })
+
   it('控制器：未安装 → not-installed；成功后才切官方；取消回到 idle', async () => {
     const useOfficial = vi.fn(async () => undefined)
     const missing = new ClaudeOfficialLoginController({ findCommand: async () => null, startLogin: () => { throw new Error('x') }, useOfficial })

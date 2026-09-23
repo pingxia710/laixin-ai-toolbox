@@ -3,6 +3,7 @@ import { IPC_CHANNEL } from '../../bridge-protocol'
 
 export interface ShellsApi {
   inventory(): Promise<{ snapshot: string }>
+  claudeEditions(): Promise<{ snapshot: string }>
   install(input: { shell: string }): Promise<{ snapshot: string }>
   installStatus(): Promise<{ snapshot: string }>
   openOfficialPage(input: { shell: string }): Promise<{ snapshot: string }>
@@ -14,6 +15,7 @@ export interface ShellsApi {
 export const namespace = 'shells'
 export const api: ShellsApi = {
   inventory: () => ipcRenderer.invoke(IPC_CHANNEL, 'shells.inventory', undefined),
+  claudeEditions: () => ipcRenderer.invoke(IPC_CHANNEL, 'shells.claudeEditions', undefined),
   install: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'shells.install', input),
   installStatus: () => ipcRenderer.invoke(IPC_CHANNEL, 'shells.installStatus', undefined),
   openOfficialPage: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'shells.openOfficialPage', input),

@@ -15,6 +15,11 @@ export function registerSharingActions(registry: BridgeRegistry, client: Account
       termDays: bound(20), quotaAmount: bound(20), quotaUnit: bound(40), usageTier: bound(40), priceCents: bound(20), availableCount: bound(20),
       deliveryHours: bound(20), requestId: bound(80) },
     closePost: { postId: bound(80) },
+    respond: { demandPostId: bound(80), supplyPostId: bound(80), requestId: bound(80) },
+    demandResponses: { demandPostId: bound(80) },
+    myResponses: {},
+    selectResponse: { responseId: bound(80), channel: bound(20), requestId: bound(80) },
+    confirmResponse: { responseId: bound(80) }, declineResponse: { responseId: bound(80) }, withdrawResponse: { responseId: bound(80) },
     share: { software: bound(80), plan: bound(80), availableNote: bound(200), contact: bound(80), requestId: bound(80) } }
   for (const [operation, fields] of Object.entries(operations)) {
     registry.registerAction({ name: `sharing.${operation}`,

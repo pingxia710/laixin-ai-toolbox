@@ -8,6 +8,7 @@ import { dirname, join } from 'node:path'
 import { promisify } from 'node:util'
 import type { UpdateView } from '../../desktop-types'
 import { displayReleaseVersion } from '../../release-version'
+import { helperLaunch } from './update-helper-launch'
 import { newerVersion, readUpdateManifest, type UpdateRelease } from './update-manifest'
 import { updateArchivePaths } from './zip-paths'
 import { resolveTunnelDataDir } from '../tunnel/paths'
@@ -20,8 +21,18 @@ interface UpdaterOptions {
   version: string; platform: string; origin: string; publicKey: string; directory: string
   executable: string; helperPath: string; packaged: boolean; quit: () => void
   githubRepository?: string
+  /** 可信镜像主机(国内 CDN)。⛔ 接受清单里任意主机:签名失效时的纵深防御。 */
+  mirrorHosts?: readonly string[]
   sourceTimeoutMs?: number
   fetch?: typeof fetch
+  /** ⛔ 只为行为测试注入,生产不传:等助手 ready 的上限毫秒数(默认 30 秒,理由见 waitForHelperReady)。 */
+  helperReadyTimeoutMs?: number
+  /** ⛔ 只为行为测试注入,生产不传。 */
+  now?: () => number
+  /** ⛔ 只为行为测试注入,生产不传。 */
+  wait?: (ms: number) => Promise<void>
+  /** ⛔ 只为行为测试注入,生产不传:起助手用的 spawn(测试拿它钉「助手是怎么被起的」)。 */
+  spawn?: typeof spawn
 }
 
 interface PreviousUpdateFailure {
@@ -46,7 +57,9 @@ function updateFailureView(failure: PreviousUpdateFailure, notes = ''): UpdateVi
 
 function readPreviousUpdateFailure(directory: string): PreviousUpdateFailure | undefined {
   try {
-    const value = JSON.parse(physicalFs.readFileSync(join(directory, 'result.json'), 'utf8')) as { version?: unknown; state?: unknown; code?: unknown }
+    const raw = physicalFs.readFileSync(join(directory, 'result.json'), 'utf8')
+    // 助手(PowerShell 5.1)的 Set-Content -Encoding UTF8 写出的是带 BOM 的 UTF-8,JSON.parse 对 BOM 直接抛,
+    const value = JSON.parse(raw.replace(/^\uFEFF/, '')) as { version?: unknown; state?: unknown; code?: unknown }
     if (value.state !== 'error' || typeof value.version !== 'string' || value.version.length === 0 || value.version.length > 100) return undefined
     return { version: value.version, code: typeof value.code === 'string' && /^[A-Z0-9_]{1,80}$/.test(value.code) ? value.code : 'UPDATE_PREVIOUS_ATTEMPT_FAILED' }
   } catch { return undefined }
@@ -173,24 +186,28 @@ export class ToolboxUpdater {
       await writeFile(jobPath, JSON.stringify(job), { mode: 0o600 })
       await Promise.all([rm(job.ready, { force: true }), rm(join(this.options.directory, 'result.json'), { force: true })])
       // requireConnected:更新前客户是连着的 ⇒ 新版「起来了」还不算数,要等网络真的连上才写回执。
+      // previous/notes 给「更新成功」弹窗用:新版第一次启动要能告诉客户「从哪版升上来的、这版改了什么」,
+      // 只带在 pending 里这一条路 —— 助手装完会删掉工作目录,清单源那时也可能已经改版。
       await writeFile(join(this.options.directory, 'pending.json'),
-        JSON.stringify({ version: job.version, acknowledgement: job.acknowledgement, requireConnected: job.tunnelResume }), { mode: 0o600 })
-      const child = spawn(mac ? this.options.executable : 'powershell.exe', mac ? [this.options.helperPath, jobPath] :
-        ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', this.options.helperPath, '-JobPath', jobPath], {
-        env: mac ? { ...process.env, ELECTRON_RUN_AS_NODE: '1' } : process.env, detached: true, windowsHide: true, stdio: 'ignore'
-      })
+        JSON.stringify({ version: job.version, previous: this.options.version, notes: this.release.notes,
+          acknowledgement: job.acknowledgement, requireConnected: job.tunnelResume }), { mode: 0o600 })
+      // 怎么起、Windows 为什么不能直接 detached 起 PowerShell:见 update-helper-launch.ts。
+      const launch = helperLaunch(mac ? 'mac' : 'win', this.options.executable, this.options.helperPath, jobPath, process.env)
+      const child = (this.options.spawn ?? spawn)(launch.command, launch.args, launch.options)
       await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject) })
       child.unref()
-      const deadline = Date.now() + 5000
-      while (!await pathExists(job.ready)) {
-        if (Date.now() > deadline) throw new Error('UPDATE_HELPER_FAILED')
-        await new Promise((resolve) => setTimeout(resolve, 50))
-      }
+      // 助手写出 ready 前要等 PowerShell 冷启动+整脚本解析,杀软对 powershell.exe 的实时扫描
+      // 很容易拖过几秒(2026-09-16 真机:Administrator 机 13:33 那次 5 秒没等到就 UPDATE_HELPER_FAILED,
+      // 连程序都没重启,pending.json 永远留在盘上)。放宽到 30 秒:helper-ready 是脚本第 9 行就写的,
+      // 真正死掉/被拦的助手照样会以 ENOENT 或到点失败收场,⛔ 把冷启动误判成「更新包坏了」。
+      await this.waitForHelperReady(job.ready)
       // Let the IPC reply reach the window before normal shutdown starts.
       setTimeout(() => this.options.quit(), 100)
     } catch (error) {
-      const location = ['EACCES', 'EPERM', 'UPDATE_LOCATION_UNWRITABLE'].includes((error as NodeJS.ErrnoException).code ?? (error as Error).message)
+      const code = (error as NodeJS.ErrnoException).code ?? (error as Error).message
+      const location = ['EACCES', 'EPERM', 'UPDATE_LOCATION_UNWRITABLE'].includes(code)
       this.fail(location ? '暂时无法替换程序，请将工具箱移至可写的应用目录后重试。账号和配置已保留。'
+        : code === 'UPDATE_HELPER_FAILED' ? '更新程序没能启动（可能被安全软件拦截）。账号和配置已保留；请重试一次，仍失败请把诊断发给客服。'
         : '更新包未能完成校验或准备，请重新下载。原版本和账号数据已保留。')
     } finally { this.busy = false }
     return this.status()
@@ -198,6 +215,19 @@ export class ToolboxUpdater {
 
   dispose(): void { this.disposed = true; this.controller?.abort() }
   private fail(message: string): void { this.view = { ...this.view, state: 'error', message } }
+
+  /** 等助手把 ready 文件写出来;到点没等到就 UPDATE_HELPER_FAILED(文案在 install 的 catch 里区分)。
+   *  now/wait/时长注入出来只为行为测试能钉住「29 秒 ready 要放行、30 秒没 ready 要判死、立即 ready 不白等」,
+   *  生产走默认值:和旧实现一样 30 秒、Date.now、50 毫秒一查,⛔ 改变等待行为。 */
+  private async waitForHelperReady(ready: string): Promise<void> {
+    const now = this.options.now ?? Date.now
+    const wait = this.options.wait ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+    const deadline = now() + (this.options.helperReadyTimeoutMs ?? 30_000)
+    while (!await pathExists(ready)) {
+      if (now() > deadline) throw new Error('UPDATE_HELPER_FAILED')
+      await wait(50)
+    }
+  }
   private async updatePrefix(): Promise<string> { await mkdir(this.options.directory, { recursive: true, mode: 0o700 }); return join(this.options.directory, 'download-') }
 
   private async readRelease(origin: URL): Promise<UpdateRelease> {
@@ -218,7 +248,7 @@ export class ToolboxUpdater {
           chunks.push(chunk)
         }
         return readUpdateManifest(Buffer.concat(chunks).toString('utf8'), this.options.publicKey, origin, this.options.platform,
-          this.options.version, this.options.githubRepository)
+          this.options.version, this.options.githubRepository, this.options.mirrorHosts)
       } catch (error) {
         if (this.controller?.signal.aborted) throw error
       } finally {
@@ -317,10 +347,16 @@ export async function readRejectedVersion(directory: string): Promise<{ version:
   } catch { return undefined }
 }
 
-export async function acknowledgeUpdate(directory: string, version: string, deps?: AcknowledgeDeps): Promise<void> {
+/** 这次启动确实是「更新装好了」的第一眼时,给界面弹「更新成功」用的两样。
+ *  只在写回执的那一次启动有值:pending.json 被助手装完删掉,重启就不会再弹。 */
+export interface UpdateSuccess { previous: string; notes: string }
+
+export async function acknowledgeUpdate(directory: string, version: string, deps?: AcknowledgeDeps): Promise<UpdateSuccess | undefined> {
+  let success: UpdateSuccess | undefined
   try {
-    const pending = JSON.parse(await readFile(join(directory, 'pending.json'), 'utf8')) as { version: string; requireConnected?: boolean }
-    if (pending.version !== version) return
+    const pending = JSON.parse(await readFile(join(directory, 'pending.json'), 'utf8')) as
+      { version: string; previous?: unknown; notes?: unknown; requireConnected?: boolean }
+    if (pending.version !== version) return undefined
     // 更新前客户是连着的 ⇒ 「起来了」还不算数，要等网络真的连上才写回执。
     // 在此之前 ⛔ 修剪 previous-*.app —— 那是唯一的退路，提前剪掉就回不去了。
     if (pending.requireConnected === true && deps !== undefined) {
@@ -330,11 +366,14 @@ export async function acknowledgeUpdate(directory: string, version: string, deps
         // 会用既有的两个 rename 把旧版换回来并拉起 —— ⛔ 在这里自己搬 bundle。
         await writeFile(rejectedVersionPath(directory), JSON.stringify({ version, at: (deps.now ?? Date.now)() }), { mode: 0o600 })
         deps.giveUp()
-        return
+        return undefined
       }
     }
     await writeFile(join(directory, 'acknowledgement.json'), JSON.stringify({ version, pid: process.pid }), { mode: 0o600 })
-  } catch { /* No pending update on ordinary startup. */ return }
+    // ⛔ 拿类型去判:旧 pending 没有这两样,缺了就给空串,弹窗自己兜底文案。
+    success = { previous: typeof pending.previous === 'string' ? pending.previous : '',
+      notes: typeof pending.notes === 'string' ? pending.notes : '' }
+  } catch { /* No pending update on ordinary startup. */ return undefined }
   // 新版启动已确认:只保留最近一份可回退备份,并清掉历次更新的 download-* 工作目录。
   try {
     const entries = await readdir(directory)
@@ -348,6 +387,7 @@ export async function acknowledgeUpdate(directory: string, version: string, deps
       .filter((entry) => entry.isDirectory() && entry.name.startsWith('download-'))
       .map((entry) => rm(join(directory, entry.name), { recursive: true, force: true })))
   } catch { /* 清理失败不影响更新确认。 */ }
+  return success
 }
 
 /** 盯到「连上」或「客户自己不要连了」为止；到点仍在试就返回 waiting。 */

@@ -292,7 +292,177 @@ describe('配置生效观察器', () => {
     const observed = await observer()
     expect(observed).toEqual({ codex: { source: 'unknown' } })
     expect(calls.filter(call => call.command.endsWith('tasklist.exe')).every(call => call.command === 'C:\\Windows\\System32\\tasklist.exe')).toBe(true)
-    expect(calls.some(call => call.command.includes('Users\\customer'))).toBe(false)
+    expect(calls.filter(call => call.command.endsWith('powershell.exe')).map(call => call.command))
+      .toEqual(['C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'])
+    expect(calls.some(call => call.command.includes('Users\\customer') || call.args.some(arg => arg.includes('Users\\customer')))).toBe(false)
+  })
+
+  describe('Windows 按程序所在位置区分桌面应用与命令行版', () => {
+    const home = 'C:\\Users\\customer'
+    const claudeDesktop = 'C:\\Program Files\\WindowsApps\\Claude_2.110.0.0_x64__pzs8sxrjxfjjc\\app\\Claude.exe'
+    const codexDesktop = 'C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.915.0.0_x64__2p2nqsd0c76g0\\app\\Codex.exe'
+    const claudeCli = 'C:\\Users\\customer\\.local\\bin\\claude.exe'
+
+    interface FakeProcess { readonly image: string; readonly id: string; readonly path: string | null; readonly line: string | null }
+
+    /** tasklist 按镜像名过滤；PowerShell 按脚本里的 ProcessId 返回详情，和真机输出同形。 */
+    function windows(processes: () => readonly FakeProcess[], options: { powershell?: 'fail' | 'garbage' | 'bad-item' } = {}) {
+      const powershellCalls: string[] = []
+      const run = async (command: string, args: readonly string[]) => {
+        if (command === 'C:\\Windows\\System32\\tasklist.exe') {
+          const image = /IMAGENAME eq (.+)$/.exec(args[1] ?? '')?.[1] ?? ''
+          const rows = processes().filter(item => item.image.toLowerCase() === image.toLowerCase())
+          return rows.length === 0 ? 'INFO: No tasks are running which match the specified criteria.'
+            : rows.map(item => `"${item.image}","${item.id}","Console","1","125,672 K"`).join('\r\n')
+        }
+        if (command === 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe') {
+          const script = args[args.length - 1] ?? ''
+          powershellCalls.push(script)
+          if (options.powershell === 'fail') throw Object.assign(new Error('blocked by policy'), { code: 'ETIMEDOUT' })
+          if (options.powershell === 'garbage') return '{"id":"1"}'
+          if (options.powershell === 'bad-item') return '[null]'
+          const ids = [...script.matchAll(/ProcessId=(\d+)/g)].map(match => match[1])
+          return JSON.stringify(processes().filter(item => ids.includes(item.id)).map(item => ({ id: item.id, image: item.image, path: item.path, line: item.line })))
+        }
+        return absentCommand()
+      }
+      return { run, powershellCalls }
+    }
+
+    function observerFor(fake: ReturnType<typeof windows>, now?: () => number) {
+      return createConfigurationExecutionObserver({ platform: 'win32', home, policyFilePresence: async () => 'absent', run: fake.run, ...(now ? { now } : {}) })
+    }
+
+    it('Claude 桌面版与商店版 Codex 开着（含只剩托盘）不再阻断写配置', async () => {
+      const fake = windows(() => [
+        { image: 'claude.exe', id: '5500', path: claudeDesktop, line: `"${claudeDesktop}"` },
+        { image: 'claude.exe', id: '6264', path: claudeDesktop, line: `"${claudeDesktop}" --type=renderer` },
+        { image: 'Codex.exe', id: '7001', path: codexDesktop, line: `"${codexDesktop}"` }
+      ])
+      await expect(observerFor(fake)()).resolves.toEqual({})
+    })
+
+    it('桌面版自带的 Claude Code 会话、旧版安装目录与 Hermes 桌面版同样按桌面应用处理', async () => {
+      const fake = windows(() => [
+        { image: 'claude.exe', id: '11', path: 'C:\\Users\\customer\\AppData\\Local\\AnthropicClaude\\app-1.49585.0\\claude.exe', line: null },
+        { image: 'claude.exe', id: '12', path: 'C:\\Users\\customer\\AppData\\Roaming\\Claude\\claude-code\\2.1.273\\claude.exe', line: 'claude.exe --setting-sources user' },
+        { image: 'claude.exe', id: '13', path: 'C:\\Users\\customer\\AppData\\Local\\Claude-3p\\claude-code\\2.1.273\\claude.exe', line: null },
+        { image: 'hermes.exe', id: '14', path: 'C:\\Users\\customer\\.hermes\\hermes-agent\\apps\\desktop\\release\\win-unpacked\\Hermes.exe', line: null }
+      ])
+      await expect(observerFor(fake)()).resolves.toEqual({})
+    })
+
+    it('命令行版在运行时仍按看不到继承环境阻断；带改配置的启动参数时如实说成启动参数', async () => {
+      const secret = 'D:\\company\\private-settings.json'
+      const plain = windows(() => [{ image: 'claude.exe', id: '900', path: claudeCli, line: `"${claudeCli}"` }])
+      await expect(observerFor(plain)()).resolves.toEqual({ claude: { source: 'unknown' } })
+
+      const override = windows(() => [
+        { image: 'claude.exe', id: '901', path: claudeDesktop, line: null },
+        { image: 'claude.exe', id: '902', path: claudeCli, line: `"${claudeCli}" --settings ${secret}` },
+        { image: 'codex.exe', id: '903', path: 'C:\\Users\\customer\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\vendor\\x86_64-pc-windows-msvc\\codex\\codex.exe', line: 'codex.exe -c model_provider=x' },
+        { image: 'hermes.exe', id: '904', path: 'C:\\Users\\customer\\AppData\\Local\\hermes\\hermes-agent\\venv\\Scripts\\hermes.exe', line: 'hermes.exe chat' }
+      ])
+      const observed = await observerFor(override)()
+      expect(observed).toEqual({
+        claude: { source: 'observed', commandLine: true },
+        codex: { source: 'observed', commandLine: true },
+        hermes: { source: 'unknown' }
+      })
+      expect(JSON.stringify(observed)).not.toContain('private-settings')
+      expect(JSON.stringify(observed)).not.toContain('customer')
+    })
+
+    it('认不出的位置、读不到路径、查询失败或输出不合形时都保持原来的阻断', async () => {
+      const unknownPlace = windows(() => [{ image: 'claude.exe', id: '31', path: 'D:\\tools\\claude.exe', line: null }])
+      await expect(observerFor(unknownPlace)()).resolves.toEqual({ claude: { source: 'unknown' } })
+
+      const noPath = windows(() => [{ image: 'claude.exe', id: '32', path: null, line: null }])
+      await expect(observerFor(noPath)()).resolves.toEqual({ claude: { source: 'unknown' } })
+
+      const failed = windows(() => [{ image: 'claude.exe', id: '33', path: claudeDesktop, line: null }], { powershell: 'fail' })
+      await expect(observerFor(failed)()).resolves.toEqual({ claude: { source: 'unknown' } })
+
+      const garbage = windows(() => [{ image: 'claude.exe', id: '34', path: claudeDesktop, line: null }], { powershell: 'garbage' })
+      await expect(observerFor(garbage)()).resolves.toEqual({ claude: { source: 'unknown' } })
+
+      const badItem = windows(() => [{ image: 'claude.exe', id: '35', path: claudeDesktop, line: null }], { powershell: 'bad-item' })
+      await expect(observerFor(badItem)()).resolves.toEqual({ claude: { source: 'unknown' } })
+    })
+
+    it('tasklist 之后已退出的进程不算在运行；进程号被别的程序复用时不冒用旧详情', async () => {
+      let processes: FakeProcess[] = [{ image: 'claude.exe', id: '41', path: claudeCli, line: null }]
+      const gone = windows(() => processes)
+      const observer = observerFor(gone)
+      await expect(observer()).resolves.toEqual({ claude: { source: 'unknown' } })
+
+      // 同一个进程号被另一个程序复用：缓存按进程号＋镜像名核对，旧详情必须丢掉重查。
+      processes = [{ image: 'codex.exe', id: '41', path: codexDesktop, line: null }]
+      await expect(observer()).resolves.toEqual({})
+      expect(gone.powershellCalls).toHaveLength(2)
+
+      const exited = windows(() => [{ image: 'claude.exe', id: '42', path: claudeCli, line: null }])
+      const exitedRun = exited.run
+      const vanished = createConfigurationExecutionObserver({
+        platform: 'win32', home, policyFilePresence: async () => 'absent',
+        run: async (command, args) => command.endsWith('powershell.exe') ? '[]' : exitedRun(command, args)
+      })
+      await expect(vanished()).resolves.toEqual({})
+    })
+
+    it('关掉桌面版后命令行版复用了同一个进程号：进程号集合一变就重查，⛔ 沿用桌面版的旧详情放行', async () => {
+      let processes: FakeProcess[] = ['71', '72', '73', '74', '75', '76'].map(id => ({ image: 'claude.exe', id, path: claudeDesktop, line: null }))
+      const fake = windows(() => processes)
+      const observer = observerFor(fake, () => 5_000)
+      await expect(observer()).resolves.toEqual({})
+      processes = [{ image: 'claude.exe', id: '73', path: claudeCli, line: `"${claudeCli}" --settings D:\\company.json` }]
+      await expect(observer()).resolves.toEqual({ claude: { source: 'observed', commandLine: true } })
+      expect(fake.powershellCalls).toHaveLength(2)
+    })
+
+    it('托盘里常驻的桌面版不会让每次读状态都启动 PowerShell；新进程或过期才重查', async () => {
+      let clock = 1_000
+      let processes: FakeProcess[] = [{ image: 'claude.exe', id: '51', path: claudeDesktop, line: null }]
+      const fake = windows(() => processes)
+      const observer = observerFor(fake, () => clock)
+      for (let index = 0; index < 5; index++) {
+        await expect(observer()).resolves.toEqual({})
+        clock += 1_000
+      }
+      expect(fake.powershellCalls).toHaveLength(1)
+
+      processes = [...processes, { image: 'claude.exe', id: '52', path: claudeCli, line: null }]
+      await expect(observer()).resolves.toEqual({ claude: { source: 'unknown' } })
+      expect(fake.powershellCalls).toHaveLength(2)
+      // 同名进程集合变了（多了 52）：整组重查，⛔ 只查新进程而沿用 51 的旧详情——进程号可能已被复用。
+      expect(fake.powershellCalls[1]).toContain('ProcessId=52')
+      expect(fake.powershellCalls[1]).toContain('ProcessId=51')
+
+      clock += 61_000
+      await observer()
+      expect(fake.powershellCalls).toHaveLength(3)
+    })
+
+    it('Claude 桌面版开着时，Windows 适配器可以写入用户级配置；命令行版开着时仍拒写', async () => {
+      const key = 'sk-toolbox-desktop-running-fixture-key'
+      const adapterWith = (processes: readonly FakeProcess[]) => {
+        const f = files()
+        const claude = createDeepSeekAdapters({
+          home, platform: 'win32', file: f.io, observeConfigurationExecution: observerFor(windows(() => processes))
+        }).find(adapter => adapter.shell === 'claude')!
+        return { f, claude }
+      }
+
+      const desktop = adapterWith([{ image: 'claude.exe', id: '61', path: claudeDesktop, line: null }])
+      await expect(desktop.claude.configurationTargetStatus!()).resolves.toMatchObject({ scope: 'user', writable: true })
+      await desktop.claude.applyDeepSeek(key)
+      expect([...desktop.f.data.values()].some(contents => contents.includes(key))).toBe(true)
+
+      const cli = adapterWith([{ image: 'claude.exe', id: '62', path: claudeCli, line: null }])
+      await expect(cli.claude.configurationTargetStatus!()).resolves.toMatchObject({ scope: 'unknown', writable: false, reason: 'unknown-launch-context' })
+      await expect(cli.claude.applyDeepSeek(key)).rejects.toThrow()
+      expect(cli.f.data.size).toBe(0)
+    })
   })
 
   it('同一个适配器在后续观察到受管策略后立即禁止写入，也不覆盖现有配置', async () => {

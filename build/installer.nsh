@@ -74,3 +74,25 @@
     ${EndIf}
   ${EndIf}
 !macroend
+; ---- 安装器钩子:换文件前先停常驻与网络进程(2026-09-15,Windows「点更新重启又换回旧版」)----
+; 背景:0.5.5 客户端里的更新助手(update-helper.ps1)在调安装器前不停守护/内核;旧卸载器虽然会
+; taskkill(上面的 customUnInstall),但「升级」分支 ⛔ 删任务——常驻任务每 1 分钟重入,守护可能在
+; 「杀掉 → 新文件落盘」的窗口里被任务再拉起来,占住安装目录里的文件让静默安装失败,更新助手按设计
+; 整目录还原旧版,客户看到「点了更新重启,又换回旧版」(2026-09-15 客户实测)。
+; 顺序是硬的:先禁任务(⛔ 删——升级删任务 = 客户每升一级丢一次常驻,删除判断在 customUnInstall),
+; 再杀守护(主程序当 node 跑)与内核 xray.exe。任务被禁不影响:新版/旧版启动时的「按开关校准常驻」
+; 会按客户选择重装任务(Register-ScheduledTask -Force 顺带解禁);点连接的叫醒路径也会先 /change /enable。
+; 首次安装没有任务也没有进程,这两步安静失败,与 customUnInstall 同一取舍。
+; ⛔ 这里照搬卸载钩子的按映像名杀法:.onInit 阶段拿不到命令行过滤,靠「早于一切文件操作」兜底;
+; 新客户端的助手已在调安装器前做过带路径限定的精准停进程(0.5.6-winupdate.1 起),那是正门,
+; 这道是旧客户端升级那一跳的保险,两道都要。
+!macro customInit
+  nsExec::ExecToLog 'schtasks.exe /change /tn "\Laixin\cn.laixin.toolbox.tunnel" /disable'
+  Pop $0
+  nsExec::ExecToLog 'schtasks.exe /change /tn "cn.laixin.toolbox.tunnel" /disable'
+  Pop $0
+  nsExec::ExecToLog 'taskkill.exe /f /im "${APP_EXECUTABLE_FILENAME}"'
+  Pop $0
+  nsExec::ExecToLog 'taskkill.exe /f /im "xray.exe"'
+  Pop $0
+!macroend

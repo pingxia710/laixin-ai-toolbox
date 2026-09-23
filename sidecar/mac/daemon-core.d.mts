@@ -160,6 +160,12 @@ export interface Daemon {
   run(): Promise<void>
   requestShutdown(): void
   notifyEvent(event: string): void
+  restoreSettings(options?: { checkHandover?: boolean; keepWriteRight?: boolean }): Record<string, unknown> | undefined
+  settingsBusy: boolean
+  restoreWithRetryLadder(
+    label: string,
+    options?: { checkHandover?: boolean; shouldContinue?: () => boolean }
+  ): Promise<Record<string, unknown> | undefined>
 }
 
 export declare function intentPath(dataDir: string): string

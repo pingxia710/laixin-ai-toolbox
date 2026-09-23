@@ -25,7 +25,7 @@ class Element {
 afterEach(() => vi.unstubAllGlobals())
 
 describe('各 AI 页的官方下载与版本入口', () => {
-  it('保留六个已定平台和唯一的官方资源入口', () => {
+  it('六款软件均有官方获取入口，只有三款接入工具箱 API 配置', () => {
     expect(officialInstallPlatforms.map((platform) => platform.id)).toEqual([
       'codex', 'claude-code', 'hermes', 'deepseek-harness', 'zcode', 'kimi-code'
     ])
@@ -63,6 +63,46 @@ describe('各 AI 页的官方下载与版本入口', () => {
 
     expect(reachability).toHaveBeenCalledTimes(1)
     expect(openExternal).toHaveBeenCalledTimes(1)
+    teardown()
+  })
+
+  it('Intel Mac 明确提示不能安装的 AI，同时说明工具箱网络功能仍可使用', async () => {
+    vi.stubGlobal('document', {
+      createElement: () => new Element(),
+      createTextNode: (text: string) => Object.assign(new Element(), { textContent: text })
+    })
+    vi.stubGlobal('window', {
+      toolbox: {
+        app: { info: async () => ({ platform: 'darwin', architecture: 'x64' }) },
+        download: { openExternal: vi.fn() }
+      }
+    })
+    const root = new Element()
+    const teardown = mountInstallCard(root as unknown as HTMLElement, 'codex')
+
+    await vi.waitFor(() => expect(root.all().some((element) => element.textContent.includes('Codex 当前官方桌面应用只支持 Apple 芯片'))).toBe(true))
+    expect(root.all().some((element) => element.textContent.includes('AI 网络功能仍可使用'))).toBe(true)
+    expect(root.all().some((element) => element.children.some((child) => child.textContent === '查看兼容说明'))).toBe(true)
+    teardown()
+  })
+
+  it('Intel Mac 不会把官方支持的 Claude Code 误报为不支持', async () => {
+    vi.stubGlobal('document', {
+      createElement: () => new Element(),
+      createTextNode: (text: string) => Object.assign(new Element(), { textContent: text })
+    })
+    vi.stubGlobal('window', {
+      toolbox: {
+        app: { info: async () => ({ platform: 'darwin', architecture: 'x64' }) },
+        download: { openExternal: vi.fn() }
+      }
+    })
+    const root = new Element()
+    const teardown = mountInstallCard(root as unknown as HTMLElement, 'claude-code')
+
+    await vi.waitFor(() => expect(root.all().some((element) => element.textContent === 'Intel Mac')).toBe(true))
+    expect(root.all().some((element) => element.textContent.includes('只支持 Apple 芯片'))).toBe(false)
+    expect(root.all().some((element) => element.children.some((child) => child.textContent === '官方下载'))).toBe(true)
     teardown()
   })
 })

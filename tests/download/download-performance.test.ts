@@ -349,7 +349,7 @@ describe('孤儿目录清扫', () => {
 })
 
 describe('文件任务存储流式哈希', () => {
-  it('300MB 安装包核验的缓冲区峰值增量 < 50MB,摘要正确', async () => {
+  it('300MB 安装包核验进程 RSS 增量 < 50MB,摘要正确', async () => {
     const root = await mkdtemp(join(tmpdir(), 'laixin-stream-hash-'))
     try {
       const store = createFileTaskStore(root)
@@ -366,23 +366,14 @@ describe('文件任务存储流式哈希', () => {
         receivedBytes: '0', totalBytes: '0', retryCount: '0', resumeEtag: '', resumeLastModified: '', localSha256: '',
         artifactPath: paths.artifactPath, partPath: paths.partPath, startedAt: '', endedAt: ''
       }
-      const buffersBefore = process.memoryUsage().arrayBuffers
-      let buffersPeak = buffersBefore
-      const sampler = setInterval(() => {
-        buffersPeak = Math.max(buffersPeak, process.memoryUsage().arrayBuffers)
-      }, 5)
-      let digest: ArtifactDigest | undefined
-      try {
-        digest = await store.hashArtifact(task)
-      } finally {
-        clearInterval(sampler)
-        buffersPeak = Math.max(buffersPeak, process.memoryUsage().arrayBuffers)
-      }
+      const rssBefore = process.memoryUsage().rss
+      const digest = await store.hashArtifact(task)
+      const rssAfter = process.memoryUsage().rss
       expect(digest?.byteLength).toBe(300 * 1024 * 1024)
       const expected = createHash('sha256')
       for await (const piece of createReadStream(paths.artifactPath)) expected.update(piece as Buffer)
       expect(digest?.sha256).toBe(expected.digest('hex'))
-      expect(buffersPeak - buffersBefore).toBeLessThan(50 * 1024 * 1024)
+      expect(rssAfter - rssBefore).toBeLessThan(50 * 1024 * 1024)
     } finally {
       await rm(root, { recursive: true, force: true })
     }

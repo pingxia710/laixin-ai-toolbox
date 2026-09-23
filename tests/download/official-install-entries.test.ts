@@ -25,3 +25,12 @@ it('下载页和已核对的 GitHub 入口均只打开登记的 HTTPS 官方页�
     expect(resource.allowedHosts).toContain(page.hostname)
   }
 })
+
+it('Claude Code 的官方入口打开命令行版中文安装页，⛔ 带客户去桌面版下载页（CD-03）', async () => {
+  const { defaultRecipes } = await import('../../app/main/recipes/recipes')
+  const resource = loadCatalog().resources.find(item => item.id === 'claude-code-official-install')!
+  expect(resource.officialPageUrl).toBe('https://code.claude.com/docs/zh-CN/setup')
+  expect(resource.officialVersionLabel).toContain('命令行版')
+  expect(defaultRecipes.shells['claude-code'].officialPage).toBe('https://code.claude.com/docs/zh-CN/setup')
+  for (const url of [resource.officialPageUrl, defaultRecipes.shells['claude-code'].officialPage]) expect(url).not.toContain('claude.com/download')
+})

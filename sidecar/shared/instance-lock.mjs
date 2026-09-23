@@ -8,7 +8,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { randomBytes } from 'node:crypto'
-import { processAlive } from './ledger.mjs'
+import { currentProcessStartedAt, lockHolderAlive } from './ledger.mjs'
 
 export function instanceLockPath(dataDir) {
   return join(dataDir, 'daemon.lock')
@@ -24,6 +24,32 @@ export function readInstanceLock(dataDir) {
   return { holder, ino }
 }
 
+// N-25:主进程状态路径的席位锁记忆化读——ino+mtime+size 未变时复用上次结果
+// (loadLedgerCached 同一模式;⛔ TTL 时间窗)。锁文件的释放与接手都换 inode 或改 mtime,缓存自失效。
+// ⛔ 抢锁/破锁/释放路径仍用 readInstanceLock:它们是对盘面的判定,必须看到最新事实。
+const instanceLockReadCache = new Map()
+let instanceLockDiskReadCount = 0
+
+/** 诊断计数:readInstanceLockCached 真正读盘的次数(供测试与巡检断言)。 */
+export function instanceLockDiskReads() {
+  return instanceLockDiskReadCount
+}
+
+export function readInstanceLockCached(dataDir) {
+  const path = instanceLockPath(dataDir)
+  let key
+  try {
+    const stat = statSync(path)
+    key = `${stat.ino}:${stat.mtimeMs}:${stat.size}`
+  } catch { key = 'missing' }
+  const cached = instanceLockReadCache.get(dataDir)
+  if (cached !== undefined && cached.key === key) return cached.value
+  instanceLockDiskReadCount += 1
+  const value = readInstanceLock(dataDir)
+  instanceLockReadCache.set(dataDir, { key, value })
+  return value
+}
+
 /**
  * 抢这个数据目录的守护席位。
  * 抢到 → 返回 { acquired: true, release() }；席位有人（进程还活着）→ 返回 { acquired: false, holder }，调用方应安静退出 0。
@@ -36,7 +62,9 @@ export function acquireInstanceLock(dataDir, { runId = '', maxAttempts = 5 } = {
   const token = `${String(process.pid)}-${randomBytes(4).toString('hex')}`
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     try {
-      writeFileSync(path, JSON.stringify({ token, pid: process.pid, runId, at: Date.now() }), { flag: 'wx', mode: 0o600 })
+      // startedAt 是本进程自己的启动时刻:判活者拿它和该 PID 现在的启动时刻对账,
+      // 同一次开机内的 PID 复用(持有者死了、号码给了路人)在这里现形 ⛔ 只查 pid 活性。
+      writeFileSync(path, JSON.stringify({ token, pid: process.pid, runId, at: Date.now(), startedAt: currentProcessStartedAt() }), { flag: 'wx', mode: 0o600 })
       let ino
       try { ino = statSync(path).ino } catch { ino = undefined }
       return { acquired: true, token, release: () => releaseInstanceLock(dataDir, token, ino) }
@@ -47,7 +75,7 @@ export function acquireInstanceLock(dataDir, { runId = '', maxAttempts = 5 } = {
     if (observed === undefined) continue // 刚被释放:马上再抢
     // 内容读不出来（刚创建还没写完）也当席位有人：⛔ 拿一个瞬间窗口去踢掉正在起来的同伴
     if (observed.holder === undefined) return { acquired: false, holder: undefined }
-    if (processAlive(observed.holder.pid)) return { acquired: false, holder: observed.holder }
+    if (lockHolderAlive(observed.holder)) return { acquired: false, holder: observed.holder }
     if (!takeOverStaleInstanceLock(dataDir, observed)) return { acquired: false, holder: observed.holder }
   }
   return { acquired: false, holder: readInstanceLock(dataDir)?.holder }
@@ -61,7 +89,7 @@ export function takeOverStaleInstanceLock(dataDir, observed) {
   let moved
   try { moved = { holder: JSON.parse(readFileSync(bucket, 'utf8')), ino: statSync(bucket).ino } } catch { moved = undefined }
   const sameOne = moved !== undefined && moved.ino === observed.ino && moved.holder?.token === observed.holder?.token
-  const stillDead = moved !== undefined && moved.holder !== undefined && !processAlive(moved.holder.pid)
+  const stillDead = moved !== undefined && moved.holder !== undefined && !lockHolderAlive(moved.holder)
   if (sameOne || stillDead) {
     try { rmSync(bucket, { force: true }) } catch { /* 暂存删不掉不影响 */ }
     return true

@@ -56,7 +56,11 @@ export function shellConfigFixture(initial: AiAccessState = { version: 1, select
     findHermesCommand: async () => 'hermes',
     runHermes: async (_command, args) => {
       if (args[0] === 'config' && args[1] === 'set') hermesSettings.set(args[2], args[3])
-      if (args[0] === 'config' && args[1] === 'unset') hermesSettings.delete(args[2])
+      // 真实 hermes ≥0.21 语义：unset 本就未设置的键以非零退出（"Config key not set"）。
+      if (args[0] === 'config' && args[1] === 'unset') {
+        if (!hermesSettings.has(args[2])) throw new Error(`Config key not set: ${args[2]}`)
+        hermesSettings.delete(args[2])
+      }
       syncHermesConfig()
     },
     readHermesConfig: async (_command, key) => hermesSettings.get(key)

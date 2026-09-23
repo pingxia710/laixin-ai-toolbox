@@ -479,7 +479,7 @@ async function captureHermesConnection(
   // ⛔ 中途失败后留下半新半旧的恢复点让下次恢复拿到错值。
   const [env, backup] = await Promise.all([file.read(envPath), file.read(backupPath)])
   return async () => {
-    await restoreHermesModelSettings(command, previous, run)
+    await syncHermesModelSettings(command, previous, run, read)
     await replaceConfigurationTransaction(file, [
       { path: envPath, before: await file.read(envPath), after: env },
       { path: backupPath, before: await file.read(backupPath), after: backup }
@@ -589,7 +589,7 @@ async function deactivateHermesConnection(input: HermesConnectionFiles): Promise
   const keysOwned = routePresent || (envOwner !== undefined && matchesDirectHermesTakeover(current, envOwner))
   try {
     if (keysOwned) {
-      await writeHermesModelSettings(command, deactivateValues, run)
+      await syncHermesModelSettings(command, deactivateValues, run, read)
     }
     await removeHermesManagedEnvBlock(file, envPath, 'deactivate')
     if (keysOwned) {
@@ -597,7 +597,7 @@ async function deactivateHermesConnection(input: HermesConnectionFiles): Promise
     }
   } catch (error) {
     if (keysOwned) {
-      try { await writeHermesModelSettings(command, current, run) } catch (rollbackError) {
+      try { await syncHermesModelSettings(command, current, run, read) } catch (rollbackError) {
         throw new Error('AI_ACCESS_HERMES_ROLLBACK_FAILED', { cause: rollbackError })
       }
     }
@@ -622,12 +622,12 @@ async function restoreHermesPreviousConnection(input: HermesConnectionFiles): Pr
   const deactivatedForm = hermesModelKeys.every((key) => current[key] === undefined)
   if (!deactivatedForm && !isToolboxHermesRoute(current)) throw new Error('AI_ACCESS_CONFIG_UNMANAGED')
   try {
-    await writeHermesModelSettings(command, restoreValues, run)
+    await syncHermesModelSettings(command, restoreValues, run, read)
     await removeHermesManagedEnvBlock(file, envPath, 'restore')
     await assertHermesSettings(command, read, restoreValues)
     await replaceConfigurationTransaction(file, [{ path: backupPath, before: await file.read(backupPath), after: undefined }], { backupAction: 'restore' })
   } catch (error) {
-    try { await writeHermesModelSettings(command, current, run) } catch (rollbackError) {
+    try { await syncHermesModelSettings(command, current, run, read) } catch (rollbackError) {
       throw new Error('AI_ACCESS_HERMES_ROLLBACK_FAILED', { cause: rollbackError })
     }
     throw new Error('AI_ACCESS_HERMES_ROLLBACK_FAILED', { cause: error })
@@ -654,7 +654,7 @@ async function applyHermesProvider(
   try {
     const definition = modelProvider(provider).hermes
     const expected = directHermesSettings(provider, definition.provider, definition.model)
-    await writeHermesModelSettings(command, expected, run)
+    await syncHermesModelSettings(command, expected, run, read)
     await config.apply(key)
     await assertHermesSettings(command, read, expected)
   } catch (error) {
@@ -663,13 +663,13 @@ async function applyHermesProvider(
       try {
         await replaceConfigurationTransaction(file, [{ path: backupPath, before: await file.read(backupPath), after: undefined }])
       } catch (removalError) {
-        try { await restoreHermesModelSettings(command, previous, run) } catch (rollbackError) {
+        try { await syncHermesModelSettings(command, previous, run, read) } catch (rollbackError) {
           throw new Error('AI_ACCESS_HERMES_ROLLBACK_FAILED', { cause: rollbackError })
         }
         throw new Error('AI_ACCESS_HERMES_ROLLBACK_FAILED', { cause: removalError })
       }
     }
-    try { await restoreHermesModelSettings(command, previous, run) } catch (rollbackError) {
+    try { await syncHermesModelSettings(command, previous, run, read) } catch (rollbackError) {
       throw new Error('AI_ACCESS_HERMES_ROLLBACK_FAILED', { cause: rollbackError })
     }
     throw new Error('AI_ACCESS_HERMES_CONFIG_FAILED', { cause: error })
@@ -695,7 +695,7 @@ async function applyHermesConnection(
   const createdRecoveryPoint = await captureHermesRecoveryPoint(file, envPath, backupPath, previous)
   try {
     const expected = localHermesSettings(provider, connection)
-    await writeHermesModelSettings(command, expected, run)
+    await syncHermesModelSettings(command, expected, run, read)
     await assertHermesSettings(command, read, expected)
   } catch (error) {
     // 失败的首次接管不能留下本次新建的恢复点：客户随后手工改配置再接入时，⛔ 被这份假恢复点覆盖。
@@ -703,13 +703,13 @@ async function applyHermesConnection(
       try {
         await replaceConfigurationTransaction(file, [{ path: backupPath, before: await file.read(backupPath), after: undefined }])
       } catch (removalError) {
-        try { await restoreHermesModelSettings(command, previous, run) } catch (rollbackError) {
+        try { await syncHermesModelSettings(command, previous, run, read) } catch (rollbackError) {
           throw new Error('AI_ACCESS_HERMES_ROLLBACK_FAILED', { cause: rollbackError })
         }
         throw new Error('AI_ACCESS_HERMES_ROLLBACK_FAILED', { cause: removalError })
       }
     }
-    try { await restoreHermesModelSettings(command, previous, run) } catch (rollbackError) {
+    try { await syncHermesModelSettings(command, previous, run, read) } catch (rollbackError) {
       throw new Error('AI_ACCESS_HERMES_ROLLBACK_FAILED', { cause: rollbackError })
     }
     throw new Error('AI_ACCESS_HERMES_CONFIG_FAILED', { cause: error })
@@ -834,25 +834,29 @@ function contextLength(provider: ModelProviderId, model: string): string | undef
   return value === undefined ? undefined : String(value)
 }
 
-async function writeHermesModelSettings(
+/**
+ * Hermes ≥0.21 的 `config unset` 对本就未设置的键以非零退出（"Config key not set"），
+ * 而「键应为空」在这里全部表达成 unset。因此 unset 失败后必须复核键是否确实已缺失：
+ * 已缺失即目标已达成（幂等成功）；仍存在才是真实失败。夹具按同一语义模拟真实 CLI。
+ */
+async function syncHermesModelSettings(
   command: string,
   next: HermesModelSettings,
-  run: (command: string, args: readonly string[]) => Promise<void>
+  run: (command: string, args: readonly string[]) => Promise<void>,
+  read: HermesSettingsReader
 ): Promise<void> {
   for (const key of hermesModelKeys) {
     const value = next[key]
-    await run(command, value === undefined ? ['config', 'unset', key] : ['config', 'set', key, value])
-  }
-}
-
-async function restoreHermesModelSettings(
-  command: string,
-  previous: HermesModelSettings,
-  run: (command: string, args: readonly string[]) => Promise<void>
-): Promise<void> {
-  for (const key of hermesModelKeys) {
-    const value = previous[key]
-    await run(command, value === undefined ? ['config', 'unset', key] : ['config', 'set', key, value])
+    if (value !== undefined) {
+      await run(command, ['config', 'set', key, value])
+      continue
+    }
+    try {
+      await run(command, ['config', 'unset', key])
+    } catch (error) {
+      const current = await read(command)
+      if (current[key] !== undefined) throw error
+    }
   }
 }
 

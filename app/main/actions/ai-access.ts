@@ -4,13 +4,17 @@ import type { BridgeRegistry } from '../bridge/bridge-registry'
 import { schema } from '../bridge/schema'
 import { createDeepSeekAdapters, observedConfigurationExecution } from '../ai-access/adapters'
 import { createProjectConfigurationTargetStore } from '../ai-access/configuration-target'
-import { createConfigurationExecutionObserver } from '../ai-access/configuration-execution-observer'
+import { createConfigurationExecutionObserver, configurationObservationTtlMs } from '../ai-access/configuration-execution-observer'
 import { createManagedTextFile } from '../ai-access/file'
 import { createRestartGuidanceReader, restartMessage, type ShellRestartGuidance } from '../ai-access/restart-guidance'
 import { environmentChecklist, type EnvironmentChecklistItem } from '../ai-access/environment-checklist'
 import { createAiAccessStore } from '../ai-access/store'
 import { AiAccessService, aiAccessProviders, aiAccessShells, type AiAccessProvider, type AiAccessShell } from '../ai-access/service'
 import { CodexOfficialLoginController, startCodexChatGptLogin } from '../ai-access/codex-official-login'
+import { sharedAddedOfficialAccounts } from '../ai-access/added-accounts'
+import { readCodexUsage } from '../codex-usage/client'
+import { codexAccountKey } from '../codex-usage/normalize'
+import { readClaudeOfficialAccount } from '../ai-access/official-account'
 import { AiGateway } from '../ai-access/gateway'
 import { createDesktopRouteAttestor } from '../ai-access/desktop-route-attestation'
 import { modelProviders } from '../../shared/model-providers'
@@ -38,7 +42,7 @@ const providerConfigurationSchema = schema.object({ shell: schema.string({ maxLe
 // provider 传的是**这次失败针对的**那家；桥上不给可选字段，界面拿不准就传空串走回退。
 const remedySchema = schema.object({ shell: schema.string({ maxLength: 20 }), action: schema.string({ maxLength: 20 }), provider: schema.string({ maxLength: 20 }) })
 
-type ModelApiAccessActions = Pick<AiAccessService, 'status' | 'saveProviderKey' | 'useProvider' | 'useOfficial'>
+type ModelApiAccessActions = Pick<AiAccessService, 'status' | 'saveProviderKey' | 'useProvider' | 'useOfficial' | 'cancelTests'>
 type ProjectConfigurationDirectoryPicker = () => Promise<string | undefined>
 type RestartGuidanceReader = { read(shell: AiAccessShell): Promise<ShellRestartGuidance> }
 
@@ -95,13 +99,13 @@ export function registerAiAccessActions(
       return respond(resolvedAccess.saveProviderKey(readShell(input.shell), readProvider(input.provider), input.key))
     }
   })
-  registry.registerAction({
-    name: 'aiaccess.useProvider', paramsSchema: providerShellSchema, resultSchema,
-    handler: (params) => {
-      const input = params as { readonly provider: string; readonly shell: string }
-      return respond(resolvedAccess.useProvider(readShell(input.shell), readProvider(input.provider)))
-    }
-  })
+    registry.registerAction({
+      name: 'aiaccess.useProvider', paramsSchema: providerShellSchema, resultSchema,
+      handler: (params) => {
+        const input = params as { readonly provider: string; readonly shell: string }
+        return respond(resolvedAccess.useProvider(readShell(input.shell), readProvider(input.provider)))
+      }
+    })
   registry.registerAction({
     name: 'aiaccess.useOfficial', paramsSchema: shellSchema, resultSchema,
     handler: (params) => respond(resolvedAccess.useOfficial(readShell((params as { readonly shell: string }).shell)))
@@ -141,6 +145,12 @@ export function registerAiAccessActions(
       const input = params as { shell: string; provider: string; key: string; model: string }
       return respond(resolvedAccess.configureProvider(readShell(input.shell), readProvider(input.provider), input.key, input.model))
     } })
+    // API-06：快捷 Key 表单的原子入口——候选 Key 先验证，任一步失败都回到原 Key、原模型、原路由。
+    registry.registerAction({ name: 'aiaccess.useProviderWithKey', paramsSchema: providerKeySchema, resultSchema,
+      handler: (params) => {
+        const input = params as { readonly shell: string; readonly provider: string; readonly key: string }
+        return respond(resolvedAccess.useProviderWithKey(readShell(input.shell), readProvider(input.provider), input.key))
+      } })
     registry.registerAction({ name: 'aiaccess.measureProviderLatency', paramsSchema: providerConfigurationSchema, resultSchema, handler: params => {
       const input = params as { shell: string; provider: string; key: string; model: string }
       return respond(resolvedAccess.measureProviderLatency(readShell(input.shell), readProvider(input.provider), input.key, input.model))
@@ -171,6 +181,9 @@ export function registerAiAccessActions(
       const input = params as { provider: string; shell: string }
       return respond(resolvedAccess.testProvider(readShell(input.shell), readProvider(input.provider)))
     } })
+    // API-10：服务面板「取消检查」/关闭面板时中止在飞自测请求；不进队列，堵着也能立刻生效。
+    registry.registerAction({ name: 'aiaccess.cancelServiceTests', paramsSchema: schema.undefined(), resultSchema,
+      handler: () => respond(resolvedAccess.cancelTests()) })
     registry.registerAction({ name: 'aiaccess.providerBalance', paramsSchema: providerShellSchema, resultSchema, handler: async params => {
       const input = params as { provider: string; shell: string }
       const provider = readProvider(input.provider), shell = readShell(input.shell)
@@ -313,7 +326,9 @@ export function productionAiAccessService(): AiAccessService {
   const home = app.getPath('home')
   const environment = shellInventory().environment()
   const file = createManagedTextFile()
-  const observeConfigurationExecution = createConfigurationExecutionObserver({ platform: process.platform, home })
+  // API-11：观察器结果带 10 秒时间窗——登录等待等高频 status 读取不再每轮 spawn profiles＋ps；
+  // 窗口过期或观察失败即重查，写路径判定的失效语义见 configuration-execution-observer。
+  const observeConfigurationExecution = createConfigurationExecutionObserver({ platform: process.platform, home, ttlMs: configurationObservationTtlMs })
   // Mac 使用回执（API-04）：主进程侧五个固定阶段的白名单记录；⛔ 因记录失败影响主流程。
   const usageReceipt = productionUsageReceiptRecorder()
   productionAccess = new AiAccessService(
@@ -363,26 +378,45 @@ async function pickProjectConfigurationDirectory(): Promise<string | undefined> 
 function productionCodexLogin(access: ModelApiAccessActions): CodexOfficialLoginController {
   if (!(access instanceof AiAccessService)) throw new Error('AI_ACCESS_SERVICE_INVALID')
   const home = app.getPath('home')
+  const addedAccounts = sharedAddedOfficialAccounts()
   const environment = async (): Promise<NodeJS.ProcessEnv> => ({
     ...shellInventory().environment(),
     // Finder-launched Toolbox may not inherit a terminal's CODEX_HOME. The adapter resolves the
     // same verified root used for config.toml and auth.json; it never leaves this login command.
     CODEX_HOME: await access.codexOfficialLoginRoot()
   })
+  let loginCommand: { executable: string; args: readonly string[]; environment?: NodeJS.ProcessEnv } | undefined
   return new CodexOfficialLoginController({
     findCommand: async () => {
       const commandEnvironment = await environment()
       const executable = await trustedCliExecutable('codex', process.platform, home, commandEnvironment)
-      return executable === undefined ? null : { executable, args: ['app-server', '--listen', 'stdio://'], environment: commandEnvironment }
+      const command = executable === undefined ? null : { executable, args: ['app-server', '--listen', 'stdio://'] as readonly string[], environment: commandEnvironment }
+      loginCommand = command ?? undefined
+      return command
     },
     startLogin: (command) => startCodexChatGptLogin(command, { cwd: home, openExternal: (url) => shell.openExternal(url) }),
-    useOfficial: (software) => access.useOfficial(software)
+    useOfficial: async (software) => {
+      await access.useOfficial(software)
+      // 登录完成即由主进程登记账号指纹：这是「已添加账号」的唯一来源，之后用量只对在案账号读取。
+      // 登记失败不回滚登录本身——客户再登录一次就会重新登记。
+      try {
+        const command = loginCommand
+        if (command) {
+          const { account } = await readCodexUsage(
+            { executable: command.executable, args: command.args },
+            { cwd: home, signal: new AbortController().signal, accountOnly: true, env: command.environment }
+          )
+          await addedAccounts.mark('codex', codexAccountKey(account))
+        }
+      } catch { /* 登记失败保持未登记态：用量保持门控，重新登录可修复 */ }
+    }
   })
 }
 
 function productionClaudeLogin(access: ModelApiAccessActions): ClaudeOfficialLoginController {
   if (!(access instanceof AiAccessService)) throw new Error('AI_ACCESS_SERVICE_INVALID')
   const home = app.getPath('home')
+  const addedAccounts = sharedAddedOfficialAccounts()
   const environment = (): NodeJS.ProcessEnv => {
     const env = shellInventory().environment()
     const tunnel = downloadTunnelSnapshot()
@@ -397,7 +431,17 @@ function productionClaudeLogin(access: ModelApiAccessActions): ClaudeOfficialLog
     findCommand,
     startLogin: (command) => startClaudeLogin(command, { cwd: home, env: environment(), openExternal: (url) => shell.openExternal(url),
       statusCheck: () => readClaudeAuthStatus({ executable: command.executable, args: [] }, environment()) }),
-    useOfficial: (software) => access.useOfficial(software)
+    useOfficial: async (software) => {
+      await access.useOfficial(software)
+      // 与 Codex 一致：登录完成即由主进程登记账号指纹，之后身份与用量只对在案账号读取。
+      try {
+        const executable = await trustedCliExecutable('claude-code', process.platform, home, environment())
+        if (executable) {
+          const account = await readClaudeOfficialAccount(executable, home, environment())
+          if (account.state === 'signed-in' && account.accountKey) await addedAccounts.mark('claude', account.accountKey)
+        }
+      } catch { /* 登记失败保持未登记态：用量保持门控，重新登录可修复 */ }
+    }
   })
 }
 

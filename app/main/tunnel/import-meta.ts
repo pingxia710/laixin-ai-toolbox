@@ -2,7 +2,7 @@
 // 供状态展示回读。凭据内容 ⛔ 进此文件。
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { layout, writeFileAtomic } from './paths'
+import { layout, statSignature, writeFileAtomic } from './paths'
 import { currentBatchId, pendingBatchId } from './transactions'
 
 export interface ImportMeta {
@@ -115,12 +115,40 @@ function readInfo(dataDir: string, batchId: string): CurrentInfo | undefined {
   }
 }
 
+// N-25:主进程状态路径的记忆化读。键 = 指针批次 + manifest + import-meta 三者的盘面签名,
+// 任一变化即重读解析(loadLedgerCached 同一模式;⛔ TTL 时间窗——状态读读到旧值是正确性问题)。
+// 等待循环与 status() 轮询每轮走到这里,从「全量重读重解析」降到 stat 命中。
+// 诊断计数:调用次数与真实读盘解析次数(供测试断言读取节奏)。
+const infoCache = new Map<string, { key: string; info: CurrentInfo | undefined }>()
+let importMetaReadCallCount = 0
+let importMetaDiskReadCount = 0
+
+export function importMetaReadCalls(): number {
+  return importMetaReadCallCount
+}
+
+export function importMetaDiskReads(): number {
+  return importMetaDiskReadCount
+}
+
+function readInfoCached(dataDir: string, kind: 'current' | 'pending', batchId: string | undefined): CurrentInfo | undefined {
+  importMetaReadCallCount += 1
+  const dir = batchId === undefined ? '' : layout.batchDir(dataDir, batchId)
+  const key = batchId === undefined ? 'none'
+    : `${batchId}:${statSignature(join(dir, 'manifest.json'))}:${statSignature(join(dir, 'import-meta.json'))}`
+  const cacheKey = `${dataDir}\u0000${kind}`
+  const cached = infoCache.get(cacheKey)
+  if (cached !== undefined && cached.key === key) return cached.info
+  importMetaDiskReadCount += 1
+  const info = batchId === undefined ? undefined : readInfo(dataDir, batchId)
+  infoCache.set(cacheKey, { key, info })
+  return info
+}
+
 export function readCurrentInfo(dataDir: string): CurrentInfo | undefined {
-  const batchId = currentBatchId(dataDir)
-  return batchId === undefined ? undefined : readInfo(dataDir, batchId)
+  return readInfoCached(dataDir, 'current', currentBatchId(dataDir))
 }
 
 export function readPendingInfo(dataDir: string): CurrentInfo | undefined {
-  const batchId = pendingBatchId(dataDir)
-  return batchId === undefined ? undefined : readInfo(dataDir, batchId)
+  return readInfoCached(dataDir, 'pending', pendingBatchId(dataDir))
 }

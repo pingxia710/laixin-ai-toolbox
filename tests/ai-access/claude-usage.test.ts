@@ -16,8 +16,27 @@ describe('Claude 官方客户端用量协议', () => {
     expect(calls.map(call => call.request.subtype)).toEqual(['initialize', 'get_usage'])
     expect(calls[1].request.skip_behaviors).toBe(true)
   })
-  it.each(['empty', 'invalid', 'unsupported', 'request', 'hang'])('%s 不伪造额度，也不执行其他请求', async mode => {
-    expect(await readClaudeQuota({ executable: process.execPath, args: [fixture, mode] }, tmpdir(), process.env, 300)).toEqual({ status: 'official-unavailable', plan: null })
+  // Phase 2 ④:失败原因透传,⛔ 全部归一成一句「官方暂未读到」。stderr 不再丢弃——
+  // 登录过期的客户要看到「先登录」,而不是「请确认已更新且能联网」。不伪造额度、不执行其他请求的旧判据保留。
+  it.each([
+    ['empty', undefined],
+    ['invalid', 'protocol-changed'],
+    ['unsupported', 'protocol-changed'],
+    ['request', 'protocol-changed'],
+    ['hang', 'timeout']
+  ])('%s 的失败原因如实透传,不伪造额度', async (mode, reason) => {
+    const result = await readClaudeQuota({ executable: process.execPath, args: [fixture, mode] }, tmpdir(), process.env, 300)
+    expect(result.status).toBe('official-unavailable')
+    expect(result.plan).toBeNull()
+    expect(result.reason).toBe(reason)
+  })
+  it('stderr 说登录问题时报「登录过期」，⛔ 丢进通用失败', async () => {
+    const result = await readClaudeQuota({ executable: process.execPath, args: [fixture, 'auth'] }, tmpdir(), process.env, 300)
+    expect(result).toMatchObject({ status: 'official-unavailable', reason: 'auth-required' })
+  })
+  it('可执行文件不存在报「没装好」', async () => {
+    const result = await readClaudeQuota({ executable: '/missing-claude-binary' }, tmpdir(), process.env, 300)
+    expect(result).toMatchObject({ status: 'official-unavailable', reason: 'not-installed' })
   })
   it('未知数值不按零处理，动态模型窗口保留官方名字', () => {
     const result = parseClaudeQuota({ subscription_type: 'pro', rate_limits_available: true, rate_limits: { five_hour: { utilization: '1', resets_at: 'bad' }, model_scoped: [{ display_name: '模型窗口', utilization: 40 }] } })

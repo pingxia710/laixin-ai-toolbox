@@ -48,6 +48,9 @@ it('退出后重开并已连接，旧守护的慢恢复不得还原新会话', a
   const fresh = createDaemon({ dataDir: root, runId: 'new', adapter, clock: clock(), parentAlive: () => true,
     onExit: () => {}, connectorFactory, bridgeFactory })
   await fresh.run()
+  // 启动恢复梯子改为后台跑(甲-2):run() 不再等接续连接跑完,先驱动到落定再断言
+  await vi.advanceTimersByTimeAsync(0)
+  await vi.advanceTimersByTimeAsync(0)
   const view = () => JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'))
   expect(view()).toMatchObject({ state: 'connected', runId: 'new' })
   expect(base.read({ service: 'WinINET', item: 'ProxyEnable' })).toMatchObject({ data: '1' })

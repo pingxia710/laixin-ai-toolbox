@@ -42,7 +42,7 @@ describe('常驻开关', () => {
     const store = preference(true)
     const resident = controller({ installed: true })
 
-    expect(await setResidentEnabled(store, resident.api, false, true)).toEqual({ enabled: false, supported: true, active: false })
+    expect(await setResidentEnabled(store, resident.api, false, true)).toEqual({ enabled: false, supported: true, active: false, staleResidentTask: false })
 
     expect(resident.state.uninstalls).toBe(1)
     expect(resident.state.installed).toBe(false)
@@ -63,7 +63,7 @@ describe('常驻开关', () => {
     const resident = controller({ installed: false })
 
     // 这一刻常驻还没装上(装在主进程的校准那一步),所以 active 如实是 false
-    expect(await setResidentEnabled(store, resident.api, true, true)).toEqual({ enabled: true, supported: true, active: false })
+    expect(await setResidentEnabled(store, resident.api, true, true)).toEqual({ enabled: true, supported: true, active: false, staleResidentTask: false })
 
     expect(store.value).toBe(true)
     expect(resident.state.uninstalls).toBe(0)
@@ -72,8 +72,8 @@ describe('常驻开关', () => {
   it('这台机器用不了（开发态没有常驻可装）：开关置灰，读写都如实报不支持', async () => {
     const store = preference(true)
     const resident = controller()
-    expect(await residentToggleStatus(store, resident.api, false)).toEqual({ enabled: false, supported: false, active: false })
-    expect(await setResidentEnabled(store, resident.api, false, false)).toEqual({ enabled: false, supported: false, active: false })
+    expect(await residentToggleStatus(store, resident.api, false)).toEqual({ enabled: false, supported: false, active: false, staleResidentTask: false })
+    expect(await setResidentEnabled(store, resident.api, false, false)).toEqual({ enabled: false, supported: false, active: false, staleResidentTask: false })
     expect(resident.state.uninstalls).toBe(0)
     expect(store.value).toBe(true)
   })
@@ -88,16 +88,16 @@ describe('常驻开关', () => {
     const registry = new BridgeRegistry()
     const calls: boolean[] = []
     registerDesktopActions(registry, {
-      residentEnabled: async () => ({ enabled: true, supported: true, active: true }),
-      setResidentEnabled: async (enabled: boolean) => { calls.push(enabled); return { enabled, supported: true, active: enabled } },
+      residentEnabled: async () => ({ enabled: true, supported: true, active: true, staleResidentTask: false }),
+      setResidentEnabled: async (enabled: boolean) => { calls.push(enabled); return { enabled, supported: true, active: enabled, staleResidentTask: false } },
       loginItem: () => ({ enabled: false, supported: true }),
       setLoginItem: () => ({ enabled: false, supported: true }),
       ready: async () => undefined, status: async () => ({}), launcher: { list: () => [], open: () => ({ opened: false, message: '' }) },
       checkUpdate: async () => ({}), updater: { download: async () => ({}), install: async () => ({}) }, configure: async () => ({})
     } as unknown as DesktopRuntime)
 
-    expect(await registry.execute('desktop.residentEnabled', undefined)).toEqual({ enabled: true, supported: true, active: true })
-    expect(await registry.execute('desktop.setResidentEnabled', { enabled: false })).toEqual({ enabled: false, supported: true, active: false })
+    expect(await registry.execute('desktop.residentEnabled', undefined)).toEqual({ enabled: true, supported: true, active: true, staleResidentTask: false })
+    expect(await registry.execute('desktop.setResidentEnabled', { enabled: false })).toEqual({ enabled: false, supported: true, active: false, staleResidentTask: false })
     expect(calls).toEqual([false])
     await expect(registry.execute('desktop.setResidentEnabled', { enabled: 'yes' })).rejects.toMatchObject({ code: 'ACTION_PARAMS_INVALID' })
   })
@@ -109,7 +109,7 @@ describe('常驻此刻到底武装着没有（给客户看的 active）', () => 
   it('客户选了开、但常驻没武装 → active 为假（设置页据此说「这次没生效」）', async () => {
     // 来路一：这次就没装上（目录不可写、系统限制）
     const failed = controller({ installed: false, loaded: false })
-    expect(await residentToggleStatus(store(), failed.api, true)).toEqual({ enabled: true, supported: true, active: false })
+    expect(await residentToggleStatus(store(), failed.api, true)).toEqual({ enabled: true, supported: true, active: false, staleResidentTask: false })
 
     // 来路二：装过，但描述文件被外力弄掉了（客户手工删、清理软件扫走）
     const wiped = controller({ installed: true, loaded: true })
@@ -139,7 +139,7 @@ describe('常驻此刻到底武装着没有（给客户看的 active）', () => 
     const resident = controller({ installed: true, loaded: true })
     let asked = 0
     const counted: ResidentController = { ...resident.api, loaded: async () => { asked += 1; return true } }
-    expect(await residentToggleStatus(preference(false), counted, true)).toEqual({ enabled: false, supported: true, active: false })
+    expect(await residentToggleStatus(preference(false), counted, true)).toEqual({ enabled: false, supported: true, active: false, staleResidentTask: false })
     expect(asked).toBe(0)
   })
 })
@@ -159,7 +159,7 @@ describe('拨开关的完整一次：记选择 → 校准 → 重读', () => {
 
     // 装上了 ⇒ 回给界面的必须是「已生效」。不重读的话这里会是 false，客户会看到一句
     // 「这次没能生效」，而它其实刚刚装好了 —— 反过来也一样会骗人。
-    expect(status).toEqual({ enabled: true, supported: true, active: true })
+    expect(status).toEqual({ enabled: true, supported: true, active: true, staleResidentTask: false })
     expect(order).toEqual(['calibrate:true']) // 正向证据：校准确实跑了，且只跑一次
     expect(store.value).toBe(true)
   })
@@ -171,7 +171,7 @@ describe('拨开关的完整一次：记选择 → 校准 → 重读', () => {
 
     const status = await applyResidentChoice(store, resident.api, true, true, calibrate)
 
-    expect(status).toEqual({ enabled: true, supported: true, active: false })
+    expect(status).toEqual({ enabled: true, supported: true, active: false, staleResidentTask: false })
     expect(store.value).toBe(true) // 选择留着：下次打开工具箱的启动校准还会再试
   })
 
@@ -180,7 +180,7 @@ describe('拨开关的完整一次：记选择 → 校准 → 重读', () => {
     const resident = controller()
     let calibrated = 0
     const status = await applyResidentChoice(store, resident.api, true, false, async () => { calibrated += 1 })
-    expect(status).toEqual({ enabled: false, supported: false, active: false })
+    expect(status).toEqual({ enabled: false, supported: false, active: false, staleResidentTask: false })
     expect(calibrated).toBe(0)
   })
 })

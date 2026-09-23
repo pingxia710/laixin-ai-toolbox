@@ -45,7 +45,7 @@ describe('配置一致性持续核对', () => {
     await f.service.verifyConfigurations()
 
     const stage = (await f.service.serviceStatus()).usage.find(item => item.shell === 'codex')!
-    expect(stage).toMatchObject({ configuration: 'modified-externally', observedClientCall: null })
+    expect(stage).toMatchObject({ configuration: 'modified-externally', observedClientCall: null, lastObservedClientCall: null })
     expect(f.gateway.clientAcceptances().codex).toBeUndefined()
   })
 
@@ -98,6 +98,59 @@ describe('配置一致性持续核对', () => {
     await f.service.useOfficial('codex')
     expect(await f.service.verifyConfigurations()).toMatchObject({ codex: 'not-managed' })
     expect(f.state().shellFingerprints?.codex).toBeUndefined()
+  })
+
+  // Phase 2 ⑥:切换进行到一半(claude 的托管段已摘除、状态还没落盘)时,并发核对 ⛔ 把工具箱
+  // 自己的改写看成「被外部改动」——那还会顺手作废刚攒下的客户端验收证据。核对必须进串行队列排队。
+  it('核对与切换并发时排在队列里,⛔ 半路上的改写被报成「被外部改动」', async () => {
+    const f = await connected(['claude'])
+    // 先建立一次 claude 的真实客户端调用,让「验收证据被误作废」可观察。
+    const relay = f.state().relay!
+    const response = await fetch(`${f.gateway.baseUrl}/claude/deepseek/v1/messages`, {
+      method: 'POST', headers: { authorization: `Bearer ${relay.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'deepseek-chat', messages: [{ role: 'user', content: 'fixture' }], stream: true })
+    })
+    await response.text()
+    expect(f.gateway.clientAcceptances().claude).toBeDefined()
+
+    // 切换把 claude 托管段摘除(settings.json 被移除/改写)的那一刻开闸:verify 停在闸上的那次读
+    // 会读到改写后的文件,而它手里的状态快照还是旧指纹——正是生产里「切换窗口期」的相对时序。
+    const originalFileWrite = f.file.write.bind(f.file)
+    const originalFileRemove = f.file.remove.bind(f.file)
+    let claudeRewritten = false
+    let releaseClaudeRead!: () => void
+    const claudeReadGate = new Promise<void>(resolve => { releaseClaudeRead = resolve })
+    const openGate = (): void => { if (!claudeRewritten) { claudeRewritten = true; releaseClaudeRead() } }
+    f.file.write = async (path, contents) => {
+      const result = await originalFileWrite(path, contents)
+      if (path === f.claudePath) openGate()
+      return result
+    }
+    f.file.remove = async (path) => {
+      const result = await originalFileRemove(path)
+      if (path === f.claudePath) openGate()
+      return result
+    }
+    // 只闸核对的第一次 claude 读(后续读不闸,⛔ 串行队列修复后核对本就排在切换后面)。
+    const originalFileRead = f.file.read.bind(f.file)
+    let gatedOnce = false
+    f.file.read = async (path) => {
+      if (path === f.claudePath && !gatedOnce) {
+        gatedOnce = true
+        if (!claudeRewritten) await Promise.race([claudeReadGate, new Promise(resolve => setTimeout(resolve, 2_000))])
+      }
+      return originalFileRead(path)
+    }
+
+    // 核对先入队(此刻队列为空,立刻开跑,停在 claude 的闸上);切换随后入队。
+    const verify = f.service.verifyConfigurations()
+    await new Promise(resolve => setTimeout(resolve, 5))
+    const switchClaude = f.service.useOfficial('claude')
+    const report = await verify
+    // 切换还没等完就看核对当时的结论:⛔ 用切换完成后的状态当判据(路由下线会合法清掉验收证据)。
+    expect(['ok', 'not-managed']).toContain(report.claude)
+    expect(f.faults.some(fault => fault.code === 'configuration_failed')).toBe(false)
+    await switchClaude
   })
 
   it('指纹只存哈希，状态里 ⛔ 出现配置原文或本机令牌', async () => {

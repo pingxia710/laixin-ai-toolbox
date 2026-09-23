@@ -14,17 +14,25 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createLoopbackProbeConnector, createSshSocksConnector } from './connectors.mjs'
 import { createVlessConnector } from './vless-connector.mjs'
-import { createDaemon, installCrashBailout, startPowerEvents, statePath, writeState } from './daemon-core.mjs'
+import { createDaemon, installCrashBailout, readIntent, startPowerEvents, statePath, writeState,
+  SHUTDOWN_RESTORE_RETRY_MS, SHUTDOWN_RESTORE_SLOW_MS, SHUTDOWN_RESTORE_SLOW_ROUNDS } from './daemon-core.mjs'
 import { acquireInstanceLock } from './instance-lock.mjs'
 import { guardedResidentSelfHeal, withWriteRight } from './write-right-owner.mjs'
 import { createResidentIntegrityCheck, runResidentSelfHeal } from './resident-integrity.mjs'
-import { lastIntent, ledgerFailure, loadLedger } from './ledger.mjs'
+import { ENTRY_STATUS, lastIntent, ledgerFailure, loadLedger } from './ledger.mjs'
 import { createLocalBridge } from './local-bridge.mjs'
 import { rebroadcastSettings, recoverLedger, restoreLedger, unrestoredEntries } from './restore.mjs'
 import { existsSync, readFileSync } from 'node:fs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const DEFAULT_ADAPTER = join(here, 'managed-adapter.mjs')
+
+/**
+ * N-23:一次性恢复拿写权的有界等待。基线 0 秒抢:常驻守护/另一份安装正持权(连接中、慢恢复中)时
+ * 探测即失败 exit 65,账本没机会被碰,客户界面永远「未完成(进程中断)」。改成有界等待——对齐甲-2
+ * 梯子的节奏语义:等持权方这一轮做完交出权,再做恢复;等不到仍按 TUNNEL_WRITE_RIGHT_HELD 如实回报。
+ */
+const RESTORE_WRITE_RIGHT_WAIT_MS = 15_000
 
 /**
  * W4-1(真机 2026-09-14):卸载兜底挂在「restore 退出码 ≠ 0」上,而**账本里一条设置账目都没有**时
@@ -79,7 +87,10 @@ async function settleResidentTask(dataDir, taskPath) {
   if (!wasShutdown) return
   await new Promise((resolve) => {
     const child = spawn('schtasks.exe', ['/change', '/tn', taskPath, '/disable'], { windowsHide: true, stdio: 'ignore' })
-    const timer = setTimeout(resolve, 5000)
+    // Phase 1 ③(schtasks 僵尸):超时兜底必须连孩子一起收——杀软锁注册表/命令表时 schtasks
+    // 会挂住,只 resolve 不 kill 的话守护照常退、挂着的孩子变孤儿,每次干净收尾攒一只,老机器
+    // 被拖慢。正常退出先清定时器,⛔ 走到 kill(误杀已退进程是 no-op,但路径上别依赖它)。
+    const timer = setTimeout(() => { try { child.kill() } catch { /* 尽力收,失败不挡退出 */ } resolve(undefined) }, 5000)
     child.once('exit', () => { clearTimeout(timer); resolve(undefined) })
     child.once('error', () => { clearTimeout(timer); resolve(undefined) })
   })
@@ -125,6 +136,21 @@ async function main() {
     return
   }
 
+  // N-23 先查后拿:常驻 start 先查席位,再装适配器/读账本。每分钟计划任务会把守护一遍遍拉起,
+  // 席位被占的那一票(恢复楔死期间尤其多)要在做任何重活之前就安静退出——基线先读账本再让位:
+  // 损坏账本当场被隔离重命名、白跑一轮恢复,每分钟一次的空转在恢复楔死期间反复发生。
+  // 恢复责任仍归席位上的守护(它启动时先按账本还旧账)。
+  let releaseInstance = () => undefined
+  if (command === 'start' && resident) {
+    const seat = acquireInstanceLock(dataDir, { runId: flags['run-id'] ?? '' })
+    if (!seat.acquired) {
+      process.stderr.write(`[tunnel-daemon] 同一数据目录已有守护在跑(pid ${String(seat.holder?.pid ?? '未知')}),本进程让位\n`)
+      return
+    }
+    releaseInstance = seat.release
+    process.on('exit', () => releaseInstance())
+  }
+
   const adapter = await loadAdapter(flags.adapter ?? DEFAULT_ADAPTER)
 
   // 损坏账本先走恢复流程(收敛包3·件4):成功即清标记继续;失败才致命停止并给可复制诊断。
@@ -155,7 +181,9 @@ async function main() {
     // 残留清理必须在**同一次**写入权里(P1 三轮):它在空账本时会写 ProxyEnable=0。
     // ⛔ 放在 withWriteRight 之后 —— 那时权已经交还,另一份来信正持权时这条路径仍能越权改 WinINET。
     // 空账本正是它唯一会开火的场景,而账本一写就轮不到它,所以之前的用例全绕过了这条路。
-    const guarded = withWriteRight(adapter, () => {
+    // N-23:拿权改「有界等待」——基线 0 秒抢在守护/另一份安装正持权的窗口必失败(见 RESTORE_WRITE_RIGHT_WAIT_MS)。
+    const logLine = (line) => process.stderr.write(`[tunnel-daemon] ${line}\n`)
+    const attempt = () => withWriteRight(adapter, () => {
       const inner = restoreLedger(dataDir, adapter)
       if (inner.notifyFailed) rebroadcastSettings(dataDir, adapter)
       // 空成功检查(W4-1):账本里一条设置账目都没有 = 什么都没还原过,此时还原「成功」不代表
@@ -168,7 +196,31 @@ async function main() {
           : clearOurProxyResidue(dataDir, adapter)
       } catch { residue = undefined }
       return { inner, residue }
-    }, (line) => process.stderr.write(`[tunnel-daemon] ${line}\n`))
+    }, logLine, { timeoutMs: RESTORE_WRITE_RIGHT_WAIT_MS })
+    // 甲-2:一次性恢复接上守护同款的重试梯子(同参数同语义,⛔ 另造一套)。基线是裸调一次
+    // restoreLedger,杀软短暂锁注册表这类暂时性写失败一次就 exit 65,等客户手动点「重试恢复原设置」。
+    // 暂时性 = 账本里有 restore-failed 设置条目;写权被别人占着不是暂时性(另一份安装接管着),
+    // 照旧如实回报不空转;意图文件变成 connected = 有守护正要接手「先恢复再连接」,本进程让位。
+    let guarded = attempt()
+    const settled = () => guarded.ok && unrestoredEntries(dataDir).length === 0
+    const transient = () => guarded.ok &&
+      loadLedger(dataDir).some((entry) => entry.kind === 'setting' && entry.status === ENTRY_STATUS.restoreFailed)
+    const shouldContinue = () => readIntent(dataDir)?.desired !== 'connected'
+    for (const delay of SHUTDOWN_RESTORE_RETRY_MS) {
+      if (settled() || !transient() || !shouldContinue()) break
+      logLine(`一次性恢复未完成,${String(delay / 1000)} 秒后再试`)
+      await new Promise((resolve) => { setTimeout(resolve, delay) })
+      // 甲-2 返工:醒来复查——睡的这一格里意图变成 connected = 有守护已接手「先恢复再连接」,
+      // ⛔ 不看一眼就把人家刚写下的设置当旧账还一遍(restoreLedger 认账不认人)。
+      if (!shouldContinue()) break
+      guarded = attempt()
+    }
+    for (let round = 1; !settled() && transient() && round <= SHUTDOWN_RESTORE_SLOW_ROUNDS && shouldContinue(); round += 1) {
+      logLine(`一次性恢复未完成,${String(SHUTDOWN_RESTORE_SLOW_MS / 1000)} 秒后再试(慢节奏第 ${String(round)} 轮)`)
+      await new Promise((resolve) => { setTimeout(resolve, SHUTDOWN_RESTORE_SLOW_MS) })
+      if (!shouldContinue()) break
+      guarded = attempt()
+    }
     if (!guarded.ok) {
       writeState(dataDir, { state: 'error', code: 'TUNNEL_WRITE_RIGHT_HELD',
         message: '这台电脑的网络设置正由另一个来信后台管理，本次未改动；请先退出那一份再重试恢复' })
@@ -203,22 +255,8 @@ async function main() {
   // 顶层兜底(收敛包3·件1):致命异常先恢复系统代理再退出。
   installCrashBailout({ dataDir, adapterOf: () => adapter, runId: flags['run-id'] ?? '', log: (line) => process.stderr.write(`[tunnel-daemon] ${line}\n`) })
 
-  // 常驻模式下抢守护席位:系统会在崩溃后把守护拉起来,主进程也可能同时 spawn 一个;两个并存时
-  // 后起的那个 run() 第一件事就是按账本还原——会把客户此刻正在用的代理还掉。抢不到就安静让位(退出 0,
-  // ⛔ 非零码,否则会被 KeepAlive 反复拉起打转)。
-  // 非常驻模式**不取这把锁**:那边「旧守护慢恢复 + 新守护接手」是合法并存(五轮复核建立的交接机制),
-  // 取锁会让客户重开工具箱时连不上。
-  let releaseInstance = () => undefined
-  if (command === 'start' && resident) {
-    const seat = acquireInstanceLock(dataDir, { runId: flags['run-id'] ?? '' })
-    if (!seat.acquired) {
-      process.stderr.write(`[tunnel-daemon] 同一数据目录已有守护在跑(pid ${String(seat.holder?.pid ?? '未知')}),本进程让位\n`)
-      return
-    }
-    releaseInstance = seat.release
-    process.on('exit', () => releaseInstance())
-  }
-
+  // 常驻席位已在 main() 开头先查后拿(N-23):非常驻模式**不取这把锁**——那边「旧守护慢恢复 +
+  // 新守护接手」是合法并存(五轮复核建立的交接机制),取锁会让客户重开工具箱时连不上。
   const startPpid = process.ppid
   const realClock = makeRealClock()
   const daemon = createDaemon({

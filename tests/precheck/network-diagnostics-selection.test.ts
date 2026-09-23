@@ -6,14 +6,18 @@ vi.mock('electron', () => ({ app: { getPath: () => '/tmp/laixin-fixture-unused' 
 
 const { BridgeRegistry } = await import('../../app/main/bridge/bridge-registry')
 const { registerAiAccessActions } = await import('../../app/main/actions/ai-access')
-const { registerActions } = await import('../../app/main/actions/network-diagnostics')
+const { registerActions, readSelection } = await import('../../app/main/actions/network-diagnostics')
+const { diagnosticSelectionFingerprint } = await import('../../app/main/network-diagnostics/service')
 const { AiAccessService, aiAccessShells } = await import('../../app/main/ai-access/service')
 const { AiGateway } = await import('../../app/main/ai-access/gateway')
 const { parseDiagnosticReport } = await import('../../app/renderer/src/pages/network-diagnostics')
 type Service = InstanceType<typeof AiAccessService>
 
 const services: Service[] = []
-afterEach(async () => { await Promise.all(services.splice(0).map(service => service.stop())) })
+afterEach(async () => {
+  try { await Promise.all(services.splice(0).map(service => service.stop())) }
+  finally { vi.useRealTimers() }
+})
 
 function reply(shell: 'codex' | 'claude' | 'hermes', second: boolean): Response {
   if (second) {
@@ -51,6 +55,47 @@ async function wired() {
 }
 
 describe('诊断入口读到的是这个软件真正在用的服务', () => {
+  it('新成功请求刷新诊断证据，但不改变首次验收和配置指纹', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-09-21T00:00:00.000Z'))
+    const f = await wired()
+    await f.service.saveProviderKey('codex', 'deepseek', 'sk-fixture-fresh-diagnostic-0123456789')
+    await f.service.useProvider('codex', 'deepseek')
+    const route = (await f.service.serviceStatus()).routes.find(item => item.shell === 'codex')!
+    const call = async () => {
+      const response = await fetch(`${route.baseUrl}/responses`, { method: 'POST', headers: { authorization: `Bearer ${f.state().relay!.token}` }, body: JSON.stringify({ stream: true }) })
+      await response.text()
+      return response.status
+    }
+    expect(await call()).toBe(200)
+    const before = await readSelection(f.registry, 'codex')
+    const first = (await f.service.serviceStatus()).usage.find(stage => stage.shell === 'codex')!.observedClientCall
+    vi.setSystemTime(new Date('2026-09-21T00:11:00.000Z'))
+    expect((await f.run('codex')).checks.find(check => check.id === 'application')?.code).toBe('AI_DIAG_APPLICATION_STALE')
+    expect(await call()).toBe(200)
+    expect((await f.run('codex')).checks.find(check => check.id === 'application')?.code).toBe('AI_DIAG_APPLICATION_OBSERVED')
+    expect((await f.service.serviceStatus()).usage.find(stage => stage.shell === 'codex')).toMatchObject({
+      observedClientCall: first, lastObservedClientCall: '2026-09-21T00:11:00.000Z'
+    })
+    expect(f.gateway.clientCalls().codex).toBe(first)
+    expect(diagnosticSelectionFingerprint(await readSelection(f.registry, 'codex'))).toBe(diagnosticSelectionFingerprint(before))
+  })
+
+  it.each([
+    [{}, '2026-09-21T00:00:00.000Z'],
+    [{ lastObservedClientCall: null }, null],
+    [{ lastObservedClientCall: '2026-09-21T00:11:00.000Z' }, '2026-09-21T00:11:00.000Z']
+  ])('最近成功缺省兼容首次时间，明确 null 不回退：%j', async (recent, expected) => {
+    const snapshots: Record<string, unknown> = {
+      'aiaccess.status': { shells: { codex: { selected: 'deepseek' } } },
+      'aiaccess.providerConfiguration': { endpoint: 'https://api.deepseek.com/responses' },
+      'aiaccess.serviceStatus': { running: true, usage: [{ shell: 'codex', observedClientCall: '2026-09-21T00:00:00.000Z', ...recent }] }
+    }
+    const registry = new BridgeRegistry()
+    vi.spyOn(registry, 'execute').mockImplementation(async (name: string) => ({ snapshot: JSON.stringify(snapshots[name]) }))
+    expect(await readSelection(registry, 'codex')).toMatchObject({ observedClientCall: expected })
+  })
+
   it('Codex 切到 DeepSeek 之后，诊断直接检查 DeepSeek，并把「已观察到调用」带出来', async () => {
     const f = await wired()
     await f.service.saveProviderKey('codex', 'deepseek', 'sk-fixture-diagnostic-0123456789')

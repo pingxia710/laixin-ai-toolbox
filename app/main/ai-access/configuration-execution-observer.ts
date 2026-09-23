@@ -11,15 +11,40 @@ const shells: readonly AiAccessShell[] = ['codex', 'claude', 'hermes']
 export type ConfigurationExecutionObservation = Readonly<Partial<Record<AiAccessShell, ConfigurationExecutionContext>>>
 type Presence = 'present' | 'absent' | 'unknown'
 
+type RunCommand = (command: string, args: readonly string[], options?: { readonly timeoutMs?: number }) => Promise<string>
+
 export interface ConfigurationExecutionObserverOptions {
   readonly platform: NodeJS.Platform
   readonly home: string
   /** Test seam. Production never reads configuration contents; it only checks fixed policy locations. */
   readonly policyFilePresence?: (path: string) => Promise<Presence>
   /** Test seam. Command output is classified in-process and never returned or logged. */
-  readonly run?: (command: string, args: readonly string[]) => Promise<string>
+  readonly run?: RunCommand
   /** Test seam. Production reads only bounded, regular local startup files and never executes them. */
   readonly readStartupFile?: (path: string) => Promise<string | undefined>
+  /** Test seam for the Windows process-detail cache clock and the result time window. */
+  readonly now?: () => number
+  /**
+   * API-11: a completed observation answers later calls that begin within this many milliseconds
+   * of its completion; 0 (the default) keeps the previous observe-on-every-call behavior. The
+   * window only widens the existing moment-in-time race of any single observation; a failed
+   * observation is never cached, so the next call observes again and stays fail-closed.
+   */
+  readonly ttlMs?: number
+}
+
+/** Production time window for reusing one observation across status reads. */
+export const configurationObservationTtlMs = 10_000
+
+const windowsPowerShell = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'
+/** A process keeps its executable and command line for its whole life; only PID reuse can change them. */
+const windowsProcessDetailTtlMs = 60_000
+
+interface WindowsProcessDetail {
+  readonly image: string
+  readonly path?: string
+  readonly commandLine?: string
+  readonly at: number
 }
 
 /**
@@ -32,14 +57,19 @@ export function createConfigurationExecutionObserver(options: ConfigurationExecu
   const policyFilePresence = options.policyFilePresence ?? defaultPolicyFilePresence
   const run = options.run ?? defaultRun
   const readStartupFile = options.readStartupFile ?? defaultStartupFileReader
+  const now = options.now ?? Date.now
+  const ttlMs = options.ttlMs ?? 0
+  const windowsDetails = new Map<string, WindowsProcessDetail>()
   let inFlight: Promise<ConfigurationExecutionObservation> | undefined
+  let cached: { readonly at: number; readonly value: ConfigurationExecutionObservation } | undefined
   return async () => {
+    if (cached !== undefined && now() - cached.at < ttlMs) return cached.value
     if (inFlight !== undefined) return inFlight
     const observation = (async () => {
       const [policies, startupRoots, processes] = await Promise.all([
         observeManagedPolicies(options.platform, policyFilePresence, run),
         observeStartupConfigurationRoots(options.platform, options.home, readStartupFile),
-        observeProcessOverrides(options.platform, options.home, run)
+        observeProcessOverrides(options.platform, options.home, run, windowsDetails, now)
       ])
       const result: Partial<Record<AiAccessShell, ConfigurationExecutionContext>> = {}
       for (const shell of shells) {
@@ -63,7 +93,11 @@ export function createConfigurationExecutionObserver(options: ConfigurationExecu
       return result
     })()
     inFlight = observation
-    try { return await observation } finally { if (inFlight === observation) inFlight = undefined }
+    try {
+      const value = await observation
+      cached = { at: now(), value }
+      return value
+    } finally { if (inFlight === observation) inFlight = undefined }
   }
 }
 
@@ -275,7 +309,9 @@ async function defaultStartupFileReader(path: string): Promise<string | undefine
 async function observeProcessOverrides(
   platform: NodeJS.Platform,
   home: string,
-  run: (command: string, args: readonly string[]) => Promise<string>
+  run: RunCommand,
+  windowsDetails: Map<string, WindowsProcessDetail>,
+  now: () => number
 ): Promise<ConfigurationExecutionObservation> {
   if (platform === 'darwin' || platform === 'linux') {
     try {
@@ -298,20 +334,152 @@ async function observeProcessOverrides(
     }
   }
   if (platform === 'win32') {
+    const running: Partial<Record<AiAccessShell, readonly string[]>> = {}
     try {
-      const result: Partial<Record<AiAccessShell, ConfigurationExecutionContext>> = {}
       for (const shell of shells) {
         const output = await run('C:\\Windows\\System32\\tasklist.exe', ['/FI', `IMAGENAME eq ${processName(shell)}.exe`, '/FO', 'CSV', '/NH'])
-        // Windows tasklist does not expose a trustworthy command line. A running known client is
-        // therefore an unknown launch context, not a claim that its default root will be used.
-        if (new RegExp(`"${escapeRegExp(processName(shell))}\\.exe"`, 'i').test(output)) result[shell] = { source: 'unknown' }
+        const ids = tasklistProcessIds(output, `${processName(shell)}.exe`)
+        if (ids.length > 0) running[shell] = ids
       }
-      return result
     } catch {
       return unknownAll()
     }
+    if (Object.keys(running).length === 0) return {}
+    // tasklist only has image names, and the desktop apps share them with the CLIs (Claude
+    // Desktop is `claude.exe`, the Store Codex app is `Codex.exe`). Ask where each process lives
+    // before treating it as a terminal client whose inherited environment we cannot see.
+    const images = new Map<string, string>()
+    for (const shell of shells) for (const id of running[shell] ?? []) images.set(id, `${processName(shell)}.exe`)
+    const details = await windowsProcessDetails(images, run, windowsDetails, now)
+    const result: Partial<Record<AiAccessShell, ConfigurationExecutionContext>> = {}
+    for (const shell of shells) {
+      const ids = running[shell]
+      if (ids === undefined) continue
+      let context: ConfigurationExecutionContext | undefined
+      for (const id of ids) {
+        // Unreadable details keep the previous fail-closed answer for this shell. A PID missing from
+        // a completed query has exited since tasklist ran.
+        if (details !== undefined && !details.has(id)) continue
+        const detail = details?.get(id)
+        const kind = detail === undefined ? 'unrecognized' : classifyWindowsClientProcess(shell, detail.path, home)
+        if (kind === 'desktop-app') continue
+        if (kind === 'cli' && launchOverridesConfiguration(shell, detail?.commandLine ?? '')) {
+          context = { source: 'observed', commandLine: true }
+          break
+        }
+        context = { source: 'unknown' }
+      }
+      if (context !== undefined) result[shell] = context
+    }
+    return result
   }
   return unknownAll()
+}
+
+export type WindowsClientProcessKind = 'desktop-app' | 'cli' | 'unrecognized'
+
+/**
+ * Classifies a running Windows process by where its executable lives. Desktop apps are started by
+ * the Windows shell (Start menu, taskbar, tray, protocol) and read the user's normal configuration
+ * root, which the Toolbox observes from the same user environment; macOS applies the same
+ * path-based rule to Claude.app. Terminal CLIs may carry an unobservable per-session environment.
+ * Anything else stays unrecognized so callers keep the fail-closed answer.
+ */
+export function classifyWindowsClientProcess(shell: AiAccessShell, executablePath: string | undefined, home: string): WindowsClientProcessKind {
+  if (executablePath === undefined || executablePath === '') return 'unrecognized'
+  const path = normalizedWindowsPath(executablePath)
+  const user = normalizedWindowsPath(home)
+  const local = `${user}/appdata/local/`
+  const roaming = `${user}/appdata/roaming/`
+  // MSIX packages (Microsoft Store Codex, Claude Desktop) run from a WindowsApps volume folder.
+  // `%LOCALAPPDATA%\Microsoft\WindowsApps` only holds execution aliases, never the real image.
+  const packaged = /\/windowsapps\/[^/]+\//.test(path) && !path.startsWith(`${local}microsoft/windowsapps/`)
+  if (shell === 'claude') {
+    if (packaged || path.startsWith(`${local}anthropicclaude/`) ||
+      path.startsWith(`${roaming}claude/claude-code/`) || path.startsWith(`${local}claude-3p/claude-code/`) ||
+      path.startsWith(`${local}packages/claude_pzs8sxrjxfjjc/`)) return 'desktop-app'
+    if (path === `${user}/.local/bin/claude.exe` || path.startsWith(`${user}/.local/share/claude/`) ||
+      path.includes('/node_modules/@anthropic-ai/claude-code') || path.includes('/winget/packages/anthropic.claudecode')) return 'cli'
+    return 'unrecognized'
+  }
+  if (shell === 'codex') {
+    if (packaged) return 'desktop-app'
+    if (path.includes('/node_modules/@openai/codex/') || path.includes('/winget/packages/openai.codex')) return 'cli'
+    return 'unrecognized'
+  }
+  if (path.startsWith(`${user}/.hermes/hermes-agent/apps/desktop/release/`)) return 'desktop-app'
+  if (path.startsWith(`${user}/.hermes/hermes-agent/venv/`) || path.startsWith(`${user}/.hermes/bin/`) ||
+    path.startsWith(`${local}hermes/hermes-agent/venv/`)) return 'cli'
+  return 'unrecognized'
+}
+
+function normalizedWindowsPath(value: string): string {
+  return value.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+}
+
+function tasklistProcessIds(output: string, image: string): readonly string[] {
+  const ids: string[] = []
+  for (const line of output.split(/\r?\n/)) {
+    const match = /^"([^"]+)","(\d{1,10})"/.exec(line.trim())
+    if (match !== null && match[1].toLowerCase() === image.toLowerCase()) ids.push(match[2])
+  }
+  return ids
+}
+
+/**
+ * Executable path and command line for the listed PIDs, read through the fixed system PowerShell.
+ * Details are cached per PID and image name: a live process never changes either value, so a tray
+ * app does not spawn PowerShell on every status read. Returns undefined when the query cannot be
+ * completed or its output is not exactly the expected shape.
+ */
+async function windowsProcessDetails(
+  images: ReadonlyMap<string, string>,
+  run: RunCommand,
+  cache: Map<string, WindowsProcessDetail>,
+  now: () => number
+): Promise<ReadonlyMap<string, WindowsProcessDetail> | undefined> {
+  const at = now()
+  // A quit desktop app and a newly started CLI can share an image name and even a recycled PID.
+  // Reuse details only while every image still has exactly the PID set we queried; any change
+  // (a process ended or started) requeries that image instead of trusting an older answer.
+  const currentSets = new Map<string, string>()
+  for (const [id, image] of images) currentSets.set(image.toLowerCase(), [...(currentSets.get(image.toLowerCase())?.split(',') ?? []), id].sort().join(','))
+  const cachedSets = new Map<string, string>()
+  for (const [id, detail] of cache) cachedSets.set(detail.image.toLowerCase(), [...(cachedSets.get(detail.image.toLowerCase())?.split(',') ?? []), id].sort().join(','))
+  for (const [id, detail] of cache) {
+    const image = images.get(id)
+    if (image === undefined || image.toLowerCase() !== detail.image.toLowerCase() || at - detail.at > windowsProcessDetailTtlMs ||
+      cachedSets.get(image.toLowerCase()) !== currentSets.get(image.toLowerCase())) cache.delete(id)
+  }
+  const missing = [...images.keys()].filter(id => !cache.has(id))
+  if (missing.length > 0) {
+    const script = [
+      "$ErrorActionPreference='Stop'",
+      '[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false)',
+      `$items=@(Get-CimInstance -ClassName Win32_Process -Filter '${missing.map(id => `ProcessId=${id}`).join(' OR ')}' | ForEach-Object { [pscustomobject]@{ id=[string]$_.ProcessId; image=$_.Name; path=$_.ExecutablePath; line=$_.CommandLine } })`,
+      'ConvertTo-Json -InputObject $items -Compress'
+    ].join('; ')
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(await run(windowsPowerShell, ['-NoProfile', '-NonInteractive', '-Command', script], { timeoutMs: 15_000 }))
+    } catch {
+      return undefined
+    }
+    if (!Array.isArray(parsed)) return undefined
+    const fresh: Array<[string, WindowsProcessDetail]> = []
+    for (const item of parsed) {
+      if (typeof item !== 'object' || item === null) return undefined
+      const { id, image, path, line } = item as Record<string, unknown>
+      if (typeof id !== 'string' || !missing.includes(id) || typeof image !== 'string' ||
+        (path !== null && path !== undefined && typeof path !== 'string') ||
+        (line !== null && line !== undefined && typeof line !== 'string')) return undefined
+      // PID reused by another program between tasklist and this query: not the client we saw.
+      if (image.toLowerCase() !== images.get(id)?.toLowerCase()) continue
+      fresh.push([id, { image, ...(typeof path === 'string' ? { path } : {}), ...(typeof line === 'string' ? { commandLine: line } : {}), at }])
+    }
+    for (const [id, detail] of fresh) cache.set(id, detail)
+  }
+  return cache
 }
 
 function knownClientInvocation(shell: AiAccessShell, line: string, home: string, platform: NodeJS.Platform): boolean {
@@ -381,8 +549,8 @@ async function defaultPolicyFilePresence(path: string): Promise<Presence> {
   }
 }
 
-async function defaultRun(command: string, args: readonly string[]): Promise<string> {
-  const { stdout } = await execFile(command, [...args], { encoding: 'utf8', timeout: 2_000, maxBuffer: 256 * 1024, windowsHide: true })
+async function defaultRun(command: string, args: readonly string[], options?: { readonly timeoutMs?: number }): Promise<string> {
+  const { stdout } = await execFile(command, [...args], { encoding: 'utf8', timeout: options?.timeoutMs ?? 2_000, maxBuffer: 256 * 1024, windowsHide: true })
   return stdout
 }
 

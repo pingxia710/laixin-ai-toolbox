@@ -74,15 +74,18 @@ function openApiService(api: AiAccessApi, shell: ApiShell, provider: ModelProvid
   const notice = node('p', '', 'platform-notice'); notice.setAttribute('role', 'status'); notice.setAttribute('aria-live', 'polite')
   const actions = node('div', '', 'platform-actions')
   const refresh = node('button', '刷新状态', 'secondary-action'); refresh.type = 'button'; refresh.onclick = () => { void load() }
-  const test = node('button', '测试接口与工具调用', 'primary-action'); test.type = 'button'; test.onclick = () => { void load(true) }
+  // API-10：检查等待中同一颗按钮变成「取消检查」，中止在飞的自测请求；关面板也一样生效。
+  const test = node('button', '测试接口与工具调用', 'primary-action'); test.type = 'button'
+  test.onclick = () => { if (busy && probeInFlight) cancelProbe(); else void load(true) }
   actions.append(refresh, test)
-  dialog.append(header, tabs, notice, content, actions, node('p', '测试会发送两次小型请求，按服务商规则计费，不操作你的文件。使用 API 时须保持工具箱运行；关闭此面板不影响服务。', 'platform-muted'))
+  dialog.append(header, tabs, notice, content, actions, node('p', '测试会发送两次小型请求，按服务商规则计费，不操作你的文件。使用 API 时须保持工具箱运行；检查等待中可点「取消检查」或关闭此面板中止，已发出的请求可能仍按服务商规则计费，面板本身的服务不受影响。', 'platform-muted'))
   let tab = initial
   let snapshot: ApiServiceSnapshot | null = null
   let configuration: { endpoint: string; model: string } | null = null
   let balance: { supported: boolean; total: number | null; currency: string } | null = null
   let serviceRemedy: ApiRemedyResult | null = null
   let busy = false
+  let probeInFlight = false
   let disposed = false
   for (const [value, label] of [['service','服务配置'], ['statistics','统计与诊断']] as const) {
     const button = node('button', label, 'secondary-action'); button.type = 'button'; button.dataset.serviceTab = value
@@ -91,8 +94,12 @@ function openApiService(api: AiAccessApi, shell: ApiShell, provider: ModelProvid
   const render = (): void => {
     if (disposed) return
     tabs.querySelectorAll<HTMLButtonElement>('button').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.serviceTab === tab)))
-    refresh.disabled = busy; test.disabled = busy || !api.testProvider
-    test.textContent = busy ? '正在检查…' : '测试接口与工具调用'
+    refresh.disabled = busy
+    if (busy && probeInFlight) {
+      test.disabled = false; test.textContent = '取消检查'
+    } else {
+      test.disabled = busy || !api.testProvider; test.textContent = '测试接口与工具调用'
+    }
     content.replaceChildren()
     if (!snapshot) { content.append(node('p', '尚未读取到服务状态。', 'platform-muted')); return }
     const route = snapshot.routes.find(r => r.shell === shell && r.provider === provider)
@@ -108,7 +115,10 @@ function openApiService(api: AiAccessApi, shell: ApiShell, provider: ModelProvid
         onSettled: result => { serviceRemedy = result; void load() } })
       if (control) content.append(control)
     }
-    const checked = !check ? '尚未测试' : check.ok ? '模型回复、工具调用及流式返回已通过' : apiFailureMessage(check.code ?? 'invalid_reply', provider)
+    // 取消的检查用取消交代整行呈现（⛔ 再叠「在 AI 里按了停止」的客户端口径）；其余失败带出 notice。
+    const checked = !check ? '尚未测试' : check.ok ? '模型回复、工具调用及流式返回已通过'
+      : check.code === 'client_aborted' && check.notice ? check.notice
+      : `${apiFailureMessage(check.code ?? 'invalid_reply', provider)}${check.notice ? ` ${check.notice}` : ''}`
     content.append(node('p', `${checked}${check ? ` · ${new Date(check.at).toLocaleString()}` : ''}`, 'platform-notice'))
     if (tab === 'service') {
       const facts = node('dl', '', 'platform-facts')
@@ -137,9 +147,15 @@ function openApiService(api: AiAccessApi, shell: ApiShell, provider: ModelProvid
       content.append(list)
     }
   }
+  const cancelProbe = (): void => {
+    // 与计费提示同一口径：中止的是「等结果」，已发出的请求服务商可能照规则计费。
+    notice.textContent = '已取消检查，正在中止在飞的自测请求；已发出的请求可能仍按服务商规则计费。'
+    void api.cancelServiceTests().catch(() => undefined)
+  }
   const load = async (probe = false): Promise<void> => {
     if (busy || disposed) return
-    busy = true; notice.textContent = probe ? '正在向所选服务商发送测试请求，请稍候…' : ''; render()
+    busy = true; probeInFlight = probe
+    notice.textContent = probe ? '正在向所选服务商发送测试请求，请稍候…' : ''; render()
     try {
       const result = await (probe ? api.testProvider({ shell, provider }) : api.serviceStatus())
       const value = readServiceSnapshot(result.snapshot)
@@ -159,9 +175,15 @@ function openApiService(api: AiAccessApi, shell: ApiShell, provider: ModelProvid
       } catch { /* Show the live route, or an explicit unknown when metadata could not be read. */ }
       if (!disposed) { snapshot = value; notice.textContent = probe ? '检查已结束，结果如下。' : '' }
     } catch { if (!disposed) { snapshot = null; notice.textContent = '服务状态读取失败，请重试；这不是“没有用量”。' } }
-    finally { busy = false; render() }
+    finally { busy = false; probeInFlight = false; render() }
   }
-  const dispose = (): void => { if (disposed) return; disposed = true; dialog.remove(); if (priorFocus?.isConnected) priorFocus.focus() }
+  const dispose = (): void => {
+    if (disposed) return
+    disposed = true
+    // API-10：面板开着时的在飞自测请求随关闭一起中止，不留一个长等待的尾巴在后台占队列。
+    if (probeInFlight) void api.cancelServiceTests().catch(() => undefined)
+    dialog.remove(); if (priorFocus?.isConnected) priorFocus.focus()
+  }
   dialog.addEventListener('close', dispose)
   document.body.append(dialog); dialog.showModal(); close.focus(); render(); void load()
   return dispose

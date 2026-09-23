@@ -198,15 +198,15 @@
       "platform": "macos",
       "architecture": "arm64",
       "type": "external-entry",
-      "officialPageUrl": "https://claude.com/download?utm_source=claude_code&utm_medium=docs",
-      "allowedHosts": ["claude.com", "code.claude.com"],
+      "officialPageUrl": "https://code.claude.com/docs/zh-CN/setup",
+      "allowedHosts": ["code.claude.com"],
       "version": "official-current",
-      "officialVersionLabel": "Anthropic 官方 Claude Code 安装页",
+      "officialVersionLabel": "Anthropic 官方 Claude Code 命令行版安装页（中文）",
       "approval": {
-        "approvedAt": "2026-09-11T00:00:00+08:00",
+        "approvedAt": "2026-09-16T00:00:00+08:00",
         "approvedBy": "来信 AI 工具箱",
-        "sourceBuild": "official-install-page",
-        "scope": "工具箱只打开 Anthropic 官方安装说明页，不代替客户执行命令或确认安装完成。"
+        "sourceBuild": "official-cli-setup-page-zh-cn",
+        "scope": "工具箱只打开 Anthropic 官方 Claude Code 命令行版中文安装页（不是 Claude 桌面版下载页；桌面版不能用模型 API Key），不代替客户执行命令或确认安装完成。"
       }
     },
     {

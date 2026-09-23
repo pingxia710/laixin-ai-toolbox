@@ -260,6 +260,22 @@ p { line-height: 1.75; }
 .breadcrumb strong { overflow: hidden; color: var(--ink); font-weight: 560; text-overflow: ellipsis; white-space: nowrap; }
 .topbar-right { display: flex; flex-shrink: 0; align-items: center; gap: 12px; }
 .build-tag { padding: 5px 8px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface-soft); color: var(--muted); font-size: 12px; white-space: nowrap; }
+/* 顶栏更新入口。安静态跟随 .build-tag 的视觉重量(同一块区域,⛔ 两种语言);
+   只有「已备好」升到实心强调 —— 那是唯一一个点下去就能装上的状态。
+   实心态跟 .button-primary 同一组:accent 底 + on-accent 字。⛔ 硬编码白字:
+   白字/accent-strong 只在浅色过 AA(5.71:1),dark 1.86、console 2.60、classic-dark 1.81
+   全不达标,而主题是设置页可选、「跟随系统」开箱即深色。accent+on-accent 五套主题全过
+   (最浅 4.52)。安静态 muted/surface-soft 五主题 4.72–7.90,hover accent-strong 字
+   4.72 主题全过;⛔ accent/accent-soft 那组(4.03:1,12px 小字不达标)。 */
+.update-entry { padding: 5px 10px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface-soft); color: var(--muted); font: inherit; font-size: 12px; white-space: nowrap; cursor: pointer; }
+.update-entry:hover { border-color: var(--accent-strong); color: var(--accent-strong); }
+.update-entry:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.update-entry.is-ready { border-color: var(--accent); background: var(--accent); color: var(--on-accent); font-weight: 650; }
+.update-entry.is-ready:hover { border-color: var(--accent-strong); background: var(--accent-strong); }
+@media (prefers-reduced-motion: no-preference) {
+  .update-entry { transition: color .18s var(--ease-out), border-color .18s var(--ease-out), background .18s var(--ease-out); }
+  .update-entry:active { transform: translateY(1px); }
+}
 
 
 .workspace-content { width: 100%; max-width: 1250px; margin: 0 auto; padding: 24px 30px 32px; }
@@ -272,7 +288,7 @@ p { line-height: 1.75; }
 #tab-panel h2 + p { margin-top: 8px; }
 #tab-panel h3 { font-size: 16px; }
 #tab-panel h4 { margin: 0 0 12px; font-size: 14px; }
-#tab-panel button, .account-shortcut, .recovery-dialog button { min-height: 40px; padding: 9px 14px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--ink); font: inherit; font-size: 14px; font-weight: 580; line-height: 1.45; }
+#tab-panel button, .recovery-dialog button { min-height: 40px; padding: 9px 14px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--ink); font: inherit; font-size: 14px; font-weight: 580; line-height: 1.45; }
 #tab-panel .primary-action, #tab-panel .button-primary, .recovery-dialog .primary-action { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 #tab-panel button:disabled { color: var(--muted); background: var(--surface-soft); cursor: not-allowed; opacity: .65; }
 #tab-panel .text-action { border: 0; padding-inline: 0; background: transparent; color: var(--accent); }
@@ -563,7 +579,7 @@ a { color: var(--accent); }
 }
 @media (hover: hover) and (pointer: fine) {
   .tab:not(.is-active):hover { background: var(--surface); color: var(--ink); }
-  #tab-panel button:not(:disabled):hover, .account-shortcut:hover { border-color: var(--accent); }
+  #tab-panel button:not(:disabled):hover { border-color: var(--accent); }
   #tab-panel .primary-action:not(:disabled):hover, .recovery-dialog .primary-action:not(:disabled):hover { background: var(--accent-strong); }
   button:not(:disabled):not(:focus-visible):active { transform: scale(.98); }
 }
@@ -668,6 +684,20 @@ a { color: var(--accent); }
 .technical-details[open] > summary { color: var(--ink); }
 .terminal-command { display: block; max-width: 100%; overflow-wrap: anywhere; padding: 10px 12px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-soft); color: var(--ink); font-size: 12px; line-height: 1.55; white-space: pre-wrap; }
 .network-diagnostics { margin-top: 0; }
+.diagnostic-conclusion { margin-top: 14px; padding: 16px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-soft); }
+.diagnostic-conclusion[data-status='blocked'] { border-color: color-mix(in srgb, var(--warning) 32%, var(--line)); }
+.diagnostic-conclusion[data-status='clear'] { border-color: color-mix(in srgb, var(--positive) 28%, var(--line)); }
+.diagnostic-conclusion-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.diagnostic-conclusion-heading h3 { margin: 0; font-size: 14px; }
+.diagnostic-conclusion-title { display: block; margin-top: 13px; color: var(--ink); font-size: 16px; line-height: 1.5; }
+.diagnostic-conclusion-summary { margin-top: 7px; color: var(--muted); font-size: 13px; line-height: 1.65; }
+.diagnostic-conclusion-facts { display: grid; gap: 10px; margin-top: 14px; }
+.diagnostic-conclusion-facts > div { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 10px; }
+.diagnostic-conclusion-facts dt { color: var(--muted); font-size: 12px; font-weight: 650; }
+.diagnostic-conclusion-facts dd { margin: 0; color: var(--ink); font-size: 13px; line-height: 1.6; }
+.diagnostic-conclusion-facts ul { margin: 0; padding-left: 18px; }
+.diagnostic-conclusion-facts li + li { margin-top: 5px; }
+.diagnostic-conclusion-meta { margin-top: 12px; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
 .diagnostic-checks { list-style: none; padding: 0; margin: 12px 0; }
 .diagnostic-checks li { padding: 12px 0; border-top: 1px solid var(--line); }
 .diagnostic-check-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
@@ -722,6 +752,8 @@ a { color: var(--accent); }
 .desktop-alerts button { text-align: left; color: var(--accent); }
 .settings-group progress { width: 100%; margin-bottom: 12px; }
 .settings-group .action-row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+.settings-group .diagnostic-actions-row { flex-wrap: wrap; }
+.settings-group .diagnostic-actions-row > p { flex: 1 1 260px; }
 
 .diagnostics-output { max-height: 320px; overflow: auto; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-all; }
 .account-peak-note { font-weight: 600; }

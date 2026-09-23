@@ -42,7 +42,7 @@ export function buildDiagnosticsText(input: DiagnosticsInput): string {
   }
   if (input.network) {
     lines.push('连通检查：')
-    const layers = (input.network.layers ?? input.network.results ?? input.network.steps) as unknown
+    const layers = (input.network.layers ?? input.network.results ?? input.network.steps ?? input.network.checks) as unknown
     if (Array.isArray(layers)) for (const layer of layers) lines.push(`  - ${str((layer as Record<string, unknown>).label ?? (layer as Record<string, unknown>).id)}：${str((layer as Record<string, unknown>).state ?? (layer as Record<string, unknown>).status)} ${str((layer as Record<string, unknown>).detail ?? (layer as Record<string, unknown>).message)}`)
     else lines.push(`  ${str(input.network)}`)
   }
@@ -50,7 +50,7 @@ export function buildDiagnosticsText(input: DiagnosticsInput): string {
   lines.push('【已装的 AI】')
   for (const shell of input.shells ?? []) {
     const installed = shell.installed === true ? `已装 ${str(shell.version)}` : shell.installed === false ? '未装' : '无法判断'
-    lines.push(`${str(shell.label)}：${installed}${shell.latest ? ` · 最新 ${str(shell.latest)}` : ''}${shell.updatable ? ' · 可更新' : ''}${shell.location ? ` · ${str(shell.location)}` : ''}`)
+    lines.push(`${str(shell.label)}：${installed}${shell.latest ? ` · 最新 ${str(shell.latest)}` : ''}${shell.updatable ? ' · 可更新' : ''}${shell.location ? ` · ${str(shell.location)}` : ''}${shell.claudeDesktop === true ? ' · 另装有 Claude 桌面版（不能用模型 API Key）' : ''}`)
   }
   if (input.install && input.install.phase !== 'idle') lines.push(`最近安装任务：${str(input.install.shell)} ${str(input.install.phase)} ${str(input.install.message)}`)
   lines.push('')

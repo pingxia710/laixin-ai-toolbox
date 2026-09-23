@@ -12,3 +12,5 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   const result = input.request.subtype === 'get_usage' ? mode === 'empty' ? { rate_limits_available: false, rate_limits: null } : usage : {}
   process.stdout.write(JSON.stringify({ type: 'control_response', response: { subtype: mode === 'unsupported' ? 'error' : 'success', request_id: input.request_id, response: result, error: mode === 'unsupported' ? 'fixture-private' : undefined } }) + '\n')
 })
+// Phase 2 ④:登录过期形态——stderr 带登录提示后退出,什么协议输出都没有。
+if (mode === 'auth') { process.stderr.write('Invalid API key · Please run /login to authenticate\n'); process.exit(1) }

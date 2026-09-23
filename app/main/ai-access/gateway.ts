@@ -21,10 +21,27 @@ type ProviderFailureDetail = { readonly code: ApiFailure; readonly recoveryNotic
 const paths: Record<ApiShell, string> = { codex: 'responses', claude: 'messages', hermes: 'chat/completions' }
 const maximumBody = 32 * 1024 * 1024
 const maximumConcurrentClients = 16
+/**
+ * 转发路径（非测速）的空闲超时：上游这么久一字节都没有才判 timeout；只要还在出字就不掐
+ * （API-08：一次性总时长会把正常出字到第 10 分钟的长回答硬掐断）。⛔ 测速超时另见 probeTimeoutMs。
+ */
+const gatewayIdleTimeoutMs = 600_000
+/**
+ * 测速路径（source:'test'）的一次性总超时。服务商黑洞时客户的等待以它为界（API-10：45 秒→15 秒）；
+ * 探测两轮串行，最坏 2×它。取消走 cancelTests()，不等超时。
+ */
+const probeTimeoutMs = 15_000
 /** 客户端内建的立即重试通常会连续发 8 次；30 秒足以止住风暴，改 Key/路由会换 revision 立即失效。 */
 const clientRetryBlockWindowMs = 30_000
 const retryBlockedClientFailures = new Set<ApiFailure>([
   'key_rejected', 'key_product_mismatch',
+  // Phase 1(429 短窗):上游自家 429(classify→rate_limited)基线不在白名单——客户端内建
+  // 的连发重试(通常 8 次)全额直打,正撞在限流枪口上。入列后同绑定 30s 内本地理应答,
+  // 状态仍是 429(shell 自己的退避语义不变),换 Key/路由换 revision 立即失效。
+  'rate_limited',
+  // Phase 1(429 短窗):上游自家 429(classify→rate_limited)基线不在白名单——客户端内建
+  // 的连发重试(通常 8 次)全额直打,正撞在限流枪口上。入列后同绑定 30s 内本地理应答,
+  // 状态仍是 429(shell 自己的退避语义不变),换 Key/路由换 revision 立即失效。
   'membership_quota_exhausted', 'membership_concurrency_limited', 'membership_rate_limited',
   'coding_plan_expired', 'coding_plan_quota_exhausted', 'coding_plan_model_unavailable', 'coding_plan_key_product_mismatch'
 ])
@@ -63,6 +80,12 @@ export class AiGateway {
   private records: ApiRequestRecord[] = []
   private startedAt: string | null = null
   private controllers = new Set<AbortController>()
+  /** 在飞的测速请求（source:'test'）；cancelTests() 只中止这一类，⛔ 不碰客户端在飞请求。 */
+  private testControllers = new Set<AbortController>()
+  /** 被客户/界面主动取消的测速请求：计类为 client_aborted，⛔ 与超时、网络故障混谈。 */
+  private cancelledTestControllers = new WeakSet<AbortController>()
+  /** stop() 正在关停:此时中止在途请求是工具箱自己的动作(Phase 2 ⑧),⛔ 记成 network_error。 */
+  private stopping = false
   /** 客户端调用只在仍匹配当前路由版本时才算验收通过。 */
   private readonly acceptance = new ClientAcceptanceTracker()
   /** Codex Desktop has a stricter proof than a generic native/CLI client call. */
@@ -86,6 +109,7 @@ export class AiGateway {
 
   async start(port: number, token: string): Promise<number> {
     if (this.server?.listening) return Number(new URL(this.baseUrl!).port)
+    this.stopping = false
     const server = createServer((req, res) => { void this.handle(req, res).catch(() => { if (!res.headersSent) sendError(res, 500, 'upstream_error'); else res.destroy() }) })
     server.requestTimeout = 60_000
     server.headersTimeout = 15_000
@@ -143,11 +167,22 @@ export class AiGateway {
     }
   }
   async stop(): Promise<void> {
+    this.stopping = true
     for (const controller of this.controllers) controller.abort()
     const server = this.server
     this.server = undefined; this.baseUrl = null; this.token = ''; this.routes = []
     this.acceptance.clear(); this.desktopAcceptance.clear(); this.timeoutRuns.clear(); this.retryBlocks.clear(); this.usageAcceptedRevisions.clear()
     if (server) await new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections() })
+  }
+
+  /**
+   * API-10：中止在飞的测速请求（服务面板「取消检查」/关闭面板）。被中止的请求按 client_aborted
+   * 计类——那是客户不等的决定，⛔ 记成网络故障。返回被中止的请求数；没有在飞请求时是 0。
+   */
+  cancelTests(): number {
+    let cancelled = 0
+    for (const controller of this.testControllers) { this.cancelledTestControllers.add(controller); controller.abort(); cancelled++ }
+    return cancelled
   }
 
   /**
@@ -162,11 +197,14 @@ export class AiGateway {
     const first = await this.request(route, probeBody(route.shell), 'test', undefined, undefined, {}, false, true)
     if (!first.record.ok) return { ok: false, code: first.record.code }
     const followup = toolResultBody(route.shell, first.json)
-    if (!followup) return first.completedAnswer
-      ? { ok: true, ...(first.firstTextMs === null ? {} : { firstTextMs: first.firstTextMs }) }
-      : { ok: false, code: 'tool_call_failed' }
+    if (!followup) {
+      if (!first.completedAnswer) return { ok: false, code: 'tool_call_failed' }
+      this.clearRetryBlock(route)
+      return { ok: true, ...(first.firstTextMs === null ? {} : { firstTextMs: first.firstTextMs }) }
+    }
     const second = await this.request(route, followup, 'test')
     if (!second.record.ok || !second.completedAnswer) return { ok: false, code: second.record.code ?? 'tool_call_failed' }
+    this.clearRetryBlock(route)
     return { ok: true, ...(second.firstTextMs === null ? {} : { firstTextMs: second.firstTextMs }) }
   }
 
@@ -176,8 +214,20 @@ export class AiGateway {
     const body = route.shell === 'codex' ? { input: [message], stream: true, max_output_tokens: 64 }
       : { messages: [message], stream: true, max_tokens: 64 }
     const result = await this.request(route, body, 'test')
-    return result.record.ok && result.firstTextMs !== null ? { ok: true, latencyMs: result.firstTextMs }
-      : { ok: false, latencyMs: null, code: result.record.code ?? 'invalid_reply' }
+    if (result.record.ok && result.firstTextMs !== null) {
+      this.clearRetryBlock(route)
+      return { ok: true, latencyMs: result.firstTextMs }
+    }
+    return { ok: false, latencyMs: null, code: result.record.code ?? 'invalid_reply' }
+  }
+
+  /** 工具箱自己刚用同一条绑定真实打通上游（探测/测速成功）：这条路由上为客户端记下的
+   * 短路已过时，立即失效——「测试已通过/重新启用成功」后客户端不再继续吃到缓存错误。
+   * 绑定不一致（测的是另一家或另一把 Key）不清，⛔ 替别的路由放行。 */
+  clearRetryBlock(route: GatewayRoute): void {
+    const active = this.routes.find(item => item.shell === route.shell)
+    if (active === undefined || !sameRouteBinding(active, route)) return
+    if (active.revision !== undefined) this.retryBlocks.delete(active.revision)
   }
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -238,7 +288,8 @@ export class AiGateway {
       const chunks: Buffer[] = []
       for await (const chunk of req) {
         size += chunk.length
-        if (size > maximumBody) { sendError(res, 413, 'invalid_reply'); return }
+        // 本机转发上限，不是「接口无有效回复」：如实说超出上限，并把这次请求留进面板与故障记录。
+        if (size > maximumBody) { sendError(res, 413, 'payload_too_large'); this.recordShortCircuitedClientFailure(route, 'payload_too_large', 413); return }
         chunks.push(chunk)
       }
       let body: Json
@@ -265,20 +316,34 @@ export class AiGateway {
     let recoveryNotice: string | undefined
     let completedAnswer = false
     let timedOut = false
+    let replyTooLarge = false
     let upstreamCompleted = false
-    const timeout = setTimeout(() => { timedOut = true; controller.abort() }, this.options.timeoutMs ?? (source === 'test' ? 45_000 : 600_000))
+    // 空闲超时：每收到上游一段数据就重置计时，只有真空闲达到上限才中止（API-08）。
+    // 测速路径（source === 'test'）保持一次性总超时，上限是 probeTimeoutMs（API-10：45 秒→15 秒）。
+    let sawUpstreamData = false
+    let idleTimer: ReturnType<typeof setTimeout> | undefined
+    const armIdleTimer = (): void => {
+      clearTimeout(idleTimer)
+      idleTimer = setTimeout(() => { timedOut = true; controller.abort() }, this.options.timeoutMs ?? (source === 'test' ? probeTimeoutMs : gatewayIdleTimeoutMs))
+    }
+    const noteUpstreamActivity = (): void => { sawUpstreamData = true; if (source !== 'test') armIdleTimer() }
+    armIdleTimer()
     // 客户自己在 AI 里停下（按 Esc、关掉窗口）会断开这条连接，中止随之而来。这不是「连不上服务商」，
     // ⛔ 记成网络故障——那会把客服的排查引到网络上去。
     let clientGone = false
     const noteClientGone = (): void => { if (downstream && !downstream.writableEnded && !downstream.writableFinished) clientGone = true }
     downstream?.once('close', noteClientGone)
-    if (!controllerAlreadyTracked) this.controllers.add(controller)
+    if (!controllerAlreadyTracked) {
+      this.controllers.add(controller)
+      if (source === 'test') this.testControllers.add(controller)
+    }
     try {
       const headers: Record<string, string> = { 'user-agent': 'Laixin-AI-Toolbox (connection-check)', ...forwardedHeaders, 'content-type': 'application/json', authorization: `Bearer ${route.key}` }
       if (route.shell === 'claude') { headers['x-api-key'] = route.key; headers['anthropic-version'] = '2023-06-01' }
       const model = routedModel(route, body)
       const rewritten = rewriteUpstreamRequest({ shell: route.shell, provider: route.provider, model, body: { ...body, model }, headers })
       const response = await (this.options.fetch ?? fetch)(route.endpoint, { method: 'POST', headers: rewritten.headers, body: JSON.stringify(rewritten.body), signal: controller.signal, redirect: 'error' })
+      noteUpstreamActivity()
       status = response.status
       if (!response.ok) {
         const body = await errorBody(response)
@@ -317,11 +382,13 @@ export class AiGateway {
               while (keepReading) {
                 const next = await reader.read()
                 if (next.done) break
+                noteUpstreamActivity()
                 sseBuffer += decoder.decode(next.value, { stream: true })
                 if (Buffer.byteLength(sseBuffer) > maximumBody) {
                   // 永远不构成完整 SSE event 的数据不能积累到 10 分钟超时；直接丢弃并回本地错误。
+                  // 这是上游单条回复超出本机转发上限，⛔ 说成「无有效回复」。
                   sseBuffer = ''
-                  code = 'invalid_reply'
+                  code = 'payload_too_large'
                   keepReading = false
                   break
                 }
@@ -348,8 +415,10 @@ export class AiGateway {
               while (true) {
                 const next = await reader.read()
                 if (next.done) break
+                noteUpstreamActivity()
                 bytes += next.value.length
-                if (bytes > maximumBody) { controller.abort(); throw new Error('REPLY_TOO_LARGE') }
+                // 上游回复超出本机转发上限：如实说超出上限，⛔ 进 catch 被说成「网络未连接」。
+                if (bytes > maximumBody) { replyTooLarge = true; controller.abort(); throw new Error('REPLY_TOO_LARGE') }
                 chunks.push(Buffer.from(next.value))
                 observer.push(next.value)
               }
@@ -387,14 +456,20 @@ export class AiGateway {
       if (!upstreamCompleted && clientGone && code === undefined && terminalOutcome.kind === 'answer') {
         completedAnswer = true
       } else if (!upstreamCompleted) {
-        code = timedOut ? 'timeout' : clientGone ? 'client_aborted' : 'network_error'
+        // 客户取消、界面取消的测速、stop() 关停中止(Phase 2 ⑧)同账 client_aborted:
+        // 都是工具箱/客户自己的动作,⛔ 记成 network_error 污染回执与 FB-1 故障统计。
+        code = replyTooLarge ? 'payload_too_large' : timedOut ? 'timeout'
+          : clientGone || this.cancelledTestControllers.has(controller) || (this.stopping && controller.signal.aborted) ? 'client_aborted' : 'network_error'
         if (downstream && !downstream.destroyed) {
           if (!downstream.headersSent) sendProviderFailure(downstream, code, route.provider)
           else downstream.destroy()
         }
       }
-    } finally { clearTimeout(timeout); downstream?.off('close', noteClientGone); if (!controllerAlreadyTracked) this.controllers.delete(controller) }
-    code = this.escalateTimeouts(route, code)
+    } finally {
+      clearTimeout(idleTimer); downstream?.off('close', noteClientGone)
+      if (!controllerAlreadyTracked) { this.controllers.delete(controller); this.testControllers.delete(controller) }
+    }
+    code = this.escalateTimeouts(route, code, sawUpstreamData)
     const record: ApiRequestRecord = {
       at: new Date().toISOString(), shell: route.shell, provider: route.provider, model: routedModel(route, body), source,
       ok: code === undefined, ...(code ? { code } : {}), status, durationMs: Date.now() - started,
@@ -498,11 +573,14 @@ export class AiGateway {
     this.retryBlocks.delete(route.revision)
   }
 
-  /** 连续三次超时且都在十分钟内，才把原因从「这次超时」改判成「厂商侧故障」。 */
-  private escalateTimeouts(route: GatewayRoute, code: ApiFailure | undefined): ApiFailure | undefined {
+  /**
+   * 连续三次「上游零数据的空闲超时」且都在十分钟内，才把原因从「这次超时」改判成「厂商侧故障」。
+   * 有过数据流动的超时（慢而在动、下游倒灌停读被掐）不算厂商账，否则健康厂商会被连坐误报（API-08）。
+   */
+  private escalateTimeouts(route: GatewayRoute, code: ApiFailure | undefined, sawUpstreamData = false): ApiFailure | undefined {
     const key = `${route.shell}/${route.provider}`
     if (code === 'client_aborted') return code
-    if (code !== 'timeout') { this.timeoutRuns.delete(key); return code }
+    if (code !== 'timeout' || sawUpstreamData) { this.timeoutRuns.delete(key); return code }
     const now = Date.now()
     const run = this.timeoutRuns.get(key)
     const next = run && now - run.first <= 600_000 ? { count: run.count + 1, first: run.first } : { count: 1, first: now }
@@ -661,6 +739,9 @@ function sseEventFailure(event: string, provider: ModelProviderId): ProviderFail
   const data = isJson(item.response) ? item.response : item
   if (!errorEvent && !data.error && !['error', 'response.failed', 'response.incomplete'].includes(String(item.type)) && !['failed', 'incomplete'].includes(String(data.status))) return undefined
   const failure = compactFailureFrame(item, data)
+  // response.incomplete 撞上输出上限是「回答太长被截断」，⛔ 落到泛化 upstream_error。
+  const incompleteDetails = isJson(data.incomplete_details) ? data.incomplete_details : undefined
+  if (incompleteDetails !== undefined && /^max(_output)?_tokens$/.test(String(incompleteDetails.reason ?? ''))) return { code: 'response_truncated' }
   return providerFailureDetailInBody(failure, provider)
     ?? { code: authFailureInBody(failure) ? 'key_rejected' : 'upstream_error' }
 }
@@ -751,6 +832,10 @@ class ReplyObserver {
     // 截断照样挡住「验收通过」：思考吃光预算时正文可能是空的（provider-rewrite 里有实据），
     // 但判类要单列，⛔ 混进 upstream_error 让客户以为服务商坏了。
     if (data.stop_reason === 'max_tokens' || (isJson(data.delta) && data.delta.stop_reason === 'max_tokens')) { this.failed = true; this.truncated = true }
+    // Responses 协议的截断形状：`incomplete_details.reason = max_tokens` 是现行规范拼写，
+    // 兼容旧拼写 max_output_tokens——⛔ 把「回答太长被截断」报成服务商异常。
+    const incompleteDetails = isJson(data.incomplete_details) ? data.incomplete_details : undefined
+    if (incompleteDetails !== undefined && /^max(_output)?_tokens$/.test(String(incompleteDetails.reason ?? ''))) { this.failed = true; this.truncated = true }
     if (Array.isArray(data.choices)) for (const choice of data.choices) {
       if (!isJson(choice)) continue
       if (choice.finish_reason) this.complete = true
@@ -842,6 +927,8 @@ function providerFailureStatus(code: ApiFailure): number {
       return 429
     case 'membership_benefits_unavailable':
       return 529
+    case 'payload_too_large':
+      return 413
     case 'timeout':
       return 504
     case 'provider_outage':

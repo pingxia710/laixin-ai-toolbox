@@ -6,6 +6,8 @@ import type { PageModule } from './types'
 import type { DesktopView, UpdateView } from '../../../desktop-types'
 import { displayReleaseVersion } from '../../../release-version'
 import { icon } from '../icons'
+import type { DiagnosticSoftware } from '../../../network-diagnostics-types'
+import { forgetDiagnosticSession, parseDiagnosticRunSnapshot, rememberDiagnosticSession } from '../diagnostic-session'
 
 // 下载进行中 1 秒跟进进度;其余 15 秒足够,⛔ 一律 1 秒轮询。
 export function settingsPollDelayMs(updateState: string): number {
@@ -59,8 +61,13 @@ export const page: PageModule = {
     // ⛔ 把开关拨回去（那是替客户改了他的选择，比静默失败更糟），也 ⛔ 弹窗——网络本身好好的，
     // 丢的只是「工具箱不在时保持」。下次打开工具箱会按客户的选择再装一次，所以说得清「还会再试」。
     const residentInactiveNote = '已记下你的选择，但这次没能生效：工具箱关掉后网络不会保持。网络本身不受影响，下次打开工具箱会再试一次。'
-    const residentNoteFor = (status: { enabled: boolean; supported: boolean; active: boolean }): string =>
-      !status.supported ? '当前安装暂不支持这项设置。' : status.enabled && !status.active ? residentInactiveNote : residentDefaultNote
+    // 甲-10 返工：存量管理员任务与本版定义对不上（例如以管理员运行过一次工具箱，之后安装位置变了）。
+    // 覆盖注册永远被拒，「下次打开会再试一次」在这个状态下不成立，⛔ 照抄上面那句——要说清客户能做什么。
+    const residentStaleTaskNote = '已记下你的选择，但这次没能生效：这台电脑上有一个当前用户无法替换或停用的旧常驻任务，当前安装不能确认它可用。处理办法二选一：以管理员身份运行一次工具箱；或以管理员身份打开终端，执行 schtasks /delete /tn "\\Laixin\\cn.laixin.toolbox.tunnel" /f，再正常打开工具箱。处理之前，工具箱关掉后网络不会保持。'
+    const residentNoteFor = (status: { enabled: boolean; supported: boolean; active: boolean; staleResidentTask?: boolean }): string =>
+      !status.supported ? '当前安装暂不支持这项设置。'
+        : status.enabled && !status.active ? (status.staleResidentTask ? residentStaleTaskNote : residentInactiveNote)
+        : residentDefaultNote
     residentNote.textContent = residentDefaultNote
     background.append(residentLabel, residentNote)
     // 读状态失败 ⛔ 把开关永久留在禁用态:控件创建时就是 disabled,只有读成功那一支解禁,
@@ -179,34 +186,75 @@ export const page: PageModule = {
     const support = document.createElement('div'); support.className = 'setting-row'
     support.append(Object.assign(document.createElement('p'), { textContent: '安装或连接遇到问题时，来信客服可以协助处理。' }), button('联系来信客服', { onClick: revealSupport }))
     help.append(support)
-    const diagRow = document.createElement('div'); diagRow.className = 'setting-row'
+    const diagRow = document.createElement('div'); diagRow.className = 'setting-row diagnostic-actions-row'
     const diagOutput = document.createElement('pre'); diagOutput.className = 'diagnostics-output'; diagOutput.hidden = true
     const diagStatus = document.createElement('p'); diagStatus.className = 'account-note'; diagStatus.setAttribute('role', 'status')
+    const diagLabel = document.createElement('label'); diagLabel.htmlFor = 'support-diagnostic-software'; diagLabel.textContent = '遇到问题的软件'
+    const diagSoftware = document.createElement('select'); diagSoftware.id = diagLabel.htmlFor; diagSoftware.className = 'theme-select'
+    for (const [value, textContent] of [['codex', 'Codex'], ['claude', 'Claude Code'], ['hermes', 'Hermes']] as const) {
+      diagSoftware.append(Object.assign(document.createElement('option'), { value, textContent }))
+    }
     const diagRun = button('一键诊断', { onClick: () => { void runDiagnostics() } })
     const diagCopy = button('复制诊断信息', { onClick: () => { void copyDiagnostics() } }); diagCopy.disabled = true
-    diagRow.append(Object.assign(document.createElement('p'), { textContent: '出问题时先点一键诊断，把结果复制给来信客服，客服就能直接定位。' }), diagRun, diagCopy)
+    const diagSend = button('把本次情况报给来信', { onClick: () => { void reportDiagnostics() } }); diagSend.disabled = true
+    diagRow.append(Object.assign(document.createElement('p'), { textContent: '先选出问题的软件再诊断；界面、复制和上报使用同一次结果。' }), diagLabel, diagSoftware, diagRun, diagCopy, diagSend)
     // 最近故障单独列出来：客服问「你试过什么」时，客户自己就能看到，不用在整页诊断文本里找。
     const faultTitle = Object.assign(document.createElement('p'), { className: 'account-note', textContent: '最近故障与已试过的处理' })
     // 分列的字全部来自主进程给的结构化记录，⛔ 回头解析诊断全文。
     const faultList = document.createElement('ol'); faultList.className = 'fault-list'
     faultTitle.hidden = faultList.hidden = true
     help.append(diagRow, diagStatus, faultTitle, faultList, diagOutput)
+    let diagnosticId = ''
+    let diagnosticGeneration = 0
+    const clearDiagnostics = () => {
+      diagnosticGeneration += 1
+      forgetDiagnosticSession(diagnosticId || undefined)
+      diagnosticId = ''; diagCopy.disabled = diagSend.disabled = true
+      diagOutput.textContent = ''; diagOutput.hidden = true
+      faultList.replaceChildren(); faultTitle.hidden = faultList.hidden = true
+    }
+    diagSoftware.addEventListener('change', () => { clearDiagnostics(); diagStatus.textContent = '已切换软件，请重新诊断。' })
     const runDiagnostics = async () => {
-      diagRun.disabled = true; diagCopy.disabled = true; diagStatus.textContent = '正在检查网络、已装的 AI、模型接入与本机服务…（约十几秒）'
+      clearDiagnostics(); const request = diagnosticGeneration
+      diagSoftware.disabled = diagRun.disabled = true; diagStatus.textContent = '正在检查网络、所选软件、模型接入与本机服务…（约十几秒）'
       try {
-        const value = JSON.parse((await window.toolbox.diagnostics.run()).snapshot) as { text: string; errors: string[]; faults?: unknown }
-        if (!active) return
+        const value = parseDiagnosticRunSnapshot((await window.toolbox.diagnostics.run({ software: diagSoftware.value as DiagnosticSoftware })).snapshot)
+        if (!active || request !== diagnosticGeneration || value.software !== diagSoftware.value) return
+        diagnosticId = value.id
+        rememberDiagnosticSession({ id: value.id, software: value.software, checkedAt: value.network.checkedAt })
         diagOutput.textContent = value.text; diagOutput.hidden = false; diagCopy.disabled = false
+        diagSend.disabled = false
         const faults = readFaultRecords(value.faults)
         faultList.replaceChildren(...(faults.length ? [faultListHead(), ...faults.map(faultEntry)] : []))
         faultTitle.hidden = faultList.hidden = faults.length === 0
         diagStatus.textContent = value.errors.length ? `诊断完成，有 ${value.errors.length} 项没读到，已列在末尾。` : '诊断完成。'
-      } catch { if (active) diagStatus.textContent = '诊断没有完成，请重试。' }
-      finally { if (active) diagRun.disabled = false }
+      } catch { if (active && request === diagnosticGeneration) diagStatus.textContent = '诊断没有完成，请重试。' }
+      finally { if (active && request === diagnosticGeneration) diagSoftware.disabled = diagRun.disabled = false }
     }
     const copyDiagnostics = async () => {
-      try { const value = JSON.parse((await window.toolbox.diagnostics.copy()).snapshot) as { copied: boolean }; if (active) diagStatus.textContent = value.copied ? '已复制，粘贴给来信客服即可。' : '请先点一键诊断。' }
-      catch { if (active) diagStatus.textContent = '复制失败，请手动选中上面的内容复制。' }
+      if (!diagnosticId) { diagStatus.textContent = '请先选择软件并完成一次诊断。'; return }
+      const id = diagnosticId; const request = diagnosticGeneration
+      try {
+        const value = JSON.parse((await window.toolbox.diagnostics.copy({ id })).snapshot) as { copied: boolean; stale?: boolean; message?: string }
+        if (active && request === diagnosticGeneration && diagnosticId === id) {
+          diagStatus.textContent = value.copied ? '已复制本次诊断，粘贴给来信客服即可。' : value.message ?? '结果已失效，请重新诊断。'
+          if (!value.copied) clearDiagnostics()
+        }
+      }
+      catch { if (active && request === diagnosticGeneration && diagnosticId === id) diagStatus.textContent = '复制失败，请手动选中上面的内容复制。' }
+    }
+    const reportDiagnostics = async () => {
+      if (!diagnosticId) { diagStatus.textContent = '请先选择软件并完成一次诊断。'; return }
+      const id = diagnosticId; const request = diagnosticGeneration
+      diagSend.disabled = true
+      try {
+        const value = JSON.parse((await window.toolbox.diagnostics.report({ id })).snapshot) as
+          { uploaded?: boolean; stale?: boolean; receipt?: string; filePath?: string; message?: string }
+        if (!active || request !== diagnosticGeneration || diagnosticId !== id) return
+        diagStatus.textContent = value.message ?? (value.uploaded ? `已上报，回执号 ${value.receipt ?? '—'}。` : `没能送达，材料已保存在 ${value.filePath ?? '本机'}。`)
+        if (value.stale) clearDiagnostics()
+      } catch { if (active && request === diagnosticGeneration && diagnosticId === id) diagStatus.textContent = '上报未完成，请重试；本次诊断不会被替换。' }
+      finally { if (active && request === diagnosticGeneration && diagnosticId === id) diagSend.disabled = false }
     }
 
     const about = group('关于')
@@ -233,8 +281,9 @@ export const page: PageModule = {
       summary.textContent = clientVersion === '' ? '正在读取当前版本…' : `当前版本 v${clientVersion}，新版本已可用。`
       notes.textContent = value.notes || '此版本未提供更新说明。'
       progress.hidden = value.state !== 'downloading'; progress.value = value.progress
+      // error 的原因也在这里说:客户和客服都靠这一行定位「为什么换回旧版」,⛔ 只写进设置页一行小字。
       progressStatus.textContent = value.state === 'downloading' ? `${value.message} ${value.progress}%` : value.state === 'ready'
-        ? '新版已下载并完成校验，确认后将重启工具箱。' : value.state === 'installing' ? value.message : ''
+        ? '新版已下载并完成校验，确认后将重启工具箱。' : value.state === 'installing' || value.state === 'error' ? value.message : ''
       progressStatus.hidden = progressStatus.textContent === ''
       const action = value.state === 'available' || value.state === 'error' ? 'downloadUpdate' : value.state === 'ready' ? 'installUpdate' : ''
       primary.dataset.updateAction = action

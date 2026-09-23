@@ -1,4 +1,4 @@
-export type IconName = 'dashboard' | 'usage' | 'network' | 'sparkle' | 'receipt' | 'share' | 'account' | 'settings' | 'arrow' | 'check' | 'play' | 'edit' | 'eye' | 'download' | 'help' | 'power' | 'refresh' | 'upload' | 'warning' | 'clock' | 'computer' | 'lock' | 'gift' | 'github'
+export type IconName = 'dashboard' | 'usage' | 'network' | 'sparkle' | 'receipt' | 'share' | 'account' | 'settings' | 'arrow' | 'check' | 'play' | 'pause' | 'edit' | 'eye' | 'download' | 'help' | 'power' | 'refresh' | 'upload' | 'warning' | 'clock' | 'computer' | 'lock' | 'gift' | 'github'
 
 const paths: Record<IconName, string> = {
   dashboard: 'M3 3h7v7H3V3Zm11 0h7v7h-7V3ZM3 14h7v7H3v-7Zm11 0h7v7h-7v-7Z',
@@ -13,6 +13,7 @@ const paths: Record<IconName, string> = {
   arrow: 'M5 12h14m-6-6 6 6-6 6',
   check: 'm5 12 4.2 4.2L19 6.5',
   play: 'm8 5 11 7-11 7V5Z',
+  pause: 'M9 5v14M15 5v14',
   edit: 'M12 4H5a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h13a2 2 0 0 0 2-2v-7M16 3l5 5-9 9-5 1 1-5 9-9Z',
   eye: 'M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Zm7 0a3 3 0 1 0 6 0 3 3 0 0 0-6 0Z',
   download: 'M12 3v12m-4-4 4 4 4-4M5 20h14',
@@ -29,7 +30,7 @@ const paths: Record<IconName, string> = {
 
 const fallback: Record<IconName, string> = {
   dashboard: '▦', usage: '▥', network: '○', sparkle: '✦', receipt: '□', share: '↗', account: '○', settings: '⚙',
-  arrow: '→', check: '✓', play: '▷', edit: '✎', eye: '◉', download: '↓', help: '?', power: '◉', refresh: '↻', upload: '↑',
+  arrow: '→', check: '✓', play: '▷', pause: '‖', edit: '✎', eye: '◉', download: '↓', help: '?', power: '◉', refresh: '↻', upload: '↑',
   warning: '!', clock: '◷', computer: '▣', lock: '⌑', gift: '✿', github: '◉'
 }
 

@@ -26,7 +26,7 @@ export function registerActions(registry: BridgeRegistry, options: DiagnosticOpt
 }
 
 /** 当前选择只从已注册的 AI 接入动作读；读不到就报未知，⛔ 猜一个渠道。 */
-async function readSelection(registry: BridgeRegistry, software: DiagnosticSoftware): Promise<DiagnosticSelection> {
+export async function readSelection(registry: BridgeRegistry, software: DiagnosticSoftware): Promise<DiagnosticSelection> {
   const unwrap = async <T>(name: string, params?: unknown): Promise<T> =>
     JSON.parse((await registry.execute(name, params) as { snapshot: string }).snapshot) as T
   try {
@@ -37,13 +37,15 @@ async function readSelection(registry: BridgeRegistry, software: DiagnosticSoftw
     const provider = mode as ModelProviderId
     const service = await unwrap<ApiServiceSnapshot>('aiaccess.serviceStatus')
     const configuration = await unwrap<{ endpoint?: string }>('aiaccess.providerConfiguration', { shell: software, provider })
+    const usage = service.usage.find((stage) => stage.shell === software)
     // 选了模型 API 就一定是经本机服务转发的；本机服务停了，路由表也是空的，⛔ 用路由表判断。
     return {
       mode: provider,
       ...(typeof configuration.endpoint === 'string' ? { endpoint: configuration.endpoint } : {}),
       routed: true,
       serviceRunning: service.running,
-      observedClientCall: service.usage.find((stage) => stage.shell === software)?.observedClientCall ?? null
+      observedClientCall: usage?.lastObservedClientCall === undefined ? usage?.observedClientCall ?? null : usage.lastObservedClientCall,
+      ...(usage?.configuration ? { configuration: usage.configuration } : {})
     }
   } catch { return { mode: 'unknown' } }
 }

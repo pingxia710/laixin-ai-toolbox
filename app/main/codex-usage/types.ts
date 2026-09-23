@@ -1,4 +1,4 @@
-export type UsageStatus = 'idle' | 'ready' | 'unavailable' | 'not-installed' | 'signed-out' | 'unsupported' | 'update-required' | 'timeout' | 'account-changed'
+export type UsageStatus = 'idle' | 'ready' | 'unavailable' | 'not-installed' | 'not-added' | 'signed-out' | 'unsupported' | 'update-required' | 'timeout' | 'account-changed'
 
 export interface UsageWindow {
   readonly usedPercent: number | null
@@ -42,6 +42,7 @@ export const usageMessages: Readonly<Record<UsageStatus, string>> = {
   ready: '用量已更新',
   unavailable: '暂时无法获取用量，请稍后刷新。',
   'not-installed': '未找到可读取用量的 Codex。请先安装 Codex 桌面版或 Codex CLI，然后刷新。',
+  'not-added': '套餐用量只读取在工具箱里登录过的账号。请先到「账号总览」点「添加账号」完成官方登录。',
   'signed-out': '请先在 Codex 中登录 ChatGPT 账号，再回到这里刷新。',
   unsupported: '当前登录方式不提供 ChatGPT 套餐额度。请在 Codex 中使用 ChatGPT 账号登录。',
   'update-required': '当前 Codex 版本不支持用量查询，请更新 Codex 后重试。',

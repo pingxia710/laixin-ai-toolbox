@@ -57,7 +57,8 @@ afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals(); vi.reset
 
 async function setup(
   status = vi.fn<() => Promise<TunnelStatusView>>().mockResolvedValue(connected),
-  explainRoute = vi.fn().mockResolvedValue({ outcome: 'direct', reasonCode: 'PROTECTED_DIRECT', title: '受保护域名直连', detail: '匹配受保护直连规则。' })
+  explainRoute = vi.fn().mockResolvedValue({ outcome: 'direct', reasonCode: 'PROTECTED_DIRECT', title: '受保护域名直连', detail: '匹配受保护直连规则。' }),
+  withDiagnosticSession = true
 ) {
   vi.useFakeTimers()
   const start = vi.fn().mockResolvedValue({ outcome: 'rejected', message: '配置校验未通过，请联系客服。', code: 'fixture' })
@@ -65,12 +66,17 @@ async function setup(
   const repair = vi.fn().mockResolvedValue({ outcome: 'started', message: '正在修复', code: '' })
   const stop = vi.fn().mockResolvedValue({ outcome: 'stopped', message: '已取消', code: '' })
   vi.stubGlobal('document', { activeElement: null, createElement: (tag: string) => Object.assign(new Element(), { tag }), createTextNode: (textContent: string) => Object.assign(new Element(), { textContent }) })
-  const report = vi.fn<() => Promise<{ snapshot: string }>>().mockResolvedValue({ snapshot: JSON.stringify({ receipt: 'LX-7K3M-9QZP', uploaded: true, message: '已上报，回执号 LX-7K3M-9QZP。把它告诉客服即可。' }) })
-  vi.stubGlobal('window', { toolbox: { tunnel: { status, start, explainRoute, repairStatus, repair, stop }, diagnostics: { report } } })
+  const copy = vi.fn<(_params: { id: string }) => Promise<{ snapshot: string }>>().mockResolvedValue({ snapshot: JSON.stringify({ copied: true }) })
+  const report = vi.fn<(_params: { id: string }) => Promise<{ snapshot: string }>>().mockResolvedValue({ snapshot: JSON.stringify({ receipt: 'LX-7K3M-9QZP', uploaded: true, message: '已上报，回执号 LX-7K3M-9QZP。把它告诉客服即可。' }) })
+  vi.stubGlobal('window', { toolbox: { tunnel: { status, start, explainRoute, repairStatus, repair, stop }, diagnostics: { copy, report } } })
+  if (withDiagnosticSession) {
+    const { rememberDiagnosticSession } = await import('../../app/renderer/src/diagnostic-session')
+    rememberDiagnosticSession({ id: 'DG-ABCDEF-123456', software: 'codex', checkedAt: Date.now() })
+  }
   const { page } = await import('../../app/renderer/src/pages/tunnel')
   const root = new Element(); page.mount(root as unknown as HTMLElement, { tab: 'tunnel' }); cleanup = page.unmount
   await flush()
-  return { page, root, status, start, explainRoute, repairStatus, repair, stop, report, text: () => root.all().map((node) => node.textContent) }
+  return { page, root, status, start, explainRoute, repairStatus, repair, stop, copy, report, text: () => root.all().map((node) => node.textContent) }
 }
 
 it('修复中禁止重复触发，取消始终可用；重进页面按主进程状态恢复', async () => {
@@ -129,11 +135,12 @@ it.each(['success', 'failure'] as const)('较早轮询迟到的 %s 不能覆盖�
   const older = new Promise<TunnelStatusView>((done, fail) => { resolve = done; reject = fail })
   const x = await setup(vi.fn<() => Promise<TunnelStatusView>>().mockResolvedValueOnce(connected).mockReturnValueOnce(older).mockResolvedValue(disconnected))
   await vi.advanceTimersByTimeAsync(4000)
-  expect(x.text()).toContain('已停止并恢复原设置')
+  // N-26:暂停落定态(已停止并恢复原设置)的状态卡文案是「已暂停使用」。
+  expect(x.text()).toContain('已暂停使用')
   if (outcome === 'success') resolve(connected)
   else reject(new Error('late failure'))
   await flush()
-  expect(x.text()).toContain('已停止并恢复原设置')
+  expect(x.text()).toContain('已暂停使用')
   expect(x.text()).not.toContain('已连接')
   expect(x.text()).not.toContain('状态读取失败，请稍后重试。')
 })
@@ -212,8 +219,33 @@ it('一键上报：⛔ 自动发，只有点了按钮才发；发出去就把回
   x.root.querySelector('[data-network-action="repair-report"]')!.click()
   await flush()
   expect(x.report).toHaveBeenCalledTimes(1)
+  expect(x.report).toHaveBeenCalledWith({ id: 'DG-ABCDEF-123456' })
   expect(x.text()).toContain('已上报，回执号 LX-7K3M-9QZP。把它告诉客服即可。')
   expect(x.root.querySelector('[data-receipt="LX-7K3M-9QZP"]')).toBeDefined()
+})
+
+it('网络页首次直接复制和上报，不要求客户先去另一页生成诊断编号', async () => {
+  const x = await setup(undefined, undefined, false)
+  x.root.querySelector('[data-network-action="repair-copy"]')!.click()
+  await flush()
+  expect(x.copy).toHaveBeenCalledWith({ id: '' })
+  expect(x.text()).toContain('当前网络信息已复制，可粘贴给来信客服。')
+
+  x.root.querySelector('[data-network-action="repair-report"]')!.click()
+  await flush()
+  expect(x.report).toHaveBeenCalledWith({ id: '' })
+  expect(x.root.querySelector('[data-receipt="LX-7K3M-9QZP"]')).toBeDefined()
+})
+
+it('网络页首次上报没送达时，仍显示同一个回执号和本机文件', async () => {
+  const x = await setup(undefined, undefined, false)
+  x.report.mockResolvedValue({ snapshot: JSON.stringify({ receipt: 'LX-2D4F-8HTV', uploaded: false,
+    filePath: '/tmp/reports/LX-2D4F-8HTV.json', message: '这次没能送出去（回执号 LX-2D4F-8HTV）。诊断包已存在本机。' }) })
+  x.root.querySelector('[data-network-action="repair-report"]')!.click()
+  await flush()
+  expect(x.report).toHaveBeenCalledWith({ id: '' })
+  expect(x.root.querySelector('[data-receipt="LX-2D4F-8HTV"]')).toBeDefined()
+  expect(x.text().some((line) => line.includes('/tmp/reports/LX-2D4F-8HTV.json'))).toBe(true)
 })
 
 it('一键上报没送出去：⛔ 谎称成功，回执号照给并指出诊断包落在哪', async () => {

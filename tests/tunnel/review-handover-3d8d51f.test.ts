@@ -66,6 +66,9 @@ it('写了新连接意图、新守护晚一步才启动:旧恢复者在它真正
   const fresh = createDaemon({ dataDir: h.root, runId: 'late', adapter: h.adapter, clock: clock(), parentAlive: () => true,
     onExit: () => {}, connectorFactory, bridgeFactory })
   await fresh.run()
+  // 启动恢复梯子改为后台跑(甲-2):run() 不再等接续连接跑完,先驱动到落定再断言
+  await vi.advanceTimersByTimeAsync(0)
+  await vi.advanceTimersByTimeAsync(0)
   const view = () => JSON.parse(readFileSync(join(h.root, 'state.json'), 'utf8'))
   expect(view()).toMatchObject({ runId: 'late', state: 'connected' })
   // 旧守护下一轮(98 秒)醒来:状态文件已是新守护的 → 交权退出 0,新会话的设置/状态原样
@@ -84,6 +87,9 @@ it('新会话已接手时，旧守护自身的崩溃兜底不能恢复新会话�
   const fresh = createDaemon({ dataDir: h.root, runId: 'new', adapter: h.adapter, clock: clock(), parentAlive: () => true,
     onExit: () => {}, connectorFactory, bridgeFactory })
   await fresh.run()
+  // 启动恢复梯子改为后台跑(甲-2):run() 不再等接续连接跑完,先驱动到落定再断言
+  await vi.advanceTimersByTimeAsync(0)
+  await vi.advanceTimersByTimeAsync(0)
   expect(JSON.parse(readFileSync(join(h.root, 'state.json'), 'utf8'))).toMatchObject({ runId: 'new', state: 'connected' })
   let crashExit: number | undefined
   // 生产里兜底由守护入口安装并带上本进程的 runId(tunnel-daemon.mjs);两个守护只在测试里同处一个进程,所以这里显式给旧守护的身份

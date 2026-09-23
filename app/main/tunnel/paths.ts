@@ -1,4 +1,4 @@
-import { mkdirSync, renameSync, writeFileSync } from 'node:fs'
+import { lstatSync, mkdirSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { randomBytes } from 'node:crypto'
 
@@ -12,6 +12,17 @@ export function resolveTunnelDataDir(env: NodeJS.ProcessEnv, userDataPath?: stri
     return join(userDataPath, 'tunnel')
   }
   throw new Error('TUNNEL_DATA_DIR_UNSET')
+}
+
+// N-25:记忆化读的盘面签名(mtime+size,文件不在 = 'missing')。失效语义与 loadLedgerCached
+// 一致:状态读读到旧值是正确性问题,⛔ 换成 TTL 时间窗——盘面没变,读数就该复用。
+export function statSignature(path: string): string {
+  try {
+    const stat = lstatSync(path)
+    return `${stat.mtimeMs}:${stat.size}`
+  } catch {
+    return 'missing'
+  }
 }
 
 export function writeFileAtomic(path: string, content: string, mode = 0o600): void {

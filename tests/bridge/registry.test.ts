@@ -57,8 +57,14 @@ describe('受限动作注册表', () => {
     })
 
     await expect(registry.execute('app.fails', undefined)).rejects.toMatchObject({ code: 'ACTION_FAILED' })
-    expect(diagnostic).toHaveBeenCalledWith('ACTION_FAILED', 'app.fails')
-    expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('参数和内部异常都不能外泄')
+    // 甲-6:兜底仍只回受控码到桥上(上面那行钉着),但原始错误要交到诊断通道留证——
+    // 之前 catch 不接收 error,唯一诊断进 console.error(打包 GUI 蒸发),本地故障记录里查不到真因。
+    expect(diagnostic).toHaveBeenCalledWith('ACTION_FAILED', 'app.fails', expect.any(Error))
+    const carried = diagnostic.mock.calls[0]?.[2]
+    expect(carried).toBeInstanceOf(Error)
+    // 桥上抛出的仍是裸码,⛔ 异常正文进客户可见面
+    const thrown = await registry.execute('app.fails', undefined).catch((error: unknown) => error)
+    expect(thrown).toMatchObject({ code: 'ACTION_FAILED', message: 'ACTION_FAILED' })
   })
 
   it('拒绝重复动作名', () => {

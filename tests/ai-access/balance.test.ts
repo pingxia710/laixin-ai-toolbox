@@ -23,4 +23,12 @@ describe('服务商余额', () => {
     expect(await readProviderBalance('deepseek', 'sk-test', html)).toMatchObject({ total: null, error: 'invalid_reply' })
     expect(await readProviderBalance('moonshot', 'sk-test', html)).toMatchObject({ total: null, error: 'invalid_reply' })
   })
+  // Phase 2 ③:判类三分——服务商忙(429/5xx)、网络不通(超时/DNS)、格式不对各是一类,各给可照做句。
+  it('429/5xx 是服务商暂时忙或故障，⛔ 折进「返回看不懂」；超时/DNS 仍是网络不通', async () => {
+    expect(await readProviderBalance('deepseek', 'sk-test', fetchWith(429, {}))).toMatchObject({ total: null, error: 'provider_busy' })
+    expect(await readProviderBalance('deepseek', 'sk-test', fetchWith(500, {}))).toMatchObject({ total: null, error: 'provider_busy' })
+    expect(await readProviderBalance('moonshot', 'sk-test', fetchWith(503, {}))).toMatchObject({ total: null, error: 'provider_busy' })
+    expect(await readProviderBalance('deepseek', 'sk-test', (async () => { throw new Error('getaddrinfo ENOTFOUND') }) as unknown as typeof fetch)).toMatchObject({ total: null, error: 'network_error' })
+    expect(await readProviderBalance('deepseek', 'sk-test', fetchWith(404, {}))).toMatchObject({ total: null, error: 'invalid_reply' })
+  })
 })

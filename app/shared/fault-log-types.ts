@@ -20,6 +20,8 @@ export interface FaultRecord {
   readonly outcome?: ApiRemedyOutcome
   /** D1 网络检查结论码，形如 AI_DIAG_*。 */
   readonly network?: string
+  /** 甲-6返工：桥上动作名（哪个模块哪个动作，如 account.snapshot）。注册表键，受控字符集，⛔ 自由文本。 */
+  readonly bridgeAction?: string
   /** 短说明**只能是模板 id**，⛔ 自由文本——上游错误体、提示词、回复正文都进不来。 */
   readonly note?: FaultNoteId
   /** 模板里的参数，最多 3 个、每个 ≤15 字符（比 Key 的最短长度还短，装不下凭据）。 */
@@ -39,6 +41,10 @@ export const faultNotes = {
   recovery_config_broken: '配置已不是工具箱写的那份，需要重新写入',
   recovery_state_unavailable: '本机保存的接入状态读不到或写不进',
   stream_interrupted: '通道中断时打断了 {0} 条回答',
+  // 甲-6:通道动作的本机故障留证(参数 = 错误名:fs码);原始消息可能带路径,⛔ 进记录。
+  tunnel_local_fault: '通道动作在本机没能完成（{0}）',
+  // 甲-6返工:非通道模块的动作在本机失败(参数 = 模块短名, 错误名:fs码);⛔ 冒充通道/网络问题。
+  action_local_fault: '工具箱 {0} 模块的动作在本机没能完成（{1}）',
   network_repair_recovered: '用户发起网络修复，本机代理与通道出口已重新验证通过；未验证 AI 账号或对话',
   network_repair_unresolved: '用户发起网络修复，未确认恢复；没有强制接管第三方设置，请结合本次诊断继续排查'
 } as const
@@ -50,6 +56,9 @@ const FAULT_NOTE_PARAM_LIMIT = 3
 export const faultShells: readonly ApiShell[] = ['codex', 'claude', 'hermes']
 export const faultOutcomes: readonly ApiRemedyOutcome[] = ['recovered', 'still_failing', 'unknown']
 const networkCodePattern = /^AI_DIAG_[A-Z0-9_]{1,48}$/
+/** 甲-6返工：桥上动作名（注册表键，如 account.redeemInviteRewards、aiaccess.hiddenState.scan）。
+ *  模块段小写字母开头，动作段字母数字；字符集装不下路径分隔符，⛔ 当自由文本放行。 */
+const bridgeActionPattern = /^[a-z][a-z0-9]{0,15}(\.[A-Za-z0-9]{1,47}){1,2}$/
 /** 与 Key 校验同形的长串（⩾16 位）一律拒收；⛔ 带 g 标志，test() 会留 lastIndex 状态。 */
 const secretLike = /[A-Za-z0-9._-]{16,}/
 export const FAULT_NOTE_LIMIT = 200
@@ -67,10 +76,14 @@ export function sanitizeFaultRecord(value: unknown): FaultRecord | undefined {
   const action = apiRemedyActions.includes(raw.action as ApiRemedyAction) ? raw.action as ApiRemedyAction : undefined
   const outcome = faultOutcomes.includes(raw.outcome as ApiRemedyOutcome) ? raw.outcome as ApiRemedyOutcome : undefined
   const network = typeof raw.network === 'string' && networkCodePattern.test(raw.network) ? raw.network : undefined
+  const bridgeAction = typeof raw.bridgeAction === 'string' && raw.bridgeAction.length <= 64 && bridgeActionPattern.test(raw.bridgeAction)
+    ? raw.bridgeAction
+    : undefined
   const note = typeof raw.note === 'string' && Object.hasOwn(faultNotes, raw.note) ? raw.note as FaultNoteId : undefined
   const noteParams = note === undefined ? undefined : sanitizeFaultNoteParams(raw.noteParams)
   return { at, version, ...(shell ? { shell } : {}), ...(provider ? { provider } : {}), ...(code ? { code } : {}),
-    ...(action ? { action } : {}), ...(outcome ? { outcome } : {}), ...(network ? { network } : {}), ...(note ? { note } : {}),
+    ...(action ? { action } : {}), ...(outcome ? { outcome } : {}), ...(network ? { network } : {}),
+    ...(bridgeAction ? { bridgeAction } : {}), ...(note ? { note } : {}),
     ...(noteParams?.length ? { noteParams } : {}) }
 }
 

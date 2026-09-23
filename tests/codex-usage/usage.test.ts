@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readFile, realpath, rm, writeFile, chmod } from 'node:f
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { codexAccountKey, normalizeBuckets, maskAccount } from '../../app/main/codex-usage/normalize'
-import { readCodexUsage, UsageReadError } from '../../app/main/codex-usage/client'
+import { readCodexUsage, readCodexUsageForAddedAccount, readCodexUsageWithFallback, UsageReadError } from '../../app/main/codex-usage/client'
 import { findCodexCommand } from '../../app/main/codex-usage/runtime'
 import { createUsageMonitor } from '../../app/main/codex-usage/monitor'
 import { percentText, resetText, windowLabel } from '../../app/renderer/src/codex-usage/view'
@@ -79,6 +79,28 @@ describe('实际子进程协议', () => {
     controller.abort()
     await expect(pending).rejects.toMatchObject({ status: 'unavailable' })
     await expect(readCodexUsage({ executable: '/missing-codex', args: [] }, { cwd: tmpdir(), signal: new AbortController().signal })).rejects.toMatchObject({ status: 'unavailable' })
+  })
+})
+
+describe('候选二进制回退', () => {
+  const command = (mode?: string) => ({ executable: process.execPath, args: mode ? [fixture, mode] : [fixture] })
+  it('传输级失败依次回退，直到拿到额度', async () => {
+    const result = await readCodexUsageWithFallback([command('exit'), command('unsupported-method'), command()], { cwd: tmpdir(), signal: new AbortController().signal })
+    expect(result.account.email).toBe(account.email)
+    expect(normalizeBuckets(result.limits)[0].primary?.remainingPercent).toBe(73)
+  })
+  it('账号结论是权威答案：未登录不因换二进制重试而被盖掉', async () => {
+    await expect(readCodexUsageWithFallback([command('signed-out'), command()], { cwd: tmpdir(), signal: new AbortController().signal }))
+      .rejects.toEqual(new UsageReadError('signed-out'))
+  })
+  it('没有候选时按未安装处理', async () => {
+    await expect(readCodexUsageWithFallback([], { cwd: tmpdir(), signal: new AbortController().signal })).rejects.toEqual(new UsageReadError('not-installed'))
+  })
+  it('在案账号才放行：读到别人的账号按换号处理', async () => {
+    await expect(readCodexUsageForAddedAccount([command()], { cwd: tmpdir(), signal: new AbortController().signal, addedAccountKey: 'f'.repeat(64) }))
+      .rejects.toEqual(new UsageReadError('account-changed'))
+    const result = await readCodexUsageForAddedAccount([command()], { cwd: tmpdir(), signal: new AbortController().signal, addedAccountKey: codexAccountKey(account) })
+    expect(result.account.email).toBe(account.email)
   })
 })
 

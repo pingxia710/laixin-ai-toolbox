@@ -5,7 +5,7 @@
 ## 下载
 
 - [GitHub Releases](https://github.com/pingxia710/laixin-ai-toolbox/releases)
-- [来信官网](https://laixin.net.cn/AI-tools/)
+- [来信 AI 工具箱](https://laixin.work/)
 
 官方版本的更新清单使用 Ed25519 签名，客户端在安装前还会校验文件大小、SHA-256 和应用包摘要。GitHub 与官网提供的是同一份版本文件；客户端优先使用 GitHub，失败时自动回到官网。
 
@@ -31,7 +31,7 @@ npm test
 构建 macOS 版本：
 
 ```bash
-TOOLBOX_ACCOUNT_ORIGIN=https://example.com/AI-tools/ npm run build
+TOOLBOX_ACCOUNT_ORIGIN=https://example.com/ TOOLBOX_UPDATE_ORIGIN=https://example.com/ npm run build
 ```
 
 `TOOLBOX_ACCOUNT_ORIGIN` 是账号服务地址。自行构建时请使用自己的服务地址；未设置时，账号服务保持未配置状态，不会自动接入来信生产账号。

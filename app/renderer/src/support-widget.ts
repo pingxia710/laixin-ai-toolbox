@@ -31,7 +31,7 @@ function networkSupportContext(status: TunnelStatusView | undefined): Pick<HelpS
     [/授权已失效|授权失效|当前权益不可用|配额或授权问题/, 'NETWORK_AUTHORIZATION_UNAVAILABLE'],
     [/受组织策略或权限限制|受管理环境/, 'NETWORK_ENVIRONMENT_RESTRICTED'],
     [/已停止自动重连/, 'NETWORK_RECONNECT_STOPPED'],
-    [/守护进程意外退出/, 'NETWORK_PROCESS_EXIT']
+    [/守护进程意外退出|未预期的问题/, 'NETWORK_PROCESS_EXIT']
   ]
   for (const [pattern, code] of categories) if (pattern.test(`${status.message}\n${status.unrestored}`)) reasonCodes.push(code)
   if (status.state === '异常' && reasonCodes.length === 0) reasonCodes.push('NETWORK_CONNECTION_ERROR')

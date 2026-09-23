@@ -19,13 +19,14 @@ export interface ActionDefinition {
 }
 
 export interface ActionRegistryOptions {
-  readonly diagnostic?: (code: string, actionName: string) => void
+  /** 诊断通道:ACTION_FAILED 时第三个参数带上原始错误(甲-6 本机留证);ACTION_RESULT_INVALID 时第二个参数是「哪个字段怎么不合」。 */
+  readonly diagnostic?: (code: string, actionName: string, error?: unknown) => void
   readonly authorize?: (actionName: string) => Promise<void>
 }
 
 export class ActionRegistry {
   private readonly actions = new Map<string, ActionDefinition>()
-  private readonly diagnostic: (code: string, actionName: string) => void
+  private readonly diagnostic: (code: string, actionName: string, error?: unknown) => void
 
   constructor(private readonly options: ActionRegistryOptions = {}) {
     this.diagnostic = options.diagnostic ?? (() => undefined)
@@ -51,8 +52,10 @@ export class ActionRegistry {
     let result: unknown
     try {
       result = await action.handler(params)
-    } catch {
-      this.diagnostic('ACTION_FAILED', action.name)
+    } catch (error) {
+      // 甲-6:兜底把原始错误一并交到诊断通道(落进本机故障记录,诊断包收集);
+      // 桥上仍只回受控码(⛔ 异常正文进客户可见面,既有用例钉着)。
+      this.diagnostic('ACTION_FAILED', action.name, error)
       throw new BridgeError('ACTION_FAILED')
     }
 

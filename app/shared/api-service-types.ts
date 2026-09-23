@@ -7,7 +7,7 @@ export type ApiFailure =
   | 'membership_model_unavailable' | 'membership_benefits_unavailable' | 'membership_quota_exhausted'
   | 'membership_concurrency_limited' | 'membership_rate_limited'
   | 'coding_plan_expired' | 'coding_plan_quota_exhausted' | 'coding_plan_model_unavailable' | 'coding_plan_key_product_mismatch'
-  | 'request_invalid' | 'content_too_long' | 'provider_outage' | 'upstream_error' | 'network_error'
+  | 'request_invalid' | 'content_too_long' | 'payload_too_large' | 'provider_outage' | 'upstream_error' | 'network_error'
   | 'client_aborted' | 'timeout' | 'invalid_reply' | 'tool_call_failed' | 'response_truncated' | 'configuration_failed'
   | 'configuration_rollback_failed' | 'configuration_interrupted' | 'port_unavailable' | 'local_service_down' | 'local_service_busy'
   | 'not_configured' | 'key_missing' | 'shell_version_incompatible' | 'unknown'
@@ -74,6 +74,8 @@ export interface ApiUsageStage {
   readonly configured: string | null
   /** 首次观察到这个 AI 自己发出的请求成功的时间；重开工具箱或换渠道后归零。 */
   readonly observedClientCall: string | null
+  /** 同一当前绑定最近一次完整成功调用的时间；缺省兼容旧状态，null 表示无有效证据。 */
+  readonly lastObservedClientCall?: string | null
   /**
    * Codex CLI 与 Codex Desktop 走同一份配置，普通客户端调用不能证明桌面版真的命中本机网关。
    * 此字段只在 Codex 当前受工具箱接管时给出；它从本机进程与同一 TCP socket 的核对产生，
@@ -129,6 +131,7 @@ export const apiFailureMessages: Record<ApiFailure, string> = {
   coding_plan_key_product_mismatch: '这个 Key 仅限企业编程套餐场景，不能用于当前产品。请在智谱官方页面确认并更换对应产品的 Key。',
   request_invalid: '服务商不接受这次请求的格式或参数，多半是这个 AI 的版本与当前接口不匹配，可先重新写入配置，再考虑更新软件。',
   content_too_long: '这次发送的内容超过了模型能接收的长度，请新开一个对话或减少内容后重试。',
+  payload_too_large: '本次发送或接收的数据超过了工具箱本机服务的转发上限（32MB），已在本地停下。请新开一个对话或缩小本次任务后重试。',
   provider_outage: '服务商一侧连续返回异常或长时间没有回复，多半是对方暂时故障，请稍后重试。',
   upstream_error: '服务商返回异常，请稍后重试。',
   network_error: '未连接到服务商，请检查网络后重试。',
@@ -303,6 +306,7 @@ export const apiFailureRemedy: Readonly<Record<ApiFailure, ApiRemedyAction | nul
   coding_plan_key_product_mismatch: 'openConsole',
   request_invalid: 'reapply',
   content_too_long: null,
+  payload_too_large: null,
   provider_outage: 'retest',
   upstream_error: 'retest',
   network_error: null,

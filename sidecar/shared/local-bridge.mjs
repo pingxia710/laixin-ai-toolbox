@@ -163,9 +163,10 @@ export function createLocalBridge(options) {
       stopped = false
       failure = undefined
       // runner 的 stdin 是停止管道:close() 关闭它,runner 见 EOF 即停 xray(跨平台可靠)。
+      // stderr 接进守护的 stderr(甲-6:runner 把内核 stderr 转发到那里 → 守护日志 → 诊断包)。
       child = spawnImpl(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), 'xray-runner.mjs'), executable, config, String(process.pid)], {
         env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
-        stdio: ['pipe', 'ignore', 'ignore'], windowsHide: true
+        stdio: ['pipe', 'ignore', 'inherit'], windowsHide: true
       })
       exited = new Promise((resolve) => {
         child.once('error', () => { failure = fail() })

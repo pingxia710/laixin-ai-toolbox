@@ -69,6 +69,22 @@ describe('更新磁盘卫生', () => {
     expect(JSON.parse(await readFile(join(directory, 'acknowledgement.json'), 'utf8'))).toMatchObject({ version: '0.4.7-fix.3' })
   })
 
+  it('更新成功的第一次启动把「从哪版升上来、改了什么」带回给界面,版本不符与普通启动都不给', async () => {
+    const directory = await tempRoot('toolbox-ack-success-')
+    await writeFile(join(directory, 'pending.json'), JSON.stringify({ version: '0.5.8', previous: '0.5.7', notes: '· 修复' }))
+    expect(await acknowledgeUpdate(directory, '0.5.8')).toEqual({ previous: '0.5.7', notes: '· 修复' })
+    // 旧 pending 没记这两样(0.5.8 及更早装的)时给空串,弹窗自己用「已更新到」兜底文案
+    const legacy = await tempRoot('toolbox-ack-success-legacy-')
+    await writeFile(join(legacy, 'pending.json'), JSON.stringify({ version: '0.5.8' }))
+    expect(await acknowledgeUpdate(legacy, '0.5.8')).toEqual({ previous: '', notes: '' })
+    // 版本不符 = 普通启动;pending 不在 = 回执后助手已收走,都不给
+    const mismatch = await tempRoot('toolbox-ack-success-mismatch-')
+    await writeFile(join(mismatch, 'pending.json'), JSON.stringify({ version: '0.5.9' }))
+    expect(await acknowledgeUpdate(mismatch, '0.5.8')).toBeUndefined()
+    const spent = await tempRoot('toolbox-ack-success-spent-')
+    expect(await acknowledgeUpdate(spent, '0.5.8')).toBeUndefined()
+  })
+
   it('没有待确认更新时启动不清任何东西', async () => {
     const directory = await tempRoot('toolbox-ack-noop-')
     await makeApp(join(directory, 'previous-1000.app'), 'ancient')

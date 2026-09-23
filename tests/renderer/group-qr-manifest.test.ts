@@ -4,19 +4,19 @@ import { groupQrManifestUrl, resolveGroupQr } from '../../app/renderer/src/refer
 const validManifest = {
   kind: 'wecom-group-live-code',
   version: '20260915T020000Z',
-  imageUrl: 'https://laixin.net.cn/AI-tools/group-entry/qr/20260915T020000Z.png'
+  imageUrl: 'https://laixin.work/group-entry/qr/20260915T020000Z.png'
 }
 const bundledLiveCode = { label: '群', title: '群', description: '群', ready: true, qrImageSrc: 'bundled-live-code.png' }
 
 it('群活码只接受来信官网专用目录和官方群活码标识，拒绝普通群码、第三方和跨目录', async () => {
-  expect(groupQrManifestUrl).toBe('https://laixin.net.cn/AI-tools/group-entry/manifest.json')
+  expect(groupQrManifestUrl).toBe('https://laixin.work/group-entry/manifest.json')
   const remote = await resolveGroupQr({ fetcher: async () => new Response(JSON.stringify(validManifest), { status: 200 }) })
   expect(remote).toEqual({ source: 'remote', imageUrl: validManifest.imageUrl })
 
   for (const manifest of [
     { ...validManifest, kind: 'temporary-group-qr' },
     { ...validManifest, imageUrl: 'https://elsewhere.example/qr.png' },
-    { ...validManifest, imageUrl: 'https://laixin.net.cn/AI-tools/updates/qr.png' }
+    { ...validManifest, imageUrl: 'https://laixin.work/updates/qr.png' }
   ]) {
     const result = await resolveGroupQr({ fetcher: async () => new Response(JSON.stringify(manifest), { status: 200 }), config: bundledLiveCode })
     expect(result.source).toBe('bundled')

@@ -11,6 +11,8 @@
 import { credentialFindings, pickRedacted, redactText, redactValue } from './report-redact'
 import type { FaultRecord } from '../../shared/fault-log-types'
 import { REPORT_MAX_BYTES } from '../../report-types'
+import { supportDiagnosticAttemptLimit } from '../../network-diagnostics-types'
+import type { SupportDiagnosis } from './support-snapshot'
 
 /** 通道状态里能出去的字段。⛔ authorization：它是句固定说明，没有诊断价值，反而会被字段名闸抹成问号。 */
 const tunnelStatusFields = ['state', 'message', 'source', 'backend', 'nodeLabel', 'exitIp', 'pathSource',
@@ -32,6 +34,10 @@ const MAX_FAULTS = 20
 const MAX_ERROR_CODES = 20
 
 export interface ReportSources {
+  /** 客户刚才在界面看到并可复制的那一次诊断；上报不得重新跑一遍替换它。 */
+  readonly diagnosis?: SupportDiagnosis
+  /** 其余机器读数可以稍后采集，但必须单独标时，不能冒充 diagnosis.checkedAt。 */
+  readonly supplementalCollectedAt?: string
   /** tunnel.status 的读数（已是白名单视图，这里再挑一遍）。 */
   readonly tunnel?: unknown
   /** tunnel.repairStatus：最近一次网络自助修复。 */
@@ -60,6 +66,8 @@ export interface ReportSources {
 }
 
 export interface ReportBody extends Record<string, unknown> {
+  readonly diagnosis: Record<string, unknown>
+  readonly supplemental: Record<string, unknown>
   readonly network: Record<string, unknown>
   readonly daemonState: Record<string, unknown>
   readonly ledger: Record<string, unknown>
@@ -71,6 +79,30 @@ export interface ReportBody extends Record<string, unknown> {
   readonly notes: readonly string[]
   /** 整包复扫抹掉了几处凭据形状。正常是 0；非 0 说明上游多塞了字段，要去补白名单。 */
   readonly filtered: number
+}
+
+function diagnosisSection(diagnosis: SupportDiagnosis | undefined): Record<string, unknown> {
+  if (!diagnosis) return { available: false }
+  const report = diagnosis.report
+  const conclusion = report?.conclusion
+  return {
+    available: true,
+    ...pickRedacted(diagnosis, ['id']),
+    ...pickRedacted(report, ['software', 'checkedAt', 'validUntil']),
+    target: pickRedacted(report?.target, ['label', 'route']),
+    conclusion: {
+      ...pickRedacted(conclusion, ['status', 'scope', 'ruleId', 'title', 'summary', 'nextStep']),
+      evidence: Array.isArray(conclusion?.evidence)
+        ? conclusion.evidence.slice(0, 5).map((item) => pickRedacted(item, ['checkId', 'code', 'statement'])) : []
+    },
+    checks: Array.isArray(report?.checks)
+      ? report.checks.slice(0, 5).map((check) => pickRedacted(check, ['id', 'label', 'state', 'code', 'message', 'elapsedMs'])) : [],
+    attempts: Array.isArray(diagnosis.attempts)
+      ? diagnosis.attempts.slice(0, supportDiagnosticAttemptLimit).map((attempt) => pickRedacted(attempt, ['at', 'software', 'action', 'outcome', 'detail'])) : [],
+    attemptsTotal: Number.isSafeInteger(diagnosis.attemptsTotal) && diagnosis.attemptsTotal >= diagnosis.attempts.length
+      ? diagnosis.attemptsTotal : diagnosis.attempts.length,
+    attemptsComplete: diagnosis.attemptsComplete === true
+  }
 }
 
 /** 账本摘要：条数与状态分布 + 每条的类别/项目/状态/时刻。⛔ 原值内容。 */
@@ -107,6 +139,8 @@ function daemonLogSection(log: ReportSources['daemonLog'], absence: ReportSource
 export function buildReportBody(sources: ReportSources): ReportBody {
   const notes = [...(sources.notes ?? [])]
   const draft = {
+    diagnosis: diagnosisSection(sources.diagnosis),
+    supplemental: pickRedacted({ collectedAt: sources.supplementalCollectedAt }, ['collectedAt']),
     network: {
       status: pickRedacted(sources.tunnel, [...tunnelStatusFields]),
       repair: pickRedacted(sources.repair, [...repairFields])

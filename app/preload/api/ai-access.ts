@@ -20,12 +20,16 @@ export interface AiAccessApi {
   restorePreviousConnection(input: { shell: AiAccessShell }): Promise<AiAccessSnapshot>
   saveProviderKey(input: { shell: AiAccessShell; provider: ModelProviderId; key: string }): Promise<AiAccessSnapshot>
   useProvider(input: { provider: ModelProviderId; shell: 'codex' | 'claude' | 'hermes' }): Promise<AiAccessSnapshot>
+  /** API-06：快捷表单换 Key 的原子入口——候选 Key 先验证，任一步失败都回到原 Key、原模型、原路由。 */
+  useProviderWithKey(input: { shell: AiAccessShell; provider: ModelProviderId; key: string }): Promise<AiAccessSnapshot>
   configureProvider(input: { provider: ModelProviderId; shell: AiAccessShell; key: string; model: string }): Promise<AiAccessSnapshot>
   serviceStatus(): Promise<AiAccessSnapshot>
   providerConfiguration(input: { provider: ModelProviderId; shell: AiAccessShell }): Promise<AiAccessSnapshot>
   measureProviderLatency(input: { provider: ModelProviderId; shell: AiAccessShell; key: string; model?: string }): Promise<AiAccessSnapshot>
   openProviderConsole(input: { provider: ModelProviderId }): Promise<AiAccessSnapshot>
   testProvider(input: { provider: ModelProviderId; shell: 'codex' | 'claude' | 'hermes' }): Promise<AiAccessSnapshot>
+  /** API-10：中止在飞的接口自测请求（服务面板「取消检查」/关闭面板）。返回被中止的请求数。 */
+  cancelServiceTests(): Promise<AiAccessSnapshot>
   remedy(input: { shell: AiAccessShell; action: ApiRemedyAction; provider: string }): Promise<AiAccessSnapshot>
   recover(): Promise<AiAccessSnapshot>
   verifyConfiguration(): Promise<AiAccessSnapshot>
@@ -56,12 +60,14 @@ export const api: AiAccessApi = {
   restorePreviousConnection: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'aiaccess.restorePreviousConnection', input),
   saveProviderKey: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'aiaccess.saveProviderKey', input),
   useProvider: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'aiaccess.useProvider', input),
+  useProviderWithKey: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'aiaccess.useProviderWithKey', input),
   configureProvider: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'aiaccess.configureProvider', input),
   serviceStatus: () => ipcRenderer.invoke(IPC_CHANNEL, 'aiaccess.serviceStatus', undefined),
   providerConfiguration: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'aiaccess.providerConfiguration', input),
   measureProviderLatency: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'aiaccess.measureProviderLatency', { ...input, model: input.model ?? '' }),
   openProviderConsole: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'aiaccess.openProviderConsole', input),
   testProvider: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'aiaccess.testProvider', input),
+  cancelServiceTests: () => ipcRenderer.invoke(IPC_CHANNEL, 'aiaccess.cancelServiceTests', undefined),
   remedy: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'aiaccess.remedy', input),
   recover: () => ipcRenderer.invoke(IPC_CHANNEL, 'aiaccess.recover', undefined),
   verifyConfiguration: () => ipcRenderer.invoke(IPC_CHANNEL, 'aiaccess.verifyConfiguration', undefined),

@@ -275,11 +275,11 @@ describe('本机 API 服务', () => {
     const response = await fetch(`${g.baseUrl}/codex/deepseek/v1/responses`, {
       method: 'POST', headers: { authorization: `Bearer ${token}` }, body: '{}'
     })
-    expect(response.status).toBe(502)
+    expect(response.status).toBe(413)
     const body = await response.text()
-    expect(body).toContain('接口没有返回有效模型回复')
+    expect(body).toContain('转发上限')
     expect(body).not.toContain('xxxxx')
-    expect(g.snapshot().requests[0]).toMatchObject({ ok: false, code: 'invalid_reply' })
+    expect(g.snapshot().requests[0]).toMatchObject({ ok: false, code: 'payload_too_large' })
   })
 
   it('客户端认证失败后的自动重试在同一路由版本内不再直打上游，换 Key 后立即解除短路', async () => {
@@ -302,6 +302,77 @@ describe('本机 API 服务', () => {
     g.setRoutes([{ ...routes[0], key: 'sk-fixture-upstream-key-replaced-0123456789' }])
     expect((await request()).status).toBe(400)
     expect(calls).toBe(2)
+  })
+
+  it('同一供应商同一把 Key 重新探测成功后立即解除客户端短路，不再吃 30 秒缓存错误', async () => {
+    let calls = 0
+    let healthy = false
+    const sse = 'data: {"type":"response.output_text.delta","delta":"OK"}\n\ndata: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":3,"output_tokens":1}}}\n\n'
+    const g = await start(async () => {
+      calls += 1
+      return healthy ? new Response(sse, { headers: { 'content-type': 'text/event-stream' } })
+        : new Response('private invalid_api_key detail', { status: 401 })
+    })
+    const request = () => fetch(`${g.baseUrl}/codex/deepseek/v1/responses`, {
+      method: 'POST', headers: { authorization: `Bearer ${token}` }, body: '{"input":[]}'
+    })
+
+    expect((await request()).status).toBe(400)
+    await request()
+    expect(calls).toBe(1)
+
+    // 上游恢复；客户在工具箱里「重新测试」——探测走直连必须成功，并立刻清掉这条绑定的短路。
+    healthy = true
+    const probe = await g.probe(routes[0])
+    expect(probe.ok).toBe(true)
+    expect(calls).toBe(2)
+
+    // 同一把 Key 的客户端请求随即放行并真实打到上游，而不是等 30 秒自然过期。
+    const unblocked = await request()
+    expect(unblocked.status).toBe(200)
+    expect(calls).toBe(3)
+  })
+
+  it('探测的是另一家供应商时不误清当前路由的短路', async () => {
+    let healthy = false
+    const sse = 'data: {"type":"response.output_text.delta","delta":"OK"}\n\ndata: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":3,"output_tokens":1}}}\n\n'
+    const g = await start(async () => {
+      return healthy ? new Response(sse, { headers: { 'content-type': 'text/event-stream' } })
+        : new Response('private invalid_api_key detail', { status: 401 })
+    })
+    const request = () => fetch(`${g.baseUrl}/codex/deepseek/v1/responses`, {
+      method: 'POST', headers: { authorization: `Bearer ${token}` }, body: '{"input":[]}'
+    })
+    expect((await request()).status).toBe(400)
+    await request()
+
+    // 用另一家（Kimi）的绑定探测成功：codex/deepseek 路由上的短路必须原样保留。
+    healthy = true
+    const other = await g.probe({ ...routes[0], provider: 'kimi', model: 'kimi-for-coding', endpoint: 'https://api.kimi.com/coding/v1/responses' })
+    expect(other.ok).toBe(true)
+    const stillBlocked = await request()
+    expect(stillBlocked.status).toBe(400)
+    expect((await stillBlocked.text()).length).toBeGreaterThan(0)
+  })
+
+  it('上游 429 限流进重试短路:客户端内建的连发重试不再全额打上游(Phase 1 429 短窗)', async () => {
+    let calls = 0
+    const g = await start(async () => {
+      calls += 1
+      return new Response('{"error":{"message":"slow down"}}', { status: 429 })
+    })
+    const request = () => fetch(`${g.baseUrl}/codex/deepseek/v1/responses`, {
+      method: 'POST', headers: { authorization: `Bearer ${token}` }, body: '{"input":[]}'
+    })
+
+    // 第一发真打上游,拿到真实限流与状态
+    expect((await request()).status).toBe(429)
+    expect(calls).toBe(1)
+    // 客户端内建重试(通常连发 8 次):本地理应短路成 429,⛔ 全额再打会被上游拉黑
+    const retried = await request()
+    expect(retried.status).toBe(429)
+    expect(await retried.text()).toContain('稍后重试')
+    expect(calls).toBe(1)
   })
 
   it('客户端自动取消不解除既有重试短路或抹掉连续超时计数', async () => {
@@ -776,5 +847,246 @@ describe('本机 API 服务', () => {
 
     const healthy = await start(async () => new Response(normalClaude, { headers: { 'content-type': 'text/event-stream' } }))
     await expect(healthy.probe(routes.find(route => route.shell === 'claude')!)).resolves.toMatchObject({ ok: true })
+  })
+
+  it('Responses 协议的回答截断单独判类，⛔ 报成服务商故障（API-05）', async () => {
+    // 流式：response.incomplete 事件，reason=max_tokens（流式事件参考口径）。
+    const incompleteStream = [
+      'data: {"type":"response.output_text.delta","delta":"部分回答"}',
+      'event: response.incomplete\ndata: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_tokens"},"usage":{"input_tokens":10,"output_tokens":40}}}',
+      ''
+    ].join('\n\n')
+    // 非流式：response 对象本身 status=incomplete，reason=max_output_tokens（对象字段文档拼写）。
+    const incompleteJson = JSON.stringify({
+      status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' },
+      output: [{ type: 'message', content: [{ type: 'output_text', text: '部分回答' }] }],
+      usage: { input_tokens: 10, output_tokens: 40 }
+    })
+
+    const streaming = await start(async () => new Response(incompleteStream, { headers: { 'content-type': 'text/event-stream' } }))
+    await expect(streaming.probe(routes.find(route => route.shell === 'codex')!))
+      .resolves.toMatchObject({ ok: false, code: 'response_truncated' })
+
+    const nonStreaming = await start(async () => new Response(incompleteJson, { headers: { 'content-type': 'application/json' } }))
+    await expect(nonStreaming.probe(routes.find(route => route.shell === 'codex')!))
+      .resolves.toMatchObject({ ok: false, code: 'response_truncated' })
+
+    // 客户的请求同样要拿到「回答过长」，而不是「服务商返回异常」。
+    const client = await start(async () => new Response(incompleteJson, { headers: { 'content-type': 'application/json' } }))
+    const response = await fetch(`${client.baseUrl}/codex/deepseek/v1/responses`, { method: 'POST', headers: { authorization: `Bearer ${token}` }, body: '{}' })
+    const body = await response.text()
+    expect(body).toContain('回答太长')
+    expect(body).not.toContain('服务商返回异常')
+    expect(client.snapshot().requests[0]).toMatchObject({ ok: false, code: 'response_truncated' })
+  })
+
+  it('请求超过本机 32MB 转发上限：如实说超出上限并留记录，⛔ 说成「无有效回复」（API-07）', async () => {
+    const g = await start(async () => { throw new Error('must not reach upstream') })
+    const response = await fetch(`${g.baseUrl}/codex/deepseek/v1/responses`, {
+      method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: 'x'.repeat(32 * 1024 * 1024 + 1)
+    })
+    expect(response.status).toBe(413)
+    const body = await response.text()
+    expect(body).toContain('转发上限')
+    expect(body).not.toContain('没有返回有效模型回复')
+    expect(g.snapshot().requests[0]).toMatchObject({ ok: false, code: 'payload_too_large', source: 'client' })
+  })
+
+  it('上游回复超过本机 32MB 转发上限：如实说超出上限，⛔ 说成网络未连接或无有效回复（API-07）', async () => {
+    const oversized = 'x'.repeat(32 * 1024 * 1024 + 1)
+    const nonStreaming = await start(async () => new Response(oversized, { headers: { 'content-type': 'application/json' } }))
+    const response = await fetch(`${nonStreaming.baseUrl}/codex/deepseek/v1/responses`, { method: 'POST', headers: { authorization: `Bearer ${token}` }, body: '{}' })
+    expect(response.status).toBe(413)
+    const body = await response.text()
+    expect(body).toContain('转发上限')
+    expect(body).not.toContain('未连接到服务商')
+    expect(nonStreaming.snapshot().requests[0]).toMatchObject({ ok: false, code: 'payload_too_large' })
+
+    const oneEvent = `data: {"type":"response.output_text.delta","delta":"${'x'.repeat(32 * 1024 * 1024)}"}\n\n`
+    const streaming = await start(async () => new Response(oneEvent, { headers: { 'content-type': 'text/event-stream' } }))
+    const sseResponse = await fetch(`${streaming.baseUrl}/codex/deepseek/v1/responses`, { method: 'POST', headers: { authorization: `Bearer ${token}` }, body: '{}' })
+    expect(sseResponse.status).toBe(413)
+    expect(await sseResponse.text()).toContain('转发上限')
+    expect(streaming.snapshot().requests[0]).toMatchObject({ ok: false, code: 'payload_too_large' })
+  })
+
+  // ── API-08：转发路径空闲超时 ──
+  type RequestRecord = ReturnType<AiGateway['snapshot']>['requests'][number]
+  /** 记录在响应落定之后才写入（destroy/end 先于 recordClientResult），按条数轮询等它。 */
+  async function waitForRecord(gateway: AiGateway, count: number): Promise<RequestRecord> {
+    for (let attempt = 0; attempt < 400 && gateway.snapshot().requests.length < count; attempt += 1) {
+      await new Promise(resolve => setTimeout(resolve, 5))
+    }
+    const records = gateway.snapshot().requests
+    expect(records.length, `网关应记下第 ${count} 条请求`).toBeGreaterThanOrEqual(count)
+    return records[0]
+  }
+  /** 上游收到请求后先吐一段就永远沉默；abort 时把流收尾，模拟真实的空闲断流。 */
+  function streamHeadThenSilence(_url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]): Promise<Response> {
+    const encoder = new TextEncoder()
+    return Promise.resolve(new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"type":"response.output_text.delta","delta":"开了个头"}\n\n'))
+        init?.signal?.addEventListener('abort', () => controller.error(new DOMException('aborted', 'AbortError')), { once: true })
+      }
+    }), { headers: { 'content-type': 'text/event-stream' } }))
+  }
+
+  it('还在正常出字的长回答不被总时长硬掐断（API-08）', async () => {
+    const encoder = new TextEncoder()
+    const frames = Array.from({ length: 50 }, (_, index) =>
+      `data: {"type":"response.output_text.delta","delta":"第${index}段"}\n\n`)
+    frames.push('event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":10,"output_tokens":50}}}\n\n')
+    const g = await start(async (_url, init) => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        let index = 0
+        let stopped = false
+        init?.signal?.addEventListener('abort', () => { stopped = true; controller.error(new DOMException('aborted', 'AbortError')) }, { once: true })
+        const tick = (): void => {
+          if (stopped) return
+          if (index >= frames.length) { controller.close(); return }
+          controller.enqueue(encoder.encode(frames[index]))
+          index += 1
+          setTimeout(tick, 20)
+        }
+        tick()
+      }
+    }), { headers: { 'content-type': 'text/event-stream' } }), 400)
+    // 总时长约 1 秒，远超 400ms；但每 20ms 都有数据流动，空闲从不达标。
+    const response = await fetch(`${g.baseUrl}/codex/deepseek/v1/responses`, {
+      method: 'POST', headers: { authorization: `Bearer ${token}` }, body: '{}'
+    })
+    const text = await response.text().catch(() => '')
+    const record = await waitForRecord(g, 1)
+    expect(record).toMatchObject({ source: 'client', ok: true })
+    expect(record.code).toBeUndefined()
+    expect(record.durationMs).toBeGreaterThan(400)
+    expect(text).toContain('response.completed')
+  }, 10_000)
+
+  it('上游真空闲达到上限仍然判 timeout，⛔ 放走真卡死（API-08）', async () => {
+    const g = await start(async (_url, init) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true })
+    }), 300)
+    const response = await fetch(`${g.baseUrl}/codex/deepseek/v1/responses`, {
+      method: 'POST', headers: { authorization: `Bearer ${token}` }, body: '{}'
+    })
+    expect(response.status).toBe(504)
+    expect(await response.text()).toContain('超时')
+    expect(await waitForRecord(g, 1)).toMatchObject({ source: 'client', ok: false, code: 'timeout' })
+  }, 10_000)
+
+  it('有过数据流动的超时不再连坐成「厂商侧故障」，健康厂商不被误报（API-08）', async () => {
+    const g = await start(streamHeadThenSilence, 300)
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const response = await fetch(`${g.baseUrl}/codex/deepseek/v1/responses`, {
+        method: 'POST', headers: { authorization: `Bearer ${token}` }, body: '{}'
+      })
+      // 首段已按 200 开流，空闲超时只能掐断流；记录先落，再限时排空可能被 destroy 的响应。
+      const record = await waitForRecord(g, attempt)
+      await Promise.race([response.text().catch(() => ''), new Promise(resolve => setTimeout(resolve, 500))])
+      expect(record, `第 ${attempt} 次「动过再停」的超时不该算厂商账`).toMatchObject({ source: 'client', ok: false, code: 'timeout' })
+    }
+    expect(JSON.stringify(g.snapshot())).not.toContain('provider_outage')
+  }, 15_000)
+
+  it('上游零数据的空闲超时照旧三次连坐升级「厂商侧故障」（API-08 守卫）', async () => {
+    const g = await start(async (_url, init) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true })
+    }), 300)
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const response = await fetch(`${g.baseUrl}/codex/deepseek/v1/responses`, {
+        method: 'POST', headers: { authorization: `Bearer ${token}` }, body: '{}'
+      })
+      // 升级改判发生在下游响应之后：响应恒为 504/timeout，provider_outage 落在记录里。
+      expect(response.status, `第 ${attempt} 次真空闲超时`).toBe(504)
+      const record = await waitForRecord(g, attempt)
+      expect(record).toMatchObject({ source: 'client', ok: false, code: attempt === 3 ? 'provider_outage' : 'timeout' })
+    }
+  }, 15_000)
+
+  it('已开始流式转发后再遇超上限事件：原流内追加 payload_too_large 错误事件收尾，HTTP 状态不再改变（API-07 复核）', async () => {
+    const encoder = new TextEncoder()
+    const g = await start(async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"type":"response.output_text.delta","delta":"部分回答"}\n\n'))
+        controller.enqueue(encoder.encode(`data: {"type":"response.output_text.delta","delta":"${'x'.repeat(32 * 1024 * 1024 + 16)}"}\n\n`))
+        controller.close()
+      }
+    }), { headers: { 'content-type': 'text/event-stream' } }))
+    const response = await fetch(`${g.baseUrl}/codex/deepseek/v1/responses`, { method: 'POST', headers: { authorization: `Bearer ${token}` }, body: '{}' })
+    // 部分内容已按 200 开始转发，HTTP 状态收不回来；超上限只能在原流里以错误事件收尾。
+    expect(response.status).toBe(200)
+    const text = await response.text()
+    expect(text).toContain('部分回答')
+    expect(text).toContain('event: error')
+    expect(text).toContain('payload_too_large')
+    expect(text).toContain('转发上限')
+    expect(g.snapshot().requests[0]).toMatchObject({ ok: false, code: 'payload_too_large' })
+  })
+
+  // ── API-10：点测试/启用要么快点有结果、要么能取消 ──
+
+  it('测速黑洞用默认超时 15 秒内如实返回失败，客户不再干等 45 秒（API-10）', async () => {
+    // 不注入 options.timeoutMs：守的正是生产默认值（⛔ 改回 45 秒这条用例必须红）。
+    const g = new AiGateway({ fetch: (_url, init) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true })
+    }) })
+    gateways.push(g)
+    await g.start(0, token)
+    g.setRoutes(routes)
+    const started = Date.now()
+    await expect(g.probe(routes[0])).resolves.toMatchObject({ ok: false, code: 'timeout' })
+    expect(Date.now() - started).toBeLessThanOrEqual(20_500)
+  }, 60_000)
+
+  it('取消检查：在飞测速请求真被中止，按取消计类而不是网络故障（API-10）', async () => {
+    let upstreamAborted = false
+    const g = new AiGateway({ fetch: (_url, init) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => { upstreamAborted = true; reject(new DOMException('aborted', 'AbortError')) }, { once: true })
+    }) })
+    gateways.push(g)
+    await g.start(0, token)
+    g.setRoutes(routes)
+    const pending = g.probe(routes[0])
+    await new Promise(resolve => setTimeout(resolve, 250))
+    expect(g.cancelTests()).toBe(1)
+    await expect(pending).resolves.toMatchObject({ ok: false, code: 'client_aborted' })
+    expect(upstreamAborted).toBe(true)
+    expect(g.snapshot().requests[0]).toMatchObject({ source: 'test', ok: false, code: 'client_aborted' })
+    // 没有在飞请求时取消是空操作。
+    expect(g.cancelTests()).toBe(0)
+  })
+
+  it('probe 首轮失败立即返回，第二轮不发出（API-10 钉守：最坏等待只按轮数×单轮预算计）', async () => {
+    let calls = 0
+    const g = await start(async () => { calls += 1; return Response.json({ error: { message: 'no' } }, { status: 500 }) })
+    await expect(g.probe(routes[0])).resolves.toMatchObject({ ok: false })
+    expect(calls).toBe(1)
+  })
+
+  // Phase 2 ⑧:stop() 中止在途客户端请求是工具箱自己在关机/换端口,不是「连不上服务商」——
+  // ⛔ 记成 network_error 污染回执与 FB-1 故障统计(那会让 M1 密度虚高、把排查引向网络)。
+  it('stop() 中止在途客户端请求不记 network_error,不进故障统计', async () => {
+    let signalUpstreamStarted!: () => void
+    const upstreamStarted = new Promise<void>(resolve => { signalUpstreamStarted = resolve })
+    const g = await start((_url, init) => {
+      signalUpstreamStarted()
+      return new Promise((_resolve, reject) => {
+        (init?.signal as AbortSignal).addEventListener('abort', () => reject(new Error('fixture aborted by stop()')))
+      })
+    }, 30_000)
+    const failures: string[] = []
+    g.onClientFailure(record => failures.push(record.code ?? ''))
+    const pending = fetch(`${g.baseUrl}/codex/deepseek/v1/responses`, {
+      method: 'POST', headers: { authorization: `Bearer ${token}` }, body: JSON.stringify({ input: 'x', stream: true })
+    }).catch(() => 'disconnected')
+    await upstreamStarted
+    await new Promise(resolve => setTimeout(resolve, 10))
+    await g.stop()
+    await pending
+    expect(failures).toEqual([])
+    expect(g.snapshot().requests.some(record => record.code === 'network_error')).toBe(false)
   })
 })

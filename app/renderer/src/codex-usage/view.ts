@@ -1,5 +1,5 @@
 import type { UsageStatus, UsageWindow } from '../../../main/codex-usage/types'
-import { LOCAL_USAGE_DAYS, type PlanUsageStatus } from '../../../shared/plan-usage-types'
+import { LOCAL_USAGE_DAYS, type ClaudeUsageFailureReason, type PlanUsageStatus } from '../../../shared/plan-usage-types'
 
 export function usageEmptyState(status: UsageStatus): { title: string; description: string } {
   const states: Record<UsageStatus, { title: string; description: string }> = {
@@ -7,6 +7,7 @@ export function usageEmptyState(status: UsageStatus): { title: string; descripti
     ready: { title: '暂未提供额度数据', description: '本次没有返回可显示的额度，请稍后刷新。' },
     unavailable: { title: '暂时读不到用量', description: '本次查询未完成，不代表账号未登录或额度已用完。稍后刷新即可。' },
     'not-installed': { title: '先安装 Codex', description: '安装 Codex 桌面版或 CLI 后，再回来查看账号用量。' },
+    'not-added': { title: '添加账号', description: '套餐用量只读取在工具箱里登录过的账号。请到「账号总览」点「添加账号」完成一次官方登录。' },
     'signed-out': { title: '先在 Codex 中登录', description: '请使用你的 ChatGPT 账号登录 Codex，然后回到这里刷新。来信账号与 ChatGPT 账号分别使用。' },
     unsupported: { title: '当前登录方式不提供套餐用量', description: '本页显示 ChatGPT 套餐额度。当前登录方式的费用或额度请在对应服务中查看。' },
     'update-required': { title: '需要更新 Codex', description: '当前 Codex 版本还不支持用量查询。更新 Codex 后再刷新。' },
@@ -38,8 +39,17 @@ export function resetText(seconds: number | null, now = Date.now()): string {
   return `${relative}后重置 · ${new Date(seconds * 1_000).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}`
 }
 
+/** Claude 官方用量没读到的四种原因各说各的话,各给客户能做的那件事(Phase 2 ④)。 */
+const claudeFailureStates: Record<ClaudeUsageFailureReason, (label: string) => { title: string; description: string }> = {
+  'not-installed': (label) => ({ title: `本机还没装 ${label}`, description: '装好并登录官方账号后回来刷新，这里会显示官方套餐额度。' }),
+  'auth-required': (label) => ({ title: `先在 ${label} 中登录`, description: '套餐用量只读取已登录的官方账号。请完成官方登录后回来刷新；与来信账号分别使用。' }),
+  'protocol-changed': (label) => ({ title: `${label} 返回了认不出的结果`, description: '官方接口的返回格式可能变了。请把客户端更新到最新版后再刷新；一直这样请联系来信客服。' }),
+  timeout: () => ({ title: '读取时间有些长', description: '检查这台电脑能否正常联网，稍后再试。这次没读到不代表账号未登录或额度用完。' })
+}
+
 /** 国内壳与套餐用量：读不到的时候，屏幕上必须写清楚是哪一种读不到。 */
-export function planUsageEmptyState(status: PlanUsageStatus, platformLabel: string): { title: string; description: string } {
+export function planUsageEmptyState(status: PlanUsageStatus, platformLabel: string, reason?: ClaudeUsageFailureReason): { title: string; description: string } {
+  if (status === 'official-unavailable' && reason !== undefined) return claudeFailureStates[reason](platformLabel)
   const states: Record<PlanUsageStatus, { title: string; description: string }> = {
     'official-unavailable': { title: '官方套餐用量暂未读到', description: '本次查询没有完成，不代表账号未登录或额度用完。请确认 Claude Code 已更新且能联网，再刷新或打开官方页面查看。' },
     idle: { title: '正在读取用量', description: '稍等一下，结果会自动显示。' },

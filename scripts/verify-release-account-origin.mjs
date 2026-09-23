@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { extractFile } from '@electron/asar'
 
-const expectedOrigin = '"https://laixin.net.cn/AI-tools/"'
+const expectedOrigin = '"https://laixin.work/"'
 const expectedVersion = JSON.parse(readFileSync(resolve('package.json'), 'utf8')).version
 const archives = process.argv.slice(2)
 
@@ -15,8 +15,10 @@ for (const archive of archives) {
   const main = extractFile(path, 'out/main/index.js').toString('utf8')
   const packagedVersion = JSON.parse(extractFile(path, 'package.json').toString('utf8')).version
   const origin = main.match(/new AccountClient\(\s*([^,]+),/)?.[1]
+  const updateOrigin = main.match(/new ToolboxUpdater\(\{[\s\S]*?\borigin:\s*([^,]+),/)?.[1]
   assert.equal(packagedVersion, expectedVersion, `PACKAGED_VERSION_MISMATCH:${path}`)
   assert.equal(origin, expectedOrigin, `ACCOUNT_ORIGIN_MISMATCH:${path}`)
+  assert.equal(updateOrigin, expectedOrigin, `UPDATE_ORIGIN_MISMATCH:${path}`)
   const sha256 = createHash('sha256').update(readFileSync(path)).digest('hex')
-  process.stdout.write(`ACCOUNT_ORIGIN_OK version=${packagedVersion} sha256=${sha256} archive=${path}\n`)
+  process.stdout.write(`ACCOUNT_UPDATE_ORIGIN_OK version=${packagedVersion} sha256=${sha256} archive=${path}\n`)
 }

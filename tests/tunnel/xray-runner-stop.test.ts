@@ -148,6 +148,33 @@ describe('xray-runner(win32 注入模拟)', () => {
     expect(exit).toHaveBeenCalledWith(64)
     expect(spawnImpl).not.toHaveBeenCalled()
   })
+
+  it('xray 内核 stderr 不再丢弃:转发到 runner 自己的 stderr(截断+限量闸),进守护日志链(甲-6)', () => {
+    const captured: string[] = []
+    const child = fakeXrayChild() as ReturnType<typeof fakeXrayChild> & { stderr?: EventEmitter }
+    startXrayRunner(runnerOptions({
+      // 夹具按 Node 的真实行为建模:stderr 流只在 runner 请求 'pipe' 时存在
+      spawnImpl: (executable: string, args: readonly string[], opts: { stdio?: readonly string[] | string }) => {
+        const stdio = opts?.stdio
+        const piped = Array.isArray(stdio) ? stdio[2] === 'pipe' : stdio === 'pipe'
+        if (piped) child.stderr = new EventEmitter()
+        return child
+      },
+      // 注入收集口(生产是 process.stderr → 守护日志 → 诊断包;包里逐行过 redact)
+      stderr: { write: (line: string) => { captured.push(line); return true } }
+    }))
+    if (child.stderr === undefined) throw new Error('runner 没有请求 pipe stderr(基线形状:ignore)')
+    child.stderr.emit('data', Buffer.from(`panic: runtime error\n${'Y'.repeat(400)}\n`))
+    expect(captured.length).toBeGreaterThan(0)
+    expect(captured[0]).toContain('panic: runtime error')
+    // 400 字符的行被截断到 200(⛔ 整段转储),爆量闸:全程共 50 行上限,前两条已占 2 → 洪水只放 48
+    const longLine = captured.find((line) => line.includes('YYYY'))
+    expect(longLine).toBeDefined()
+    expect(longLine!.length).toBeLessThanOrEqual(210)
+    for (let index = 0; index < 120; index += 1) child.stderr.emit('data', Buffer.from(`flood ${String(index)}\n`))
+    const floods = captured.filter((line) => line.includes('flood'))
+    expect(floods.length).toBe(48)
+  })
 })
 
 describe('local-bridge 停止(win32 注入模拟)', () => {
@@ -210,6 +237,40 @@ describe('local-bridge 停止(win32 注入模拟)', () => {
     expect(calls[1].cmd).not.toBe('taskkill')
     // 新 runner 的记档已就位,旧记档没有被当成新内核留下来
     expect(JSON.parse(readFileSync(pidPath, 'utf8')) as { pid: number }).toEqual(expect.objectContaining({ pid: 4002 }))
+    await bridge.close()
+  })
+
+  it('桥 spawn runner 的 stderr 去向是 inherit(接进守护日志链),⛔ 再 ignore 丢尸(甲-6)', async () => {
+    const spawns: Array<{ opts: { stdio?: readonly unknown[] } | undefined }> = []
+    const spawnImpl = (cmd: string, args: readonly string[], opts: { stdio?: readonly unknown[] }) => {
+      spawns.push({ opts })
+      const configPath = args[2] as string
+      const config = JSON.parse(readFileSync(configPath, 'utf8')) as { inbounds: Array<{ port: number }> }
+      socksServer = createServer((socket) => {
+        socket.on('data', (chunk) => { if (chunk[0] === 5) socket.write(Buffer.from([5, 0])) })
+      })
+      socksServer.listen(config.inbounds[0].port, '127.0.0.1')
+      writeFileSync(`${configPath}.pid`, `${JSON.stringify({ pid: 4002, startedAt: Date.now(), image: 'xray.exe' })}\n`, { mode: 0o600 })
+      const stdin = new PassThrough()
+      stdin.resume()
+      const child = new EventEmitter() as EventEmitter & { stdin: PassThrough, exitCode: number | null, signalCode: string | number | null, kill: (signal?: string) => boolean }
+      child.stdin = stdin
+      child.exitCode = null
+      child.signalCode = null
+      child.kill = (signal?: string) => {
+        child.signalCode = signal ?? 'SIGKILL'
+        queueMicrotask(() => child.emit('close', null, child.signalCode))
+        return true
+      }
+      return child as never
+    }
+    const bridge = createLocalBridge({
+      listenPort: 0, dataDir, routes: undefined, upstream: { host: '127.0.0.1', port: 1 },
+      spawnImpl: spawnImpl as never, platform: 'win32'
+    })
+    await bridge.listen()
+    expect(spawns).toHaveLength(1) // 数据目录是新的:无旧记档,不触发 taskkill
+    expect(spawns[0].opts?.stdio?.[2]).toBe('inherit')
     await bridge.close()
   })
 

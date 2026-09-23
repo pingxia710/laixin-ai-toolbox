@@ -41,6 +41,18 @@ export function activeBridgePort(): number {
   return tunnelService?.activeBridgePort() ?? 18080
 }
 
+/** 私有诊断会话跟随当前通路；undefined 仅表示已确认的复用直连，不代表使用系统代理。 */
+export function readNetworkDiagnosticProxy(): string | undefined {
+  const reused = tunnelService?.reusedProxy()
+  if (!reused) return `http://127.0.0.1:${String(activeBridgePort())}`
+  if (reused.kind === 'direct') return undefined
+  if (!['http', 'socks'].includes(reused.kind) || !reused.host || /[\s/@?#;\\]/.test(reused.host) ||
+      !Number.isInteger(reused.port) || reused.port! < 1 || reused.port! > 65535) throw new Error('DIAGNOSTIC_PATH_UNAVAILABLE')
+  const host = reused.host.includes(':') && !reused.host.startsWith('[') ? `[${reused.host}]` : reused.host
+  const proxy = new URL(`${reused.kind === 'socks' ? 'socks5' : 'http'}://${host}:${String(reused.port)}`)
+  return `${proxy.protocol}//${proxy.host}`
+}
+
 /**
  * 更新后这一轮到底算不算成（更新回执用）。
  * ⛔ 用 supervisor 的 `surrendered` 判：那一位只在「守护进程起不来」时置位，而「守护起来了、

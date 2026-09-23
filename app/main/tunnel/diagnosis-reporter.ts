@@ -44,6 +44,10 @@ export const DIAGNOSIS_MAX_AGE_MS = 7 * 24 * 60 * 60_000
 
 export class DiagnosisReporter {
   private flushing = false
+  /** 队列「读全量→改→写回」的串行链,enqueue 与 flush 排进同一条:flush 持本地快照在
+   * await send 挂起期间,中途入队若直接落盘,flush 恢复后会用旧快照整体覆盖——那条记录
+   * 从未发送就从盘上消失。链自身永不拒绝:一步失败不堵下一步。 */
+  private queueTail: Promise<void> = Promise.resolve()
 
   constructor(private readonly deps: DiagnosisReporterDeps) {}
 
@@ -59,36 +63,44 @@ export class DiagnosisReporter {
     }
     void this.deps.send(payload).catch((error: unknown) => {
       if ((error as DiagnosisSendError)?.diagnosisPermanent !== undefined) return
-      try { this.enqueue(payload) } catch { /* 攒批失败只能放弃这一条;⛔ 让它冒成主进程未处理拒绝 */ }
+      void this.serialized(() => this.enqueue(payload)).catch(() => { /* 攒批失败只能放弃这一条;⛔ 让它冒成主进程未处理拒绝 */ })
     })
   }
 
   /** 启动/拿到会话后的补传。按序发,一条失败即停(通道不通时条条不通,⛔ 雪崩式重试);
-   * 过期条目先丢。进行中重复调用直接让位。 */
+   * 过期条目先丢。进行中重复调用直接让位。整个读-发-写回在串行链内,中途入队排在 flush 之后。 */
   async flushPending(): Promise<void> {
     if (this.flushing || !this.deps.enabled()) return
     this.flushing = true
     try {
-      const queue = this.readQueue().filter((entry) => this.deps.now() - entry.timestamp <= DIAGNOSIS_MAX_AGE_MS)
-      while (queue.length > 0) {
-        const payload = queue[0]
-        try {
-          await this.deps.send(payload)
-        } catch (error: unknown) {
-          if ((error as DiagnosisSendError)?.diagnosisPermanent === 'route') {
-            // 老后台没有端点:留着这批,后台升级后(7 天内)还有价值;本轮回发就此打住。
-            this.writeQueue(queue)
+      await this.serialized(async () => {
+        const queue = this.readQueue().filter((entry) => this.deps.now() - entry.timestamp <= DIAGNOSIS_MAX_AGE_MS)
+        while (queue.length > 0) {
+          const payload = queue[0]
+          try {
+            await this.deps.send(payload)
+          } catch (error: unknown) {
+            if ((error as DiagnosisSendError)?.diagnosisPermanent === 'route') {
+              // 老后台没有端点:留着这批,后台升级后(7 天内)还有价值;本轮回发就此打住。
+              this.writeQueue(queue)
+              return
+            }
+            this.writeQueue(queue) // 会话过期或通道不通:整批原样保留
             return
           }
-          this.writeQueue(queue) // 会话过期或通道不通:整批原样保留
-          return
+          queue.shift()
+          this.writeQueue(queue)
         }
-        queue.shift()
-        this.writeQueue(queue)
-      }
+      })
     } finally {
       this.flushing = false
     }
+  }
+
+  private serialized<T>(op: () => T | Promise<T>): Promise<T> {
+    const result = this.queueTail.then(op)
+    this.queueTail = result.then(() => undefined, () => undefined)
+    return result
   }
 
   private enqueue(payload: DiagnosisPayload): void {

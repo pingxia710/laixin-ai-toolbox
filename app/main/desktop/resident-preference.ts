@@ -16,7 +16,7 @@
  */
 import { existsSync } from 'node:fs'
 import {
-  RESIDENT_LABEL, macAgentPath, macResidentLoaded, uninstallMacResident, uninstallWinResident, winResidentArmed, winResidentResidue
+  RESIDENT_LABEL, macAgentPath, macResidentLoaded, uninstallMacResident, uninstallWinResident, winResidentArmed, winResidentResidue, winResidentStaleTask
 } from '../tunnel/platform/resident'
 
 /** 客户还没选过时用的默认值。**这是产品取舍，不是技术裁决**——创始人拍了改这一行，其余代码不用动。 */
@@ -52,6 +52,15 @@ export interface ResidentToggleStatus {
    *  设置页必须把这一态说出来：开关显示着开而那件事并没有发生，就是假装成功。
    *  ⛔ 因此把开关拨回去（那是替客户改了他的选择），也 ⛔ 弹窗（网络本身好好的）。 */
   active: boolean
+  /** 甲-10 返工：`enabled && !active` 且系统里的存量管理员任务与本版定义不一致——
+   *  没生效，且「下次打开工具箱会再试一次」不成立（覆盖注册永远被拒），设置页换用带自救动作的文案。
+   *  恒给出（IPC 结果 schema 严格校验，⛔ 按有无裁剪字段）。 */
+  staleResidentTask: boolean
+}
+
+/** 组装给界面的状态；staleResidentTask 只有「选了开、没生效、存量任务对不上」才为真。 */
+function toggleStatus(enabled: boolean, supported: boolean, active: boolean): ResidentToggleStatus {
+  return { enabled, supported, active, staleResidentTask: enabled && supported && !active && winResidentStaleTask() }
 }
 
 export async function residentToggleStatus(
@@ -59,13 +68,13 @@ export async function residentToggleStatus(
   controller: ResidentController,
   supported: boolean
 ): Promise<ResidentToggleStatus> {
-  if (!supported) return { enabled: false, supported: false, active: false }
+  if (!supported) return toggleStatus(false, false, false)
   let enabled: boolean
-  try { enabled = preference.read() } catch { return { enabled: false, supported: false, active: false } }
+  try { enabled = preference.read() } catch { return toggleStatus(false, false, false) }
   // 没选开就谈不上武装;选了开才去问系统「此刻到底武装着没有」(⛔ 拿内存缓存当事实:
   // 客户手工删掉描述文件、清理软件扫走,缓存不会知道,读盘会)。问不出来按「没武装」报,⛔ 报成功。
   const active = enabled ? await controller.loaded().catch(() => false) : false
-  return { enabled, supported: true, active }
+  return toggleStatus(enabled, true, active)
 }
 
 export async function setResidentEnabled(
@@ -74,10 +83,10 @@ export async function setResidentEnabled(
   enabled: boolean,
   supported: boolean
 ): Promise<ResidentToggleStatus> {
-  if (!supported) return { enabled: false, supported: false, active: false }
+  if (!supported) return toggleStatus(false, false, false)
   const fallback = async (): Promise<ResidentToggleStatus> => {
     const active = await controller.loaded().catch(() => false)
-    try { return { enabled: preference.read(), supported: false, active } } catch { return { enabled: false, supported: false, active } }
+    try { return toggleStatus(preference.read(), false, active) } catch { return toggleStatus(false, false, active) }
   }
   if (!enabled) {
     // 先撤、回读确认撤干净了，才记下选择。顺序反了就会出现「开关关着、常驻还在」。
@@ -90,7 +99,7 @@ export async function setResidentEnabled(
   }
   try {
     preference.write(enabled)
-    return { enabled: preference.read(), supported: true, active: await controller.loaded().catch(() => false) }
+    return toggleStatus(preference.read(), true, await controller.loaded().catch(() => false))
   } catch { return fallback() }
 }
 
@@ -118,7 +127,10 @@ export async function applyResidentChoice(
 
 /** 真机上的常驻项。mac = LaunchAgent（描述文件在就算装着：没加载也会在下次登录加载）；Windows = 登录计划任务。
  *  Windows 的 loaded() 走 winResidentArmed（任务在且未停用才算武装），与 installed()（任一路径有残留）分开——
- *  ⛔ 因为「任务在」不等于「会拉起」，混用就是 2026-09-14 真机第 8 条那个假承诺。 */
+ *  ⛔ 因为「任务在」不等于「会拉起」，混用就是 2026-09-14 真机第 8 条那个假承诺。
+ *  mac 的 installed() 只看描述文件在不在：开关拨关走软卸载（守护在跑时不 bootout），任务会保持「已加载」
+ *  活到本轮守护自然退出/重启为止——那不是「下次登录会回来」的残留（描述文件已不在，登录时无人可加载），
+ *  ⛔ 算进残留，否则开关永远报「没卸干净」，客户的关闭选择记不下来。 */
 export function systemResidentController(platform: NodeJS.Platform | string = process.platform): ResidentController {
   if (platform === 'win32') {
     return {
@@ -128,8 +140,9 @@ export function systemResidentController(platform: NodeJS.Platform | string = pr
     }
   }
   return {
-    installed: async () => existsSync(macAgentPath(RESIDENT_LABEL)) || await macResidentLoaded(),
+    installed: async () => existsSync(macAgentPath(RESIDENT_LABEL)),
     loaded: () => macResidentLoaded(),
-    uninstall: () => uninstallMacResident()
+    // 开关路径一律软卸载（守护在跑时 ⛔ bootout）；连闲置已加载任务一起清的硬卸载由校准按席位判活兜底。
+    uninstall: () => uninstallMacResident(RESIDENT_LABEL, { leaveRunningInstance: true })
   }
 }

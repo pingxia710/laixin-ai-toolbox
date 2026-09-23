@@ -1,5 +1,5 @@
 import { session } from 'electron'
-import { activeBridgePort } from '../tunnel/runtime-owner'
+import { readNetworkDiagnosticProxy } from '../tunnel/runtime-owner'
 import { diagnosticProbeAllowed, DiagnosticProbeError, domesticDiagnosticUrl, type DiagnosticProbeResult } from './service'
 import { recipeStore } from '../shells/context'
 
@@ -13,10 +13,11 @@ function recipeEndpoints(): readonly string[] {
 // A private in-memory session carries no browser/account cookies and never changes system proxy settings.
 export async function probeDiagnosticUrl(url: string, route: 'direct' | 'tunnel'): Promise<DiagnosticProbeResult> {
   if (!diagnosticProbeAllowed(url, route, recipeEndpoints())) throw new Error('DIAGNOSTIC_TARGET_INVALID')
+  const proxy = route === 'direct' ? undefined : readNetworkDiagnosticProxy()
   const probeSession = session.fromPartition(`toolbox-network-diagnostic-${route}`, { cache: false })
   await probeSession.closeAllConnections()
-  await probeSession.setProxy(route === 'direct' ? { mode: 'direct' } : {
-    mode: 'fixed_servers', proxyRules: `http://127.0.0.1:${String(activeBridgePort())}`, proxyBypassRules: '<-loopback>'
+  await probeSession.setProxy(proxy === undefined ? { mode: 'direct' } : {
+    mode: 'fixed_servers', proxyRules: proxy, proxyBypassRules: '<-loopback>'
   })
   const startedAt = performance.now()
   try {

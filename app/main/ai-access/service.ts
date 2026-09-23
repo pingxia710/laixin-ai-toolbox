@@ -62,6 +62,8 @@ export interface AiAccessStateStore {
   write(state: AiAccessState): Promise<void>
   /** 损坏隔离后的一次性提示;无提示返回 undefined(与 read 的空状态配套)。 */
   consumeCorruptionNote?: () => string | undefined
+  /** 写失败分译(Phase 2 ⑤)的一句话:磁盘满/权限/通用各一译,一次性,status() 取走后清空。 */
+  consumeWriteFaultNote?: () => string | undefined
 }
 
 export interface AiAccessAdapter {
@@ -235,7 +237,8 @@ export class AiAccessService {
     const state = await this.read()
     // `read()` may quarantine a corrupt encrypted state and create this one-shot note. Consume it
     // afterwards so the first status response carries the customer-facing recovery instruction.
-    const note = this.store.consumeCorruptionNote?.()
+    // 写失败分译(Phase 2 ⑤)同用这个出口:磁盘满/权限那句话跟上一次状态读数,⛔ 只留在异常码里。
+    const note = this.store.consumeCorruptionNote?.() ?? this.store.consumeWriteFaultNote?.()
     await this.refreshConfigurationTargets(state)
     await this.refreshOfficialAuthentication(state)
     await this.refreshRecoveryPoints()
@@ -358,18 +361,27 @@ export class AiAccessService {
     return this.activateProvider(shell, provider)
   }
 
+  /**
+   * API-06：快捷 Key 表单的唯一原子入口。候选 Key 先探测，探测、写入、配置任一步失败都
+   * 回到原 Key、原模型、原路由，⛔ 未启用来源先把 Key 落盘再验证；模型内部沿用该来源
+   * 已存选择（走 route() 的 已存→配方→默认 顺序），⛔ 表单把默认模型写死。
+   */
+  async useProviderWithKey(shell: AiAccessShell, provider: AiAccessProvider, key: string): Promise<AiAccessStatus> {
+    return this.activateProvider(shell, provider, { key })
+  }
+
   /** Editor save is atomic: validate the candidate Key/model before replacing the old binding. */
   async configureProvider(shell: AiAccessShell, provider: AiAccessProvider, key: string, model: string): Promise<AiAccessStatus> {
     if (!model) throw new Error('AI_ACCESS_MODEL_INVALID')
     return this.activateProvider(shell, provider, { key, model })
   }
 
-  private async activateProvider(shell: AiAccessShell, provider: AiAccessProvider, input?: { key: string; model: string }): Promise<AiAccessStatus> {
+  private async activateProvider(shell: AiAccessShell, provider: AiAccessProvider, input?: { key: string; model?: string }): Promise<AiAccessStatus> {
     return this.serialize(() => this.activateProviderNow(shell, provider, input))
   }
 
   /** Runs inside the service serialization queue so a candidate Key cannot race an active route change. */
-  private async activateProviderNow(shell: AiAccessShell, provider: AiAccessProvider, input?: { key: string; model: string }): Promise<AiAccessStatus> {
+  private async activateProviderNow(shell: AiAccessShell, provider: AiAccessProvider, input?: { key: string; model?: string }): Promise<AiAccessStatus> {
       if (!isProvider(provider)) throw new Error('AI_ACCESS_PROVIDER_INVALID')
       this.assertProviderShellSupported(shell, provider)
       const adapter = this.adapter(shell)
@@ -589,6 +601,7 @@ export class AiAccessService {
         // AiGateway only retains acceptances whose revision still matches the active route. A late call on the
         // old provider therefore cannot turn the newly selected provider into "in use".
         observedClientCall: provider && currentConfiguration && observed[shell]?.provider === provider ? observed[shell]!.at : null,
+        lastObservedClientCall: provider && currentConfiguration && observed[shell]?.provider === provider ? observed[shell]!.lastAt : null,
         ...(codexDesktopRoute === undefined ? {} : { codexDesktopRoute }),
         configuration
       }
@@ -614,7 +627,10 @@ export class AiAccessService {
       this.recordUsage(shell, 'probe', result.ok ? 'success' : 'failure', result.ok ? undefined : result.code ?? 'unknown')
       const suggestedProvider = result.ok ? undefined : await this.suggestedProviderForKey(shell, provider, key, state, result.code)
       const code = suggestedProvider === undefined ? result.code : 'key_product_mismatch'
-      this.markCheck(shell, provider, result.ok, code, suggestedProvider === undefined ? undefined : this.suggestedProviderNotice(provider, suggestedProvider), suggestedProvider)
+      // 取消的检查给与计费提示一致的交代，⛔ 让面板把它当「连不上服务商」。
+      const notice = code === 'client_aborted' ? '接口测试已取消；已发出的请求可能仍按服务商规则计费。'
+        : suggestedProvider === undefined ? undefined : this.suggestedProviderNotice(provider, suggestedProvider)
+      this.markCheck(shell, provider, result.ok, code, notice, suggestedProvider)
     })
     return this.serviceStatus()
   }
@@ -740,11 +756,14 @@ export class AiAccessService {
    * 接管前的核对同时认出「别的工具留下的死地址」并把话说全（点名端口、说清来历）。
    */
   async verifyConfigurations(): Promise<ConfigurationVerification> {
-    await this.pending
-    const state = await this.read().catch(() => undefined)
-    const record = await this.inspectConfigurations(state)
-    const notes = await this.residualAddressNotes()
-    return notes.length === 0 ? record : { ...record, notes }
+    // 进串行队列(Phase 2 ⑥):切换/恢复写到一半时并发核对,会把工具箱自己的改写看成
+    // 「被外部改动」,还顺手作废刚攒下的客户端验收证据。排在队尾等写完再核,⛔ 半路上读指纹。
+    return this.serialize(async () => {
+      const state = await this.read().catch(() => undefined)
+      const record = await this.inspectConfigurations(state)
+      const notes = await this.residualAddressNotes()
+      return notes.length === 0 ? record : { ...record, notes }
+    })
   }
 
   /** 只报告：哪个壳的接口地址指着没人听的端口（= 别的工具留下的死配置）。⛔ 改接管行为。 */
@@ -1089,11 +1108,18 @@ export class AiAccessService {
 
   async stop(): Promise<void> { await this.gateway?.stop() }
 
+  /**
+   * API-10：中止在飞的测速请求（服务面板「取消检查」/关闭面板）。不进 serialize 队列——
+   * 排队被测速堵住时，取消恰恰要能立刻生效；它不读写任何状态，只中止网关在飞的 test 请求。
+   */
+  cancelTests(): number { return this.gateway?.cancelTests() ?? 0 }
+
   private markCheck(shell: AiAccessShell, provider: AiAccessProvider, ok: boolean, code?: ApiFailure, notice?: string, suggestedProvider?: AiAccessProvider): void {
     this.attempt = { shell, provider, at: new Date().toISOString(), ok, ...(code ? { code } : {}), ...(notice ? { notice } : {}), ...(suggestedProvider ? { suggestedProvider } : {}) }
     this.checks = [this.attempt, ...this.checks.filter(c => c.shell !== shell || c.provider !== provider)]
     // 闸门给的版本建议留在 ApiCheck.notice 供界面展示；记录里只留模板 id，⛔ 落自由文本。
-    if (!ok) this.extras.recordFault?.({ shell, provider, code: code ?? 'unknown', ...(code === 'shell_version_incompatible' ? { note: 'shell_version_incompatible' as const } : {}) })
+    // 客户自己取消的测速不是故障：与客户端 client_aborted 的口径一致，⛔ 进故障记录。
+    if (!ok && code !== 'client_aborted') this.extras.recordFault?.({ shell, provider, code: code ?? 'unknown', ...(code === 'shell_version_incompatible' ? { note: 'shell_version_incompatible' as const } : {}) })
   }
 
   private route(shell: AiAccessShell, provider: AiAccessProvider, key: string, state?: AiAccessState, model?: string): GatewayRoute {
