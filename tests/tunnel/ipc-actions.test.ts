@@ -16,6 +16,7 @@ import { lastIntent } from '../../sidecar/mac/ledger.mjs'
 import { buildPackageEntries, writePackageDir, type BuiltPackage } from './fixtures/package-builder'
 import {
   fakeAdapterEnv,
+  forceTunnelPathForTest,
   makeTempDir,
   readFakeStore,
   readJsonFile,
@@ -70,6 +71,7 @@ describe('五动作与桥注册(判据 3②③主进程侧、6 IPC 负向、12 �
       trust: { whitelistDigests: trustDigests, signingPublicKeys: [] },
       now: () => NOW,
       spawnDaemon: (dir: string) => {
+        forceTunnelPathForTest(dir)
         const child = spawn(
           process.execPath,
           [
@@ -100,7 +102,6 @@ describe('五动作与桥注册(判据 3②③主进程侧、6 IPC 负向、12 �
         spawnedChildren.push(child)
       },
       routesFile: join(SIDECAR_DIR, 'routes.default.json'),
-      reuseDirect: false,
       connectorOverride: {
         kind: 'loopback-probe',
         host: '127.0.0.1',

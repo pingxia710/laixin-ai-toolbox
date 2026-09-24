@@ -97,6 +97,20 @@ export function writeIntentFile(dataDir: string, intent: unknown): void {
   renameSync(temporary, path)
 }
 
+// 需要验证「来信接管」的进程级用例不能受运行机器所在地区影响：美国 CI 能直连 AI 服务，
+// 国内开发机通常不能。主进程写完意图、守护启动前，由测试夹具关掉直连复用。
+export function forceTunnelPathForTest(dataDir: string): void {
+  const path = join(dataDir, 'intent.json')
+  let intent: Record<string, unknown>
+  try {
+    intent = readJsonFile<Record<string, unknown>>(path)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+    throw error
+  }
+  writeIntentFile(dataDir, { ...intent, reuseDirect: false })
+}
+
 export function flushMicrotasks(): Promise<void> {
   return new Promise((resolvePromise) => setImmediate(resolvePromise))
 }

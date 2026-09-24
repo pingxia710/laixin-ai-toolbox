@@ -9,7 +9,7 @@ import { BridgeRegistry } from '../../app/main/bridge/bridge-registry'
 import { registerActions } from '../../app/main/actions/tunnel'
 import { layout } from '../../app/main/tunnel/paths'
 import { buildPackageEntries, writePackageDir } from './fixtures/package-builder'
-import { fakeAdapterEnv, makeTempDir, readFakeOps, readFakeStore, removeTempDir, startFakeUpstream, waitFor } from './helpers'
+import { fakeAdapterEnv, forceTunnelPathForTest, makeTempDir, readFakeOps, readFakeStore, removeTempDir, startFakeUpstream, waitFor } from './helpers'
 
 const cleanups: (() => Promise<unknown> | void)[] = []
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup() })
@@ -33,9 +33,11 @@ async function setup(timeoutMs = 10_000, launchDaemon = true) {
   }
   const service = new TunnelService({ dataDir, sidecarDir, picker: async () => packageDir,
     trust: { whitelistDigests: [built.digest], signingPublicKeys: [] }, now: () => Date.parse('2026-10-01T00:00:00Z'),
-    spawnDaemon: (_dir, runId) => launchDaemon ? launch('start', runId) : { on: () => undefined }, spawnRestore: () => launch('restore'),
+    spawnDaemon: (dir, runId) => {
+      forceTunnelPathForTest(dir)
+      return launchDaemon ? launch('start', runId) : { on: () => undefined }
+    }, spawnRestore: () => launch('restore'),
     routesFile: join(sidecarDir, 'routes.default.json'), repairTimeoutMs: timeoutMs, repairRestoreGraceMs: 800,
-    reuseDirect: false,
     connectorOverride: { kind: 'loopback-probe', host: '127.0.0.1', port: upstream.port, exitIp: '203.0.113.7' } })
   cleanups.push(async () => {
     await service.stop()
