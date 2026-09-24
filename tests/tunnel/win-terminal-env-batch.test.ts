@@ -97,13 +97,16 @@ describe('用户级环境变量:合批广播＋计时日志＋命令超时独立
 
   it('每项写入落计时日志:慢写入可见「哪个变量、多少毫秒」(基线:慢在哪一环无从判断)', async () => {
     const lines: string[] = []
-    const adapter = build({ delayMs: 25, log: (line) => lines.push(line) })
-    for (const item of envItems(adapter)) adapter.write(item.ref, item.value)
+    const adapter = build({ log: (line) => lines.push(line) })
+    const item = envItems(adapter).find((candidate) => candidate.ref.item === 'win-user-env-http-proxy')
+    expect(item).toBeDefined()
+    const now = vi.spyOn(Date, 'now').mockReturnValueOnce(1_000).mockReturnValueOnce(1_025)
+    adapter.write(item!.ref, item!.value)
+    now.mockRestore()
     await new Promise((resolve) => setImmediate(resolve))
     const envLines = lines.filter((line) => line.includes('win-user-env-http-proxy'))
     expect(envLines.length).toBe(1)
-    expect(envLines[0]).toContain('ms')
-    expect(/[2-9]\d\s*ms/.test(envLines[0])).toBe(true)
+    expect(envLines[0]).toContain('25 ms')
   })
 
   it('子进程命令超时给独立受控码 TERMINAL_ENVIRONMENT_COMMAND_TIMEOUT(基线:与「注册表不可读」混同一归因)', () => {

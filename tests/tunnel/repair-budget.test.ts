@@ -59,11 +59,12 @@ it('修复启动时按账本待结算条数取预算(注入记账函数核对输
   await waitFor(() => existsSync(layout.state(dataDir)) &&
     JSON.parse(readFileSync(layout.state(dataDir), 'utf8')).state === 'connected', 15_000)
 
+  const pendingBeforeRepair = pendingSettingEntries(dataDir).length
+  expect(pendingBeforeRepair).toBeGreaterThan(0)
   service.repair()
   await waitFor(() => !service.repairStatus().running, 20_000)
   expect(service.repairStatus().outcome).toBe('recovered')
   // 预算函数被咨询且输入=此刻账本待结算条数(连接状态下账本里是我们写下的账目)
   expect(budgetInputs).toHaveLength(1)
-  expect(budgetInputs[0]).toBe(pendingSettingEntries(dataDir).length)
-  expect(budgetInputs[0]).toBeGreaterThan(0)
+  expect(budgetInputs[0]).toBe(pendingBeforeRepair)
 }, 30_000)

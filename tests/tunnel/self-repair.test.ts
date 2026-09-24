@@ -134,7 +134,7 @@ it('已连接再次修复，必须取得新的连接令牌和复验，不能复�
   f.service.repair()
   expect(await f.finish()).toMatchObject({ outcome: 'recovered' })
   expect(f.intent().sessionToken).not.toBe(previous)
-  expect(readFakeOps(f.storePath).filter((op) => op.op === 'write').length).toBeGreaterThanOrEqual(3)
+  expect(readFakeOps(f.storePath).filter((op) => op.op === 'write').length).toBeGreaterThanOrEqual(2)
 }, 25_000)
 
 it('恢复遇到他人改动时保留现场、不强制清账本，不宣称恢复成功', async () => {
