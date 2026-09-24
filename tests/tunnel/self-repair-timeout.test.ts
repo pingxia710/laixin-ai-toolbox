@@ -56,6 +56,7 @@ for (const [label, pollFlag, adapterFile] of [['守护意图轮询 30ms', ['--in
     // 入口端口按候选表走(18080 被占就换 18180…),所以 ⛔ 把 18080 写死在断言里——
     // 那会让这条用例耦合一个全局资源:另一棵树在跑测试、或者客户机上真跑着别的代理占了 18080,它就红。
     // 要验的本来就是「系统代理指向守护此刻实际用的那个入口口」,读 state.json 的 bridgePort 才是正解。
+    await waitFor(() => readFakeStore(f.storePath)['Wi-Fi/socks-proxy'] !== undefined, 8000)
     const appliedStore = readFakeStore(f.storePath)['Wi-Fi/socks-proxy']
     const bridgePort = JSON.parse(readFileSync(layout.state(f.dataDir), 'utf8')).bridgePort as number
     await waitFor(() => !f.service.repairStatus().running, 15_000)
