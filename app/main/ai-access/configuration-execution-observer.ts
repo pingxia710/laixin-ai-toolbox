@@ -315,15 +315,24 @@ async function observeProcessOverrides(
 ): Promise<ConfigurationExecutionObservation> {
   if (platform === 'darwin' || platform === 'linux') {
     try {
-      const output = await run('/bin/ps', ['-axww', '-o', 'command='])
+      const output = await run('/bin/ps', ['-axww', '-o', 'pid=,ppid=,command='])
+      const processes = output.split(/\r?\n/).map(posixProcess)
+      const macDesktopRoots = platform === 'darwin' ? macCodexDesktopRoots(processes) : new Map<string, MacCodexDesktopApp>()
+      const processByPid = new Map(processes.flatMap(process => process.pid === undefined ? [] : [[process.pid, process] as const]))
       const result: Partial<Record<AiAccessShell, ConfigurationExecutionContext>> = {}
-      for (const line of output.split(/\r?\n/)) {
+      for (const process of processes) {
         for (const shell of shells) {
-          if (!knownClientInvocation(shell, line, home, platform)) continue
+          if (!knownClientInvocation(shell, process.command, home, platform)) continue
+          // The GUI's own app-server and sandbox workers read or serve the normal user root after
+          // a full app restart; they are not terminal clients. An official bundled binary with a
+          // different command or parent remains fail-closed because it can carry an unobservable
+          // per-session root, including one launched from a tool terminal inside the desktop app.
+          if (platform === 'darwin' && shell === 'codex' &&
+            knownMacCodexDesktopProcess(process, processByPid, macDesktopRoots)) continue
           // `ps` does not expose a process's inherited environment. A still-running native
           // client may therefore have an unobservable CODEX_HOME/CLAUDE_CONFIG_DIR/HERMES_HOME.
           // Ask for it to be closed before touching a root we cannot prove it will read.
-          result[shell] = launchOverridesConfiguration(shell, line)
+          result[shell] = launchOverridesConfiguration(shell, process.command)
             ? { source: 'observed', commandLine: true }
             : { source: 'unknown' }
         }
@@ -487,8 +496,7 @@ function knownClientInvocation(shell: AiAccessShell, line: string, home: string,
   const normalized = line.replace(/\\/g, '/')
   const homePath = home.replace(/\\/g, '/')
   if (shell === 'codex') {
-    return normalized.includes('/Codex.app/Contents/Resources/codex') ||
-      normalized.includes('/ChatGPT.app/Contents/Resources/codex') ||
+    return /\/(?:Codex|ChatGPT)\.app\/Contents\/Resources\/codex(?:\s|$)/.test(normalized) ||
       (normalized.includes('/@openai/codex/') && normalized.includes('/vendor/') && /\/codex(?:\s|$)/.test(normalized)) ||
       normalized.includes(path.join(home, '.local', 'lib', 'node_modules').replace(/\\/g, '/')) && normalized.includes('/@openai/codex/')
   }
@@ -497,6 +505,93 @@ function knownClientInvocation(shell: AiAccessShell, line: string, home: string,
       normalized.includes(`${homePath}/.local/bin/claude`)
   }
   return normalized.includes(`${homePath}/.hermes/hermes-agent/venv/`) || normalized.includes(`${homePath}/.hermes/bin/hermes`)
+}
+
+interface PosixProcess {
+  readonly pid?: string
+  readonly ppid?: string
+  readonly command: string
+}
+
+function posixProcess(line: string): PosixProcess {
+  const match = line.match(/^\s*(\d+)\s+(\d+)\s+(.+)$/)
+  return match === null ? { command: line } : { pid: match[1], ppid: match[2], command: match[3] }
+}
+
+const macCodexDesktopApps = [
+  {
+    bundle: '/Applications/ChatGPT.app',
+    executable: '/Applications/ChatGPT.app/Contents/MacOS/ChatGPT',
+    appServer: '/Applications/ChatGPT.app/Contents/Resources/codex -c features.code_mode_host=true app-server --analytics-default-enabled -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true',
+    sandbox: '/Applications/ChatGPT.app/Contents/Resources/codex sandbox'
+  },
+  {
+    bundle: '/Applications/Codex.app',
+    executable: '/Applications/Codex.app/Contents/MacOS/Codex',
+    appServer: '/Applications/Codex.app/Contents/Resources/codex -c features.code_mode_host=true app-server --analytics-default-enabled -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true',
+    sandbox: '/Applications/Codex.app/Contents/Resources/codex sandbox'
+  }
+] as const
+
+type MacCodexDesktopApp = typeof macCodexDesktopApps[number]
+
+function macCodexDesktopRoots(processes: readonly PosixProcess[]): Map<string, MacCodexDesktopApp> {
+  return new Map(processes.flatMap(process => {
+    const app = macCodexDesktopApps.find(candidate => process.command === candidate.executable)
+    return process.pid !== undefined && process.ppid === '1' && app !== undefined
+      ? [[process.pid, app] as const] : []
+  }))
+}
+
+function knownMacCodexDesktopProcess(
+  process: PosixProcess,
+  processByPid: ReadonlyMap<string, PosixProcess>,
+  roots: ReadonlyMap<string, MacCodexDesktopApp>
+): boolean {
+  const command = process.command.trim()
+  const appServer = macCodexDesktopApps.find(app => command === app.appServer)
+  if (appServer !== undefined) return process.ppid !== undefined && roots.get(process.ppid) === appServer
+  const sandbox = macCodexDesktopApps.find(app => knownMacCodexDesktopSandbox(command, app))
+  return sandbox !== undefined && macCodexDesktopSandboxParentChain(process, processByPid, roots, sandbox)
+}
+
+function knownMacCodexDesktopSandbox(command: string, app: MacCodexDesktopApp): boolean {
+  if (command === app.sandbox || command === `${app.sandbox} -c default_permissions=node_repl`) return true
+  const prefix = `${app.sandbox} -c shell_environment_policy.inherit="all" -c default_permissions="node_repl" -c permissions.node_repl={`
+  const separator = '} -- '
+  if (!command.startsWith(prefix)) return false
+  const separatorAt = command.lastIndexOf(separator)
+  if (separatorAt < prefix.length) return false
+  const worker = command.slice(separatorAt + separator.length)
+  const node = `${app.bundle}/Contents/Resources/cua_node/bin/node`
+  return worker === node || worker.startsWith(`${node} `)
+}
+
+function macCodexDesktopSandboxParentChain(
+  process: PosixProcess,
+  processByPid: ReadonlyMap<string, PosixProcess>,
+  roots: ReadonlyMap<string, MacCodexDesktopApp>,
+  app: MacCodexDesktopApp
+): boolean {
+  let parent = process.ppid
+  const visited = new Set<string>()
+  while (parent !== undefined && !visited.has(parent)) {
+    visited.add(parent)
+    const candidate = processByPid.get(parent)
+    if (candidate === undefined) return false
+    if (candidate.command.trim() === app.appServer) {
+      return candidate.ppid !== undefined && roots.get(candidate.ppid) === app
+    }
+    if (!knownMacCodexDesktopCodeModeHelper(candidate.command.trim(), app)) return false
+    parent = candidate.ppid
+  }
+  return false
+}
+
+function knownMacCodexDesktopCodeModeHelper(command: string, app: MacCodexDesktopApp): boolean {
+  const prefix = `${app.bundle}/Contents/Resources/cua_node/bin/`
+  return command === `${prefix}node_repl` || command.startsWith(`${prefix}node_repl `) ||
+    command === `${prefix}node` || command.startsWith(`${prefix}node `)
 }
 
 function launchOverridesConfiguration(shell: AiAccessShell, line: string): boolean {

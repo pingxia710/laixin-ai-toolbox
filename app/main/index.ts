@@ -13,6 +13,8 @@ import { registerDesktopActions } from './desktop/bridge'
 import { createMainCrashLog, createRendererRecovery } from './desktop/renderer-recovery'
 import { actionLocalFault } from './bridge/local-fault'
 import { recordFault } from './diagnostics/context'
+import { createAiAccessStore } from './ai-access/store'
+import { codexProviderKeyArgument, emitCodexProviderKey, readCodexProviderKeyRequest } from './ai-access/codex-workspace-key-reader'
 
 // 主进程顶层异常落盘(收敛包3·件3):⛔ 静默丢失。
 const logMainCrash = createMainCrashLog((line) => {
@@ -26,9 +28,6 @@ process.on('unhandledRejection', (reason) => logMainCrash('unhandledRejection', 
 let mainWindow: BrowserWindow | undefined
 let currentEntryUrl: string | undefined
 let desktop: DesktopRuntime
-const primaryInstance = app.requestSingleInstanceLock()
-if (!primaryInstance) app.exit(0)
-app.on('second-instance', () => desktop?.show())
 
 const bridgeRegistry = new BridgeRegistry({ diagnostic: logBridgeDiagnostic })
 const actionModules = import.meta.glob(['./actions/*.ts', '!./actions/*.test.ts'], { eager: true })
@@ -89,33 +88,44 @@ async function createWindow(): Promise<void> {
   await mainWindow.loadFile(target.value)
 }
 
-void app.whenReady().then(async () => {
-  registerDiscoveredActions(bridgeRegistry, actionModules)
-  desktop = new DesktopRuntime(bridgeRegistry)
-  registerDesktopActions(bridgeRegistry, desktop)
-  installIpcBridge(ipcMain, {
-    registry: bridgeRegistry,
-    mainFrame: () => mainWindow?.webContents.mainFrame ?? null,
-    entryUrl: () => {
-      if (currentEntryUrl === undefined) {
-        throw new Error('主窗口尚未登记入口地址。')
+const providerKeyRequest = readCodexProviderKeyRequest(process.argv)
+if (!process.argv.includes(codexProviderKeyArgument)) startApplication()
+else if (providerKeyRequest === undefined) app.exit(1)
+else void app.whenReady().then(async () => {
+  app.dock?.hide()
+  const ok = await emitCodexProviderKey(providerKeyRequest, createAiAccessStore(join(app.getPath('userData'), 'ai-access')))
+  app.exit(ok ? 0 : 1)
+}, () => app.exit(1))
+
+function startApplication(): void {
+  const primaryInstance = app.requestSingleInstanceLock()
+  if (!primaryInstance) { app.exit(0); return }
+  app.on('second-instance', () => desktop?.show())
+  void app.whenReady().then(async () => {
+    registerDiscoveredActions(bridgeRegistry, actionModules)
+    desktop = new DesktopRuntime(bridgeRegistry)
+    registerDesktopActions(bridgeRegistry, desktop)
+    installIpcBridge(ipcMain, {
+      registry: bridgeRegistry,
+      mainFrame: () => mainWindow?.webContents.mainFrame ?? null,
+      entryUrl: () => {
+        if (currentEntryUrl === undefined) {
+          throw new Error('主窗口尚未登记入口地址。')
+        }
+        return currentEntryUrl
       }
-      return currentEntryUrl
-    }
-  })
-  installShutdownLifecycle(app, bridgeRegistry.shutdownHooks, shutdownTimeoutMs, logBridgeDiagnostic)
-  await createWindow()
+    })
+    installShutdownLifecycle(app, bridgeRegistry.shutdownHooks, shutdownTimeoutMs, logBridgeDiagnostic)
+    await createWindow()
 
-  app.on('activate', async () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      await createWindow()
-    } else desktop.show()
+    app.on('activate', async () => {
+      if (BrowserWindow.getAllWindows().length === 0) {
+        await createWindow()
+      } else desktop.show()
+    })
   })
-})
-
-app.on('window-all-closed', () => {
-  app.quit()
-})
+  app.on('window-all-closed', () => { app.quit() })
+}
 
 function logBridgeDiagnostic(code: string, subject: string, error?: unknown): void {
   console.error(`[toolbox-bridge] ${code}:${subject}`)

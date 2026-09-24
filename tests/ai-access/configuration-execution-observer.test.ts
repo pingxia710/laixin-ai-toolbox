@@ -73,14 +73,148 @@ describe('配置生效观察器', () => {
     })
   })
 
-  it('正在运行但看不到继承环境的原生客户端也不猜默认根', async () => {
+  it('Mac ChatGPT/Codex 桌面版开着时仍可写用户配置；应用自己的内部参数不算模型覆盖', async () => {
+    const f = files()
     const observer = createConfigurationExecutionObserver({
       platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
       run: async command => command === '/bin/ps'
-        ? '/Applications/ChatGPT.app/Contents/Resources/codex app-server --listen stdio://'
+        ? [
+            '101 1 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT',
+            '102 101 /Applications/ChatGPT.app/Contents/Resources/codex -c features.code_mode_host=true app-server --analytics-default-enabled -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true',
+            '105 101 /Applications/ChatGPT.app/Contents/Resources/codex-code-mode-host',
+            '104 103 /Applications/ChatGPT.app/Contents/Resources/codex sandbox -c default_permissions=node_repl',
+            '106 103 /Applications/ChatGPT.app/Contents/Resources/codex sandbox -c shell_environment_policy.inherit="all" -c default_permissions="node_repl" -c permissions.node_repl={filesystem = {":tmpdir" = "write"}, network = {enabled = false}} -- /Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node --experimental-vm-modules /private/kernel.js',
+            '103 107 /Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl',
+            '107 102 /Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node /Applications/ChatGPT.app/Contents/Resources/cua_node/lib/node_modules/@oai/cua-repl/bin/cua-repl.mjs',
+            '201 1 /Applications/Codex.app/Contents/MacOS/Codex',
+            '202 201 /Applications/Codex.app/Contents/Resources/codex -c features.code_mode_host=true app-server --analytics-default-enabled -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true'
+          ].join('\n')
+        : command === '/usr/bin/profiles' ? '' : absentCommand()
+    })
+    const codex = createDeepSeekAdapters({
+      home: '/customer', platform: 'darwin', file: f.io, observeConfigurationExecution: observer
+    }).find(adapter => adapter.shell === 'codex')!
+
+    await expect(codex.configurationTargetStatus!()).resolves.toMatchObject({ scope: 'user', writable: true })
+    await codex.applyDeepSeek('sk-fixture-mac-desktop-running')
+    expect(f.data.get('/customer/.codex/config.toml')).toContain('model_provider')
+  })
+
+  it('Mac 应用包内 codex 带未知配置覆盖时仍拒写', async () => {
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      run: async command => command === '/bin/ps'
+        ? [
+            '101 1 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT',
+            '102 101 /Applications/ChatGPT.app/Contents/Resources/codex app-server -c model_provider=third-party'
+          ].join('\n')
+        : command === '/usr/bin/profiles' ? '' : absentCommand()
+    })
+    await expect(observer()).resolves.toEqual({ codex: { source: 'observed', commandLine: true } })
+  })
+
+  it('Mac 桌面版固定参数之外还有命令行参数时仍拒写', async () => {
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      run: async command => command === '/bin/ps'
+        ? [
+            '101 1 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT',
+            '102 101 /Applications/ChatGPT.app/Contents/Resources/codex -c features.code_mode_host=true app-server --analytics-default-enabled -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true --model third-party'
+          ].join('\n')
+        : command === '/usr/bin/profiles' ? '' : absentCommand()
+    })
+    await expect(observer()).resolves.toEqual({ codex: { source: 'observed', commandLine: true } })
+  })
+
+  it('Mac 应用主程序由其他父进程启动时不把同包 app-server 当作官方桌面进程', async () => {
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      run: async command => command === '/bin/ps'
+        ? [
+            '100 1 /bin/zsh',
+            '101 100 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT',
+            '102 101 /Applications/ChatGPT.app/Contents/Resources/codex -c features.code_mode_host=true app-server --analytics-default-enabled -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true'
+          ].join('\n')
+        : command === '/usr/bin/profiles' ? '' : absentCommand()
+    })
+    await expect(observer()).resolves.toEqual({ codex: { source: 'observed', commandLine: true } })
+  })
+
+  it.each([
+    ['显式来源覆盖', '-c model_provider=third-party', { source: 'observed', commandLine: true }],
+    ['未知参数', '--unexpected-option', { source: 'unknown' }]
+  ])('Mac 桌面进程树内 sandbox 带%s时仍拒写', async (_label, argument, expected) => {
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      run: async command => command === '/bin/ps'
+        ? [
+            '101 1 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT',
+            '102 101 /Applications/ChatGPT.app/Contents/Resources/codex -c features.code_mode_host=true app-server --analytics-default-enabled -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true',
+            '103 102 /Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl',
+            `104 103 /Applications/ChatGPT.app/Contents/Resources/codex sandbox ${argument}`
+          ].join('\n')
+        : command === '/usr/bin/profiles' ? '' : absentCommand()
+    })
+    await expect(observer()).resolves.toEqual({ codex: expected })
+  })
+
+  it('桌面工具终端经 shell 中转启动同包 sandbox 时仍拒写', async () => {
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      run: async command => command === '/bin/ps'
+        ? [
+            '101 1 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT',
+            '102 101 /Applications/ChatGPT.app/Contents/Resources/codex -c features.code_mode_host=true app-server --analytics-default-enabled -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true',
+            '103 102 /Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl',
+            '104 103 /bin/zsh',
+            '105 104 /Applications/ChatGPT.app/Contents/Resources/codex sandbox -c default_permissions=node_repl'
+          ].join('\n')
+        : command === '/usr/bin/profiles' ? '' : absentCommand()
+    })
+    await expect(observer()).resolves.toEqual({ codex: { source: 'observed', commandLine: true } })
+  })
+
+  it('ChatGPT 桌面进程树不能借用 Codex.app 内的 sandbox', async () => {
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      run: async command => command === '/bin/ps'
+        ? [
+            '101 1 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT',
+            '102 101 /Applications/ChatGPT.app/Contents/Resources/codex -c features.code_mode_host=true app-server --analytics-default-enabled -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true',
+            '103 102 /Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl',
+            '104 103 /Applications/Codex.app/Contents/Resources/codex sandbox -c default_permissions=node_repl'
+          ].join('\n')
+        : command === '/usr/bin/profiles' ? '' : absentCommand()
+    })
+    await expect(observer()).resolves.toEqual({ codex: { source: 'observed', commandLine: true } })
+  })
+
+  it('只看见应用包路径和 app-server 还不够，缺少桌面版固定启动参数时保持未知', async () => {
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      run: async command => command === '/bin/ps'
+        ? [
+            '101 1 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT',
+            '102 101 /Applications/ChatGPT.app/Contents/Resources/codex app-server --listen stdio://'
+          ].join('\n')
         : command === '/usr/bin/profiles' ? '' : absentCommand()
     })
     await expect(observer()).resolves.toEqual({ codex: { source: 'unknown' } })
+  })
+
+  it('桌面工具终端另起相同参数的 app-server 时仍拒写', async () => {
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      run: async command => command === '/bin/ps'
+        ? [
+            '101 1 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT',
+            '102 101 /Applications/ChatGPT.app/Contents/Resources/codex -c features.code_mode_host=true app-server --analytics-default-enabled -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true',
+            '103 102 /Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl',
+            '104 103 /Applications/ChatGPT.app/Contents/Resources/codex -c features.code_mode_host=true app-server --analytics-default-enabled -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true'
+          ].join('\n')
+        : command === '/usr/bin/profiles' ? '' : absentCommand()
+    })
+    await expect(observer()).resolves.toEqual({ codex: { source: 'observed', commandLine: true } })
   })
 
   it('普通 defaults 偏好即使存在也不能被误判为受管策略', async () => {

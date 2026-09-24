@@ -16,6 +16,7 @@ import { lastIntent } from '../../sidecar/mac/ledger.mjs'
 import { buildPackageEntries, writePackageDir, type BuiltPackage } from './fixtures/package-builder'
 import {
   fakeAdapterEnv,
+  forceTunnelPathForTest,
   makeTempDir,
   readFakeStore,
   readJsonFile,
@@ -70,6 +71,7 @@ describe('五动作与桥注册(判据 3②③主进程侧、6 IPC 负向、12 �
       trust: { whitelistDigests: trustDigests, signingPublicKeys: [] },
       now: () => NOW,
       spawnDaemon: (dir: string) => {
+        forceTunnelPathForTest(dir)
         const child = spawn(
           process.execPath,
           [
@@ -168,6 +170,7 @@ describe('五动作与桥注册(判据 3②③主进程侧、6 IPC 负向、12 �
     expect(((await registry.execute('tunnel.importConfig', undefined)) as { outcome: string }).outcome).toBe('imported')
     expect(((await registry.execute('tunnel.applyPending', undefined)) as { outcome: string }).outcome).toBe('applied')
     expect(((await registry.execute('tunnel.start', undefined)) as { outcome: string }).outcome).toBe('started')
+    expect(readJsonFile<{ reuseDirect: boolean }>(layout.intent(dataDir)).reuseDirect).toBe(false)
     await waitFor(() => service.status().state === '已连', 10_000)
     expect(service.status().exitIp).toBe(EXIT_IP)
 

@@ -10,7 +10,7 @@ import { TunnelService, repairBudgetMs, REPAIR_BUDGET_BASE_MS, REPAIR_BUDGET_PER
 import { layout } from '../../app/main/tunnel/paths'
 import { pendingSettingEntries } from '../../sidecar/mac/ledger.mjs'
 import { buildPackageEntries, writePackageDir } from './fixtures/package-builder'
-import { fakeAdapterEnv, makeTempDir, removeTempDir, startFakeUpstream, waitFor, reapDaemons } from './helpers'
+import { fakeAdapterEnv, forceTunnelPathForTest, makeTempDir, removeTempDir, startFakeUpstream, waitFor, reapDaemons } from './helpers'
 
 it('预算随账本条数伸缩:0 条=基础;条数越多越长;病态账本封顶', () => {
   expect(REPAIR_BUDGET_BASE_MS).toBe(45_000)
@@ -46,7 +46,7 @@ it('修复启动时按账本待结算条数取预算(注入记账函数核对输
   const budgetInputs: number[] = []
   const service = new TunnelService({ dataDir, sidecarDir, picker: async () => packageDir,
     trust: { whitelistDigests: [built.digest], signingPublicKeys: [] }, now: () => Date.parse('2026-10-01T00:00:00Z'),
-    spawnDaemon: (_dir, runId) => launch('start', runId), spawnRestore: () => launch('restore'),
+    spawnDaemon: (dir, runId) => { forceTunnelPathForTest(dir); return launch('start', runId) }, spawnRestore: () => launch('restore'),
     routesFile: join(sidecarDir, 'routes.default.json'),
     connectorOverride: { kind: 'loopback-probe', host: '127.0.0.1', port: upstream.port, exitIp: '203.0.113.9' },
     repairBudgetMs: (count) => { budgetInputs.push(count); return 45_000 } })
@@ -59,11 +59,12 @@ it('修复启动时按账本待结算条数取预算(注入记账函数核对输
   await waitFor(() => existsSync(layout.state(dataDir)) &&
     JSON.parse(readFileSync(layout.state(dataDir), 'utf8')).state === 'connected', 15_000)
 
+  const pendingBeforeRepair = pendingSettingEntries(dataDir).length
+  expect(pendingBeforeRepair).toBeGreaterThan(0)
   service.repair()
   await waitFor(() => !service.repairStatus().running, 20_000)
   expect(service.repairStatus().outcome).toBe('recovered')
   // 预算函数被咨询且输入=此刻账本待结算条数(连接状态下账本里是我们写下的账目)
   expect(budgetInputs).toHaveLength(1)
-  expect(budgetInputs[0]).toBe(pendingSettingEntries(dataDir).length)
-  expect(budgetInputs[0]).toBeGreaterThan(0)
+  expect(budgetInputs[0]).toBe(pendingBeforeRepair)
 }, 30_000)

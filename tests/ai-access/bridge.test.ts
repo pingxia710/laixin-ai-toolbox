@@ -55,7 +55,7 @@ describe('AI 接入后台桥', () => {
 
     const guidance = await registry.execute('aiaccess.restartGuidance', { shell: 'codex' }) as { snapshot: string }
     expect(JSON.parse(guidance.snapshot)).toEqual({
-      shell: 'codex', process: 'running', message: '检测到 Codex 正在运行。请关闭并重新打开 Codex 终端或 ChatGPT/Codex 桌面版，再发送一条消息。'
+      shell: 'codex', process: 'running', message: '检测到 Codex 正在运行。请彻底退出（Mac 请用“退出”或 ⌘Q）并重新打开 Codex 终端或 ChatGPT/Codex 桌面版，再发送一条消息。'
     })
     expect(guidance.snapshot).not.toContain(secret)
 
