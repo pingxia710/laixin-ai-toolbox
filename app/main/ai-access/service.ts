@@ -357,6 +357,37 @@ export class AiAccessService {
     })
   }
 
+  /**
+   * API-15R: verify and retain a Key for a provider-bound Codex thread without changing the
+   * client's global provider configuration. A rejected candidate leaves the prior Key, official
+   * login selection and every existing thread untouched.
+   */
+  async verifyAndSaveProviderKey(shell: AiAccessShell, provider: AiAccessProvider, value: string): Promise<AiAccessStatus> {
+    return this.serialize(async () => {
+      this.adapter(shell)
+      if (!isProvider(provider)) throw new Error('AI_ACCESS_PROVIDER_INVALID')
+      this.assertProviderShellSupported(shell, provider)
+      const key = value.trim()
+      if (!keyPattern.test(key)) throw new Error(`AI_ACCESS_${provider.toUpperCase()}_KEY_INVALID`)
+      if (!this.gateway) throw new Error('AI_ACCESS_PROVIDER_UNSUPPORTED')
+      const previous = await this.read()
+      const result = await this.gateway.probe(this.route(shell, provider, key, previous))
+      this.recordUsage(shell, 'probe', result.ok ? 'success' : 'failure', result.ok ? undefined : result.code ?? 'unknown')
+      const suggestedProvider = result.ok ? undefined : await this.suggestedProviderForKey(shell, provider, key, previous, result.code)
+      const code = suggestedProvider === undefined ? result.code : 'key_product_mismatch'
+      this.markCheck(shell, provider, result.ok, code,
+        suggestedProvider === undefined ? undefined : this.suggestedProviderNotice(provider, suggestedProvider), suggestedProvider)
+      if (!result.ok) return this.publicStatus(previous)
+      const next: AiAccessState = {
+        ...previous,
+        shellKeys: { ...previous.shellKeys, [shell]: { ...previous.shellKeys?.[shell], [provider]: key } }
+      }
+      await this.store.write(next)
+      this.updateRoutes(next)
+      return this.publicStatus(next)
+    })
+  }
+
   async useProvider(shell: AiAccessShell, provider: AiAccessProvider): Promise<AiAccessStatus> {
     return this.activateProvider(shell, provider)
   }

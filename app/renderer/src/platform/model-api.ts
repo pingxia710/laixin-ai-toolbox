@@ -21,6 +21,7 @@ import { icon } from '../icons'
 import { openProviderEditor } from './provider-editor'
 import { measureProviderLatency } from './provider-latency'
 import { openOfficialDownloadPage } from './install-card'
+import { createCodexWorkspaceViewState, renderCodexWorkspaces } from './codex-workspaces'
 
 function node<K extends keyof HTMLElementTagNameMap>(tag: K, text = '', className = ''): HTMLElementTagNameMap[K] {
   return Object.assign(document.createElement(tag), { textContent: text, className })
@@ -235,6 +236,7 @@ export function mountModelApi(element: HTMLElement, platform: UsagePlatformId, a
   let closeProviderServices: (() => void)[] = []
   let closeEditor = (): void => undefined
   let receiptResult: UsageReceiptResult | null = null
+  const workspaceState = createCodexWorkspaceViewState()
   let claudeEditions: ClaudeEditionsView | null = null
   const stopPoll = (): void => { if (poll !== undefined) clearInterval(poll); poll = undefined }
   const action = (text: string, run: () => void, primary = false): HTMLButtonElement => {
@@ -323,6 +325,7 @@ export function mountModelApi(element: HTMLElement, platform: UsagePlatformId, a
     if (legacyDirect) {
       root.append(node('p', `检测到旧版 ${modelProviders[legacyDirect.provider].title} 直连记录；它未由当前工具箱网关接管。原 Key 保留在本机，确认后点击“启用”可迁移到当前安全路由。`, 'platform-notice'))
     }
+    if (shell === 'codex') root.append(renderCodexWorkspaces(window.toolbox.codexworkspaces, status, workspaceState, render, refresh))
     const target = status?.configurationTargets?.[shell]
     const claudeConfigurationBound = shell === 'claude' && hasClaudeConfigurationBinding(status)
     const codexProjectNotice = codexProjectConfigurationNotice(shell, target)

@@ -4,7 +4,7 @@ import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { codexAccountKey, normalizeBuckets, maskAccount } from '../../app/main/codex-usage/normalize'
 import { readCodexUsage, readCodexUsageForAddedAccount, readCodexUsageWithFallback, UsageReadError } from '../../app/main/codex-usage/client'
-import { findCodexCommand } from '../../app/main/codex-usage/runtime'
+import { findCodexCommand, isCodexDesktopExecutable } from '../../app/main/codex-usage/runtime'
 import { createUsageMonitor } from '../../app/main/codex-usage/monitor'
 import { percentText, resetText, windowLabel } from '../../app/renderer/src/codex-usage/view'
 
@@ -159,6 +159,12 @@ describe('刷新与账号生命周期', () => {
 })
 
 describe('本机 Codex 发现', () => {
+  it('工作窗口只认 Desktop 应用内的受信任二进制，不把 CLI-only 安装当桌面版', () => {
+    expect(isCodexDesktopExecutable('/Applications/ChatGPT.app/Contents/Resources/codex', 'darwin')).toBe(true)
+    expect(isCodexDesktopExecutable('/Users/customer/.npm-global/lib/node_modules/@openai/codex/vendor/codex', 'darwin')).toBe(false)
+    expect(isCodexDesktopExecutable('C:\\Users\\customer\\AppData\\Local\\Programs\\Codex\\resources\\codex.exe', 'win32')).toBe(true)
+    expect(isCodexDesktopExecutable('C:\\Users\\customer\\AppData\\Roaming\\npm\\node_modules\\codex.exe', 'win32')).toBe(false)
+  })
   it('固定 npm 全局目录中的官方原生文件可用，不通过 cmd、shell 或 PATH launcher', async () => {
     const directory = await realpath(await mkdtemp(join(tmpdir(), 'usage-npm-')))
     try {

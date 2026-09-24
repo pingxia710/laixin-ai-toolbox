@@ -106,6 +106,16 @@ html:has(.platform-account-overview) { scrollbar-gutter: stable; }
 .platform-usage-card .usage-bucket, .platform-usage-card .usage-empty { padding: 0; border: 0; background: none; }
 .platform-usage-card .usage-header button { padding: 7px 11px; min-height: 40px; font-size: 13px; }
 .model-api { display: grid; gap: 18px; }
+.codex-workspaces { display: grid; gap: 12px; padding: 20px; border: 1px solid var(--accent); border-radius: 16px; background: var(--accent-soft); }
+.codex-workspaces-header { display: grid; gap: 4px; }
+.codex-workspaces-header h2, .codex-workspaces-header p, .codex-workspaces-notice { margin: 0; }
+.codex-workspaces .model-provider { padding: 16px; background: var(--surface); }
+.codex-workspaces .provider-details h3 { margin: 0; font-size: 15px; }
+.codex-workspaces .provider-details p { margin: 4px 0 0; }
+.codex-workspace-form { display: flex; flex: 1 1 300px; align-items: center; justify-content: flex-end; gap: 8px; }
+.codex-workspace-form input { width: min(260px, 100%); min-height: 40px; box-sizing: border-box; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-soft); color: var(--ink); font: inherit; }
+.codex-workspace-form input:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+@media (max-width: 720px) { .codex-workspace-form { justify-content: flex-start; flex-wrap: wrap; } .codex-workspace-form input { width: 100%; } }
 .api-service-entry { display: flex; gap: 8px; flex-wrap: wrap; }
 #tab-panel .api-service-small { position: relative; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 32px; width: 32px; height: 32px; min-height: 32px; padding: 7px; color: var(--muted); background: var(--surface-soft); }
 .api-action-tooltip { position: absolute; right: 0; bottom: calc(100% + 6px); z-index: 1; width: max-content; padding: 6px 10px; border-radius: 6px; background: var(--ink); color: var(--surface); font-size: 12px; font-weight: 500; line-height: 1.5; white-space: nowrap; visibility: hidden; }

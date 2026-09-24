@@ -22,7 +22,7 @@ export function restartGuidanceMessage(guidance: RestartGuidance): string {
   switch (guidance.shell) {
     case 'codex':
       return guidance.process === 'running'
-        ? '检测到 Codex 正在运行。请关闭并重新打开 Codex 终端或 ChatGPT/Codex 桌面版，再发送一条消息。'
+        ? '检测到 Codex 正在运行。请彻底退出（Mac 请用“退出”或 ⌘Q）并重新打开 Codex 终端或 ChatGPT/Codex 桌面版，再发送一条消息。'
         : guidance.process === 'not-running'
           ? 'Codex 下次启动会读取新配置。若你使用 ChatGPT/Codex 桌面版，请重新打开它后再发送消息。'
           : 'Codex 需要重新打开终端或 ChatGPT/Codex 桌面版后读取新配置。'

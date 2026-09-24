@@ -3,7 +3,8 @@ import { createRestartGuidanceReader, restartMessage } from '../../app/main/ai-a
 
 describe('切换后的原生软件提示', () => {
   it('按三个软件的实际重读方式给出不同提示', () => {
-    expect(restartMessage('codex', 'running')).toContain('关闭并重新打开')
+    expect(restartMessage('codex', 'running')).toContain('彻底退出')
+    expect(restartMessage('codex', 'running')).toContain('⌘Q')
     expect(restartMessage('claude', 'running')).toContain('新开一个会话')
     expect(restartMessage('hermes', 'running')).toContain('当前会话生效')
   })
