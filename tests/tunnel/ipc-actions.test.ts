@@ -100,6 +100,7 @@ describe('五动作与桥注册(判据 3②③主进程侧、6 IPC 负向、12 �
         spawnedChildren.push(child)
       },
       routesFile: join(SIDECAR_DIR, 'routes.default.json'),
+      reuseDirect: false,
       connectorOverride: {
         kind: 'loopback-probe',
         host: '127.0.0.1',
@@ -168,10 +169,8 @@ describe('五动作与桥注册(判据 3②③主进程侧、6 IPC 负向、12 �
     expect(((await registry.execute('tunnel.importConfig', undefined)) as { outcome: string }).outcome).toBe('imported')
     expect(((await registry.execute('tunnel.applyPending', undefined)) as { outcome: string }).outcome).toBe('applied')
     expect(((await registry.execute('tunnel.start', undefined)) as { outcome: string }).outcome).toBe('started')
-    await waitFor(() => {
-      const status = service.status()
-      return status.state === '已连' && status.exitIp === EXIT_IP
-    }, 10_000)
+    expect(readJsonFile<{ reuseDirect: boolean }>(layout.intent(dataDir)).reuseDirect).toBe(false)
+    await waitFor(() => service.status().state === '已连', 10_000)
     expect(service.status().exitIp).toBe(EXIT_IP)
 
     const appliedWhileConnected = (await registry.execute('tunnel.applyPending', undefined)) as {
@@ -276,10 +275,7 @@ describe('五动作与桥注册(判据 3②③主进程侧、6 IPC 负向、12 �
     expect(((await actions.execute('tunnel.importConfig', undefined)) as { outcome: string }).outcome).toBe('imported')
     expect(((await actions.execute('tunnel.applyPending', undefined)) as { outcome: string }).outcome).toBe('applied')
     expect(((await actions.execute('tunnel.start', undefined)) as { outcome: string }).outcome).toBe('started')
-    await waitFor(() => {
-      const snapshot = readTunnelSnapshot()
-      return snapshot.state === 'connected' && snapshot.localProxyUrl === 'http://127.0.0.1:18080'
-    }, 10_000)
+    await waitFor(() => readTunnelSnapshot().state === 'connected', 10_000)
 
     expect(readTunnelSnapshot()).toEqual({ state: 'connected', localProxyUrl: 'http://127.0.0.1:18080' })
     expect(((await anotherMainModule.execute('tunnel.status', undefined)) as { state: string }).state).toBe('已连')

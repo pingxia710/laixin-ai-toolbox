@@ -35,6 +35,7 @@ async function setup(timeoutMs = 10_000, launchDaemon = true) {
     trust: { whitelistDigests: [built.digest], signingPublicKeys: [] }, now: () => Date.parse('2026-10-01T00:00:00Z'),
     spawnDaemon: (_dir, runId) => launchDaemon ? launch('start', runId) : { on: () => undefined }, spawnRestore: () => launch('restore'),
     routesFile: join(sidecarDir, 'routes.default.json'), repairTimeoutMs: timeoutMs, repairRestoreGraceMs: 800,
+    reuseDirect: false,
     connectorOverride: { kind: 'loopback-probe', host: '127.0.0.1', port: upstream.port, exitIp: '203.0.113.7' } })
   cleanups.push(async () => {
     await service.stop()
@@ -57,7 +58,6 @@ it('零参数修复：真实守护和本机回环复验后才成功，复制摘�
   expect(await f.registry.execute('tunnel.repair', undefined)).toMatchObject({ outcome: 'started' })
   expect(f.service.repairStatus().running).toBe(true)
   expect(await f.finish()).toMatchObject({ outcome: 'recovered', phase: 'finished' })
-  await waitFor(() => f.service.status().exitIp === '203.0.113.7', 10_000)
   expect(f.service.status()).toMatchObject({ state: '已连', exitIp: '203.0.113.7' })
   expect(readFakeStore(f.storePath)['Wi-Fi/socks-proxy']).toMatchObject({ enabled: true })
   const view = JSON.stringify(await f.registry.execute('tunnel.repairStatus', undefined))
@@ -127,8 +127,7 @@ it('新电脑已有别的代理但它出不了外网(端口没人听):接管建�
 
 it('已连接再次修复，必须取得新的连接令牌和复验，不能复用旧成功', async () => {
   const f = await setup()
-  await f.service.start(); await waitFor(() => f.service.status().exitIp === '203.0.113.7' &&
-    readFakeStore(f.storePath)['Wi-Fi/socks-proxy'] !== undefined, 10_000)
+  await f.service.start(); await waitFor(() => f.service.status().state === '已连', 10_000)
   const previous = f.intent().sessionToken
   f.service.repair()
   expect(await f.finish()).toMatchObject({ outcome: 'recovered' })
@@ -138,8 +137,7 @@ it('已连接再次修复，必须取得新的连接令牌和复验，不能复�
 
 it('恢复遇到他人改动时保留现场、不强制清账本，不宣称恢复成功', async () => {
   const f = await setup(500)
-  await f.service.start(); await waitFor(() => f.service.status().exitIp === '203.0.113.7' &&
-    readFakeStore(f.storePath)['Wi-Fi/socks-proxy'] !== undefined, 10_000)
+  await f.service.start(); await waitFor(() => f.service.status().state === '已连', 10_000)
   const foreign = { enabled: true, host: '127.0.0.1', port: 7890 }
   writeFileSync(f.storePath, JSON.stringify({ 'Wi-Fi/socks-proxy': foreign }))
   f.service.repair()

@@ -48,6 +48,7 @@ it('修复启动时按账本待结算条数取预算(注入记账函数核对输
     trust: { whitelistDigests: [built.digest], signingPublicKeys: [] }, now: () => Date.parse('2026-10-01T00:00:00Z'),
     spawnDaemon: (_dir, runId) => launch('start', runId), spawnRestore: () => launch('restore'),
     routesFile: join(sidecarDir, 'routes.default.json'),
+    reuseDirect: false,
     connectorOverride: { kind: 'loopback-probe', host: '127.0.0.1', port: upstream.port, exitIp: '203.0.113.9' },
     repairBudgetMs: (count) => { budgetInputs.push(count); return 45_000 } })
   cleanups.push(async () => {
@@ -57,15 +58,13 @@ it('修复启动时按账本待结算条数取预算(注入记账函数核对输
   await service.importConfig(); await service.applyPending()
   await service.start()
   await waitFor(() => existsSync(layout.state(dataDir)) &&
-    JSON.parse(readFileSync(layout.state(dataDir), 'utf8')).state === 'connected' &&
-    pendingSettingEntries(dataDir).length > 0, 15_000)
-  const pendingBeforeRepair = pendingSettingEntries(dataDir).length
+    JSON.parse(readFileSync(layout.state(dataDir), 'utf8')).state === 'connected', 15_000)
 
   service.repair()
   await waitFor(() => !service.repairStatus().running, 20_000)
   expect(service.repairStatus().outcome).toBe('recovered')
   // 预算函数被咨询且输入=此刻账本待结算条数(连接状态下账本里是我们写下的账目)
   expect(budgetInputs).toHaveLength(1)
-  expect(budgetInputs[0]).toBe(pendingBeforeRepair)
+  expect(budgetInputs[0]).toBe(pendingSettingEntries(dataDir).length)
   expect(budgetInputs[0]).toBeGreaterThan(0)
 }, 30_000)

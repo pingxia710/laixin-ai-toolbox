@@ -74,6 +74,8 @@ export interface TunnelServiceDeps {
   readonly routesFile: string // routes.default.json 路径
   // 测试注入；生产从已验证的公司配置选择 SSH 或 VLESS/REALITY。
   readonly connectorOverride?: Record<string, unknown>
+  /** 测试注入：缺省启用直连复用；需要验证来信接管链路的用例显式关闭。 */
+  readonly reuseDirect?: boolean
   /** D3:留一条故障经过(⛔ 正文)。缺省即不留痕,测试可注入。 */
   readonly recordFault?: (fault: { readonly network: string; readonly note?: FaultNoteId; readonly noteParams?: readonly string[] }) => void
   /** Phase 1 ④:监管器失败留痕(UNKNOWN 归因);生产写 <userData>/logs/tunnel-daemon.log,测试注入收集。 */
@@ -1280,7 +1282,7 @@ export class TunnelService {
       bridgePortCandidates: [...BRIDGE_PORT_CANDIDATES],
       // 「客户这台电脑本来就能到 AI 服务就用它、不改他的设置」。判据与探测都在守护侧；
       // 这里给开关是因为真实探测 ⛔ 在用例里默认发生（开着专线的机器上会把用例集体带进复用分支）。
-      reuseDirect: true,
+      reuseDirect: this.deps.reuseDirect ?? true,
       // 隐藏多节点:这份授权带几个入口就给几个,守护把它们一起交给内核探活择路;单节点包这里就是一项,形状不变。
       ...(this.deps.connectorOverride === undefined && current.protocol === 'vless-reality' && current.nodes.length > 1
         ? { connectors: current.nodes.map((entry) => ({
