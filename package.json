@@ -8,6 +8,7 @@
   "scripts": {
     "dev": "electron-vite dev",
     "lint": "eslint app tests --max-warnings=0",
+    "pretypecheck": "npm run prepare:sidecar",
     "typecheck": "tsc --noEmit",
     "test": "npm run prepare:sidecar && npm run prepare:xray && npm run prepare:public-test-package && vitest run",
     "prepare:sidecar": "node scripts/prepare-sidecar.mjs",
