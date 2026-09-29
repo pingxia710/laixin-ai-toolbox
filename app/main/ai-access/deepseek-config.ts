@@ -1,9 +1,9 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { dirname, join } from 'node:path'
 import { modelProvider, providerModelWindow, type ApiServiceConnection, type ModelProviderId } from '../../shared/model-providers'
 import { type ConfigurationTarget } from './configuration-target'
 import { inspectCodexOfficialAuthentication, type CodexOfficialAuthStatus } from './codex-auth-document'
-import { codexToolboxSection, parseCodexTomlDocument, restoreCodexTomlConnection } from './codex-toml-document'
+import { codexToolboxConnectionBlock, codexToolboxSection, parseCodexTomlDocument, restoreCodexTomlConnection } from './codex-toml-document'
 import { replaceConfigurationTransaction, withConfigWriteLock } from './config-write-guard'
 
 export interface ManagedTextFile {
@@ -16,8 +16,18 @@ export interface ManagedTextFile {
   withConfigWriteLock?<T>(lockPath: string, task: () => Promise<T>): Promise<T>
 }
 
+export type ApplicationIsolationApplyResult = 'stale' | {
+  readonly outcome: 'applied'
+  readonly managedFingerprint: string
+  readonly isolationFingerprint: string
+}
+/** Compatibility name retained for the N-56 Codex adapter. */
+export type CodexIsolationApplyResult = ApplicationIsolationApplyResult
+
 export interface DeepSeekConfig {
   apply(key: string): Promise<void>
+  /** Application isolation: under the shared config lock, refuse to replace a block changed after capture. */
+  applyIfIsolationFingerprint?(expectedFingerprint: string, leaseId: string, key: string, verifyTarget?: () => Promise<boolean>): Promise<ApplicationIsolationApplyResult>
   /** Restores a valid pre-connection snapshot when removing the Toolbox route, then clears Toolbox sidecars. */
   deactivateToolboxConnection(): Promise<void>
   /** Explicitly restores a still-present pre-connection snapshot. */
@@ -65,6 +75,7 @@ export function createCodexModelApiConfig(
   const modelsPath = join(configDirectory, 'laixin-models.json')
   const backupPath = join(configDirectory, 'laixin-model-api-backup.json')
   const configLockPath = join(configDirectory, 'laixin-config.lock')
+  const isolationLeasePath = join(configDirectory, 'laixin-codex-isolation-lease.json')
   // CODEX_HOME changes the whole Codex user root, including the credential document. Keep the
   // status check beside the effective config rather than accidentally classifying another profile.
   const authPath = join(configDirectory, 'auth.json')
@@ -83,6 +94,35 @@ export function createCodexModelApiConfig(
           { path: modelsPath, before: models, after: renderCodexModels(provider, connection?.model), validate: validateModelsJson },
           { path: configPath, before: config, after: desiredConfig, validate: validateCodexToml }
         ], { backupAction: 'apply' })
+      })
+    },
+    async applyIfIsolationFingerprint(expectedFingerprint, leaseId, key, verifyTarget) {
+      return withManagedConfigWriteLock(file, configLockPath, async () => {
+        if (verifyTarget !== undefined && !await verifyTarget().catch(() => false)) return 'stale'
+        const [config, backup, models, rawLease] = await Promise.all([file.read(configPath), file.read(backupPath), file.read(modelsPath), file.read(isolationLeasePath)])
+        let currentFingerprint: string | undefined
+        try { currentFingerprint = config === undefined ? undefined : managedFingerprint(codexToolboxConnectionBlock(config)) } catch { return 'stale' }
+        if (currentFingerprint !== expectedFingerprint) return 'stale'
+        let lease: CodexIsolationLease
+        try { lease = parseCodexIsolationLease(rawLease) } catch { return 'stale' }
+        if (lease.id !== leaseId || lease.beforeFingerprint !== expectedFingerprint || lease.expectedFingerprint !== undefined) return 'stale'
+        const saved = inspectModelApiBackup(backup)
+        if (saved.kind === 'corrupt') throw new Error('AI_ACCESS_CONFIG_BACKUP_CORRUPT')
+        const original = saved.kind === 'valid' ? saved.original : (isLegacyCodexConfig(config) ? null : config ?? null)
+        const desiredConfig = mergeCodexConfig(config, renderCodexConfig(provider, connection, key, modelsPath))
+        const postWriteManagedFingerprint = managedFingerprint(codexManagedSection(desiredConfig))
+        const postWriteIsolationFingerprint = managedFingerprint(codexToolboxConnectionBlock(desiredConfig))
+        if (postWriteManagedFingerprint === undefined || postWriteIsolationFingerprint === undefined) throw new Error('AI_ACCESS_CONFIG_READBACK_MISMATCH')
+        await replaceConfigurationTransaction(file, [
+          // Write the recoverable post-write identity first. A process crash before config.toml
+          // changes still sees the old fingerprint and safely drops this lease; a crash after it
+          // changes can always restore the captured block.
+          { path: isolationLeasePath, before: rawLease, after: renderCodexIsolationLease({ ...lease, expectedFingerprint: postWriteIsolationFingerprint }) },
+          { path: backupPath, before: backup, after: saved.kind === 'missing' ? renderBackup(original) : backup },
+          { path: modelsPath, before: models, after: renderCodexModels(provider, connection?.model), validate: validateModelsJson },
+          { path: configPath, before: config, after: desiredConfig, validate: validateCodexToml }
+        ], { backupAction: 'apply' })
+        return { outcome: 'applied', managedFingerprint: postWriteManagedFingerprint, isolationFingerprint: postWriteIsolationFingerprint }
       })
     },
     async deactivateToolboxConnection() {
@@ -202,6 +242,7 @@ export function createClaudeModelApiConfig(
   const configDirectory = dirname(path)
   const backupPath = join(configDirectory, 'laixin-model-api-backup.json')
   const configLockPath = join(configDirectory, 'laixin-config.lock')
+  const isolationLeasePath = join(configDirectory, 'laixin-claude-isolation-lease.json')
   return {
     async apply(key) {
       return withManagedConfigWriteLock(file, configLockPath, async () => {
@@ -214,6 +255,27 @@ export function createClaudeModelApiConfig(
           { path: backupPath, before: backup, after: saved.kind === 'missing' ? renderBackup(original) : backup },
           { path, before: current, after: desired, validate: validateClaudeSettings }
         ], { backupAction: 'apply' })
+      })
+    },
+    async applyIfIsolationFingerprint(expectedFingerprint, leaseId, key, verifyTarget) {
+      return withManagedConfigWriteLock(file, configLockPath, async () => {
+        if (verifyTarget !== undefined && !await verifyTarget().catch(() => false)) return 'stale'
+        const [current, rawLease] = await Promise.all([file.read(path), file.read(isolationLeasePath)])
+        const currentFingerprint = managedFingerprint(claudeManagedSection(current))
+        if (currentFingerprint !== expectedFingerprint) return 'stale'
+        let lease: ApplicationIsolationLease
+        try { lease = parseApplicationIsolationLease(rawLease) } catch { return 'stale' }
+        if (lease.id !== leaseId || lease.beforeFingerprint !== expectedFingerprint || lease.expectedFingerprint !== undefined) return 'stale'
+        const desired = mergeClaudeSettings(current, provider, connection, key)
+        const postWriteManagedFingerprint = managedFingerprint(claudeManagedSection(desired))
+        if (postWriteManagedFingerprint === undefined) throw new Error('AI_ACCESS_CONFIG_READBACK_MISMATCH')
+        await replaceConfigurationTransaction(file, [
+          // The post-write identity is durable before settings.json changes, so crash recovery
+          // can remove only this lease or restore only its owned env keys.
+          { path: isolationLeasePath, before: rawLease, after: renderApplicationIsolationLease({ ...lease, expectedFingerprint: postWriteManagedFingerprint }) },
+          { path, before: current, after: desired, validate: validateClaudeSettings }
+        ], { backupAction: 'apply' })
+        return { outcome: 'applied', managedFingerprint: postWriteManagedFingerprint, isolationFingerprint: postWriteManagedFingerprint }
       })
     },
     async deactivateToolboxConnection() {
@@ -372,6 +434,43 @@ export function managedFingerprint(section: string | undefined): string | undefi
   return section === undefined ? undefined : createHash('sha256').update(section).digest('hex')
 }
 
+/** Durable N-56 recovery evidence; opaque id prevents an old action deleting a later lease. */
+export interface ApplicationIsolationLease {
+  readonly id: string
+  readonly beforeBlock: string
+  readonly beforeFingerprint: string
+  readonly expectedFingerprint: string | undefined
+}
+
+/** Compatibility name retained for the N-56 Codex lease. */
+export type CodexIsolationLease = ApplicationIsolationLease
+
+export function createApplicationIsolationLease(beforeBlock: string, beforeFingerprint: string): ApplicationIsolationLease {
+  return { id: randomBytes(16).toString('hex'), beforeBlock, beforeFingerprint, expectedFingerprint: undefined }
+}
+
+export function renderApplicationIsolationLease(lease: ApplicationIsolationLease): string {
+  return `${JSON.stringify({ version: 1, id: lease.id, beforeBlock: lease.beforeBlock, beforeFingerprint: lease.beforeFingerprint, expectedFingerprint: lease.expectedFingerprint ?? null })}\n`
+}
+
+export function parseApplicationIsolationLease(contents: string | undefined): ApplicationIsolationLease {
+  if (contents === undefined) throw new Error('AI_ACCESS_ISOLATION_LEASE_MISSING')
+  let value: unknown
+  try { value = JSON.parse(contents) } catch { throw new Error('AI_ACCESS_ISOLATION_LEASE_INVALID') }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error('AI_ACCESS_ISOLATION_LEASE_INVALID')
+  const record = value as Record<string, unknown>
+  if (record.version !== 1 || typeof record.id !== 'string' || !/^[a-f0-9]{32}$/.test(record.id) || typeof record.beforeBlock !== 'string' || typeof record.beforeFingerprint !== 'string' ||
+    !(typeof record.expectedFingerprint === 'string' || record.expectedFingerprint === null) || Object.keys(record).length !== 5) {
+    throw new Error('AI_ACCESS_ISOLATION_LEASE_INVALID')
+  }
+  return { id: record.id, beforeBlock: record.beforeBlock, beforeFingerprint: record.beforeFingerprint, expectedFingerprint: record.expectedFingerprint ?? undefined }
+}
+
+/** Compatibility exports keep N-56's frozen surface unchanged. */
+export const createCodexIsolationLease = createApplicationIsolationLease
+export const renderCodexIsolationLease = renderApplicationIsolationLease
+export const parseCodexIsolationLease = parseApplicationIsolationLease
+
 /** Codex：语义托管段；第三方工具删掉注释后仍能识别同一条工具箱连接。 */
 export function codexManagedSection(contents: string | undefined): string | undefined {
   if (contents === undefined) return undefined
@@ -389,6 +488,15 @@ export function claudeManagedSection(contents: string | undefined): string | und
       .sort(([left], [right]) => left.localeCompare(right))
     return JSON.stringify(managed)
   } catch { return undefined }
+}
+
+/** Restores only the captured Toolbox-owned Claude model env keys, preserving all other settings and env keys. */
+export function restoreClaudeManagedSection(current: string, managedSection: string): string {
+  if (!isManagedClaudeSettings(current)) throw new Error('AI_ACCESS_CONFIG_UNMANAGED')
+  const settings = parseClaudeSettings(current)
+  const env = record(settings.env) ? settings.env : {}
+  const restored = parseClaudeManagedSection(managedSection)
+  return `${JSON.stringify(withClaudeEnv(settings, { ...withoutClaudeManagedEnv(env), ...restored }), null, 2)}\n`
 }
 
 /** Hermes：配置在它自己的 CLI 里，指纹取工具箱设过的六个键。 */
@@ -577,6 +685,24 @@ function parseClaudeSettings(contents: string): Record<string, unknown> {
     if (!record(candidate) || (candidate.env !== undefined && !record(candidate.env))) throw new Error()
     return candidate
   } catch { throw new Error('AI_ACCESS_CONFIG_UNMANAGED') }
+}
+
+function parseClaudeManagedSection(contents: string): Record<string, unknown> {
+  let value: unknown
+  try { value = JSON.parse(contents) } catch { throw new Error('AI_ACCESS_ISOLATION_LEASE_INVALID') }
+  if (!Array.isArray(value)) throw new Error('AI_ACCESS_ISOLATION_LEASE_INVALID')
+  const env: Record<string, unknown> = {}
+  for (const entry of value) {
+    if (!Array.isArray(entry) || entry.length !== 2 || typeof entry[0] !== 'string' ||
+      !claudeManagedEnvKeys.includes(entry[0] as typeof claudeManagedEnvKeys[number]) ||
+      typeof entry[1] !== 'string' || Object.hasOwn(env, entry[0])) {
+      throw new Error('AI_ACCESS_ISOLATION_LEASE_INVALID')
+    }
+    env[entry[0]] = entry[1]
+  }
+  const candidate = JSON.stringify({ env })
+  if (!isManagedClaudeSettings(candidate)) throw new Error('AI_ACCESS_ISOLATION_LEASE_INVALID')
+  return env
 }
 
 function restoreClaudeSettings(current: string, original: string | null): string | undefined {

@@ -82,6 +82,10 @@ it('写了新连接意图、新守护晚一步才启动:旧恢复者在它真正
 
 it('新会话已接手时，旧守护自身的崩溃兜底不能恢复新会话的账目', async () => {
   const h = await oldRecovery()
+  let crashExit: number | undefined
+  // 生产里兜底在旧守护启动时就安装：必须在新守护 claim 前记住当时的 generation，
+  // ⛔ 新会话连上后才安装一个「旧守护」处理器，那会把已发生的交接当成启动基线。
+  const bailout = installCrashBailout({ dataDir: h.root, adapterOf: () => h.adapter, runId: 'old', exit: code => { crashExit = code } })
   h.box.locked = false
   writeIntentFile(h.root, intent('new'))
   const fresh = createDaemon({ dataDir: h.root, runId: 'new', adapter: h.adapter, clock: clock(), parentAlive: () => true,
@@ -91,9 +95,6 @@ it('新会话已接手时，旧守护自身的崩溃兜底不能恢复新会话�
   await vi.advanceTimersByTimeAsync(0)
   await vi.advanceTimersByTimeAsync(0)
   expect(JSON.parse(readFileSync(join(h.root, 'state.json'), 'utf8'))).toMatchObject({ runId: 'new', state: 'connected' })
-  let crashExit: number | undefined
-  // 生产里兜底由守护入口安装并带上本进程的 runId(tunnel-daemon.mjs);两个守护只在测试里同处一个进程,所以这里显式给旧守护的身份
-  const bailout = installCrashBailout({ dataDir: h.root, adapterOf: () => h.adapter, runId: 'old', exit: code => { crashExit = code } })
   let observed
   try {
     process.emit('uncaughtException', Error('injected old-daemon crash during handover'))
@@ -108,7 +109,7 @@ it('新会话已接手时，旧守护自身的崩溃兜底不能恢复新会话�
   expect(observed.state).toMatchObject({ runId: 'new', state: 'connected' })
 })
 
-it('PAC 连续两次被外部软件开启并换地址，退出须恢复最后一次完整外部值', () => {
+it('PAC 连续三次外部改写会有界夺回，第四次受限；退出仍保留最后一次完整外部值', () => {
   const root = directory()
   writeIntentFile(root, intent('pac'))
   const adapterUrl = new URL('../../sidecar/mac/adapter-networksetup.mjs', import.meta.url).href
@@ -142,28 +143,33 @@ it('PAC 连续两次被外部软件开启并换地址，退出须恢复最后一
       clock:{now:Date.now,setInterval:()=>0,setTimeout:()=>0,clearTimer:()=>{}},parentAlive:()=>true,onExit:()=>{},
       connectorFactory:()=>({kind:'loopback-probe',start:async()=>{},stop:async()=>{},localProxyPort:()=>1,onLost:()=>{},verify:async()=>({exitIp:'203.0.113.1'})}),
       bridgeFactory:()=>({listen:async()=>{},close:async()=>{},isAlive:()=>true,onLost:()=>{}})})
+    const blocks=[]
+    const block=daemon.availability.block.bind(daemon.availability)
+    daemon.availability.block=(...args)=>{const result=block(...args);blocks.push(result);return result}
     await daemon.run()
     const repairs=[]
-    for(const url of ['http://127.0.0.1:7891/b.pac','http://127.0.0.1:7892/c.pac']) {
+    for(const url of ['http://127.0.0.1:7891/b.pac','http://127.0.0.1:7892/c.pac','http://127.0.0.1:7893/d.pac','http://127.0.0.1:7894/e.pac']) {
       pacEnabled=true; pacUrl=url
       daemon.notifyEvent('network-change')
       await new Promise(resolve=>setTimeout(resolve,10))
       repairs.push({pacEnabled,pacUrl})
     }
     const ledgerBefore=JSON.parse(readFileSync(root+'/ledger.json','utf8')).filter(e=>e.item==='auto-proxy')
+    const limited=JSON.parse(readFileSync(root+'/state.json','utf8')).availability
     daemon.requestShutdown()
     await new Promise(resolve=>setTimeout(resolve,30))
-    console.log(JSON.stringify({repairs,ledgerBefore,restored:{pacEnabled,pacUrl},state:JSON.parse(readFileSync(root+'/state.json','utf8')).state}))
+    const finalState=JSON.parse(readFileSync(root+'/state.json','utf8'))
+    console.log(JSON.stringify({repairs,ledgerBefore,restored:{pacEnabled,pacUrl},state:finalState.state,limited,availability:finalState.availability,blocks}))
   `
   const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
     encoding: 'utf8', timeout: 5000, env: { ...process.env, ...macDaemonLaunch('/unused-review-path').env }
   })
   expect(result.status, result.stderr).toBe(0)
   const observed = JSON.parse(result.stdout)
-  // 2026-09-15 起「两次连续被改即止损」(创始人定):第一次改回 → PAC 被关掉;
-  // 第二次又被改 → 停止自动写回,保留对方现状(PAC 仍开着)。⛔ 再每轮都关它。
-  expect(observed.repairs[0].pacEnabled).toBe(false)
-  expect(observed.repairs[1].pacEnabled).toBe(true)
+  // N-55：证据、租约和读回每轮都还成立时，前三次受控夺回；第四次到达严格上限并保留外部 PAC。
+  expect(observed.repairs.map((repair: { pacEnabled: boolean }) => repair.pacEnabled)).toEqual([false, false, false, true])
+  expect(observed.blocks.at(-1)).toMatchObject({ status: 'limited', code: 'RECLAIM_LIMIT' })
+  expect(observed.limited).toMatchObject({ status: 'recovered', code: 'TUNNEL_AVAILABILITY_RECLAIM_LIMIT' })
   // 本条用例的原始意图不变:退出必须还给对方**最后**写的那个完整值。
-  expect(observed.restored).toEqual({ pacEnabled: true, pacUrl: 'http://127.0.0.1:7892/c.pac' })
+  expect(observed.restored).toEqual({ pacEnabled: true, pacUrl: 'http://127.0.0.1:7894/e.pac' })
 })

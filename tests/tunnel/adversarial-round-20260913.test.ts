@@ -51,10 +51,7 @@ describe('对抗检测轮 · 通知通道坏掉 / 另一款代理软件争抢', 
     h.daemon.requestShutdown(); await flushMicrotasks()
   })
 
-  it('另一款代理软件反复改系统代理:第一次改回、第二次止损并保留对方现值,账本只多一条、退出还它最后写的值', async () => {
-    // 2026-09-15 创始人定「两次连续被改即止损」,撤销原「每次都改回(硬标准 ⛔ 放弃)」。
-    // 止损的是**跟别人抢系统代理**这个动作,不是连接努力本身:保留对方现值 + 稳定报冲突 + 等客户显式重新接管。
-    // 本用例仍然盯住两条没变的意图:账本这一项只多一条;原值跟着对方**最后**写的值走(GPT-6 补核 R6)。
+  it('另一款代理软件反复改系统代理:按本意图有界夺回，到顶后保留对方现值并不再写入', async () => {
     const h = harness({ verifyIntervalMs: 30_000 })
     await h.daemon.run()
     expect(h.view().state).toBe('connected')
@@ -66,25 +63,24 @@ describe('对抗检测轮 · 通知通道坏掉 / 另一款代理软件争抢', 
     expect(h.view().state).toBe('connected')
     expect(h.view().code).toBe('TUNNEL_SETTINGS_CONTESTED')
     expect(h.view().message).toContain('另一款代理软件')
-    // 第二次又被改:止损。⛔ 写回、⛔ 继续「已改回 N 次」数下去
+    // 第二、三次都仍有当前对象、租约和目标实测，允许受控夺回；旧的“第二次即停”不能复活。
     h.write('ProxyServer', 'other.proxy:7892')
     clock.advance(30_000); await flushMicrotasks(); await flushMicrotasks()
-    expect(h.registry().ProxyServer?.data).toBe('other.proxy:7892')
-    // 止损后要稳定停在冲突态(正向证据:⛔ 只断言「没再改回」——那条在什么都不做时也成立)
+    expect(h.registry().ProxyServer?.data).toBe('127.0.0.1:18080')
+    h.write('ProxyServer', 'other.proxy:7893')
+    clock.advance(30_000); await flushMicrotasks(); await flushMicrotasks()
+    expect(h.registry().ProxyServer?.data).toBe('127.0.0.1:18080')
+    // 第四次超过本意图上限：不再抢写，并以受控限制码说明原因。
+    h.write('ProxyServer', 'other.proxy:7894')
+    clock.advance(30_000); await flushMicrotasks(); await flushMicrotasks(); await flushMicrotasks()
+    expect(h.registry().ProxyServer?.data).toBe('other.proxy:7894')
     expect(h.view().state).toBe('error')
-    expect(h.view().code).toBe('TUNNEL_SETTINGS_CONTEST_STOPPED')
-    // 再放两轮:对方继续改,我们一次都不再写回(这才是「不再循环」)
-    for (const port of [7893, 7894]) {
-      h.write('ProxyServer', `other.proxy:${String(port)}`)
-      clock.advance(30_000); await flushMicrotasks(); await flushMicrotasks()
-      expect(h.registry().ProxyServer?.data).toBe(`other.proxy:${String(port)}`)
-    }
+    expect(h.view().code).toBe('TUNNEL_AVAILABILITY_RECLAIM_LIMIT')
     // 账本:本会话这一项仍只多一条,原值跟着对方最后写的值走
     const repairEntries = loadLedger(dataDir).filter((entry) => entry.kind === 'setting')
     expect(repairEntries.length).toBe(ledgerBefore + 1)
-    expect((repairEntries.at(-1) as { originalValue: { data: string } }).originalValue.data).toBe('other.proxy:7892')
-    // ⛔ 自动恢复(创始人 2026-09-15 定:进入冲突态后不再定时探测、不自己抢回,只给明确的「重试连接」)。
-    // 对方停手很久也不许自己爬回来——自动恢复正是这次反复横跳的放大器。
+    expect((repairEntries.at(-1) as { originalValue: { data: string } }).originalValue.data).toBe('other.proxy:7894')
+    // 到顶后不再定时抢回；新意图或新的路径证据才会重新裁决。
     clock.advance(6 * 60_000); await flushMicrotasks(); await flushMicrotasks()
     expect(h.registry().ProxyServer?.data).toBe('other.proxy:7894')
     expect(h.view().state).toBe('error')

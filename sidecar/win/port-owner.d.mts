@@ -2,7 +2,8 @@
 export declare const LAIXIN_PROCESS_NAMES: readonly string[]
 
 export interface PortOwner {
-  kind: 'laixin' | 'other' | 'unknown'
+  kind: 'laixin' | 'other' | 'none' | 'unknown'
+  reason?: 'address-ambiguous'
   pid?: number
   name?: string
   path?: string

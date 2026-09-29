@@ -269,6 +269,17 @@ describe('Windows 终端自动接入', () => {
     expect(readFileSync(source, 'utf8')).toBe("Write-Output 'KEEP'\r\n")
   })
 
+  it('注册表写入失败时提示注册表原因，不误报配置文件', () => {
+    const terminal = { ...build(), write: () => {
+      throw Object.assign(new Error('private registry detail'), { code: 'TERMINAL_ENVIRONMENT_REGISTRY_WRITE_FAILED' })
+    } }
+    const network: ManagedNetworkAdapter = { managedItems: () => [], read: () => null, write: () => undefined }
+    const adapter = composeManagedAdapters(network, terminal)
+    expect(() => adapter.write({ service: 'TerminalEnvironment', item: 'win-cmd-autorun' }, null)).toThrow()
+    expect(adapter.optionalNote?.()).toContain('注册表写入失败')
+    expect(adapter.optionalNote?.()).not.toContain('private registry detail')
+  })
+
   it('默认关闭不改目录或注册表；非法代理受控拒绝', () => {
     const guarded = createTerminalEnvironmentAdapter({ home, run: fakeRegistry(autoRun, environment) })
     expect(guarded.managedItems(PROXY)).toEqual([])

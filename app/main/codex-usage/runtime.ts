@@ -19,7 +19,8 @@ export async function findCodexDesktopCommand(home: string, platform = process.p
 
 export function isCodexDesktopExecutable(executable: string, platform: string): boolean {
   const normalized = executable.replace(/\\/g, '/')
-  if (platform === 'darwin') return /\/(?:Codex|ChatGPT)\.app\/Contents\/Resources\/codex$/.test(normalized)
-  if (platform === 'win32') return /\/AppData\/Local\/(?:Programs\/(?:Codex|ChatGPT)|ChatGPT)\/resources\/codex\.exe$/i.test(normalized)
+  if (platform === 'darwin') return /\/(?:Codex|ChatGPT)\.app\/Contents\/Resources\/(?:codex|codex-cli\/bin\/codex|codex-cli\/CodexCLI\.app\/Contents\/MacOS\/codex)$/.test(normalized)
+  if (platform === 'win32') return /\/(?:Programs\/(?:Codex|ChatGPT)|ChatGPT)\/resources\/codex\.exe$/i.test(normalized) ||
+    /\/OpenAI\.Codex_\d+\.\d+\.\d+\.\d+_(?:x64|arm64|x86)__2p2nqsd0c76g0\/(?:[^/]+\/)*resources\/codex\.exe$/i.test(normalized)
   return false
 }

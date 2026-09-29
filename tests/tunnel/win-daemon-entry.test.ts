@@ -41,7 +41,7 @@ describe('win 守护入口(CLI,真进程)', () => {
     expect(result.stderr).toContain('REAL_ADAPTER_GUARD')
   })
 
-  it('W4-1 空成功:无账本 + 代理指着我们候选口 → restore 关掉残留(退出码 0 + 回执带字段)', () => {
+  it('N-44 空账本 + 候选口:无法证明是来信还是第三方同端口，保留现值并报告人工核实', () => {
     const dataDir = makeTempDir('laixin-win-entry-')
     roots.push(dataDir)
     const storePath = join(dataDir, 'fake-wininet.json')
@@ -52,15 +52,15 @@ describe('win 守护入口(CLI,真进程)', () => {
     const result = runDaemon(['restore', '--data-dir', dataDir, '--adapter', FAKE_ADAPTER], {
       FAKE_WININET_STORE: storePath
     })
-    expect(result.status).toBe(0)
-    const receipt = JSON.parse(result.stdout) as { residueClearedProxyPort?: number }
-    expect(receipt.residueClearedProxyPort).toBe(18080)
+    expect(result.status).toBe(65)
+    const receipt = JSON.parse(result.stdout) as { ownershipUnknown?: boolean; suspectProxyPort?: number }
+    expect(receipt).toMatchObject({ ownershipUnknown: true, suspectProxyPort: 18080 })
     const store = JSON.parse(readFileSync(storePath, 'utf8')) as Record<string, { data: string }>
-    expect(store.ProxyEnable.data).toBe('0')
-    // 客户自己的回环代理(不在我们的口集合)⛔ 被顺手关掉
+    expect(store.ProxyEnable.data).toBe('1')
+    expect(JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8')).code).toBe('TUNNEL_PROXY_OWNERSHIP_UNKNOWN')
   })
 
-  it('W4-1 反向:回环代理但不是我们的口 → 兜底 ⛔ 开火', () => {
+  it('W4-1 反向:其他端口有第三方活监听 → 兜底 ⛔ 开火', () => {
     const dataDir = makeTempDir('laixin-win-entry-')
     roots.push(dataDir)
     const storePath = join(dataDir, 'fake-wininet.json')
@@ -69,7 +69,7 @@ describe('win 守护入口(CLI,真进程)', () => {
       ProxyServer: { type: 'REG_SZ', data: '127.0.0.1:7897' }
     }))
     const result = runDaemon(['restore', '--data-dir', dataDir, '--adapter', FAKE_ADAPTER], {
-      FAKE_WININET_STORE: storePath
+      FAKE_WININET_STORE: storePath, FAKE_WININET_PORT_OWNER: 'other'
     })
     expect(result.status).toBe(0)
     const receipt = JSON.parse(result.stdout) as { residueClearedProxyPort?: number }
@@ -78,11 +78,16 @@ describe('win 守护入口(CLI,真进程)', () => {
     expect(store.ProxyEnable.data).toBe('1')
   })
 
-  it('restore --adapter 假适配器:按账本把四键读数恢复为原值', () => {
+  it('restore --adapter 假适配器:按同会话账本把 WinINET 代理读数恢复为原值', () => {
     const dataDir = makeTempDir('laixin-win-entry-')
     roots.push(dataDir)
     const storePath = join(dataDir, 'fake-wininet.json')
     // 预置「系统里还有我们写的值」:账本 applied 项 + 假 WinINET 存储里是写入值
+    appendSettingEntry(dataDir, {
+      service: 'WinINET', item: 'ProxyServer', originalValue: null,
+      writtenValue: { type: 'REG_SZ', data: '127.0.0.1:18080' },
+      sessionToken: 'entry-test', time: Date.now() - 1
+    })
     appendSettingEntry(dataDir, {
       service: 'WinINET',
       item: 'ProxyEnable',
@@ -91,13 +96,14 @@ describe('win 守护入口(CLI,真进程)', () => {
       sessionToken: 'entry-test',
       time: Date.now()
     })
-    writeFileSync(storePath, JSON.stringify({ ProxyEnable: { type: 'REG_DWORD', data: '1' } }))
+    writeFileSync(storePath, JSON.stringify({ ProxyEnable: { type: 'REG_DWORD', data: '1' },
+      ProxyServer: { type: 'REG_SZ', data: '127.0.0.1:18080' } }))
     const result = runDaemon(['restore', '--data-dir', dataDir, '--adapter', FAKE_ADAPTER], {
       FAKE_WININET_STORE: storePath
     })
     expect(result.status).toBe(0)
     const receipt = JSON.parse(result.stdout) as { restored: number; keptModified: string[]; failed: string[] }
-    expect(receipt.restored).toBe(1)
+    expect(receipt.restored).toBe(2)
     expect(readFileSync(storePath, 'utf8').trim()).toBe('{}')
   })
 })

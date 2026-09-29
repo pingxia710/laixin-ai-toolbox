@@ -6,7 +6,7 @@ import type { UpdateSuccessNotice } from '../../desktop-types'
 // ⛔ 每次启动弹多次:一次更新只认第一眼,shown 钉住本次页面生命周期。
 let shown = false
 
-export function showUpdateSuccessNotice(notice: UpdateSuccessNotice): void {
+export function showUpdateSuccessNotice(notice: UpdateSuccessNotice, onDismiss?: () => void): void {
   if (shown || notice.version === '') return
   shown = true
   const dialog = document.createElement('dialog')
@@ -58,7 +58,7 @@ export function showUpdateSuccessNotice(notice: UpdateSuccessNotice): void {
   ack.addEventListener('click', () => dialog.close())
   footer.append(ack)
   dialog.append(header, content, footer)
-  dialog.addEventListener('close', () => dialog.remove())
+  dialog.addEventListener('close', () => { dialog.remove(); onDismiss?.() })
   dialog.addEventListener('cancel', (event) => { event.preventDefault(); dialog.close() })
   document.body.append(dialog)
   dialog.showModal()

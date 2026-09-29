@@ -20,7 +20,9 @@ export function registerSubscriptionActions(registry: BridgeRegistry, client: Ac
             if (payment?.redirect?.kind === 'url') {
               const url = new URL(payment.redirect.data)
               if (url.protocol !== 'https:' || url.hostname !== 'openapi.alipay.com' || url.port || url.username || url.password || url.pathname !== '/gateway.do') throw new AccountClientError('SUBSCRIPTION_UNAVAILABLE')
-              await shell.openExternal(url.href)
+              // 浏览器没弹出来是「打开付款页」失败,不是「下单」失败(PAY-11):订单已建,
+              // 保留数据、如实标记,让界面引导客户重试打开 ⛔ 整包丢成「暂未开放购买」。
+              try { await shell.openExternal(url.href) } catch { return { data: JSON.stringify({ ...(data as SubscriptionPayment), browserOpened: false }), error: '' } }
             }
           }
           return { data: JSON.stringify(data), error: '' }

@@ -166,6 +166,9 @@ export class CodexOfficialLoginController {
       if (generation === this.generation) this.current = 'failed'
       throw new Error('AI_ACCESS_CODEX_LOGIN_FAILED')
     }
+    // N-59:取消可能落在上面的 await 窗口里。恢复后必须先认代次——客户已经取消,
+    // ⛔ 把控制器拽回 pending、再调 startLogin 弹出授权页。
+    if (generation !== this.generation) { this.current = 'idle'; return this.status() }
     if (command === null) {
       if (generation === this.generation) this.current = 'idle'
       throw new Error('AI_ACCESS_CODEX_NOT_INSTALLED')
@@ -176,6 +179,14 @@ export class CodexOfficialLoginController {
     } catch {
       if (generation === this.generation) this.current = 'failed'
       throw new Error('AI_ACCESS_CODEX_LOGIN_FAILED')
+    }
+    // N-59:startLogin 窗口里被取消:会话可能已经建好(浏览器可能已弹),必须立刻取消它,
+    // ⛔ 登记成 this.pending——迟到的 completed 会把状态永久卡在 pending。
+    if (generation !== this.generation) {
+      this.current = 'idle'
+      this.pending = undefined
+      await pending.cancel()
+      return this.status()
     }
     this.pending = pending
     void pending.completed.then(async (succeeded) => {

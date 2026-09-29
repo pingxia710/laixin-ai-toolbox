@@ -25,6 +25,7 @@ function makeResident(options: { active?: boolean; alive?: boolean; wakeSucceeds
   const bridge: ResidentBridge = {
     armed: () => state.active,
     alive: () => state.alive,
+    seatRunId: () => state.alive ? '常驻守护自己发的' : undefined,
     wake: async () => {
       wakes += 1
       // 「叫醒就起来」的常驻:叫过之后席位上就有活人了。
@@ -238,6 +239,17 @@ describe('常驻接入 · 主进程侧', () => {
     h.cleanup()
   })
 
+  it('常驻席位身份缺失或与旧 state 不同，连接态必须 fail closed', () => {
+    const resident = makeResident({ alive: true })
+    const h = makeHarness(resident.bridge)
+    expect(h.supervisor.currentState({ state: 'connected', runId: '旧守护' })?.state).toBe('connecting')
+    expect(h.supervisor.currentState({ state: 'connected' })?.state).toBe('connecting')
+    const unreadable = makeHarness({ ...resident.bridge, seatRunId: () => undefined })
+    expect(unreadable.supervisor.currentState({ state: 'connected', runId: '常驻守护自己发的' })?.state).toBe('connecting')
+    unreadable.cleanup()
+    h.cleanup()
+  })
+
   it('常驻重新连上后异常标记要清掉:⛔ 让「上次异常退出」永远挂在界面上', async () => {
     const resident = makeResident({ alive: false, wakeSucceeds: false })
     const h = makeHarness(resident.bridge)
@@ -247,6 +259,7 @@ describe('常驻接入 · 主进程侧', () => {
     expect(h.supervisor.lastUnexpectedExitAt({ state: 'error' })).toBeTypeOf('number')
     // 守护回来了、状态连上了 → 标记清掉
     resident.state.alive = true
+    expect(h.supervisor.lastUnexpectedExitAt({ state: 'connected', runId: '旧守护' })).toBeTypeOf('number')
     expect(h.supervisor.lastUnexpectedExitAt({ state: 'connected', runId: '常驻守护自己发的' })).toBeUndefined()
     h.cleanup()
   })

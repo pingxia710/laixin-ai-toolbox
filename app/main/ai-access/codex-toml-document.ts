@@ -90,6 +90,21 @@ export function codexToolboxSection(contents: string): string | undefined {
   return JSON.stringify({ root, provider })
 }
 
+/**
+ * Returns the exact marker-bounded Toolbox connection only when the marker and semantic provider
+ * table agree. This is kept in process memory solely for a conditional N-56 rollback; it is never
+ * serialized into diagnostics or a second config/credential store.
+ */
+export function codexToolboxConnectionBlock(contents: string): string {
+  const document = parse(contents)
+  const connection = connectionOf(document)
+  if (document.managedMarker === undefined || !markerOwnsConnection(document, connection)) {
+    throw new Error('AI_ACCESS_CONFIG_UNMANAGED')
+  }
+  const [start, end] = document.managedMarker
+  return `${document.lines.slice(start, end + 1).join('\n')}\n`
+}
+
 function markedCodexSection(document: ParsedDocument): string | undefined {
   if (document.managedMarker === undefined) return undefined
   const [start, end] = document.managedMarker

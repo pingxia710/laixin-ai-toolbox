@@ -22,7 +22,8 @@ export function wininetValuesEqual(left, right, ref) {
 }
 
 // ProxyServer 有两种写法:`host:port`(所有协议同一代理)或 `http=h:p;https=h:p;socks=h:p`。
-// 取 http(或 https)那条当 http 代理;只有 socks 那条就当 socks 代理。
+// 我们探的是 HTTPS AI 服务，所以分协议时只能探 WinINET 真正给 HTTPS 用的 https=；
+// 缺 https= 时可按 WinINET 的 SOCKS 回落探 socks=，绝不能拿只承载明文 HTTP 的 http= 冒充。
 export function parseProxyServer(data) {
   const text = String(data ?? '').trim()
   if (text === '') return undefined
@@ -35,5 +36,5 @@ export function parseProxyServer(data) {
   }
   if (entries.length === 1 && !entries[0].includes('=')) return pick(entries[0], 'http')
   const byScheme = Object.fromEntries(entries.filter((part) => part.includes('=')).map((part) => part.split('=').map((piece) => piece.trim().toLowerCase())))
-  return pick(byScheme.http ?? '', 'http') ?? pick(byScheme.https ?? '', 'http') ?? pick(byScheme.socks ?? '', 'socks')
+  return pick(byScheme.https ?? '', 'http') ?? pick(byScheme.socks ?? '', 'socks')
 }

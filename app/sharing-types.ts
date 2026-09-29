@@ -43,7 +43,7 @@ export interface SharingDelivery {
   expiresAt: number
 }
 export interface SharingCatalog { listings: SharingListing[]; channels: (PaymentChannelName | 'manual')[] }
-export interface SharingPayment { order: SharingOrderView; payment: PaymentOrderView | null }
+export interface SharingPayment { order: SharingOrderView; payment: PaymentOrderView | null; /** 仅在主进程打开浏览器失败时为 false:租单已建,界面如实提示重试(PAY-11)。 */ browserOpened?: boolean }
 export type SharingIntentionStatus = 'pending' | 'contacted' | 'listed' | 'closed'
 export interface SharingIntention {
   id: string

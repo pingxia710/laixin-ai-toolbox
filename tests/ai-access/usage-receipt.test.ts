@@ -384,7 +384,7 @@ function serviceWithRecorder(recorder: UsageReceiptRecorder, harness: ServiceHar
   const hermes: AiAccessAdapter = { shell: 'hermes', applyDeepSeek: async () => undefined, applyProvider: async () => undefined }
   const gatewayStub = {
     baseUrl: 'http://127.0.0.1:45101',
-    start: async () => { if (harness.gatewayStartFails === true) throw new Error('AI_ACCESS_PORT_UNAVAILABLE'); return 45101 },
+    start: async () => { if (harness.gatewayStartFails === true) throw Object.assign(new Error('AI_ACCESS_PORT_UNAVAILABLE'), { code: 'EADDRINUSE' }); return 45101 },
     stop: async () => undefined,
     setRoutes: () => undefined,
     snapshot: () => ({ running: true, baseUrl: 'http://127.0.0.1:45101', startedAt: '2026-09-15T00:00:00.000Z', requests: [], routes: [] }),

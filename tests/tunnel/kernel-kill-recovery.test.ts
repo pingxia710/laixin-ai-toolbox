@@ -4,7 +4,7 @@
 //   ② 然后自己把内核拉起来重新接上,系统代理重新写回;
 //   ③ 用户断开 → 假设置回到空;退出 → 进程正常结束。
 import { spawn, type ChildProcess } from 'node:child_process'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { expect, it } from 'vitest'
@@ -35,7 +35,9 @@ it('内核被外部杀掉:先还系统代理、再自己拉起内核重新接上
     expect(Object.keys(readFakeStore(storePath)).length).toBeGreaterThan(0)
 
     // 从外面杀内核(SIGKILL,清理钩子不跑),pid 在桥的记档里
-    const record = JSON.parse(readFileSync(join(dataDir, 'xray-bridge.json.pid'), 'utf8')) as { pid: number }
+    const pidRecords = () => readdirSync(dataDir).filter((name) => /^xray-bridge\.json\.[0-9a-f-]+\.pid$/.test(name))
+    expect(pidRecords()).toHaveLength(1)
+    const record = JSON.parse(readFileSync(join(dataDir, pidRecords()[0]), 'utf8')) as { pid: number }
     process.kill(record.pid, 'SIGKILL')
     // ① 先还系统代理
     await waitFor(() => readDaemonState(dataDir)?.state === 'error' && Object.keys(readFakeStore(storePath)).length === 0, 4000)
@@ -43,7 +45,8 @@ it('内核被外部杀掉:先还系统代理、再自己拉起内核重新接上
     // ② 自己拉起内核、重新接上、设置写回
     await waitFor(() => readDaemonState(dataDir)?.state === 'connected', 10_000)
     expect(Object.keys(readFakeStore(storePath)).length).toBeGreaterThan(0)
-    const again = JSON.parse(readFileSync(join(dataDir, 'xray-bridge.json.pid'), 'utf8')) as { pid: number }
+    expect(pidRecords()).toHaveLength(1)
+    const again = JSON.parse(readFileSync(join(dataDir, pidRecords()[0]), 'utf8')) as { pid: number }
     expect(again.pid).not.toBe(record.pid)
     // ③ 断开还原、退出干净
     writeFileAtomic(layout.intent(dataDir), JSON.stringify({ desired: 'user-disconnected' }))

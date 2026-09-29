@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createHash, generateKeyPairSync, sign } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import type { ChildProcess, SpawnOptions, spawn } from 'node:child_process'
-import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, win32 } from 'node:path'
 import type { UpdateRelease } from '../../app/main/desktop/update-manifest'
@@ -57,7 +57,7 @@ function windowsSpawn(rewrite?: (jobPath: string) => ReturnType<typeof originalL
   return { fake, launches }
 }
 
-async function readyToInstall(fakeSpawn: typeof spawn) {
+async function readyToInstall(fakeSpawn: typeof spawn, prepareAiRouterUpdate?: () => Promise<(() => Promise<void>) | undefined>) {
   // 目录名故意带中文、空格和 cmd 元字符:客户的 userData 就在「来信AI工具箱统一版」下,Windows 用户名还能带 & ( ) %。
   const directory = join(await mkdtemp(join(tmpdir(), 'toolbox-update-launch-')), '来信 R&D (测试) 100%', 'updates')
   await mkdir(directory, { recursive: true })
@@ -75,13 +75,13 @@ async function readyToInstall(fakeSpawn: typeof spawn) {
     directory, executable: join(installed, '来信AI工具箱统一版.exe'), helperPath: 'C:\\Users\\R&D\\AppData\\Local\\Programs\\laixin-ai-toolbox\\resources\\update-helper.ps1',
     packaged: true, quit, fetch: fetchStub, spawn: fakeSpawn, now: () => now,
     // 假时钟每次等待先让出一轮事件循环,假助手的 ready 才落得了盘;不吃真实 30 秒。
-    wait: async (ms) => { now += ms; await new Promise((resolve) => setImmediate(resolve)) } })
+    wait: async (ms) => { now += ms; await new Promise((resolve) => setImmediate(resolve)) }, prepareAiRouterUpdate })
   cleanups.push(async () => updater.dispose())
   expect(await updater.check()).toMatchObject({ state: 'available' })
   expect(await updater.download()).toMatchObject({ state: 'ready' })
   const folder = (await readdir(directory)).find((name) => name.startsWith('download-'))
   if (!folder) throw new Error('夹具:下载目录不存在')
-  return { updater, quit, jobPath: join(directory, folder, 'job.json') }
+  return { updater, quit, directory, jobPath: join(directory, folder, 'job.json') }
 }
 
 describe('Windows 起更新助手(0.5.10→0.5.11 真机:助手没执行 → 「更新程序没能启动」)', () => {
@@ -98,6 +98,23 @@ describe('Windows 起更新助手(0.5.10→0.5.11 真机:助手没执行 → 「
     expect(launches[0].args.join(' ')).not.toContain('R&D')
   })
 
+  it('启动更新助手前先停止 AI 路由，ready 后不重启旧路由', async () => {
+    const { fake, launches } = windowsSpawn()
+    const events: string[] = []
+    const restore = vi.fn(async () => { events.push('restore') })
+    const orderedSpawn = ((command: string, args: readonly string[], options: SpawnOptions) => {
+      events.push('spawn')
+      return fake(command, args, options)
+    }) as unknown as typeof spawn
+    const f = await readyToInstall(orderedSpawn, async () => { events.push('stop'); return restore })
+
+    await f.updater.install()
+
+    expect(launches).toHaveLength(1)
+    expect(events).toEqual(['stop', 'spawn'])
+    expect(restore).not.toHaveBeenCalled()
+  })
+
   it('反向对照:同一套夹具换回 v0.4.8~0.5.11 的原写法 → 助手不执行,30 秒判死、不退出、文案是「更新程序没能启动」', async () => {
     const { fake, launches } = windowsSpawn((jobPath) => originalLaunch('C:\\x\\update-helper.ps1', jobPath))
     const f = await readyToInstall(fake)
@@ -105,6 +122,42 @@ describe('Windows 起更新助手(0.5.10→0.5.11 真机:助手没执行 → 「
     expect(launches[0].outcome.executes).toBe(false)
     expect(f.quit).not.toHaveBeenCalled()
     expect(f.updater.status()).toMatchObject({ state: 'error', message: expect.stringContaining('更新程序没能启动') })
+  })
+
+  it('助手未 ready 时恢复已停止的旧路由，不留下半份交接', async () => {
+    const { fake } = windowsSpawn((jobPath) => originalLaunch('C:\\x\\update-helper.ps1', jobPath))
+    const restore = vi.fn(async () => undefined)
+    const f = await readyToInstall(fake, async () => restore)
+
+    await f.updater.install()
+
+    expect(restore).toHaveBeenCalledTimes(1)
+    expect(f.quit).not.toHaveBeenCalled()
+    expect(f.updater.status()).toMatchObject({ state: 'error' })
+  })
+
+  it('旧路由回滚也失败时留脱敏 result 证据并失败关闭', async () => {
+    const { fake } = windowsSpawn((jobPath) => originalLaunch('C:\\x\\update-helper.ps1', jobPath))
+    const f = await readyToInstall(fake, async () => async () => { throw new Error('private fixture detail') })
+
+    await f.updater.install()
+
+    expect(f.quit).not.toHaveBeenCalled()
+    expect(f.updater.status()).toMatchObject({ state: 'error', message: expect.stringContaining('旧 AI 路由未能自动恢复') })
+    const evidence = JSON.parse(await readFile(join(f.directory, 'result.json'), 'utf8'))
+    expect(evidence).toMatchObject({ state: 'error', code: 'AI_ROUTER_UPDATE_RESTORE_FAILED' })
+    expect(JSON.stringify(evidence)).not.toContain('private fixture detail')
+  })
+
+  it('更新前交接已报告恢复失败时同样留下脱敏 result 证据', async () => {
+    const { fake } = windowsSpawn()
+    const f = await readyToInstall(fake, async () => { throw new Error('AI_ROUTER_UPDATE_RESTORE_FAILED') })
+
+    await f.updater.install()
+
+    expect(f.quit).not.toHaveBeenCalled()
+    expect(f.updater.status()).toMatchObject({ state: 'error', message: expect.stringContaining('旧 AI 路由未能自动恢复') })
+    await expect(readFile(join(f.directory, 'result.json'), 'utf8')).resolves.toContain('AI_ROUTER_UPDATE_RESTORE_FAILED')
   })
 
   it('去掉 detached 直接起 PowerShell 也不行:会执行,但主进程一退就被一起收掉(换不了文件)', () => {

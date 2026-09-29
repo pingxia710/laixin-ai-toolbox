@@ -3,7 +3,7 @@ import type { SettingsAdapter } from './restore.d.mts'
 import type { VlessSpec } from './vless-connector.mjs'
 
 export declare function readIntentChecked(dataDir: string): { intent: DaemonIntent | { desired: 'shutdown' } | undefined; corrupted: boolean }
-/** 同一数据目录的恢复权规则(退出流程与崩溃兜底共用):状态文件已由别的 runId 写过 = 别的守护已实际接手。 */
+/** 同一数据目录的恢复权规则(退出流程与崩溃兜底共用):启动后出现更高接管代次才算别的守护已实际接手。 */
 /** 上一轮实际监听的入口端口(候选口占满时会是系统随机分的那个)。 */
 export declare function lastBridgePort(dataDir: string): number | undefined
 export declare function recoveryOwnedByOther(dataDir: string, runId: string): boolean
@@ -78,6 +78,7 @@ export interface DaemonState {
   readonly reusedProxy?: ExistingProxyInfo
   /** 可选项说明(终端接入未启用等)。 */
   readonly note?: string
+  readonly availability?: { readonly active?: boolean; readonly status?: string; readonly action?: string; readonly code?: string; readonly intentGeneration?: number }
   readonly updatedAt: number
 }
 
@@ -99,11 +100,18 @@ export interface ManagedItem {
 export interface ExistingProxyInfo { kind: 'http' | 'socks' | 'pac' | 'direct'; host?: string; port?: number; url?: string; source?: string }
 
 export interface ManagedAdapter extends SettingsAdapter {
+  /** N-55:平台已证实的当前系统路径身份；没有实现时守护不猜名称。 */
+  currentPathIdentity?(): { readonly id: string; readonly kind?: string }
+  identifyPortOwner?(port: number | undefined): { readonly kind: string; readonly pid?: number; readonly name?: string } | undefined
   reapplyOnChange?(ref: { service: string; item: string }): boolean
   /** 电脑上别的代理(不是我们的)当前是否开着;PAC 也报,但守护按不可判定处理。
    *  knownPorts = 守护用过/可能用的入口端口(本轮实际、意图默认、候选表、上一轮 state.json 里的实际口);
    *  「这是不是我们的」按这份记录判,⛔ 靠端口长什么样猜。 */
   existingProxy?(ours: { host: string; port: number; knownPorts?: readonly number[] }): ExistingProxyInfo | undefined
+  /** 平台可在异步探测后重新读取系统路径，候选变化时抛错以拒绝 reused。 */
+  validateExistingProxy?(candidate: ExistingProxyInfo): void
+  /** 将一次性候选转换为可长期保存/复验的普通 DTO；缺省保持原对象。 */
+  materializeExistingProxy?(candidate: ExistingProxyInfo): ExistingProxyInfo
   /** 可选项(终端接入)这次没启用的原因。 */
   optionalNote?(): string
   preflight?(proxy: { host: string; port: number }): void
@@ -146,6 +154,9 @@ export interface DaemonOptions {
   readonly verifyIntervalMs?: number
   readonly random?: () => number
   readonly log?: (line: string) => void
+  /** Read-only continuity sampling. Runs off the daemon event loop in production. */
+  readonly continuityEvidence?: boolean
+  readonly readContinuityFaces?: () => Promise<Record<string, Record<string, number>> | undefined>
   /** 探测「现有代理能不能出外网」;缺省 probeExistingProxy,用例注入。 */
   readonly probeProxy?: (existing: ExistingProxyInfo) => Promise<unknown>
   /** 这台电脑不经任何代理能不能到 AI 服务。缺省探 AI_SERVICE_PROBE_URLS；只在意图带 reuseDirect 时才被调用。 */

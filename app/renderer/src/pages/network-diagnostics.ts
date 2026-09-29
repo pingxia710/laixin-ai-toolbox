@@ -1,16 +1,24 @@
-import { diagnosticCheckCodes, diagnosticConclusionContracts, diagnosticConclusionRuleIds, networkDiagnosticReportTtlMs,
+import { diagnosticCheckCodes, diagnosticConclusionContracts, diagnosticConclusionRuleIds, diagnosticPathKinds, diagnosticPathStates, diagnosticProbePhases, networkDiagnosticReportTtlMs,
   type DiagnosticSoftware, type NetworkDiagnosticReport } from '../../../network-diagnostics-types'
 import { button, statusPill } from '../page-ui'
 import { refreshSupportContext, registerSupportContext, revealSupport } from '../support-widget'
 import { forgetDiagnosticSession, parseDiagnosticRunSnapshot, rememberDiagnosticSession } from '../diagnostic-session'
 import type { DiagnosticAttempt } from '../diagnostic-session'
+import { localEgressDescription, type LocalEgressEvidence } from '../../../shared/local-egress-evidence'
 import type { PageModule } from './types'
 
 const names: Record<DiagnosticSoftware, string> = { codex: 'Codex', claude: 'Claude Code', hermes: 'Hermes（DeepSeek）' }
 const states = { passed: '已确认', attention: '需要处理', unknown: '未能确认', 'not-checked': '未检查' } as const
 const codes = new Set<string>(diagnosticCheckCodes)
 const rules = new Set<string>(diagnosticConclusionRuleIds)
+const phases = new Set<string>(diagnosticProbePhases)
 const checkIds = ['internet', 'tunnel', 'service', 'account', 'application'] as const
+const matrixServiceCodes = new Set([
+  'AI_DIAG_PRIMARY_PATH_UNAVAILABLE',
+  'AI_DIAG_SERVICE_TIMEOUT', 'AI_DIAG_SERVICE_UNAVAILABLE', 'AI_DIAG_SERVICE_DNS_FAILED', 'AI_DIAG_SERVICE_PROXY_FAILED',
+  'AI_DIAG_SERVICE_CONNECTION_FAILED', 'AI_DIAG_SERVICE_TLS_FAILED', 'AI_DIAG_SERVICE_HTTP_FAILED',
+  'AI_DIAG_CONTEXT_CHANGED', 'AI_DIAG_TUNNEL_CHANGED', 'AI_DIAG_PATH_CONTEXT_UNKNOWN'
+])
 
 export interface DiagnosticConclusionView {
   readonly stale: boolean
@@ -29,12 +37,21 @@ export function parseDiagnosticReport(snapshot: string): NetworkDiagnosticReport
   if (!report || !Object.hasOwn(names, report.software) || !Number.isSafeInteger(report.checkedAt) ||
       !Number.isSafeInteger(report.validUntil) || report.validUntil !== report.checkedAt + networkDiagnosticReportTtlMs ||
       !report.target || typeof report.target.label !== 'string' || report.target.label.length < 1 || report.target.label.length > 80 ||
-      !['direct', 'tunnel'].includes(report.target.route) ||
+      !['direct', 'tunnel', 'isolated'].includes(report.target.route) ||
       !Array.isArray(report.checks) || report.checks.length !== 5 ||
       report.checks.some((check, index) => !check || check.id !== checkIds[index] ||
         !Object.hasOwn(states, check.state) || !codes.has(check.code) || typeof check.label !== 'string' || check.label.length > 30 ||
         typeof check.message !== 'string' || check.message.length > 300 ||
-        (check.elapsedMs !== undefined && (!Number.isSafeInteger(check.elapsedMs) || check.elapsedMs < 0 || check.elapsedMs > 60_000)))) throw new Error('DIAGNOSTIC_REPORT_INVALID')
+        (check.phase !== undefined && (!['internet', 'service'].includes(check.id) || !phases.has(check.phase))) ||
+        (check.elapsedMs !== undefined && (!Number.isSafeInteger(check.elapsedMs) || check.elapsedMs < 0 || check.elapsedMs > 60_000))) ||
+      (report.pathMatrix !== undefined && (!Number.isSafeInteger(report.pathMatrix.checkedAt) || report.pathMatrix.checkedAt !== report.checkedAt ||
+        report.checks[2]?.state !== 'unknown' || !matrixServiceCodes.has(report.checks[2]?.code) ||
+        typeof report.pathMatrix.valid !== 'boolean' || !Array.isArray(report.pathMatrix.entries) || report.pathMatrix.entries.length !== 3 ||
+        report.pathMatrix.entries.some((entry, index) => !entry || entry.path !== diagnosticPathKinds[index] ||
+          !diagnosticPathStates.includes(entry.state) || typeof entry.message !== 'string' || entry.message.length < 1 || entry.message.length > 160 ||
+          (entry.phase !== undefined && !phases.has(entry.phase)) ||
+          (entry.elapsedMs !== undefined && (!Number.isSafeInteger(entry.elapsedMs) || entry.elapsedMs < 0 || entry.elapsedMs > 60_000)))))
+    ) throw new Error('DIAGNOSTIC_REPORT_INVALID')
   const conclusion = report.conclusion
   const contract = conclusion && rules.has(conclusion.ruleId) ? diagnosticConclusionContracts[conclusion.ruleId] : undefined
   if (!conclusion || !contract || conclusion.status !== contract.status || conclusion.scope !== contract.scope ||
@@ -96,6 +113,21 @@ function renderDiagnosticConclusion(container: HTMLElement, report: NetworkDiagn
   const next = document.createElement('div')
   next.append(Object.assign(document.createElement('dt'), { textContent: '下一步' }), Object.assign(document.createElement('dd'), { textContent: view.nextStep }))
   facts.append(next)
+  if (report.pathMatrix !== undefined) {
+    const matrix = document.createElement('div')
+    matrix.append(Object.assign(document.createElement('dt'), { textContent: '失败后路径对照' }))
+    const detail = document.createElement('dd')
+    if (!report.pathMatrix.valid) detail.textContent = '本次未能确认路径对照使用的是同一份配置与通道状态，矩阵已失效，请重新检查。'
+    else {
+      const labels = { direct: '直连', 'existing-proxy': '系统现有代理', 'laixin-tunnel': '来信通道' } as const
+      const list = document.createElement('ul')
+      for (const entry of report.pathMatrix.entries) list.append(Object.assign(document.createElement('li'), {
+        textContent: `${labels[entry.path]}：${entry.message}`
+      }))
+      detail.append(list)
+    }
+    matrix.append(detail); facts.append(matrix)
+  }
   const tried = document.createElement('div')
   tried.append(Object.assign(document.createElement('dt'), { textContent: '已试与复验' }))
   const triedDetail = document.createElement('dd')
@@ -115,6 +147,21 @@ function renderDiagnosticConclusion(container: HTMLElement, report: NetworkDiagn
   const meta = document.createElement('p'); meta.className = 'diagnostic-conclusion-meta'
   meta.textContent = `检查时间 ${new Date(view.checkedAt).toLocaleString('zh-CN')} · 目标 ${view.target} · 诊断编号 ${id}`
   container.append(heading, title, summary, facts, meta)
+}
+
+function renderLocalEgress(container: HTMLElement, evidence: LocalEgressEvidence, report: NetworkDiagnosticReport): void {
+  const internet = report.checks.find((check) => check.id === 'internet')?.state ?? 'unknown'
+  const view = localEgressDescription(evidence, internet)
+  const interfaces = { up: '有活动接口', none: '无活动接口', unknown: '未知' }
+  const routes = { present: '有', absent: '无', unknown: '未知' }
+  container.replaceChildren(
+    Object.assign(document.createElement('h3'), { textContent: '本机出站路径' }),
+    Object.assign(document.createElement('strong'), { textContent: view.title }),
+    Object.assign(document.createElement('p'), { textContent: view.detail }),
+    Object.assign(document.createElement('p'), { textContent:
+      `接口：${interfaces[evidence.interface]} · IPv4 默认路由：${routes[evidence.ipv4DefaultRoute]} · IPv6 默认路由：${routes[evidence.ipv6DefaultRoute]} · 采集时间 ${new Date(evidence.sampledAt).toLocaleString('zh-CN')}` })
+  )
+  container.hidden = false
 }
 
 let cleanup = (): void => undefined
@@ -140,6 +187,7 @@ export const page: PageModule = {
     for (const [value, textContent] of Object.entries(names)) select.append(Object.assign(document.createElement('option'), { value, textContent }))
     const feedback = document.createElement('p'); feedback.className = 'account-note'; feedback.setAttribute('role', 'status')
     const conclusion = document.createElement('section'); conclusion.className = 'diagnostic-conclusion'; conclusion.hidden = true; conclusion.setAttribute('aria-live', 'polite')
+    const localEgress = document.createElement('section'); localEgress.className = 'diagnostic-local-egress'; localEgress.hidden = true
     const list = document.createElement('ol'); list.className = 'diagnostic-checks'; list.hidden = true
     const help = button('查看客服信息', { onClick: revealSupport }); help.hidden = true
     const copy = button('复制本次诊断', { onClick: () => { void copyResult() } }); copy.disabled = true
@@ -160,6 +208,7 @@ export const page: PageModule = {
       sessionAttemptsTotal = 0
       sessionAttemptsComplete = false
       report = undefined; conclusion.replaceChildren(); conclusion.hidden = true; delete conclusion.dataset.ruleId; delete conclusion.dataset.status
+      localEgress.replaceChildren(); localEgress.hidden = true
       list.replaceChildren(); list.hidden = true; help.hidden = true; copy.disabled = send.disabled = true; feedback.textContent = ''
       refreshSupportContext()
     }
@@ -178,6 +227,7 @@ export const page: PageModule = {
         sessionAttemptsComplete = result.attemptsComplete
         rememberDiagnosticSession({ id: result.id, software: result.software, checkedAt: report.checkedAt })
         renderDiagnosticConclusion(conclusion, report, sessionId, sessionAttempts, sessionAttemptsTotal, sessionAttemptsComplete)
+        renderLocalEgress(localEgress, result.localEgress, report)
         for (const check of report.checks) {
           const item = document.createElement('li')
           const title = document.createElement('div'); title.className = 'diagnostic-check-title'
@@ -219,12 +269,17 @@ export const page: PageModule = {
           { receipt?: string; uploaded?: boolean; stale?: boolean; filePath?: string; message?: string }
         if (!active || request !== generation || sessionId !== id) return
         if (value.stale) { forgetDiagnosticSession(sessionId); sessionId = ''; copy.disabled = true; feedback.textContent = value.message ?? '结果已失效，请重新检查。' }
-        else feedback.textContent = value.message ?? (value.uploaded ? `已上报，回执号 ${value.receipt ?? '—'}。` : `没能送达，材料已保存到 ${value.filePath ?? '本机'}。`)
+        else feedback.textContent = value.uploaded ? value.message ?? `已上报，回执号 ${value.receipt ?? '—'}。`
+          : typeof value.filePath === 'string' && value.filePath.trim()
+            ? `${value.message ?? '这次没能送出去。'} 诊断包位置：${value.filePath}`
+            : '未能送达，也未取得本机保存文件的位置。请重试或联系来信客服。'
       } catch { if (active && request === generation && sessionId === id) feedback.textContent = '上报未完成，请重试；本次诊断不会被替换。' }
       finally { if (active && request === generation && sessionId === id) send.disabled = false }
     }
     const actions = document.createElement('div'); actions.className = 'action-row'; actions.append(copy, send, help)
-    row.append(label, select, run); body.append(note, row, feedback, conclusion, list, actions); details.append(summary, body); element.append(details)
+    const reportNote = document.createElement('p'); reportNote.className = 'account-note'
+    reportNote.textContent = '只有点击上报才会发送脱敏诊断包，可能包含账号/设备编号、出口 IP、代理与设置恢复状态、近期故障和网络运行日志。日志中的地址文本会做脱敏处理，但仍可能保留部分地址。'
+    row.append(label, select, run); body.append(note, row, feedback, conclusion, localEgress, list, actions, reportNote); details.append(summary, body); element.append(details)
     // 从出错的软件跳进来：预选那个软件、展开这一节并滚到眼前，客户不用自己找。
     if (context.diagnosticSoftware !== undefined && Object.hasOwn(names, context.diagnosticSoftware)) {
       select.value = context.diagnosticSoftware

@@ -30,8 +30,22 @@ describe('更新信任边界', () => {
     expect(newerVersion('0.4.1-unified.9', '0.4.1-unified.13')).toBe(false)
     expect(newerVersion('0.4.1', '0.4.1-unified.13')).toBe(true)
     expect(newerVersion('malformed', '0.4.1')).toBe(false)
-    expect(displayReleaseVersion('0.4.2')).toBe('V0.42')
+    expect(displayReleaseVersion('0.4.2')).toBe('V0.4.2')
+    expect(displayReleaseVersion('0.5.18')).toBe('V0.5.18')
     expect(displayReleaseVersion('0.4.1-unified.18')).toBe('0.4.1-unified.18')
+  })
+  it('已安装测试版可比较正式清单，但签名清单不能发布测试版', () => {
+    expect(newerVersion('0.5.20-test.1', '0.5.16')).toBe(true)
+    expect(newerVersion('0.5.16', '0.5.20-test.1')).toBe(false)
+    expect(newerVersion('0.5.20', '0.5.20-test.1')).toBe(true)
+    expect(newerVersion('0.5.20-test.1', '0.5.20')).toBe(false)
+    expect(newerVersion('0.5.20-test.2', '0.5.20-test.1')).toBe(true)
+    const older = { ...release, version: '0.5.16' }
+    expect(readUpdateManifest(envelope(older), publicKey, origin, 'darwin-arm64', '0.5.20-test.1')).toEqual(older)
+    const official = { ...release, version: '0.5.20' }
+    expect(readUpdateManifest(envelope(official), publicKey, origin, 'darwin-arm64', '0.5.20-test.1')).toEqual(official)
+    expect(() => readUpdateManifest(envelope({ ...official, version: '0.5.20-test.2' }), publicKey, origin,
+      'darwin-arm64', '0.5.20-test.1')).toThrow('UPDATE_MANIFEST_INVALID')
   })
   it('只有发布密钥签名的清单和同源更新包才能被接受', () => {
     expect(readUpdateManifest(envelope(release), publicKey, origin, 'darwin-arm64', '0.4.1-unified.12')).toEqual(release)
@@ -162,6 +176,16 @@ it('尚未发布更新服务时不能误报已是最新版', async () => {
   expect(await f.updater.check()).toMatchObject({ state: 'error', message: '更新服务暂未提供版本信息，请稍后再检查。' })
 })
 
+it('测试包检查仍为旧版的正式清单时显示已是最新版，不报更新失败', async () => {
+  const f = await fixture()
+  const older = { ...release, version: '0.5.16' }
+  const updater = new ToolboxUpdater({ version: '0.5.20-test.1', platform: 'darwin-arm64', origin: origin.toString(), publicKey,
+    directory: f.directory, executable: '/does-not-exist', helperPath: '/does-not-exist', packaged: false, quit: vi.fn(),
+    fetch: async () => new Response(envelope(older), { status: 200 }) })
+  cleanups.push(async () => updater.dispose())
+  expect(await updater.check()).toMatchObject({ state: 'current', message: '当前已是最新可用版本。' })
+})
+
 it('官网清单不可用时从 GitHub Release 读取同一份签名清单', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'toolbox-update-github-feed-'))
   cleanups.push(() => rm(directory, { recursive: true, force: true }))
@@ -241,9 +265,83 @@ it('上一轮更新启动失败会保留原因，不会重开后静默回到重�
   cleanups.push(async () => restored.dispose())
 
   expect(restored.status()).toMatchObject({ state: 'error', version: '0.4.1-unified.13', message: expect.stringContaining('新版未能正常启动') })
-  expect(await restored.check()).toMatchObject({ state: 'error', version: '0.4.1-unified.13', message: expect.stringContaining('新版未能正常启动') })
+  expect(restored.status()).toMatchObject({ retryDownload: false })
+  expect(await restored.check()).toMatchObject({ state: 'error', version: '0.4.1-unified.13',
+    message: expect.stringContaining('新版未能正常启动'), retryDownload: true })
   // 失败信息不把用户锁死：明确点“重新下载”仍可重试。
   expect((await restored.download()).state).toBe('ready')
+})
+
+it('已装版本高于旧失败目标时不把历史回执显示为当前更新失败', async () => {
+  const f = await fixture()
+  await writeFile(join(f.directory, 'result.json'), JSON.stringify({
+    version: '0.4.0', state: 'error', code: 'UPDATE_STARTUP_UNCONFIRMED'
+  }))
+  const restored = new ToolboxUpdater({ version: '0.4.1-unified.12', platform: 'darwin-arm64', origin: origin.toString(), publicKey,
+    directory: f.directory, executable: '/does-not-exist', helperPath: '/does-not-exist', packaged: false, quit: vi.fn() })
+  cleanups.push(async () => restored.dispose())
+  expect(restored.status().state).toBe('idle')
+})
+
+it('新版已启动但同版本恢复失败时必须保留故障回执', async () => {
+  const f = await fixture()
+  await writeFile(join(f.directory, 'result.json'), JSON.stringify({
+    version: '0.4.1-unified.12', state: 'error',
+    message: '新版已启动，但网络恢复提交未确认。原版本备份已保留，请联系来信客服协助。'
+  }))
+  const restored = new ToolboxUpdater({ version: '0.4.1-unified.12', platform: 'darwin-arm64', origin: origin.toString(), publicKey,
+    directory: f.directory, executable: '/does-not-exist', helperPath: '/does-not-exist', packaged: false, quit: vi.fn() })
+  cleanups.push(async () => restored.dispose())
+  expect(restored.status()).toMatchObject({ state: 'error', version: '0.4.1-unified.12' })
+  expect(restored.status()).toMatchObject({ retryDownload: false })
+  expect(restored.status().message).toContain('网络恢复提交未确认')
+  expect(restored.status().message).not.toContain('重新下载')
+  const same = { ...release, version: '0.4.1-unified.12' }
+  const checked = new ToolboxUpdater({ version: same.version, platform: 'darwin-arm64', origin: origin.toString(), publicKey,
+    directory: f.directory, executable: '/does-not-exist', helperPath: '/does-not-exist', packaged: false, quit: vi.fn(),
+    fetch: async () => new Response(envelope(same), { status: 200 }) })
+  cleanups.push(async () => checked.dispose())
+  expect(await checked.check()).toMatchObject({ state: 'error', version: same.version, retryDownload: false })
+  expect((await checked.download()).state).toBe('error')
+  const older = { ...release, version: '0.4.0' }
+  const olderFeed = new ToolboxUpdater({ version: same.version, platform: 'darwin-arm64', origin: origin.toString(), publicKey,
+    directory: f.directory, executable: '/does-not-exist', helperPath: '/does-not-exist', packaged: false, quit: vi.fn(),
+    fetch: async () => new Response(envelope(older), { status: 200 }) })
+  cleanups.push(async () => olderFeed.dispose())
+  expect(await olderFeed.check()).toMatchObject({ state: 'error', version: same.version, retryDownload: false })
+  const newer = { ...release, version: '0.4.2' }
+  const newerFeed = new ToolboxUpdater({ version: same.version, platform: 'darwin-arm64', origin: origin.toString(), publicKey,
+    directory: f.directory, executable: '/does-not-exist', helperPath: '/does-not-exist', packaged: false, quit: vi.fn(),
+    fetch: async (input) => new Response(String(input).endsWith('latest.json') ? envelope(newer) : content, { status: 200 }) })
+  cleanups.push(async () => newerFeed.dispose())
+  expect(await newerFeed.check()).toMatchObject({ state: 'error', version: newer.version, retryDownload: true,
+    message: expect.stringContaining('网络恢复提交未确认') })
+  expect((await newerFeed.download()).state).toBe('ready')
+})
+
+it('旧目标更新失败后出现更高签名新版，保留故障且仍能下载新版', async () => {
+  const f = await fixture()
+  await writeFile(join(f.directory, 'result.json'), JSON.stringify({
+    version: '0.4.1-unified.13', state: 'error', code: 'UPDATE_STARTUP_UNCONFIRMED'
+  }))
+  const next = { ...release, version: '0.4.2' }
+  const updater = new ToolboxUpdater({ version: '0.4.1-unified.12', platform: 'darwin-arm64', origin: origin.toString(), publicKey,
+    directory: f.directory, executable: '/does-not-exist', helperPath: '/does-not-exist', packaged: false, quit: vi.fn(),
+    fetch: async (input) => new Response(String(input).endsWith('latest.json') ? envelope(next) : content, { status: 200 }) })
+  cleanups.push(async () => updater.dispose())
+  expect(await updater.check()).toMatchObject({ state: 'error', version: next.version, retryDownload: true,
+    message: expect.stringContaining('新版未能正常启动') })
+  expect((await updater.download()).state).toBe('ready')
+})
+
+it('非助手已知文案不能从对象原型链冒充故障说明', async () => {
+  const f = await fixture()
+  await writeFile(join(f.directory, 'result.json'), JSON.stringify({ version: '0.4.1-unified.12', state: 'error', message: 'constructor' }))
+  const updater = new ToolboxUpdater({ version: '0.4.1-unified.12', platform: 'darwin-arm64', origin: origin.toString(), publicKey,
+    directory: f.directory, executable: '/does-not-exist', helperPath: '/does-not-exist', packaged: false, quit: vi.fn() })
+  cleanups.push(async () => updater.dispose())
+  expect(updater.status().message).toContain('上一次更新未完成')
+  expect(updater.status().message).not.toContain('function Object')
 })
 
 it('兼容旧 Windows 助手仅写了失败提示、还没有失败代码的记录', async () => {

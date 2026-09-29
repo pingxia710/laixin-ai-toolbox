@@ -43,6 +43,7 @@ export function createAdapter(env = process.env) {
     appendFileSync(opsPath, `${JSON.stringify({ op, key, value, time: Date.now() })}\n`)
 
   return {
+    ...(env.FAKE_PORT_OWNER ? { identifyPortOwner: () => ({ kind: env.FAKE_PORT_OWNER }) } : {}),
     // 系统代理写入权(2026-09-15):**只有设置了 FAKE_WRITE_RIGHT 才暴露这个方法**——
     // 不设置时适配器没有它,守护按「平台不提供、无需协调」走原路径,既有用例行为一字不变。
     //   held      = 被别人持着,一个字节都不许写

@@ -9,8 +9,23 @@ import { validDeviceReceipt, type DeviceFacts } from '../../customer-ops-types'
 import type { DownloadTaskSnapshot } from '../download/types'
 import { loadCatalog } from '../download/catalog'
 
+type AccountRequestStage = 'prepare' | 'fetch' | 'response' | 'body' | 'http' | 'schema' | 'local'
+
+const safeExceptionName = (error: unknown): string =>
+  error instanceof Error && ['TypeError', 'AbortError', 'TimeoutError', 'SyntaxError', 'RangeError'].includes(error.name) ? error.name : 'Other'
+
+const safeCauseCode = (error: unknown): string | undefined => {
+  const cause = error instanceof Error ? error.cause : undefined
+  const code = cause && typeof cause === 'object' && 'code' in cause ? cause.code : undefined
+  return typeof code === 'string' && [
+    'ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT',
+    'CERT_HAS_EXPIRED', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'ERR_TLS_CERT_ALTNAME_INVALID'
+  ].includes(code) ? code : undefined
+}
+
 export class AccountClientError extends Error {
-  constructor(code: string, readonly detail?: string) { super(code) }
+  constructor(code: string, readonly detail?: string, readonly httpStatus?: number, readonly serverCode?: string,
+    readonly requestStage?: AccountRequestStage, readonly exception?: string, readonly causeCode?: string) { super(code) }
 }
 export interface SessionStore {
   deviceId?(): Promise<string>
@@ -35,6 +50,17 @@ export const accountMessages: Record<string, string> = {
   ACCOUNT_RESPONSE_INVALID: '暂时无法确认账号状态，请稍后重试。',
   ACCOUNT_REQUEST_INVALID: '账号服务暂不支持这项操作，请更新后重试。',
   ACCOUNT_STORAGE_UNAVAILABLE: '本机无法安全保存登录状态，请稍后重试。',
+  WECHAT_LOGIN_NOT_CONFIGURED: '微信登录尚未配置，请联系来信客服。',
+  WECHAT_LOGIN_INVALID: '微信验证已失效，请重新开始。',
+  WECHAT_LOGIN_EXPIRED: '微信验证已过期，请重新开始。',
+  WECHAT_LOGIN_REJECTED: '微信未完成授权，请重试。',
+  WECHAT_LOGIN_UNAVAILABLE: '暂时无法连接微信登录服务，请稍后重试。',
+  WECHAT_LOGIN_OPEN_FAILED: '无法打开微信登录页面，请稍后重试。',
+  WECHAT_LOGIN_TIMEOUT: '等待微信授权超时，请重试。',
+  WECHAT_LOGIN_CANCELLED: '本次微信验证已取消，可重新发起。',
+  WECHAT_ACCOUNT_UNBOUND: '请在打开的网页中登录或注册来信账号，完成微信绑定。',
+  WECHAT_ALREADY_BOUND: '这个微信已绑定其他来信账号，请使用原账号登录。',
+  WECHAT_ACCOUNT_BOUND: '当前来信账号已绑定其他微信，请联系来信客服核对。',
   ACCOUNT_BUSY: '正在处理账号操作，请稍候。',
   NETWORK_NOT_CONFIGURED: '网络开通服务暂未开放。',
   APPLICATION_ALREADY_EXISTS: '已有网络套餐，请刷新查看当前套餐后重试。',
@@ -45,6 +71,7 @@ export const accountMessages: Record<string, string> = {
   PAYMENT_CHANNEL_UNREADY: '该支付渠道暂未就绪，请换一种支付方式。',
   PAYMENT_ORDER_NOT_FOUND: '订单不存在或已失效。',
   PAYMENT_ORDER_BUSY: '正在处理支付，请稍候。',
+  PAYMENT_TERMS_CHANGED: '本次购买的套餐、价格或支付方式未能核对一致，未展示付款入口。请刷新权益并核对已有订单；再次出现，请联系客服。',
   PLAN_INVALID: '套餐不存在或已下架。',
   ACCOUNT_SESSION_NOT_FOUND: '这次登录已退出，请刷新设备列表。',
   ACCOUNT_CLOSE_PENDING: '账号还有未完成订单或仍有效的网络，请先处理或到期后再注销。',
@@ -56,7 +83,8 @@ export const accountMessages: Record<string, string> = {
   PAYMENT_ORDER_REFUNDED: '此订单有退款记录，请查看原订单或联系售后。',
   TOOLBOX_RECEIPT_USED: '这笔收款已关联其他账号，请核对原购买账号。',
   INVITE_CODE_INVALID: '邀请码无效，请核对后重试；不需要邀请码可清空后直接注册。',
-  INVITE_REWARD_LIMIT: '该邀请码的本月邀请奖励已达上限，暂时无法使用；可清空邀请码直接注册。'
+  INVITE_REWARD_LIMIT: '该邀请码的本月邀请奖励已达上限，暂时无法使用；可清空邀请码直接注册。',
+  INVITE_REWARD_RECORD_LIMIT: '该邀请码的邀请记录已达安全上限，请联系客服处理；也可清空邀请码直接注册。'
 }
 const canonicalAccountOrigin = 'https://laixin.work/'
 const migratedAccountOrigins = new Set(['https://laixin.net.cn/', 'https://laixin.net.cn/AI-tools/'])
@@ -73,6 +101,9 @@ export class AccountClient {
   private session: AccountSession | null = null
   private restored = false
   private busy = false
+  private wechatAttempt?: { attemptId: string; pollToken: string }
+  private wechatCancelled = false
+  private wechatStarting = false
   private statusRequest?: Promise<AccountView>
   private statusController?: AbortController
   private boundDevice?: { token: string; id: string }
@@ -89,7 +120,10 @@ export class AccountClient {
   private readonly device: AccountDevice = process.platform === 'darwin' ? 'macos' : process.platform === 'win32' ? 'windows' : process.platform === 'linux' ? 'linux' : 'unknown'
   constructor(origin: string, private readonly store: SessionStore,
     private readonly setNetwork: (access: NetworkAccountAccess | undefined, reason?: 'temporary-unavailable' | 'login-expired') => Promise<unknown>,
-    private readonly collectDevice?: () => Promise<DeviceFacts>) {
+    private readonly collectDevice?: () => Promise<DeviceFacts>,
+    private readonly openExternal: (url: string) => Promise<void> = async () => { throw new AccountClientError('WECHAT_LOGIN_OPEN_FAILED') },
+    private readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    private readonly logFailure?: (event: string, detail: string) => void) {
     this.base = origin ? new URL(origin) : null
     // 允许挂在单个路径前缀下；当前正式账号服务使用 https://laixin.work/。
     const basePathOk = this.base !== null && (this.base.pathname === '/' || /^\/[A-Za-z0-9_-]+\/$/.test(this.base.pathname))
@@ -103,23 +137,65 @@ export class AccountClient {
     return new URL(path.replace(/^\/+/, ''), this.base!)
   }
 
-  private async request(path: string, body?: unknown, token?: string, maxBytes = 128 * 1024, signal?: AbortSignal): Promise<unknown> {
+  private async transientRead<T>(read: () => Promise<T>, cancelled: () => boolean,
+    retryCodes: readonly string[] = ['ACCOUNT_SERVICE_UNAVAILABLE']): Promise<T> {
+    const retryDelays = [250, 750]
+    for (let attempt = 0; ; attempt += 1) {
+      try { return await read() }
+      catch (error) {
+        const retryable = error instanceof AccountClientError && retryCodes.includes(error.message) &&
+          (error.httpStatus === undefined || error.httpStatus >= 500)
+        if (!retryable || attempt >= retryDelays.length || cancelled() || this.controller.signal.aborted) throw error
+        await this.sleep(retryDelays[attempt])
+        if (cancelled() || this.controller.signal.aborted) throw error
+      }
+    }
+  }
+
+  private async request(path: string, body?: unknown, token?: string, maxBytes = 128 * 1024, signal?: AbortSignal,
+    onResponse?: (status: number) => void): Promise<unknown> {
     if (!this.base) throw new AccountClientError('ACCOUNT_NOT_CONFIGURED')
+    const overviewRequest = path === '/v1/account/overview'
+    let stage: AccountRequestStage = 'prepare'
+    let httpStatus: number | undefined
     try {
-      const response = await fetch(this.resolve(path), {
+      const url = this.resolve(path)
+      const requestSignal = AbortSignal.any([this.controller.signal, AbortSignal.timeout(12_000), ...(signal ? [signal] : [])])
+      stage = 'fetch'
+      const response = await fetch(url, {
         method: body === undefined ? 'GET' : 'POST', redirect: 'error', cache: 'no-store',
-        signal: AbortSignal.any([this.controller.signal, AbortSignal.timeout(12_000), ...(signal ? [signal] : [])]),
+        signal: requestSignal,
         headers: { Accept: 'application/json', ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
           ...(token ? { Authorization: `Bearer ${token}` } : {}) },
         ...(body === undefined ? {} : { body: JSON.stringify(body) })
       })
+      httpStatus = response.status
+      onResponse?.(response.status)
+      stage = response.ok ? 'response' : 'http'
       if (response.status >= 500) {
-        await response.body?.cancel(); throw new AccountClientError('ACCOUNT_SERVICE_UNAVAILABLE')
+        let serverCode: string | undefined
+        if (response.headers.get('content-type')?.split(';')[0] === 'application/json' && response.body) {
+          const reader = response.body.getReader(); const chunks: Uint8Array[] = []; let size = 0
+          try {
+            while (size <= 2048) {
+              const { done, value } = await reader.read(); if (done) break
+              size += value.length; if (size <= 2048) chunks.push(value)
+            }
+            if (size <= 2048) {
+              const data = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { code?: unknown }
+              if (typeof data?.code === 'string' && /^[A-Z][A-Z0-9_]{1,79}$/.test(data.code)) serverCode = data.code
+            }
+          } catch { /* An invalid error body cannot hide the HTTP status. */ }
+          finally { await reader.cancel().catch(() => undefined); reader.releaseLock() }
+        } else await response.body?.cancel()
+        const code = serverCode && Object.hasOwn(accountMessages, serverCode) ? serverCode : 'ACCOUNT_SERVICE_UNAVAILABLE'
+        throw new AccountClientError(code, undefined, response.status, serverCode)
       }
       if (!response.body || response.headers.get('content-type')?.split(';')[0] !== 'application/json') {
-        await response.body?.cancel(); throw new AccountClientError([401, 403].includes(response.status) ? 'ACCOUNT_LOGIN_REQUIRED' : 'ACCOUNT_RESPONSE_INVALID')
+        await response.body?.cancel(); throw new AccountClientError([401, 403].includes(response.status) ? 'ACCOUNT_LOGIN_REQUIRED' : 'ACCOUNT_RESPONSE_INVALID', undefined, response.status)
       }
       const reader = response.body.getReader(); const chunks: Uint8Array[] = []; let size = 0
+      if (response.ok) stage = 'body'
       try {
         while (true) {
           const { done, value } = await reader.read(); if (done) break
@@ -132,12 +208,19 @@ export class AccountClient {
       try { data = JSON.parse(Buffer.concat(chunks).toString('utf8')) } catch { throw new AccountClientError('ACCOUNT_RESPONSE_INVALID') }
       if (!response.ok) {
         const code = data && typeof data === 'object' && 'code' in data ? String(data.code) : ''
-        throw new AccountClientError(Object.hasOwn(accountMessages, code) ? code : [401, 403].includes(response.status) ? 'ACCOUNT_LOGIN_REQUIRED' : 'ACCOUNT_SERVICE_UNAVAILABLE')
+        throw new AccountClientError(Object.hasOwn(accountMessages, code) ? code : [401, 403].includes(response.status) ? 'ACCOUNT_LOGIN_REQUIRED' : 'ACCOUNT_SERVICE_UNAVAILABLE',
+          undefined, response.status, /^[A-Z][A-Z0-9_]{1,79}$/.test(code) ? code : undefined)
       }
       return data
     } catch (error) {
-      if (error instanceof AccountClientError) throw error
-      throw new AccountClientError('ACCOUNT_SERVICE_UNAVAILABLE')
+      if (error instanceof AccountClientError) {
+        if (!overviewRequest) throw error
+        throw new AccountClientError(error.message, error.detail, error.httpStatus ?? httpStatus, error.serverCode,
+          error.requestStage ?? stage, error.exception, error.causeCode)
+      }
+      throw new AccountClientError('ACCOUNT_SERVICE_UNAVAILABLE', undefined, httpStatus, undefined,
+        overviewRequest ? stage : undefined, overviewRequest ? safeExceptionName(error) : undefined,
+        overviewRequest ? safeCauseCode(error) : undefined)
     }
   }
 
@@ -155,6 +238,10 @@ export class AccountClient {
     }
     catch (error) {
       const code = error instanceof AccountClientError ? error.message : 'ACCOUNT_SERVICE_UNAVAILABLE'
+      if (code === 'PAYMENT_TERMS_CHANGED' || code === 'PLAN_INVALID') {
+        this.terms = undefined; this.termsFailedAt = 0
+        this.view = { ...this.view, overview: null, terms: null }
+      }
       if (code === 'ACCOUNT_LOGIN_REQUIRED') {
         // 登录过期 ≠ 用户退出:通道按本地配置有效期继续,只是之后领新配置要先登录。
         await this.setNetwork(undefined, 'login-expired')
@@ -241,7 +328,9 @@ export class AccountClient {
       return this.withTerms(signedOut())
     }
     try {
-      const data = await this.request('/v1/account/session', undefined, this.session.accessToken, undefined, signal) as Omit<AccountSession, 'accessToken'>
+      const data = await this.transientRead(
+        () => this.request('/v1/account/session', undefined, this.session!.accessToken, undefined, signal) as Promise<Omit<AccountSession, 'accessToken'>>,
+        () => signal.aborted)
       current()
       if (!validSession({ ...data, accessToken: this.session.accessToken }) || data.account.id !== this.session.account.id) throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
       this.session = { ...data, accessToken: this.session.accessToken }
@@ -316,15 +405,128 @@ export class AccountClient {
     return droppedInvite ? { ...view, message: '已登录。当前账号服务版本暂不支持邀请码，本次注册未获得邀请奖励。' } : view
   }) }
 
+  async cancelWechatLogin(): Promise<boolean> {
+    const attempt = this.wechatAttempt
+    if (!attempt) {
+      if (this.wechatStarting) { this.wechatCancelled = true; return true }
+      return false
+    }
+    try {
+      const result = await this.request('/v1/account/wechat/cancel-attempt', attempt) as { cancelled?: unknown }
+      if (result.cancelled === true) { this.wechatCancelled = true; return true }
+    } catch { /* The pending poll will report its own failure or timeout. */ }
+    return false
+  }
+
+  wechatLogin(mode: 'login' | 'bind' = 'login', onRecovery: (code: string) => void = () => undefined): Promise<AccountView> { return this.run(async () => {
+    if ((mode === 'bind') !== Boolean(this.session)) throw new AccountClientError('ACCOUNT_LOGIN_REQUIRED')
+    this.wechatCancelled = false
+    this.wechatStarting = true
+    let deviceId: string | undefined
+    let started: Record<string, unknown>
+    try {
+      deviceId = await this.store.deviceId?.()
+      started = await this.request('/v1/account/wechat/start',
+        { device: this.device, ...(deviceId ? { deviceId } : {}), mode },
+        mode === 'bind' ? this.session!.accessToken : undefined) as Record<string, unknown>
+    } finally { this.wechatStarting = false }
+    if (typeof started.attemptId !== 'string' || !/^[A-Za-z0-9_-]{20,64}$/.test(started.attemptId) ||
+        typeof started.pollToken !== 'string' || !/^[A-Za-z0-9_-]{32,64}$/.test(started.pollToken) ||
+        typeof started.authorizeUrl !== 'string' || typeof started.expiresAt !== 'number' ||
+        !Number.isSafeInteger(started.expiresAt) || started.expiresAt <= Date.now()) throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
+    let authorize: URL
+    try { authorize = new URL(started.authorizeUrl) } catch { throw new AccountClientError('ACCOUNT_RESPONSE_INVALID') }
+    const query = authorize.searchParams
+    const expected = ['appid', 'redirect_uri', 'response_type', 'scope', 'state']
+    if (!started.authorizeUrl.startsWith('https://open.weixin.qq.com/connect/qrconnect?') ||
+        authorize.protocol !== 'https:' || authorize.hostname !== 'open.weixin.qq.com' || authorize.port || authorize.username ||
+        authorize.password || authorize.pathname !== '/connect/qrconnect' || authorize.hash !== '#wechat_redirect' ||
+        [...query.keys()].length !== expected.length || expected.some((key) => query.getAll(key).length !== 1) ||
+        [...query.keys()].some((key) => !expected.includes(key)) || !/^wx[A-Za-z0-9]{6,64}$/.test(query.get('appid') ?? '') ||
+        query.get('redirect_uri') !== this.resolve('/v1/account/wechat/callback').href ||
+        query.get('response_type') !== 'code' || query.get('scope') !== 'snsapi_login' ||
+        !/^[A-Za-z0-9_-]{20,64}$/.test(query.get('state') ?? '')) throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
+    this.wechatAttempt = { attemptId: started.attemptId, pollToken: started.pollToken }
+    let result: Record<string, unknown> | undefined
+    try {
+      if (this.wechatCancelled) throw new AccountClientError('WECHAT_LOGIN_CANCELLED')
+      try { await this.openExternal(authorize.href) } catch { throw new AccountClientError('WECHAT_LOGIN_OPEN_FAILED') }
+      while (Date.now() < Number(started.expiresAt)) {
+        if (this.wechatCancelled) throw new AccountClientError('WECHAT_LOGIN_CANCELLED')
+        try {
+          result = await this.transientRead(
+            () => this.request('/v1/account/wechat/poll', this.wechatAttempt) as Promise<Record<string, unknown>>,
+            () => this.wechatCancelled,
+            ['ACCOUNT_SERVICE_UNAVAILABLE', 'WECHAT_LOGIN_UNAVAILABLE'])
+        }
+        catch (error) { if (this.wechatCancelled) throw new AccountClientError('WECHAT_LOGIN_CANCELLED'); throw error }
+        if (result.status === 'pending' || result.status === 'awaiting_account') { await this.sleep(1000); continue }
+        if (result.status === 'failed' && typeof result.code === 'string') throw new AccountClientError(result.code)
+        break
+      }
+    } finally {
+      if (!result || ['pending', 'awaiting_account'].includes(String(result.status))) {
+        try { await this.request('/v1/account/wechat/cancel-attempt', this.wechatAttempt) } catch { /* Attempt expires on server. */ }
+      }
+      this.wechatAttempt = undefined
+    }
+    if (mode === 'bind') {
+      if (result?.status !== 'bound') throw new AccountClientError('WECHAT_LOGIN_TIMEOUT')
+      return { ...(await this.overview()), message: '微信已绑定到当前来信账号。' }
+    }
+    if (!result || !['complete', 'registered'].includes(String(result.status)) || !result.session || typeof result.session !== 'object') throw new AccountClientError('WECHAT_LOGIN_TIMEOUT')
+    const data = result.session as AccountSession
+    if (!validSession(data) || data.expiresAt <= Date.now()) throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
+    if (result.status === 'registered') {
+      const code = (result.session as AccountRegistration).recoveryCode
+      if (!validRecovery(code)) throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
+      onRecovery(code)
+    }
+    const session = { account: data.account, accessToken: data.accessToken, expiresAt: data.expiresAt }
+    const saved = { ...session, serviceOrigin: this.base!.href }
+    try { await this.store.write(saved) } catch {
+      try { await this.request('/v1/account/logout', {}, data.accessToken) } catch { /* Preserve storage failure. */ }
+      throw new AccountClientError('ACCOUNT_STORAGE_UNAVAILABLE')
+    }
+    this.session = session; this.restored = true
+    this.view = { state: 'signed-in', account: data.account, code: '', message: '已登录', overview: null }
+    await this.ensureTerms()
+    await this.setNetwork({ client: new NetworkAccountClient(new URL('v1/network/', this.base!).href),
+      session: { accountId: data.account.id, accessToken: data.accessToken, deviceId } })
+    return this.overview()
+  }) }
+
   private async overview(signal?: AbortSignal): Promise<AccountView> {
     if (!this.session) return signedOut()
     const view: AccountView = { state: 'signed-in', account: this.session.account, code: '', message: '', overview: null }
+    let responseStatus: number | undefined
     try {
-      const data = await this.request('/v1/account/overview', undefined, this.session.accessToken, undefined, signal) as AccountOverview
+      let data: AccountOverview | undefined
+      const retryDelays = [250, 750]
+      for (let attempt = 0; data === undefined; attempt += 1) {
+        try {
+          responseStatus = undefined
+          data = await this.request('/v1/account/overview', undefined, this.session.accessToken, undefined, signal,
+            (status) => { responseStatus = status }) as AccountOverview
+        } catch (error) {
+          const retryable = error instanceof AccountClientError && (error.message === 'PAYMENT_ORDER_BUSY' ||
+            (error.message === 'ACCOUNT_SERVICE_UNAVAILABLE' && (['fetch', 'response', 'body'].includes(error.requestStage ?? '') ||
+              (error.requestStage === 'http' && (error.httpStatus ?? 0) >= 500))))
+          if (!retryable || attempt >= retryDelays.length || signal?.aborted || this.controller.signal.aborted) throw error
+          await this.sleep(retryDelays[attempt])
+        }
+      }
       if (!data || !Array.isArray(data.plans) || typeof data.networkAvailable !== 'boolean' || !data.trial ||
           typeof data.recoveryReady !== 'boolean' || typeof data.trial.available !== 'boolean' ||
+          (data.wechatBound !== undefined && typeof data.wechatBound !== 'boolean') ||
           (data.trial.usage !== null && (!validUsage(data.trial.usage) || data.trial.usage.kind !== 'trial')) ||
           (data.subscription !== null && (!validUsage(data.subscription) || data.subscription.kind !== 'subscription')) ||
+          (data.subscriptions !== undefined && (!Array.isArray(data.subscriptions) || data.subscriptions.some((item) =>
+            !validUsage(item) || item.kind !== 'subscription'))) ||
+          (data.pendingSubscription !== undefined && data.pendingSubscription !== null &&
+            (!/^lx-[a-f0-9]{32}$/.test(data.pendingSubscription.id) || typeof data.pendingSubscription.planId !== 'string')) ||
+          (data.queuedSubscriptions !== undefined && (!Array.isArray(data.queuedSubscriptions) || data.queuedSubscriptions.some((item) =>
+            !item || !/^lx-[a-f0-9]{32}$/.test(item.id) || typeof item.planId !== 'string'))) ||
           !Array.isArray(data.paymentChannels) || !data.paymentChannels.every((name) => ['alipay', 'wechat'].includes(name))) throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
       // 邀请块可选（旧版后台不下发时界面不渲染邀请卡）。邀请码由客户手动填入注册页；
       // 账号服务本身没有客户注册链接，不能把后台地址伪装成带码链接。
@@ -335,6 +537,13 @@ export class AccountClient {
       return { ...view, overview: { ...data, profile } }
     } catch (error) {
       if (error instanceof AccountClientError && error.message === 'ACCOUNT_LOGIN_REQUIRED') throw error
+      const failure = error instanceof AccountClientError ? error :
+        new AccountClientError('ACCOUNT_SERVICE_UNAVAILABLE', undefined, undefined, undefined, 'local', safeExceptionName(error), safeCauseCode(error))
+      const stage = failure.requestStage ?? (failure.message === 'ACCOUNT_RESPONSE_INVALID' ? 'schema' : 'local')
+      try {
+        this.logFailure?.('account-overview-failed', JSON.stringify({ code: failure.message, stage, status: failure.httpStatus ?? responseStatus ?? null,
+          serverCode: failure.serverCode ?? null, exception: failure.exception ?? null, causeCode: failure.causeCode ?? null }))
+      } catch { /* Diagnostics cannot break the account view. */ }
       return { ...view, code: 'ACCOUNT_SERVICE_UNAVAILABLE', message: '已登录，暂时无法获取账号权益与安装记录。' }
     }
   }
@@ -518,39 +727,39 @@ export class AccountClient {
   }
 
   /** 创建支付订单（幂等复用未结订单）；支付宝的跳转由主进程用返回的 URL 打开系统浏览器。 */
-  async pay(planId: string, channel: PaymentChannelName): Promise<{ view: AccountView; order: PaymentOrderView | null }> {
+  async pay(planId: string, channel: PaymentChannelName, displayedAmountFen: number): Promise<{ view: AccountView; order: PaymentOrderView | null }> {
     let order: PaymentOrderView | null = null
     const view = await this.run(async () => {
       if (!this.session) return signedOut('ACCOUNT_LOGIN_REQUIRED', accountMessages.ACCOUNT_LOGIN_REQUIRED)
-      await this.prepareNetworkPurchase(planId, channel)
+      await this.prepareNetworkPurchase(planId, channel, displayedAmountFen)
       const data = await this.request('/v1/payment/orders', { planId, channel }, this.session.accessToken) as PaymentOrderView
       if (!validPaymentOrder(data)) throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
+      if (data.planId !== planId || data.channel !== channel || data.amountFen !== displayedAmountFen) {
+        try {
+          this.logFailure?.('payment-order-contract-mismatch', JSON.stringify({
+            expected: { planId, channel, amountFen: displayedAmountFen },
+            received: { planId: data.planId, channel: data.channel, amountFen: data.amountFen, status: data.status,
+              paid: data.paidAt !== null, hasRedirect: Boolean(data.redirect) }
+          }))
+        } catch { /* Diagnostics cannot alter payment safety behavior. */ }
+        throw new AccountClientError('PAYMENT_TERMS_CHANGED')
+      }
+      if (data.status !== 'open' || data.paidAt !== null || !data.redirect) throw new AccountClientError('PAYMENT_ORDER_INVALID')
       order = data
       return { ...await this.overview(), message: '订单已创建，完成支付后自动开通。' }
     })
     return { view, order }
   }
 
-  private async prepareNetworkPurchase(planId: string, channel: PaymentChannelName): Promise<void> {
+  private async prepareNetworkPurchase(planId: string, channel: PaymentChannelName, displayedAmountFen: number): Promise<void> {
     this.view = await this.overview()
     const overview = this.view.overview
     if (!overview) throw new AccountClientError('ACCOUNT_SERVICE_UNAVAILABLE')
-    if (!overview.plans.some((plan) => plan.id === planId)) throw new AccountClientError('PLAN_INVALID')
+    const selectedPlan = overview.plans.find((plan) => plan.id === planId)
+    if (!selectedPlan) throw new AccountClientError('PLAN_INVALID')
     if (!overview.networkAvailable) throw new AccountClientError('NETWORK_NOT_CONFIGURED')
     if (!overview.paymentChannels.includes(channel)) throw new AccountClientError('PAYMENT_CHANNEL_UNREADY')
-    const usage = overview.subscription
-    if (usage?.state !== 'pending' || usage.planId === planId) return
-    const orders = (await this.paymentOrders()).filter((order) => order.applicationId === usage.authorizationId && order.status !== 'cancelled')
-    for (const existing of orders) {
-      const result = await this.request(`/v1/payment/orders/${encodeURIComponent(existing.orderId)}/cancel`, {}, this.session!.accessToken) as PaymentOrderView
-      if (!validPaymentOrder(result)) throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
-      if (result.status !== 'cancelled') {
-        this.view = await this.overview()
-        throw new AccountClientError('PAYMENT_ALREADY_PAID')
-      }
-    }
-    // The server rechecks order ownership and cancellation before releasing the old selection.
-    await this.request('/v1/account/network-cancel', { applicationId: usage.authorizationId }, this.session!.accessToken)
+    if (selectedPlan.priceCents !== displayedAmountFen) throw new AccountClientError('PAYMENT_TERMS_CHANGED')
   }
 
   /** 轮询订单状态；不动账号视图，由调用方在确认后刷新，避免轮询噪音写进界面消息。 */
@@ -769,6 +978,7 @@ function validTerms(data: unknown): data is CommercialTerms {
     typeof v.toolbox.subject === 'string' && v.toolbox.subject !== '' &&
     !!v.trial && positiveInt(v.trial.bytes) && positiveInt(v.trial.hours) && Number.isSafeInteger(v.trial.perAccount) && v.trial.perAccount >= 1 &&
     positiveInt(v.deviceLimit) && v.deviceLimit <= 32 &&
+    (v.wechatLoginAvailable === undefined || typeof v.wechatLoginAvailable === 'boolean') &&
     (v.invite === undefined || !!v.invite && positiveInt(v.invite.bytes) && positiveInt(v.invite.hours) &&
       Number.isSafeInteger(v.invite.perMonth) && v.invite.perMonth >= 1))
 }
@@ -835,9 +1045,10 @@ function validUsage(value: unknown): boolean {
   const v = value as Record<string, unknown>
   const numberOrNull = (n: unknown) => n === null || (typeof n === 'number' && Number.isSafeInteger(n) && n >= 0)
   if (!['subscription', 'trial', 'invite'].includes(String(v.kind)) || typeof v.planId !== 'string' || typeof v.state !== 'string' ||
-      !['pending', 'provisioning', 'active', 'exhausted', 'expired', 'disabled', 'unknown'].includes(v.state) ||
+      !['pending', 'queued', 'provisioning', 'active', 'exhausted', 'expired', 'disabled', 'unknown'].includes(v.state) ||
       !['current', 'unavailable', 'not-requested'].includes(String(v.measurement)) ||
       typeof v.totalBytes !== 'number' || !Number.isSafeInteger(v.totalBytes) || v.totalBytes <= 0 ||
-      ![v.usedBytes, v.remainingBytes, v.expiresAt, v.observedAt].every(numberOrNull)) return false
+      ![v.usedBytes, v.remainingBytes, v.expiresAt, v.observedAt].every(numberOrNull) ||
+      (v.startsAt !== undefined && !numberOrNull(v.startsAt))) return false
   return v.measurement !== 'current' || (typeof v.usedBytes === 'number' && typeof v.remainingBytes === 'number' && typeof v.observedAt === 'number')
 }

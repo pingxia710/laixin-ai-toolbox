@@ -1,4 +1,5 @@
 import type { PageModule } from './types'
+import type { AccountView } from '../../../account-types'
 import { accountAction, cancelAccountNavigation, finishAccountNavigation, onAccountChange, refreshAccount, takeAccountEntryMode } from '../account-state'
 import { actionButton, mountAccountOverview, textNode } from '../ui/account-overview'
 import { mountAccountSecurity } from '../ui/account-security'
@@ -34,6 +35,29 @@ export const page: PageModule = {
     cleanup(); let active = true; let mode: 'login' | 'register' | 'recover' = takeAccountEntryMode(); let usernameValue = ''
     let unsubscribe = (): void => undefined
     let stopDeviceReport = (): void => undefined
+    let wechatPending = false
+    const startWechat = (kind: 'login' | 'bind', container: HTMLElement) => {
+      if (wechatPending) return
+      wechatPending = true
+      const waiting = textNode('p', kind === 'bind' ? '已打开微信网页。扫码后请在网页输入当前账号密码完成绑定，工具箱正在等待结果…'
+        : '已打开微信网页。扫码后请在网页登录或注册来信账号，工具箱正在等待结果…', 'account-note')
+      waiting.setAttribute('role', 'status')
+      const cancel = actionButton('取消本次验证', () => {
+        void window.toolbox.account.cancelWechatLogin().then(({ cancelled }) => {
+          if (cancelled) { waiting.textContent = '已取消，稍后可重新发起。'; cancel.disabled = true }
+        })
+      })
+      container.append(waiting, cancel)
+      void accountAction(async () => {
+        const response = await window.toolbox.account.wechatLogin({ mode: kind })
+        if (response.recoveryCode) {
+          const view = JSON.parse(response.snapshot) as AccountView
+          void showRecoveryCode(response.recoveryCode, view.account?.username ?? '')
+        }
+        return response
+      }).then((next) => { if (active && next.state === 'signed-in') finishAccountNavigation() })
+        .finally(() => { wechatPending = false; waiting.remove(); cancel.remove() })
+    }
     const render = () => {
       if (!active) return
       unsubscribe()
@@ -58,7 +82,11 @@ export const page: PageModule = {
         securityPanel.append(textNode('h3', '账号安全'))
         if (view.state === 'signed-in') {
           const identity = document.createElement('dl'); identity.className = 'account-facts'
-          for (const [label, value] of [['账号', view.account!.username], ['登录状态', '已登录'], ['密码恢复码', view.overview ? view.overview.recoveryReady ? '已设置' : '尚未设置' : '暂时无法获取']]) {
+          const facts = [['账号', view.account!.username], ['登录状态', '已登录']]
+          if (view.terms?.wechatLoginAvailable === true) facts.push(['微信', view.overview?.wechatBound === true ? '已绑定'
+            : view.overview?.wechatBound === false ? '未绑定' : '暂时无法获取'])
+          facts.push(['密码恢复码', view.overview ? view.overview.recoveryReady ? '已设置' : '尚未设置' : '暂时无法获取'])
+          for (const [label, value] of facts) {
             const row = document.createElement('div'); row.append(textNode('dt', label), textNode('dd', value)); identity.append(row)
           }
           access.append(identity, textNode('p', '在右侧查看体验和套餐流量，在下方管理订单和账号安全。', 'account-note'))
@@ -83,6 +111,13 @@ export const page: PageModule = {
           })
           security.append(recovery)
           access.append(buttons)
+          if (view.terms?.wechatLoginAvailable === true && view.overview?.wechatBound === false) {
+            const bind = document.createElement('details'); bind.className = 'account-security'
+            bind.append(textNode('summary', '绑定微信到当前账号'))
+            bind.append(textNode('p', '扫码后在网页确认当前账号密码。绑定后原套餐和流量仍归属这个账号。', 'account-note'),
+              actionButton('打开微信绑定网页', () => startWechat('bind', bind)))
+            access.append(bind)
+          }
           securityPanel.append(security)
           stopDeviceReport = mountDeviceReport(help)
           mountAccountSecurity(securityPanel); return
@@ -119,7 +154,8 @@ export const page: PageModule = {
         show.append(toggle, document.createTextNode('显示密码')); form.append(show)
         if (mode === 'register') form.append(textNode('p', '无需手机或邮箱。注册后请保存恢复码，忘记密码时用它找回账号。', 'account-note'))
         if (mode === 'recover') form.append(textNode('p', '输入原恢复码或客服核验后发放的一次性找回凭证。重设后旧登录全部失效，原购买权益保留。两者都没有时，联系客服提供原购买订单和付款归属证明；不要发送密码或恢复码。', 'account-note'))
-        const submit = textNode('button', mode === 'register' ? '注册账号' : mode === 'recover' ? '重设密码' : '登录', 'primary-action'); submit.type = 'submit'
+        const submit = textNode('button', mode === 'register' ? '注册账号' : mode === 'recover' ? '重设密码' : '账号密码登录',
+          mode === 'login' ? 'secondary-action' : 'primary-action'); submit.type = 'submit'
         submit.disabled = view.code === 'ACCOUNT_NOT_CONFIGURED'; form.append(submit)
         form.addEventListener('submit', (event) => {
           event.preventDefault()
@@ -144,6 +180,14 @@ export const page: PageModule = {
           })
         })
         const actions = document.createElement('div'); actions.className = 'account-actions'
+        if (mode === 'login' && view.terms?.wechatLoginAvailable === true) {
+          const wechat = actionButton('微信登录', () => {
+            startWechat('login', entry)
+          }, true)
+          const entry = document.createElement('div'); entry.className = 'account-wechat-entry'
+          entry.append(wechat, textNode('p', '扫码后在网页登录原账号，或注册并绑定；完成后回到工具箱。也可以使用下方账号密码登录。', 'account-note'))
+          message.after(entry)
+        }
         actions.append(actionButton(mode === 'login' ? '没有账号，去注册' : '已有账号，去登录', () => { mode = mode === 'login' ? 'register' : 'login'; render() }))
         if (mode === 'recover') actions.append(actionButton('恢复码也丢了，联系客服', revealSupport))
         if (mode === 'login') actions.append(actionButton('忘记密码', () => { mode = 'recover'; render() }))
@@ -152,6 +196,6 @@ export const page: PageModule = {
       })
     }
     render(); void refreshAccount()
-    cleanup = () => { active = false; unsubscribe(); stopDeviceReport(); element.replaceChildren() }
+    cleanup = () => { active = false; if (wechatPending) void window.toolbox.account.cancelWechatLogin(); unsubscribe(); stopDeviceReport(); element.replaceChildren() }
   }, unmount: () => cleanup()
 }

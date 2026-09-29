@@ -22,6 +22,8 @@ export interface TunnelStatusView {
   readonly canApplyPending: boolean
   readonly state: string
   readonly message: string
+  /** 后台明确拒绝后自主暂停的受控原因；不进入自动上报载荷。 */
+  readonly pauseReason: '' | 'entitlement-denied'
   readonly source: string
   readonly authorization: string
   readonly backend: string
@@ -36,6 +38,9 @@ export interface TunnelStatusView {
   readonly unrestored: string
   readonly componentMissing: string
   readonly traffic?: string
+  /** N-55 控制器阶段；为空表示当前没有受控网络设置动作。 */
+  readonly availabilityStatus?: '' | 'examining' | 'reusing' | 'taking-over' | 'reclaiming' | 'recovering' | 'recovered' | 'limited'
+  readonly availabilityReason?: string
 }
 
 export interface RouteExplanationView {

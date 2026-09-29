@@ -131,8 +131,6 @@ export function buildGroupCard(config: WeComGroupConfig, qr = bundledGroupQr(con
 
 function paint(element: HTMLElement, view: AccountView, groupQr: GroupQrResolution): void {
   element.className = 'account-workspace referral-workspace'
-  const intro = textNode('p', '', 'referral-intro')
-  intro.append(previewBadge(), textNode('span', '本地预览版：邀请码与奖励为占位示例；客户群入口使用企业微信官方群活码，界面与规则以后续正式发布为准。'))
   const grid = document.createElement('div'); grid.className = 'referral-grid'
   grid.append(
     buildInviteCard(view, {
@@ -141,7 +139,11 @@ function paint(element: HTMLElement, view: AccountView, groupQr: GroupQrResoluti
     }),
     buildGroupCard(wecomGroupConfig, groupQr)
   )
-  element.replaceChildren(intro, grid)
+  if (view.state === 'signed-out') {
+    const intro = textNode('p', '', 'referral-intro')
+    intro.append(previewBadge(), textNode('span', '本地预览版：邀请码与奖励为占位示例；客户群入口使用企业微信官方群活码，界面与规则以后续正式发布为准。'))
+    element.replaceChildren(intro, grid)
+  } else element.replaceChildren(grid)
 }
 
 let cleanup = (): void => undefined

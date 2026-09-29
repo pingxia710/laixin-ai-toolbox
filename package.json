@@ -1,6 +1,6 @@
 {
   "name": "laixin-ai-toolbox",
-  "version": "0.5.17",
+  "version": "0.6.1",
   "productName": "来信AI工具箱统一版",
   "private": false,
   "description": "来信AI工具箱桌面客户端骨架",
@@ -8,12 +8,16 @@
   "scripts": {
     "dev": "electron-vite dev",
     "lint": "eslint app tests --max-warnings=0",
+    "pretypecheck": "npm run prepare:sidecar",
     "typecheck": "tsc --noEmit",
-    "test": "npm run prepare:sidecar && npm run prepare:xray && vitest run",
+    "test": "npm run prepare:sidecar && npm run prepare:xray && npm run prepare:public-test-package && vitest run",
     "prepare:sidecar": "node scripts/prepare-sidecar.mjs",
+    "prepare:public-test-package": "node scripts/prepare-public-test-package.mjs",
     "prepare:xray": "node scripts/prepare-xray.mjs",
     "prepare:koffi": "node scripts/prepare-koffi.mjs",
     "build": "npm run build:mac",
+    "build:mac": "npm run prepare:sidecar && npm run lint && npm run typecheck && node scripts/prepare-xray.mjs mac-arm64 && electron-vite build && electron-builder --mac --arm64 --publish never",
+    "build:mac-intel": "npm run prepare:sidecar && npm run lint && npm run typecheck && node scripts/prepare-xray.mjs mac-x64 && electron-vite build && electron-builder --mac --x64 --config.electronVersion=43.7.1 --publish never",
     "build:pilot": "npm run prepare:sidecar && npm run lint && npm run typecheck && node scripts/prepare-xray.mjs mac-arm64 win-x64 && npm run prepare:koffi && electron-vite build && electron-builder --mac --arm64 --publish never && electron-builder --win --x64 --publish never",
     "verify:release-account-origin": "node scripts/verify-release-account-origin.mjs",
     "postinstall": "node node_modules/electron/install.js"
@@ -21,6 +25,7 @@
   "build": {
     "appId": "com.laixin.ai-toolbox.ui-capabilities",
     "productName": "来信AI工具箱统一版",
+    "afterPack": "./build/foreground-uninstall-confirmation.cjs",
     "directories": {
       "output": "release"
     },

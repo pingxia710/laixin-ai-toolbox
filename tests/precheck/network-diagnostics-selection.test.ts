@@ -34,13 +34,17 @@ function reply(shell: 'codex' | 'claude' | 'hermes', second: boolean): Response 
 
 async function wired() {
   let state: AiAccessState = { version: 1, selected: {} }
+  let clientFailure = false
+  const fingerprints = new Map(aiAccessShells.map(shell => [shell, 'a'.repeat(64)] as const))
   const fetcher = vi.fn<typeof fetch>(async (url, init) => {
+    if (clientFailure) return new Response('{"error":{"message":"fixture failure"}}', { status: 502, headers: { 'content-type': 'application/json' } })
     const endpoint = String(url)
     const shell = endpoint.endsWith('/responses') ? 'codex' : endpoint.endsWith('/messages') ? 'claude' : 'hermes'
     return reply(shell, JSON.parse(String(init?.body)).stream === true)
   })
   const adapters = aiAccessShells.map(shell => ({ shell, applyDeepSeek: vi.fn(async () => undefined),
     applyConnection: vi.fn(async () => undefined), captureConnection: vi.fn(async () => vi.fn(async () => undefined)),
+    readManagedFingerprint: vi.fn(async () => fingerprints.get(shell)),
     ...(shell !== 'hermes' ? { activateOfficial: vi.fn(async () => undefined) } : {}) }))
   const gateway = new AiGateway({ fetch: fetcher, timeoutMs: 1000 })
   const store = { read: async () => state, write: async (next: AiAccessState) => { state = next } }
@@ -51,7 +55,12 @@ async function wired() {
   const probe = vi.fn(async () => ({ status: 204, durationMs: 5 }))
   registerActions(registry, { probe, status: () => ({ state: '已连', lastVerifiedAt: new Date().toISOString(), configVersion: '2', nodeLabel: 'fixture', unrestored: '', componentMissing: '' }) })
   const run = async (software: string) => parseDiagnosticReport(((await registry.execute('networkdiagnostics.run', { software })) as { snapshot: string }).snapshot)
-  return { service, gateway, registry, probe, run, state: () => state }
+  return { service, gateway, registry, probe, run, state: () => state,
+    setClientFailure: (value: boolean) => { clientFailure = value },
+    setFingerprint: (shell: typeof aiAccessShells[number], value: string | undefined) => {
+      if (value === undefined) fingerprints.delete(shell)
+      else fingerprints.set(shell, value)
+    } }
 }
 
 describe('诊断入口读到的是这个软件真正在用的服务', () => {
@@ -88,6 +97,7 @@ describe('诊断入口读到的是这个软件真正在用的服务', () => {
   ])('最近成功缺省兼容首次时间，明确 null 不回退：%j', async (recent, expected) => {
     const snapshots: Record<string, unknown> = {
       'aiaccess.status': { shells: { codex: { selected: 'deepseek' } } },
+      'aiaccess.verifyConfiguration': {},
       'aiaccess.providerConfiguration': { endpoint: 'https://api.deepseek.com/responses' },
       'aiaccess.serviceStatus': { running: true, usage: [{ shell: 'codex', observedClientCall: '2026-09-21T00:00:00.000Z', ...recent }] }
     }
@@ -111,6 +121,45 @@ describe('诊断入口读到的是这个软件真正在用的服务', () => {
     const report = await f.run('codex')
     expect(report.checks.find(check => check.id === 'application')).toMatchObject({ state: 'passed', code: 'AI_DIAG_APPLICATION_OBSERVED' })
     expect(report.checks.find(check => check.id === 'account')).toMatchObject({ code: 'AI_DIAG_ACCOUNT_PROVIDER' })
+  })
+
+  it('真实网关上更新的失败请求会使旧成功证据失效', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-09-21T00:00:00.000Z'))
+    const f = await wired()
+    await f.service.saveProviderKey('codex', 'deepseek', 'sk-fixture-current-failure-0123456789')
+    await f.service.useProvider('codex', 'deepseek')
+    const route = (await f.service.serviceStatus()).routes.find(item => item.shell === 'codex')!
+    const call = async () => (await fetch(`${route.baseUrl}/responses`, { method: 'POST',
+      headers: { authorization: `Bearer ${f.state().relay!.token}` }, body: JSON.stringify({ stream: true }) })).text()
+
+    await call()
+    expect((await f.run('codex')).conclusion.ruleId).toBe('DG01_NO_BLOCKER_FOUND')
+    vi.setSystemTime(new Date('2026-09-21T00:00:01.000Z'))
+    f.setClientFailure(true)
+    await call()
+
+    const report = await f.run('codex')
+    expect(report.checks.find(check => check.id === 'application')).toMatchObject({
+      state: 'attention', code: 'AI_DIAG_APPLICATION_FAILED'
+    })
+    expect(report.conclusion).toMatchObject({ status: 'unknown', ruleId: 'DG01_APPLICATION_UNCONFIRMED' })
+  })
+
+  it('客户直接检查时会重读被外部改动或删除的配置，不把旧调用判成当前正常', async () => {
+    const f = await wired()
+    await f.service.saveProviderKey('codex', 'deepseek', 'sk-fixture-config-diagnostic-0123456789')
+    await f.service.useProvider('codex', 'deepseek')
+    const route = (await f.service.serviceStatus()).routes.find(item => item.shell === 'codex')!
+    await (await fetch(`${route.baseUrl}/responses`, { method: 'POST',
+      headers: { authorization: `Bearer ${f.state().relay!.token}` }, body: JSON.stringify({ stream: true }) })).text()
+    expect((await f.run('codex')).conclusion.ruleId).toBe('DG01_NO_BLOCKER_FOUND')
+
+    f.setFingerprint('codex', 'b'.repeat(64))
+    expect((await f.run('codex')).conclusion.ruleId).toBe('DG01_APPLICATION_CONFIGURATION')
+    f.setFingerprint('codex', undefined)
+    expect((await f.run('codex')).checks.find(check => check.id === 'application')?.code)
+      .toBe('AI_DIAG_APPLICATION_CONFIGURATION_MISSING')
   })
 
   it('没切过的软件仍按官方站点检查，本机 API 服务停了会被直接指出来', async () => {

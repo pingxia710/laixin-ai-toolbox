@@ -4,7 +4,7 @@
 // 守护干净退出本会自禁任务(sidecar settleResidentTask),这里是自禁没写上时的补手。
 // 注入假 schtasks 记录调用,核对真实命令形状;未修代码上本用例红(没有禁用调用发生)。
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -31,6 +31,8 @@ import { RESIDENT_TASK } from '../../app/main/tunnel/platform/resident'
 
 const roots: string[] = []
 afterEach(() => {
+  vi.clearAllTimers()
+  vi.useRealTimers()
   roots.splice(0).forEach((path) => rmSync(path, { recursive: true, force: true }))
   control.calls.length = 0
 })
@@ -72,6 +74,40 @@ const waitForDisableCall = async (): Promise<void> => {
 }
 
 describe('N-26 暂停落定后确保常驻任务禁用', () => {
+  it.each(['user-disconnected', 'error', 'stopped-restored'])('账本已结清但守护仍为 %s 且未确认本轮时不提前禁用恢复任务', async (state) => {
+    vi.useFakeTimers()
+    const f = setup('windows')
+    writeFileSync(join(f.dataDir, 'state.json'), JSON.stringify({ state, code: 'TUNNEL_STOP_INCOMPLETE' }))
+    await f.tunnel.stop()
+    await vi.advanceTimersByTimeAsync(500)
+    expect(disableCalls()).toEqual([])
+    const intent = JSON.parse(readFileSync(join(f.dataDir, 'intent.json'), 'utf8')) as { sessionToken: string }
+    writeFileSync(join(f.dataDir, 'state.json'), JSON.stringify({ state: 'stopped-restored', intentToken: intent.sessionToken }))
+    await vi.advanceTimersByTimeAsync(200)
+    expect(disableCalls()).toHaveLength(1)
+  })
+
+  it('守护状态损坏不能当作从未启动，恢复任务保持可用', async () => {
+    vi.useFakeTimers()
+    const f = setup('windows')
+    writeFileSync(join(f.dataDir, 'state.json'), '{broken')
+    await f.tunnel.stop()
+    await vi.advanceTimersByTimeAsync(500)
+    expect(disableCalls()).toEqual([])
+  })
+
+  it('等待收尾时新连接已接手，旧断开的迟到确认不能禁用常驻', async () => {
+    vi.useFakeTimers()
+    const f = setup('windows')
+    writeFileSync(join(f.dataDir, 'state.json'), JSON.stringify({ state: 'user-disconnected' }))
+    await f.tunnel.stop()
+    const oldIntent = JSON.parse(readFileSync(join(f.dataDir, 'intent.json'), 'utf8')) as { sessionToken: string }
+    writeFileSync(join(f.dataDir, 'intent.json'), JSON.stringify({ desired: 'connected', sessionToken: 'new' }))
+    writeFileSync(join(f.dataDir, 'state.json'), JSON.stringify({ state: 'stopped-restored', intentToken: oldIntent.sessionToken }))
+    await vi.advanceTimersByTimeAsync(500)
+    expect(disableCalls()).toEqual([])
+  })
+
   it('Windows:客户暂停落定后记录到 schtasks /change /disable(幂等,形状照 wake 的 enable 反向)', async () => {
     const f = setup('windows')
     expect((await f.tunnel.stop()).outcome).toBe('stopped')

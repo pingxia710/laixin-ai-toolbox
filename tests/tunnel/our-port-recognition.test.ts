@@ -13,6 +13,7 @@ import { makeTempDir, removeTempDir } from './helpers'
 
 function winAdapterWith(proxyServer: string, store: string) {
   writeFileSync(store, JSON.stringify({
+    DefaultConnectionSettings: { type: 'REG_BINARY', data: '460000000000000001000000' },
     ProxyEnable: { type: 'REG_DWORD', data: '1' },
     ProxyServer: { type: 'REG_SZ', data: proxyServer }
   }))

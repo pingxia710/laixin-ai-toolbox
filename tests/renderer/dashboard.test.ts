@@ -3,6 +3,7 @@ import { apiKeyGuideEntries, buildDashboardView } from '../../app/renderer/src/p
 import type { TunnelStatusView } from '../../app/preload/api/tunnel'
 
 const connectedStatus: TunnelStatusView = {
+  pauseReason: '',
   currentConfig: '', pendingConfig: '', canApplyPending: false,
   state: '已连',
   message: '出口已复验',

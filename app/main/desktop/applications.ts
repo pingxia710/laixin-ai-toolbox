@@ -4,6 +4,7 @@ import { constants } from 'node:fs'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import type { AiApplicationId, AiApplicationView } from '../../desktop-types'
+import { readWindowsCodexPackage } from './codex-package'
 
 const execFile = promisify(execFileCallback)
 export type ReadCommand = (command: string, args: string[]) => Promise<string>
@@ -68,12 +69,9 @@ export class ApplicationLauncher {
   private async windows(id: AiApplicationId): Promise<ApplicationTarget> {
     if (id === 'codex') {
       // Discover the launch ID from the installed official package, never accept an ID from the renderer.
-      const output = await this.read('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-        "$ErrorActionPreference='Stop'; $p=Get-AppxPackage -Name OpenAI.Codex | Select-Object -First 1; if($p){$m=Get-AppxPackageManifest -Package $p.PackageFullName; $a=@($m.Package.Applications.Application)[0]; [pscustomobject]@{Family=$p.PackageFamilyName; AppId=$a.Id; Version=$p.Version.ToString()} | ConvertTo-Json -Compress}"])
-      if (!output) return { id, state: 'missing', version: '' }
-      const value = JSON.parse(output) as { Family: string; AppId: string; Version: string }
-      if (!/^OpenAI\.Codex_[a-z0-9]{13}$/i.test(value.Family) || !/^[A-Za-z0-9_.-]{1,100}$/.test(value.AppId) || typeof value.Version !== 'string') throw new Error('AI_IDENTITY_INVALID')
-      return { id, state: 'installed', version: value.Version, storeId: `${value.Family}!${value.AppId}` }
+      const value = await readWindowsCodexPackage(this.read)
+      if (!value) return { id, state: 'missing', version: '' }
+      return { id, state: 'installed', version: value.version, storeId: value.storeId }
     }
     const root = join(this.home, '.hermes', 'hermes-agent', 'apps', 'desktop', 'release')
     for (const directory of ['win-unpacked', 'win-arm64-unpacked']) {

@@ -10,6 +10,7 @@ export interface RestoreResult {
 
 export interface SettingsAdapter {
   valuesEqual?(left: unknown, right: unknown, ref?: { service: string; item: string }): boolean
+  identifyPortOwner?(port: number | undefined): { kind: string; pid?: number; name?: string } | undefined
   preserveExternalChanges?(ref: { service: string; item: string }): boolean
   restoredValueMatches?(current: unknown, originalValue: unknown, writtenValue: unknown): boolean
   broadcastSettingsChanged?(): void

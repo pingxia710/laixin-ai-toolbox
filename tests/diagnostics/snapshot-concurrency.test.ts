@@ -50,6 +50,7 @@ function fixture() {
   return {
     handlers, appInfo, submitReport,
     run: async () => JSON.parse((await registry.execute('diagnostics.run', { software: 'codex' })).snapshot) as { id: string },
+    runForReport: async () => JSON.parse((await registry.execute('diagnostics.runForReport', { software: 'codex' })).snapshot) as { id: string },
     copy: async (id: string) => JSON.parse((await registry.execute('diagnostics.copy', { id })).snapshot) as { copied: boolean; stale: boolean },
     report: async (id: string) => JSON.parse((await registry.execute('diagnostics.report', { id })).snapshot) as { uploaded: boolean; stale: boolean },
     advance: () => { clock += 601_000 },
@@ -60,6 +61,21 @@ function fixture() {
     }
   }
 }
+
+it('另一页面同软件探测未结时，报障新动作不得复用点击前的结果', async () => {
+  const f = fixture(); const entered = deferred(); const release = deferred()
+  const original = f.handlers.get('networkdiagnostics.run')!
+  f.handlers.set('networkdiagnostics.run', async (params) => { entered.resolve(); await release.promise; return original(params) })
+  const fresh = vi.fn(() => { throw new Error('DIAGNOSTIC_BUSY') })
+  f.handlers.set('networkdiagnostics.runFresh', fresh)
+  const old = f.run()
+  await entered.promise
+  await expect(f.runForReport()).rejects.toThrow('DIAGNOSTIC_BUSY')
+  expect(fresh).toHaveBeenCalledTimes(1)
+  release.resolve()
+  const previous = await old
+  expect(await f.copy(previous.id)).toMatchObject({ copied: true })
+})
 
 it('旧页诊断迟到不覆盖新页已完成的快照，复制与上报继续使用新结果', async () => {
   const f = fixture(); const entered = deferred(); const release = deferred()

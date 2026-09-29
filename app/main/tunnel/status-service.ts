@@ -25,11 +25,18 @@ export interface DaemonStateView {
   readonly note?: string
   /** 写入权被别的来信后台持有时,对方当前处于什么状态(白名单词,守护已做过安全过滤)。 */
   readonly peerState?: string
+  /** N-27:本次「断了又自己接上」的恢复事件(片段起点 id/重连次数/中断毫秒)。守护写、桌面主进程读它
+   * 弹一次系统通知后按 id 去重;界面状态不展示。⛔ 凭据/网址/节点信息——只有数字。 */
+  readonly recovery?: { readonly id: number; readonly attempts: number; readonly outageMs: number }
+  /** N-55 只允许守护公布阶段、动作、代次和受控限制码；对象、快照与租约不得出进程。 */
+  readonly availability?: { readonly active?: boolean; readonly status?: string; readonly action?: string; readonly code?: string; readonly intentGeneration?: number }
 }
 
 export interface TunnelStatus {
   readonly state: string
   readonly message: string
+  /** 后台明确拒绝后，从已连状态自主暂停；仅本地状态页使用。 */
+  readonly pauseReason: '' | 'entitlement-denied'
   readonly source: string
   readonly authorization: string
   readonly backend: string
@@ -50,6 +57,9 @@ export interface TunnelStatus {
   // 随包 OpenSSH(Windows)有无的如实读数:有/无;非 Windows 为空串不展示。
   readonly sshBinary: string
   readonly traffic: string
+  /** N-55 主动冲突控制器的脱敏阶段。 */
+  readonly availabilityStatus: '' | 'examining' | 'reusing' | 'taking-over' | 'reclaiming' | 'recovering' | 'recovered' | 'limited'
+  readonly availabilityReason: string
 }
 
 export interface TrafficObservation {
@@ -90,6 +100,7 @@ export const DISPLAY_STATES = {
   resuming: '正在接续',
   connected: '已连',
   degraded: '通道待确认',
+  disconnecting: '断开中',
   userDisconnected: '用户主动断开',
   error: '异常',
   stoppedRestored: '已停止并恢复原设置'
@@ -123,6 +134,7 @@ export function computeStatus(input: StatusInput): TunnelStatus {
 
   let state: string = DISPLAY_STATES.unconfigured
   let message = ''
+  const availabilityStatus = availabilityPhase(daemon)
   if (input.daemonSurrendered) {
     state = DISPLAY_STATES.error
     message = '网络守护已停止，点连接重试'
@@ -167,9 +179,23 @@ export function computeStatus(input: StatusInput): TunnelStatus {
     message = failure?.message ?? '配置记录损坏，请联系客服协助处理；原配置已保留'
   }
 
+  // 控制器状态优先于通常的 connected 文案：写入、读回、目标复验尚在任一步时绝不展示「已连」。
+  const availabilityReason = availabilityMessage(daemon?.availability?.code)
+  if (availabilityStatus === 'limited') {
+    state = DISPLAY_STATES.error
+    message = availabilityReason
+  } else if (availabilityStatus === 'recovered' && state === DISPLAY_STATES.error && availabilityReason) {
+    // 接管失败后的恢复已完成，只说明旧设置安全还回；连接失败原因仍要留在界面上。
+    message = availabilityReason
+  } else if (availabilityStatus && availabilityStatus !== 'recovered') {
+    state = DISPLAY_STATES.connecting
+    message = availabilityMessage(availabilityStatus)
+  }
+
   return {
     state,
     message,
+    pauseReason: '',
     source: info?.sourceLine ?? '',
     authorization: info === undefined ? '' : STATUS_LINES.authorization,
     backend: info === undefined ? '' : STATUS_LINES.backend,
@@ -194,14 +220,49 @@ export function computeStatus(input: StatusInput): TunnelStatus {
             ? '未恢复:已被改动'
             : entry.status === 'restore-failed'
               ? `未恢复:失败:${entry.note}`
-              : '未恢复:未完成(进程中断)'
+              : '未恢复:待恢复确认'
         }`
       )),
     componentMissing:
       input.componentMissing.length > 0 ? `组件缺失:${input.componentMissing.join(',')}` : '',
     sshBinary: input.sshBinary,
-    traffic: active ? trafficSummary(input.dataDir) : ''
+    traffic: active ? trafficSummary(input.dataDir) : '',
+    availabilityStatus,
+    availabilityReason
   }
+}
+
+function availabilityPhase(daemon: DaemonStateView | undefined): TunnelStatus['availabilityStatus'] {
+  if (daemon?.availability?.active !== true) return ''
+  const status = daemon?.availability?.status
+  return ['examining', 'reusing', 'taking-over', 'reclaiming', 'recovering', 'recovered', 'limited'].includes(status ?? '')
+    ? status as TunnelStatus['availabilityStatus']
+    : ''
+}
+
+export function availabilityMessage(code: string | undefined): string {
+  const phases: Record<string, string> = {
+    examining: '正在取证',
+    reusing: '正在复用',
+    'taking-over': '正在接管',
+    reclaiming: '正在夺回',
+    recovering: '正在恢复',
+    recovered: '已恢复',
+    'TUNNEL_AVAILABILITY_RECLAIM_LIMIT': '无法安全自动处理：已达到本轮可验证夺回上限，保留当前外部设置并等待新的连接意图或路径证据',
+    'TUNNEL_AVAILABILITY_POLICY_LOCKED': '无法安全自动处理：系统设置已被组织策略锁定',
+    'TUNNEL_AVAILABILITY_OBJECT_IDENTITY_MISSING': '无法确认本机网卡或网络路径。请重新连接；仍失败请点击“复制诊断给客服”，无需重复购买套餐。',
+    'TUNNEL_AVAILABILITY_RECOVERY_CONTRACT_MISSING': '无法安全自动处理：当前设置没有可验证的快照、读回或恢复接口',
+    'TUNNEL_AVAILABILITY_PROCESS_OWNERSHIP_UNPROVEN': '无法安全自动处理：端口所属进程无法确认，来信没有结束它',
+    'TUNNEL_AVAILABILITY_PEER_LAIXIN_RUNNING': '无法安全自动处理：这台电脑上已有另一份来信正在使用该入口，请退出或卸载那一份后重新连接',
+    'TUNNEL_AVAILABILITY_WRITE_FAILED': '无法安全自动处理：系统设置写入失败，原设置和恢复账本已保留',
+    'TUNNEL_AVAILABILITY_READBACK_MISMATCH': '无法安全自动处理：设置写入后读回不一致',
+    'TUNNEL_AVAILABILITY_RESTORE_READBACK_MISMATCH': '无法安全自动处理：恢复设置后读回不一致，原设置恢复尚未完成',
+    'TUNNEL_AVAILABILITY_STALE_OPERATION': '无法安全自动处理：先前连接意图已失效，正在等待当前意图重新取证',
+    'TUNNEL_AVAILABILITY_TARGET_UNREACHABLE': '无法安全自动处理：设置读回一致，但目标服务仍不可达',
+    'TUNNEL_AVAILABILITY_TARGET_UNCONFIRMED': '无法安全自动处理：目标服务当前无法完成有效复验，正在等待新的路径证据',
+    'TUNNEL_AVAILABILITY_EVIDENCE_CHANGED': '无法安全自动处理：网络路径或冲突对象在操作期间发生变化，正在等待重新取证'
+  }
+  return phases[code ?? ''] ?? (code === undefined ? '' : '无法安全自动处理：当前网络设置缺少可验证的处理条件')
 }
 
 // 未恢复项可能很多（整批网络服务出故障），拼接必须留在动作结果 schema 限长（300）以内，
@@ -344,6 +405,10 @@ export function connectionMessage(daemon: DaemonStateView): string {
     // 正是 0.4.9 同一个坑。每条都要说清**客户能做什么**。
     'TUNNEL_PEER_LAIXIN_RUNNING': '这台电脑上已经有一份来信在管理网络，请退出或卸载多余的那一份，再点击重新连接',
     'TUNNEL_SETTINGS_CONTEST_STOPPED': '系统代理正被这台电脑上的其他程序反复修改，来信已停手并保留它当前的设置；请关闭那个程序后点击重新连接',
+    'TUNNEL_AVAILABILITY_RECLAIM_LIMIT': '无法安全自动处理：已达到本轮可验证夺回上限，保留当前外部设置并等待新的连接意图或路径证据',
+    'TUNNEL_AVAILABILITY_READBACK_MISMATCH': '无法安全自动处理：设置写入后读回不一致',
+    'TUNNEL_AVAILABILITY_TARGET_UNREACHABLE': '无法安全自动处理：设置读回一致，但目标服务仍不可达',
+    'TUNNEL_AVAILABILITY_EVIDENCE_CHANGED': '无法安全自动处理：网络路径或冲突对象在操作期间发生变化，正在等待重新取证',
     'TUNNEL_WRITE_RIGHT_HELD': '这台电脑的网络设置正由另一个来信后台管理，本次没有改动；请先退出那一份，再点击重新连接',
     'TUNNEL_WRITE_RIGHT_UNKNOWN': '暂时无法确认系统代理归属，本次没有改动网络设置；请点击重新连接，若仍不行请联系来信客服',
     // N-23:一次性恢复的两类受控失败(supervisor 落盘)。基线是静默吞掉,客户对着「未完成(进程中断)」永远转圈。

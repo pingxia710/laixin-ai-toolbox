@@ -85,8 +85,8 @@ it('账号切换等待窗口(5 秒)内:状态读 ≤60 次、盘上真实读 ≤
   f.service.status() // 预热:首次解析与缓存填充不计入等待窗口
   const before = snapshot()
   const result = await f.service.setAccountAccess(f.accessB)
-  // 流程收尾与现行语义一致(假上游拒绝同步);计数只看读取节奏,不看判定结果。
-  expect(result.code).toBe('NETWORK_RESPONSE_INVALID')
+  // 旧账号设置未恢复、且没有恢复进程时停在断开闸；不向新账号后台发起配置请求。
+  expect(result.code).toBe('NETWORK_DISCONNECT_REQUIRED')
   const delta = deltas(before)
   // ①等待条件单次求值+200ms 节奏:5 秒窗口 ≤25 轮(现行 50ms×每轮 1-2 次 = 97 次状态读,红)。
   // 配置读每轮 current+pending 各一次(≤50)加流程收尾零星几读,上限 75(现行约 290,红)。

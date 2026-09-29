@@ -20,7 +20,7 @@ function reply(second: boolean): Response {
   return Response.json({ status: 'completed', output: [{ type: 'function_call', call_id: 'probe-1', name: 'toolbox_probe', arguments: '{}' }] })
 }
 
-async function fixture() {
+async function fixture(runtime: Parameters<typeof registerAiAccessActions>[5] = {}) {
   let state = { version: 1 as const, selected: {} as Record<string, string> }
   const fetcher = vi.fn<typeof fetch>(async (_url, init) => reply(JSON.parse(String(init?.body)).stream === true))
   const adapters = aiAccessShells.map(shell => ({ shell, applyDeepSeek: vi.fn(async () => undefined),
@@ -30,7 +30,7 @@ async function fixture() {
   const service = new AiAccessService(store, adapters, new AiGateway({ fetch: fetcher, timeoutMs: 1000 }))
   services.push(service)
   const registry = new BridgeRegistry()
-  registerAiAccessActions(registry, service)
+  registerAiAccessActions(registry, service, undefined, undefined, undefined, runtime)
   await service.saveProviderKey('codex', 'deepseek', 'sk-fixture-bridge-remedy-0123456789')
   await service.useProvider('codex', 'deepseek')
   return { service, registry, fetcher }
@@ -87,5 +87,21 @@ describe('处理动作的后台入口', () => {
     const result = await remedy(f.registry, 'codex', 'retest')
     expect(result).toMatchObject({ outcome: 'still_failing', code: 'key_rejected' })
     expect(JSON.stringify(result)).not.toContain('sk-fixture-bridge-remedy')
+  })
+
+  it('Claude 的重新写入和重启网关动作都先撤销模型 API 隔离租约', async () => {
+    const disable = vi.fn(async () => ({ application: 'claude', scope: 'model-api-egress', capability: 'http-connect', mode: 'disabled', systemNetwork: 'unmanaged', phase: 'restored', action: 'disable', intentGeneration: 2, available: false, code: 'RESTORED' } as const))
+    const isolation = {
+      status: vi.fn(() => ({ application: 'claude', scope: 'model-api-egress', capability: 'http-connect', mode: 'application-only', systemNetwork: 'unmanaged', phase: 'available', action: 'enable', intentGeneration: 1, available: true, code: 'AVAILABLE' } as const)),
+      enable: vi.fn(), disable, recover: vi.fn(), reverify: vi.fn()
+    }
+    const f = await fixture({ claudeIsolation: isolation })
+    await f.service.saveProviderKey('claude', 'deepseek', 'sk-fixture-claude-remedy-0123456789')
+    await f.service.useProvider('claude', 'deepseek')
+
+    await remedy(f.registry, 'claude', 'reapply', 'deepseek')
+    await remedy(f.registry, 'claude', 'restartGateway', 'deepseek')
+
+    expect(disable).toHaveBeenCalledTimes(2)
   })
 })

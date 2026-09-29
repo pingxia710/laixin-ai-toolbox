@@ -1,4 +1,5 @@
 import { supportDiagnosticAttemptLimit, type DiagnosticSoftware, type NetworkDiagnosticReport } from '../../network-diagnostics-types'
+import { localEgressDescription, type LocalEgressEvidence } from '../../shared/local-egress-evidence'
 
 export interface SupportAttempt {
   readonly at: string
@@ -11,6 +12,7 @@ export interface SupportAttempt {
 export interface SupportDiagnosis {
   readonly id: string
   readonly report: NetworkDiagnosticReport
+  readonly localEgress?: LocalEgressEvidence
   readonly attempts: readonly SupportAttempt[]
   readonly attemptsTotal: number
   readonly attemptsComplete: boolean
@@ -33,6 +35,8 @@ export interface SupportSessionContext {
   readonly tunnelVerified: boolean
   readonly repairFingerprint: string
   readonly attemptsFingerprint: string
+  /** N-54 三路径矩阵使用的脱敏内部路径指纹；未生成矩阵时为 not-required。 */
+  readonly pathFingerprint: string
 }
 
 export type SupportSessionInvalidReason = 'expired' | 'changed'
@@ -41,13 +45,18 @@ export function supportSessionInvalidReason(report: NetworkDiagnosticReport, ori
   current: SupportSessionContext, now = Date.now()): SupportSessionInvalidReason | undefined {
   if (!Number.isFinite(now) || now < report.checkedAt || now >= report.validUntil) return 'expired'
   const tunnelCheck = report.checks.find((check) => check.id === 'tunnel')
+  const serviceCheck = report.checks.find((check) => check.id === 'service')
+  const pathContextAlreadyUnknown = report.pathMatrix?.valid === false && serviceCheck?.code === 'AI_DIAG_PATH_CONTEXT_UNKNOWN'
+  if (report.pathMatrix !== undefined && !pathContextAlreadyUnknown &&
+      (original.pathFingerprint === 'unreadable' || current.pathFingerprint === 'unreadable')) return 'changed'
   if (report.conclusion.ruleId !== 'DG01_EVIDENCE_CHANGED' && current.tunnelRequired && tunnelCheck?.code === 'AI_DIAG_TUNNEL_VERIFIED' &&
       (!current.tunnelReadable || !current.tunnelVerified)) return 'changed'
   if (original.selectionFingerprint !== current.selectionFingerprint ||
       original.serviceRunning !== current.serviceRunning ||
       original.tunnelRequired !== current.tunnelRequired ||
       original.repairFingerprint !== current.repairFingerprint ||
-      original.attemptsFingerprint !== current.attemptsFingerprint) return 'changed'
+      original.attemptsFingerprint !== current.attemptsFingerprint ||
+      original.pathFingerprint !== current.pathFingerprint) return 'changed'
   if (original.tunnelRequired && (original.tunnelReadable !== current.tunnelReadable ||
       original.tunnelFingerprint !== current.tunnelFingerprint || original.tunnelVerified !== current.tunnelVerified)) return 'changed'
   return undefined
@@ -63,15 +72,17 @@ export function selectSupportAttempts(attempts: readonly SupportAttempt[]): Supp
 }
 
 export function createSupportDiagnosis(id: string, report: NetworkDiagnosticReport,
-  attempts: readonly SupportAttempt[], attemptsComplete = true, attemptsTotal = attempts.length): SupportDiagnosis {
+  attempts: readonly SupportAttempt[], attemptsComplete = true, attemptsTotal = attempts.length,
+  localEgress?: LocalEgressEvidence): SupportDiagnosis {
   const selected = selectSupportAttempts(attempts)
   const total = Number.isSafeInteger(attemptsTotal) && attemptsTotal >= selected.total ? attemptsTotal : selected.total
-  return { id, report, attempts: selected.attempts, attemptsTotal: total, attemptsComplete }
+  return { id, report, ...(localEgress ? { localEgress } : {}), attempts: selected.attempts, attemptsTotal: total, attemptsComplete }
 }
 
 const softwareNames: Readonly<Record<DiagnosticSoftware, string>> = {
   codex: 'Codex', claude: 'Claude Code', hermes: 'Hermes'
 }
+const pathNames = { direct: '直连', 'existing-proxy': '系统现有代理', 'laixin-tunnel': '来信通道' } as const
 
 /** 客户复制的摘要与上报结构共用同一个 SupportDiagnosis。规则码只在结构化材料中供客服追溯。 */
 export function buildSupportSummary(diagnosis: SupportDiagnosis): string {
@@ -80,7 +91,7 @@ export function buildSupportSummary(diagnosis: SupportDiagnosis): string {
     '【本次客服诊断】',
     `诊断编号：${diagnosis.id}`,
     `问题软件：${softwareNames[report.software]}`,
-    `检查目标：${report.target.label}（${report.target.route === 'direct' ? '直连' : '经 AI 网络'}）`,
+    `检查目标：${report.target.label}（${report.target.route === 'isolated' ? '经应用隔离出口' : report.target.route === 'direct' ? '直连' : '经 AI 网络'}）`,
     `检查时间：${new Date(report.checkedAt).toLocaleString('zh-CN')}`,
     `本次结论：${report.conclusion.title}`,
     report.conclusion.summary,
@@ -93,6 +104,11 @@ export function buildSupportSummary(diagnosis: SupportDiagnosis): string {
   const unconfirmed = report.checks.filter((check) => check.state === 'unknown' || check.state === 'not-checked')
   if (unconfirmed.length === 0) lines.push('- 本次五项检查没有保留未知或未检查项。')
   else for (const check of unconfirmed) lines.push(`- ${check.label}：${check.message}`)
+  if (report.pathMatrix !== undefined) {
+    lines.push('', '失败后路径对照：')
+    if (!report.pathMatrix.valid) lines.push('- 本次未能确认路径对照使用的是同一份配置与通道状态，矩阵已失效。')
+    else for (const entry of report.pathMatrix.entries) lines.push(`- ${pathNames[entry.path]}：${entry.message}`)
+  }
   lines.push('', '实际已试动作与复验：')
   if (diagnosis.attempts.length === 0 && diagnosis.attemptsComplete) lines.push('- 本次诊断快照中没有记录到已执行的处理动作或复验结果。')
   else for (const attempt of diagnosis.attempts) {
@@ -102,6 +118,14 @@ export function buildSupportSummary(diagnosis: SupportDiagnosis): string {
     lines.push(`- 共读取到 ${diagnosis.attemptsTotal} 条已试动作与复验记录；本次材料只保留最近 ${diagnosis.attempts.length} 条。`)
   }
   if (!diagnosis.attemptsComplete) lines.push('- 已试动作或复验记录未能完整读取，未读到的部分保持未知。')
+  if (diagnosis.localEgress) {
+    const local = diagnosis.localEgress
+    const internet = report.checks.find((check) => check.id === 'internet')?.state ?? 'unknown'
+    const view = localEgressDescription(local, internet)
+    lines.push('', '【本机出站路径】', `采集时间：${new Date(local.sampledAt).toLocaleString('zh-CN')}`,
+      `接口：${local.interface}；IPv4 默认路由：${local.ipv4DefaultRoute}；IPv6 默认路由：${local.ipv6DefaultRoute}`,
+      `${view.title}。${view.detail}`)
+  }
   lines.push('', `下一步：${report.conclusion.nextStep}`)
   return lines.join('\n')
 }

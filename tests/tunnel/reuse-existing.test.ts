@@ -166,6 +166,59 @@ describe('已有可用外网优先复用', () => {
     alive.daemon.requestShutdown(); await flushMicrotasks()
   })
 
+  it('macOS 快照读连续暂时失败：继续探旧通道并保持待确认，不能把 materialized fallback 当快照变化后接管', async () => {
+    const store = `${dataDir}/registry.json`
+    const base = createAdapter({ FAKE_WININET_STORE: store })
+    const snapshots = new WeakSet<object>()
+    let readFails = false
+    let connectorStarts = 0
+    let probes = 0
+    const adapter = {
+      ...base,
+      existingProxy: () => {
+        if (readFails) throw new Error('temporary networksetup read failure')
+        const candidate = Object.freeze({ kind: 'http' as const, host: '127.0.0.1', port: 7890, source: 'Wi-Fi/secure-web-proxy' })
+        snapshots.add(candidate)
+        return candidate
+      },
+      validateExistingProxy: (candidate: object) => {
+        if (!snapshots.has(candidate)) throw Object.assign(new Error('snapshot changed'), { code: 'TUNNEL_ACTIVE_PROXY_CHANGED' })
+      },
+      materializeExistingProxy: (candidate: { kind: 'http'; host: string; port: number; source: string }) => Object.freeze({ ...candidate })
+    }
+    writeIntentFile(dataDir, { desired: 'connected', sessionToken: 'reuse-transient-read', bridgePort: 18080,
+      connector: { kind: 'loopback-probe', host: '127.0.0.1', port: 1, exitIp: '203.0.113.6' } })
+    const daemon = createDaemon({ dataDir, clock, adapter, random: () => 0, parentAlive: () => true, onExit: () => undefined,
+      verifyIntervalMs: 30_000,
+      probeProxy: async () => { probes += 1 },
+      connectorFactory: () => ({ kind: 'loopback-probe', start: async () => { connectorStarts += 1 }, stop: async () => undefined,
+        localProxyPort: () => 1, onLost: () => undefined, verify: async () => ({ exitIp: '203.0.113.6' }) }),
+      bridgeFactory: () => ({ listen: async () => undefined, close: async () => undefined, isAlive: () => true, onLost: () => undefined })
+    })
+
+    await daemon.run()
+    expect(connectorStarts).toBe(0)
+    readFails = true
+    clock.advance(30_000)
+    await flushMicrotasks(); await flushMicrotasks()
+    clock.advance(1_000)
+    await flushMicrotasks(); await flushMicrotasks()
+    expect(probes).toBe(3)
+    expect(connectorStarts).toBe(0)
+    expect(JSON.parse(readFileSync(`${dataDir}/state.json`, 'utf8'))).toMatchObject({
+      state: 'degraded', code: 'TUNNEL_VERIFY_UNCONFIRMED'
+    })
+    expect(existsSync(store) ? JSON.parse(readFileSync(store, 'utf8')) : {}).toEqual({})
+
+    readFails = false
+    clock.advance(29_000)
+    await flushMicrotasks(); await flushMicrotasks()
+    expect(JSON.parse(readFileSync(`${dataDir}/state.json`, 'utf8'))).toMatchObject({
+      state: 'connected', code: 'TUNNEL_REUSED_EXISTING', reusedProxy: { port: 7890 }
+    })
+    daemon.requestShutdown(); await flushMicrotasks()
+  })
+
   it('④原本直连(没有别的代理):正常建来信连接;PAC 按不可判定 → 接管', async () => {
     const direct = harness(undefined, () => true)
     await direct.daemon.run()

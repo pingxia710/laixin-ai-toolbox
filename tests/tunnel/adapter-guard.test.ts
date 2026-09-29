@@ -62,7 +62,9 @@ describe('真实适配器守卫(判据 7)与平台原语', () => {
       'tests/tunnel/resident-agent.test.ts',
       'tests/tunnel/system-adapters-reliability.test.ts',
       'tests/tunnel/win-adapter.test.ts',
-      'tests/tunnel/win-daemon-entry.test.ts'
+      'tests/tunnel/win-daemon-entry.test.ts',
+      'tests/tunnel/win-path-script.test.ts',
+      'tests/tunnel/wpad-reuse.test.ts'
     ])
   })
 
@@ -88,7 +90,10 @@ describe('真实适配器守卫(判据 7)与平台原语', () => {
     expect(missingSidecarComponents('macos', '/nonexistent')).toEqual([
       'tunnel-daemon.mjs',
       'adapter-networksetup.mjs',
+      'active-network-path.mjs',
       'managed-adapter.mjs',
+      'port-owner.mjs',
+      'macos-write-right.mjs',
       'terminal-environment.mjs',
       'power-events.mjs',
       'ledger.mjs',

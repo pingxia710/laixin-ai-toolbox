@@ -12,6 +12,8 @@ export interface UpdateView {
   notes: string
   progress: number
   message: string
+  /** 可重试版本已与签名更新来源核对，且确实比当前安装版新。 */
+  retryDownload?: boolean
 }
 /** 「更新成功」弹窗的内容。version=装上的新版;previous=升级前的版本(空=旧 pending 没记);notes=那次更新的说明。 */
 export interface UpdateSuccessNotice { version: string; previous: string; notes: string }

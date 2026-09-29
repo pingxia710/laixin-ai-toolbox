@@ -33,7 +33,8 @@ export function registerSharingActions(registry: BridgeRegistry, client: Account
             if (payment?.redirect?.kind === 'url') {
               const url = new URL(payment.redirect.data)
               if (url.protocol !== 'https:' || url.hostname !== 'openapi.alipay.com' || url.port || url.username || url.password || url.pathname !== '/gateway.do') throw new AccountClientError('SHARING_UNAVAILABLE')
-              await shell.openExternal(url.href)
+              // 同 PAY-11:「打开付款页」失败不等于「下单」失败,租单数据必须保留给客户重试。
+              try { await shell.openExternal(url.href) } catch { return { data: JSON.stringify({ ...(data as SharingPayment), browserOpened: false }), error: '' } }
             }
           }
           return { data: JSON.stringify(data), error: '' }

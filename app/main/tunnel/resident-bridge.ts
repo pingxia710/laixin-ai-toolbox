@@ -88,7 +88,12 @@ export function makeResidentRuntime(deps: ResidentRuntimeDeps): ResidentRuntime 
   // N-25:桥上的 alive 挂在 isRunning() 下、状态轮询每次都问,席位锁读走记忆化
   // (ino+mtime+size 失效,锁文件被换必翻新);校准决策(leaveRunningInstance)是对盘面的
   // 判定,保持现读——⛔ 两处共用一个读法。
-  const aliveCached = (): boolean => lockHolderAlive(readInstanceLockCached(deps.dataDir)?.holder)
+  const cachedSeat = () => readInstanceLockCached(deps.dataDir)?.holder
+  const aliveCached = (): boolean => lockHolderAlive(cachedSeat())
+  const seatRunId = (): string | undefined => {
+    const holder = cachedSeat()
+    return holder && lockHolderAlive(holder) && typeof holder.runId === 'string' && holder.runId !== '' ? holder.runId : undefined
+  }
   const alive = (): boolean => lockHolderAlive(readInstanceLock(deps.dataDir)?.holder)
 
   const calibrateOnce = async (enabled: boolean): Promise<ResidentOutcome> => {
@@ -143,6 +148,7 @@ export function makeResidentRuntime(deps: ResidentRuntimeDeps): ResidentRuntime 
     bridge: {
       armed: () => installed,
       alive: aliveCached,
+      seatRunId,
       wake: async () => {
         const outcome = await wake(platformKey, staleTaskPaths)
         // Phase 1 ④:叫醒被拒的原因(reason)被 boolean 契约丢掉——supervisor 只见「没叫动」。

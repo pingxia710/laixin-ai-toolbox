@@ -1,6 +1,6 @@
 import type { AiAccessMode, AiAccessShell, AiAccessStatus } from '../../../main/ai-access/service'
 import { apiFailureMessages, type ApiCheck } from '../../../shared/api-service-types'
-import { modelProviderIds, type ModelProviderId } from '../../../shared/model-providers'
+import { isProviderModelAllowed, modelIdPattern, modelProviderIds, type ModelProviderId } from '../../../shared/model-providers'
 
 type CodexOfficialLoginStatus = 'idle' | 'pending' | 'connected' | 'failed'
 export type ClaudeOfficialLoginStatus = 'idle' | 'pending' | 'code-required' | 'connected' | 'failed' | 'not-installed'
@@ -24,14 +24,33 @@ export function readAccessStatus(snapshot: string): AiAccessStatus {
   const configurationTargets = readConfigurationTargets(value.configurationTargets)
   const officialAuthentication = readOfficialAuthentication(value.officialAuthentication)
   const storageNote = readStorageNote(value.storageNote)
+  const codexMultiModel = readCodexMultiModel(value.codexMultiModel)
   return {
     legacyZaiKeySaved: value.legacyZaiKeySaved === true,
     ...(storageNote ? { storageNote } : {}),
     ...(attempt ? { attempt } : {}),
     ...(configurationTargets ? { configurationTargets } : {}),
     ...(officialAuthentication ? { officialAuthentication } : {}),
+    codexMultiModel,
     shells
   }
+}
+
+function readCodexMultiModel(value: unknown): NonNullable<AiAccessStatus['codexMultiModel']> {
+  if (value === undefined) return { mode: 'single', models: [] }
+  if (!isRecord(value) || (value.mode !== 'single' && value.mode !== 'multi') || !Array.isArray(value.models)) throw new Error('AI_ACCESS_STATUS_INVALID')
+  const providers = new Set<ModelProviderId>()
+  const models = value.models.map(candidate => {
+    if (!isRecord(candidate) || !modelProviderIds.includes(candidate.provider as ModelProviderId) ||
+      typeof candidate.model !== 'string' || !isProviderModelAllowed(candidate.provider as ModelProviderId, 'codex', candidate.model) ||
+      typeof candidate.internalModelId !== 'string' || !modelIdPattern.test(candidate.internalModelId) ||
+      candidate.internalModelId !== `laixin.${String(candidate.provider)}.${candidate.model}` || providers.has(candidate.provider as ModelProviderId)) {
+      throw new Error('AI_ACCESS_STATUS_INVALID')
+    }
+    providers.add(candidate.provider as ModelProviderId)
+    return { provider: candidate.provider as ModelProviderId, model: candidate.model, internalModelId: candidate.internalModelId }
+  })
+  return { mode: value.mode, models }
 }
 
 export function readCodexLoginStatus(snapshot: string): CodexOfficialLoginStatus {

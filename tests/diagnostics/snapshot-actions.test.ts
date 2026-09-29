@@ -55,6 +55,7 @@ it('运行、复制、上报都绑定同一软件和同一快照；复制或上�
     'networkdiagnostics.run': (params) => networkRun(params),
     'shells.inventory': () => wrapped([]),
     'aiaccess.status': () => wrapped({ shells: { hermes: { selected: 'deepseek', providerKeys: { deepseek: true } } } }),
+    'aiaccess.verifyConfiguration': () => wrapped({ hermes: configuration }),
     'aiaccess.serviceStatus': () => wrapped({ running: true, baseUrl: 'http://127.0.0.1:47000', requests: [],
       usage: [{ shell: 'hermes', provider: 'deepseek', tested: null, configured: null, observedClientCall, configuration }] }),
     'aiaccess.providerConfiguration': () => wrapped({ endpoint: 'https://api.deepseek.com/' }),
@@ -63,6 +64,9 @@ it('运行、复制、上报都绑定同一软件和同一快照；复制或上�
   }
   for (const [name, handler] of Object.entries(actions)) registry.handlers.set(name, handler)
   const submitted = vi.fn(async () => ({ receipt: 'LX-ABCD-1234', uploaded: true, message: '已上报' }))
+  const localEgress = { platform: 'windows' as const, sampledAt: checkedAt + 900,
+    interface: 'none' as const, ipv4DefaultRoute: 'absent' as const, ipv6DefaultRoute: 'absent' as const }
+  const collectLocalEgress = vi.fn(async () => localEgress)
   registerActions(registry as unknown as BridgeRegistry, {
     now: () => checkedAt + 1_000,
     createId: () => 'DG-SAME123',
@@ -70,12 +74,16 @@ it('运行、复制、上报都绑定同一软件和同一快照；复制或上�
     recipesVersion: () => 7,
     installStatus: () => ({ phase: 'idle' }),
     copyText: clipboardWriteText,
+    collectLocalEgress,
     submitReport: submitted
   })
 
   const run = JSON.parse(((await registry.execute('diagnostics.run', { software: 'hermes' })) as { snapshot: string }).snapshot) as
-    { id: string; software: string; text: string; network: NetworkDiagnosticReport }
+    { id: string; software: string; text: string; network: NetworkDiagnosticReport; localEgress: typeof localEgress }
   expect(run).toMatchObject({ id: 'DG-SAME123', software: 'hermes', network })
+  expect(run.localEgress).toEqual(localEgress)
+  expect(run.text).toContain('本机出站路径')
+  expect(run.text).not.toContain('本机未发现可用出站路径') // 固定 204 已通过，不能和它矛盾地下断网结论。
   expect(run.text).toContain('问题软件：Hermes')
   expect(networkRun).toHaveBeenCalledTimes(1)
   expect(networkRun).toHaveBeenCalledWith({ software: 'hermes' })
@@ -88,6 +96,8 @@ it('运行、复制、上报都绑定同一软件和同一快照；复制或上�
   const reported = JSON.parse(((await registry.execute('diagnostics.report', { id: run.id })) as { snapshot: string }).snapshot) as { uploaded: boolean }
   expect(reported.uploaded).toBe(true)
   expect(submitted).toHaveBeenCalledWith(expect.objectContaining({ id: run.id, report: network }), faults)
+  expect(submitted).toHaveBeenCalledWith(expect.objectContaining({ localEgress }), faults)
+  expect(collectLocalEgress).toHaveBeenCalledTimes(1)
   expect(networkRun).toHaveBeenCalledTimes(1)
 
   configuration = 'modified-externally'
@@ -97,4 +107,61 @@ it('运行、复制、上报都绑定同一软件和同一快照；复制或上�
   expect(staleReport).toMatchObject({ uploaded: false, stale: true })
   expect(submitted).toHaveBeenCalledTimes(1)
   expect(networkRun).toHaveBeenCalledTimes(1)
+})
+
+it('路径上下文持续读不到时，已明确标为无法核对的矩阵仍能上屏和复制', async () => {
+  const unknown: NetworkDiagnosticReport = {
+    ...network,
+    conclusion: {
+      status: 'unknown', scope: 'diagnostic-context', ruleId: 'DG01_CONTEXT_UNREADABLE', title: '本次路径对照无法核对',
+      summary: '这次没有完整读到系统代理或来信通道入口。', nextStep: '保持当前网络状态不变，重新检查。',
+      evidence: [{ checkId: 'service', code: 'AI_DIAG_PATH_CONTEXT_UNKNOWN', statement: '路径对照前后未能完整读到入口。' }]
+    },
+    checks: network.checks.map((check) => check.id === 'service'
+      ? { ...check, state: 'unknown', code: 'AI_DIAG_PATH_CONTEXT_UNKNOWN', message: '路径对照前后未能完整读到入口。' }
+      : check),
+    pathMatrix: {
+      checkedAt, valid: false,
+      entries: [
+        { path: 'direct', state: 'failed', message: '本路径未完成。' },
+        { path: 'existing-proxy', state: 'unavailable', message: '本路径未执行。' },
+        { path: 'laixin-tunnel', state: 'unavailable', message: '本路径未执行。' }
+      ]
+    }
+  }
+  const registry = new FakeRegistry()
+  const actions: Record<string, (params: unknown) => unknown> = {
+    'app.info': () => ({ version: '0.5.20', platform: 'darwin', architecture: 'arm64', packaged: true }),
+    'tunnel.status': () => ({ state: '未配置', lastVerifiedAt: '', configVersion: '', nodeLabel: '', unrestored: '', componentMissing: '' }),
+    'tunnel.repairStatus': () => ({ running: false, phase: 'idle', outcome: 'idle', code: '', message: '' }),
+    'networkdiagnostics.run': () => wrapped(unknown),
+    'shells.inventory': () => wrapped([]),
+    'aiaccess.status': () => wrapped({ shells: { hermes: { selected: 'deepseek', providerKeys: { deepseek: true } } } }),
+    'aiaccess.verifyConfiguration': () => wrapped({ hermes: 'ok' }),
+    'aiaccess.serviceStatus': () => wrapped({ running: true, requests: [], usage: [] }),
+    'aiaccess.providerConfiguration': () => wrapped({ endpoint: 'https://api.deepseek.com/' }),
+    'aiaccess.providerBalance': () => wrapped({ provider: 'deepseek', supported: false }),
+    'desktop.status': () => wrapped({})
+  }
+  for (const [name, handler] of Object.entries(actions)) registry.handlers.set(name, handler)
+  registerActions(registry as unknown as BridgeRegistry, {
+    now: () => checkedAt + 1_000,
+    createId: () => 'DG-UNKNOWN-PATH',
+    recentFaults: async () => [],
+    recordNetworkFault: async () => undefined,
+    recipesVersion: () => 7,
+    installStatus: () => ({ phase: 'idle' }),
+    copyText: clipboardWriteText,
+    collectLocalEgress: async () => ({ platform: 'other', sampledAt: checkedAt + 900,
+      interface: 'unknown', ipv4DefaultRoute: 'unknown', ipv6DefaultRoute: 'unknown' }),
+    pathContext: async () => { throw new Error('private unreadable detail') }
+  })
+
+  const snapshot = JSON.parse(((await registry.execute('diagnostics.run', { software: 'hermes' })) as { snapshot: string }).snapshot) as
+    { id: string; text: string; network: NetworkDiagnosticReport }
+  expect(snapshot.network.conclusion.ruleId).toBe('DG01_CONTEXT_UNREADABLE')
+  expect(snapshot.text).toContain('本次路径对照无法核对')
+  expect(snapshot.text).not.toContain('private unreadable detail')
+  const copied = JSON.parse(((await registry.execute('diagnostics.copy', { id: snapshot.id })) as { snapshot: string }).snapshot)
+  expect(copied).toMatchObject({ copied: true, stale: false })
 })

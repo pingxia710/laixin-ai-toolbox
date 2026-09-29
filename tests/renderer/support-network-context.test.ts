@@ -15,6 +15,7 @@ class Element {
   scrollIntoView() {}
 }
 const base: TunnelStatusView = {
+  pauseReason: '',
   currentConfig: '', pendingConfig: '', canApplyPending: false, state: '未配置', message: '', source: '', authorization: '', backend: '',
   nodeLabel: '', exitIp: '', pathSource: '' as const, lastVerifiedAt: '', configVersion: '', expiresAt: '', pendingAvailable: false, unrestored: '', componentMissing: ''
 }
@@ -42,6 +43,21 @@ it.each(['用户主动断开', '已停止并恢复原设置', '未配置'])('客
 
 it('恢复完成与仍在恢复在客服摘要中可以区分', async () => {
   expect((await readCopiedContext({ state: '已停止并恢复原设置' })).reasonCodes).toContain('NETWORK_RESTORED')
+})
+
+it('断开在途的客服摘要保留未知状态与恢复待完成，不报已经恢复', async () => {
+  const state = await readCopiedContext({ state: '断开中', currentConfig: '版本 1' })
+  expect(state.channelStatus).toBe('未知')
+  expect(state.reasonCodes).toContain('NETWORK_RESTORE_PENDING')
+  expect(state.reasonCodes).not.toContain('NETWORK_RESTORED')
+})
+
+it('权益拒绝在途用固定原因码说明，不复制原始敏感文字', async () => {
+  const state = await readCopiedContext({ state: '断开中', pauseReason: 'entitlement-denied',
+    message: 'secret-fixture /Users/private/config.json' })
+  expect(state.reasonCodes).toContain('NETWORK_AUTHORIZATION_UNAVAILABLE')
+  expect(state.reasonCodes).toContain('NETWORK_RESTORE_PENDING')
+  expect(formatHelpState(state)).not.toMatch(/secret-fixture|Users|config\.json/)
 })
 
 it('故障类别和恢复未完成进入副本，原始路径与敏感内容不进入副本', async () => {

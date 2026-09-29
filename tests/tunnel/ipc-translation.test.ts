@@ -89,6 +89,16 @@ describe('tunnel.start / tunnel.stop:受控失败在桥层就地翻译', () => {
 })
 
 describe('status 字段限长:超长内容源头截断,轮询不塌', () => {
+  it('自主暂停原因作为固定受控字段通过严格桥接，普通状态传空串', async () => {
+    const dataDir = directory()
+    const ordinary = computeStatus({ dataDir, daemonState: undefined, daemonUnexpectedExitAt: undefined,
+      componentMissing: [], sshBinary: '' })
+    expect(ordinary.pauseReason).toBe('')
+    const paused = { ...ordinary, state: '已停止并恢复原设置', pauseReason: 'entitlement-denied' }
+    const registry = registryWith(stubService({ status: () => paused }))
+    expect(await registry.execute('tunnel.status', undefined)).toMatchObject({ pauseReason: 'entitlement-denied' })
+  })
+
   it('manifest 塞进 250 字符超长 host → computeStatus 的 currentConfig 截到 300 以内(基线:不限长放行)', () => {
     const dataDir = directory()
     const batchId = '20260916080000-deadbeef'

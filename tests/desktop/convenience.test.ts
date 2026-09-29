@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DesktopStore, visibleBounds } from '../../app/main/desktop/preferences'
-import { keepWindowInBackground } from '../../app/main/desktop/window-lifecycle'
+import { keepWindowInBackground, showCloseToTrayHintOnce } from '../../app/main/desktop/window-lifecycle'
 import { quotaAlerts } from '../../app/main/desktop/alerts'
 import { ApplicationLauncher } from '../../app/main/desktop/applications'
 import type { UsageReport } from '../../app/main/codex-usage/types'
@@ -21,6 +21,26 @@ it('关窗口只隐藏，明确退出和无托盘时正常关闭', () => {
   close({ preventDefault }); expect(hide).toHaveBeenCalledOnce(); expect(preventDefault).toHaveBeenCalledOnce()
   background = false; close({ preventDefault })
   expect(hide).toHaveBeenCalledOnce(); expect(preventDefault).toHaveBeenCalledOnce(); expect(save).toHaveBeenCalledTimes(2)
+})
+
+it('首次关闭窗口提示托盘退出入口，同一设备只提示一次；真正退出不提示', async () => {
+  const file = join(await temporary(), 'desktop.json')
+  const store = new DesktopStore(file)
+  let close!: (event: { preventDefault(): void }) => void
+  let background = true
+  const hide = vi.fn(), save = vi.fn(), preventDefault = vi.fn(), show = vi.fn()
+  keepWindowInBackground({ on: (_event, fn) => { close = fn }, hide }, () => background, save,
+    () => showCloseToTrayHintOnce(store, show))
+  close({ preventDefault })
+  close({ preventDefault })
+  expect(show).toHaveBeenCalledOnce()
+  expect(hide).toHaveBeenCalledTimes(2)
+  showCloseToTrayHintOnce(new DesktopStore(file), show)
+  expect(show).toHaveBeenCalledOnce()
+  background = false
+  close({ preventDefault })
+  expect(show).toHaveBeenCalledOnce()
+  expect(hide).toHaveBeenCalledTimes(2)
 })
 
 it('缩放和窗口重启后仍在，断开显示器后不恢复到屏幕外', async () => {

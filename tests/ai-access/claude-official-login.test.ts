@@ -4,12 +4,14 @@ import { ClaudeOfficialLoginController, readClaudeAuthStatus, startClaudeLogin, 
 
 const fixture = resolve('tests/ai-access/fixtures/claude-login-cli.mjs')
 const command = (...extra: string[]) => ({ executable: process.execPath, args: [fixture, ...extra] })
+const outputCommand = (text: string, delay = 30) => ({ executable: process.execPath,
+  args: ['-e', `process.stdout.write(${JSON.stringify(text)}); setTimeout(() => process.exit(0), ${delay})`] })
 const options = (openExternal = vi.fn(async () => undefined), statusCheck = vi.fn(async () => false)) => ({ cwd: process.cwd(), platform: 'linux', openExternal, statusCheck, timeoutMs: 5_000 })
 
 describe('Claude 官方登录', () => {
   it('打开官方授权页，出现粘码提示后进入 code-required，提交正确登录码后成功', async () => {
     const openExternal = vi.fn(async () => undefined)
-    const session = startClaudeLogin(command(), options(openExternal))
+    const session = startClaudeLogin(command(), options(openExternal, vi.fn(async () => true)))
     await vi.waitFor(() => expect(session.state()).toBe('code-required'))
     expect(openExternal).toHaveBeenCalledWith('https://claude.ai/oauth/authorize?client_id=test&state=abc')
     session.submitCode(' code-1234 ')
@@ -49,7 +51,7 @@ describe('Claude 官方登录', () => {
 
   it('CLI 先打印帮助链接时，打开的仍是真正的授权页（第 4 轮防御）', async () => {
     const openExternal = vi.fn(async () => undefined)
-    const session = startClaudeLogin(command('docs-first'), options(openExternal))
+    const session = startClaudeLogin(command('docs-first'), options(openExternal, vi.fn(async () => true)))
     await vi.waitFor(() => expect(openExternal).toHaveBeenCalledTimes(1))
     expect(openExternal).toHaveBeenCalledWith('https://claude.ai/oauth/authorize?client_id=test&state=abc')
     expect(session.authUrl()).toBe('https://claude.ai/oauth/authorize?client_id=test&state=abc')
@@ -58,7 +60,7 @@ describe('Claude 官方登录', () => {
 
   it('兜底在会话活着时开：CLI 问码而没有任何授权形态链接被打开，立刻打开域名命中的最后一条，之后仍能粘码走到成功（第 4 轮返修）', async () => {
     const openExternal = vi.fn(async () => undefined)
-    const session = startClaudeLogin(command('domain-only-hang'), options(openExternal))
+    const session = startClaudeLogin(command('domain-only-hang'), options(openExternal, vi.fn(async () => true)))
     // ⛔ 先 await completed 再断言：浏览器必须开在会话还活着的时候（触发点＝开始问登录码）。
     await vi.waitFor(() => expect(openExternal).toHaveBeenCalledTimes(1))
     expect(session.state()).toBe('code-required')
@@ -112,6 +114,93 @@ describe('Claude 官方登录', () => {
     expect(await readClaudeAuthStatus({ executable: 'claude', args: [] }, {}, boom)).toBe(false)
   })
 
+  it.each(['You are not logged in.\n', 'Not logged in. Run /login.\n', 'You are not currently logged in.\n', 'You are no longer logged in.\n'])('否定句不触发成功核实：%s', async text => {
+    const statusCheck = vi.fn(async () => false)
+    const session = startClaudeLogin(outputCommand(text, 200), options(undefined, statusCheck))
+    await new Promise(resolve => setTimeout(resolve, 100))
+    expect(session.state()).toBe('pending')
+    expect(statusCheck).not.toHaveBeenCalled()
+    await expect(session.completed).resolves.toBe(false)
+    expect(statusCheck).toHaveBeenCalledTimes(1)
+  })
+
+  it('肯定成功文字也必须以状态复核为准，未登录不能成功', async () => {
+    const statusCheck = vi.fn(async () => false)
+    const session = startClaudeLogin(outputCommand('Login successful. You are now logged in.\n'), options(undefined, statusCheck))
+    await expect(session.completed).resolves.toBe(false)
+    expect(statusCheck).toHaveBeenCalled()
+  })
+
+  it.each(['not-ready', 'transient-error'])('成功提示早于凭据状态可用（%s）时，退出复核仍能成功', async mode => {
+    const statusCheck = vi.fn(async () => true)
+    if (mode === 'not-ready') statusCheck.mockResolvedValueOnce(false)
+    else statusCheck.mockRejectedValueOnce(new Error('fixture status not ready'))
+    const session = startClaudeLogin(outputCommand('Login successful.\n', 100), options(undefined, statusCheck))
+    await expect(session.completed).resolves.toBe(true)
+    expect(statusCheck).toHaveBeenCalledTimes(2)
+  })
+
+  it('成功提示重复刷新时只启动一次提前核实；取消后迟到的成功不生效', async () => {
+    let resolveStatus!: (value: boolean) => void
+    const statusCheck = vi.fn(() => new Promise<boolean>(resolve => { resolveStatus = resolve }))
+    const cmd = { executable: process.execPath, args: ['-e', 'setInterval(() => process.stdout.write("Login successful.\\n"), 10)'] }
+    const session = startClaudeLogin(cmd, options(undefined, statusCheck))
+    try {
+      await vi.waitFor(() => expect(statusCheck).toHaveBeenCalledTimes(1))
+      await new Promise(resolve => setTimeout(resolve, 50))
+      expect(statusCheck).toHaveBeenCalledTimes(1)
+      await session.cancel()
+      resolveStatus(true)
+      await expect(session.completed).resolves.toBe(false)
+      expect(session.state()).toBe('failed')
+    } finally { await session.cancel() }
+  })
+
+  it.each([
+    { loggedIn: true, authMethod: 'api_key' },
+    { authenticated: true, authMethod: 'api_key' },
+    { status: 'authenticated', authMethod: 'api_key' }
+  ])('API Key 认证不是官方订阅登录：%j', async data => {
+    const exec = (async () => ({ stdout: JSON.stringify(data), stderr: '' })) as never
+    expect(await readClaudeAuthStatus({ executable: 'claude', args: [] }, {}, exec)).toBe(false)
+  })
+
+  it.each([
+    { loggedIn: true, authMethod: 'claude.ai', subscriptionType: 'max' },
+    { loggedIn: true }, { authenticated: true }, { isAuthenticated: true }, { isLoggedIn: true },
+    { status: 'authenticated' }, { status: 'logged_in' }
+  ])('标准 OAuth 和旧版缺认证方式字段的明确已登录状态保留：%j', async data => {
+    const exec = (async () => ({ stdout: `noise\n${JSON.stringify(data)}\nstatus read complete`, stderr: '' })) as never
+    expect(await readClaudeAuthStatus({ executable: 'claude', args: [] }, {}, exec)).toBe(true)
+  })
+
+  it.each([
+    ['Logged in as demo@example.test\n', true],
+    ['You are not logged in\n', false],
+    ['You are no longer logged in.\n', false],
+    ['Logged in with an API key\n', false]
+  ])('旧文本状态仍区分官方登录与 API Key：%s', async (stdout, expected) => {
+    const exec = (async () => ({ stdout, stderr: '' })) as never
+    expect(await readClaudeAuthStatus({ executable: 'claude', args: [] }, {}, exec)).toBe(expected)
+  })
+
+  it.each([
+    ['Login successful.\n', '{"loggedIn":true,"authMethod":"api_key"}'],
+    ['You are no longer logged in.\n', 'You are no longer logged in.\n']
+  ])('控制器不会因文案 %s 和不支持的状态切到官方订阅', async (banner, status) => {
+    const useOfficial = vi.fn(async () => undefined)
+    const exec = (async () => ({ stdout: status, stderr: '' })) as never
+    const cmd = outputCommand(banner)
+    const controller = new ClaudeOfficialLoginController({
+      findCommand: async () => cmd,
+      startLogin: () => startClaudeLogin(cmd, options(undefined, vi.fn(() => readClaudeAuthStatus(cmd, {}, exec)))),
+      useOfficial
+    })
+    await controller.start()
+    await vi.waitFor(() => expect(controller.status()).toEqual({ status: 'failed' }))
+    expect(useOfficial).not.toHaveBeenCalled()
+  })
+
   // Phase 2 ⑦:CLI 在 JSON 后面再打一行人类可读的尾随输出时,⛔ 把成功登录判成失败——
   // 登录刚成功,状态核对却说没登录,客户面对「登录失败」重试循环。
   it('JSON 带尾随输出时仍以其中的已登录字段为准', async () => {
@@ -127,7 +216,7 @@ describe('Claude 官方登录', () => {
     const useOfficial = vi.fn(async () => undefined)
     const missing = new ClaudeOfficialLoginController({ findCommand: async () => null, startLogin: () => { throw new Error('x') }, useOfficial })
     expect(await missing.start()).toEqual({ status: 'not-installed' })
-    const controller = new ClaudeOfficialLoginController({ findCommand: async () => command(), startLogin: (cmd) => startClaudeLogin(cmd, options()), useOfficial })
+    const controller = new ClaudeOfficialLoginController({ findCommand: async () => command(), startLogin: (cmd) => startClaudeLogin(cmd, options(undefined, vi.fn(async () => true))), useOfficial })
     expect(await controller.start()).toEqual({ status: 'pending' })
     await vi.waitFor(() => expect(controller.status()).toEqual({ status: 'code-required' }))
     controller.submitCode('code-1234')

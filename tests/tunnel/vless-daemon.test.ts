@@ -35,7 +35,7 @@ it('生产守护接 VLESS：真实回环连接、失败状态、自动恢复、�
     expect(readTrafficObservation(dataDir)?.downloadBytes).toBeGreaterThan(0)
     expect(Object.keys(readFakeStore(storePath)).length).toBeGreaterThan(0)
     await node.stop()
-    await waitFor(() => readDaemonState(dataDir)?.state === 'error', 4000)
+    await waitFor(() => readDaemonState(dataDir)?.state === 'error', 10000)
     await node.start()
     await waitFor(() => readDaemonState(dataDir)?.state === 'connected', 8000)
     writeFileAtomic(layout.intent(dataDir), JSON.stringify({ desired: 'user-disconnected' }))
@@ -47,6 +47,9 @@ it('生产守护接 VLESS：真实回环连接、失败状态、自动恢复、�
     expect(child.exitCode).toBe(0)
     expect(logs).not.toContain(node.credential.uuid)
     expect(logs).toContain('重连尝试')
+    // N-27:真实进程的断→自愈场景同样要有成功下文(次数+中断时长),⛔ 停在「重连尝试 N/5」
+    expect(logs).toContain('重连成功')
+    expect(logs).toContain('本次中断')
     expect(logs).not.toContain(node.credential.publicKey)
   } finally {
     if (child && child.exitCode === null && child.signalCode === null) {
@@ -57,4 +60,4 @@ it('生产守护接 VLESS：真实回环连接、失败状态、自动恢复、�
     await node.close()
     removeTempDir(root)
   }
-}, 25000)
+}, 30000)

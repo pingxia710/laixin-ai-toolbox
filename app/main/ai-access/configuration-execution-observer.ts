@@ -233,29 +233,41 @@ interface StartupRootAssignment {
 
 function startupRootAssignments(contents: string, home: string): readonly StartupRootAssignment[] {
   const assignments: StartupRootAssignment[] = []
-  let dynamicStartup = false
+  let opaqueStartup = false
+  let blockDepth = 0
+  let groupDepth = 0
+  let continued = false
   for (const rawLine of contents.replace(/\r\n?/g, '\n').split('\n')) {
-    const line = rawLine.trim()
-    if (line === '' || line.startsWith('#')) continue
-    // We do not execute startup files. A control group, shell composition, or dynamically run
-    // command can change any root for one launch but not another, so no automatic target is safe.
-    dynamicStartup ||= hasDynamicStartupSyntax(line)
+    const { line, syntax, incompleteQuote } = startupLine(rawLine)
+    if (line === '') continue
+    // Loading another script can change any root; multiline literals cannot be read as
+    // assignments. Ordinary PATH/prompt setup does not make every root uncertain.
+    opaqueStartup ||= incompleteQuote || syntax.includes('<<') || /(?:^|[;&|({]\s*|\b(?:builtin|command|then|do|else|if|elif|while|until)\s+)(?:(?:source|eval)\b|\.\s+)/.test(syntax)
+    const dynamicAssignment = blockDepth > 0 || groupDepth > 0 || continued || hasDynamicStartupSyntax(syntax)
     const shell = /^(?:export\s+)?(CODEX_HOME|CLAUDE_CONFIG_DIR|HERMES_HOME)\s*=\s*(.+?)\s*$/.exec(line)
     const fish = /^set\s+-gx\s+(CODEX_HOME|CLAUDE_CONFIG_DIR|HERMES_HOME)\s+(.+?)\s*$/.exec(line)
     const match = shell ?? fish
-    if (match === null) {
-      if (/\b(?:CODEX_HOME|CLAUDE_CONFIG_DIR|HERMES_HOME)\b/.test(line)) {
-        const name = /\b(CODEX_HOME|CLAUDE_CONFIG_DIR|HERMES_HOME)\b/.exec(line)?.[1] as StartupRootAssignment['name']
-        assignments.push({ name, value: undefined })
+    const value = match !== null && !dynamicAssignment ? resolveStartupRoot(match[2], home) : undefined
+    if (match === null || value === undefined) {
+      for (const reference of line.matchAll(/\b(CODEX_HOME|CLAUDE_CONFIG_DIR|HERMES_HOME)\b/g)) {
+        assignments.push({ name: reference[1] as StartupRootAssignment['name'], value: undefined })
       }
     } else {
-      assignments.push({
-        name: match[1] as StartupRootAssignment['name'],
-        value: resolveStartupRoot(match[2], home)
-      })
+      assignments.push({ name: match[1] as StartupRootAssignment['name'], value })
     }
+    for (const token of syntax.matchAll(/(?:^|[;&|]\s*|\b(?:then|do|else)\s+)(if|for|while|until|case|select|begin|switch|function|fi|done|esac|end)\b/g)) {
+      if (/^(?:fi|done|esac|end)$/.test(token[1])) blockDepth = Math.max(0, blockDepth - 1)
+      else if (token[1] !== 'function' || !syntax.includes('{')) blockDepth += 1
+    }
+    // Quotes and variable expansions are absent from syntax, so prompt strings and ${PATH}
+    // cannot create a fake group that would capture a later, unconditional root assignment.
+    for (const character of syntax) {
+      if (character === '{' || character === '(') groupDepth += 1
+      else if (character === '}' || character === ')') groupDepth = Math.max(0, groupDepth - 1)
+    }
+    continued = syntax.endsWith('\\')
   }
-  if (dynamicStartup) {
+  if (opaqueStartup) {
     return [
       ...assignments,
       { name: 'CODEX_HOME', value: undefined },
@@ -266,30 +278,48 @@ function startupRootAssignments(contents: string, home: string): readonly Startu
   return assignments
 }
 
+/** Strip shell comments and hide quoted text only for syntax classification; never evaluate it. */
+function startupLine(raw: string): { line: string; syntax: string; incompleteQuote: boolean } {
+  let quote: string | undefined
+  let syntax = ''
+  let end = raw.length
+  for (let index = 0; index < raw.length; index += 1) {
+    const character = raw[index]
+    if (character === '\\' && quote !== "'") {
+      syntax += quote === undefined ? '\\ ' : '  '
+      index += 1
+    } else if (quote !== undefined) {
+      if (character === quote) quote = undefined
+      syntax += ' '
+    } else if (character === '"' || character === "'") {
+      quote = character
+      syntax += ' '
+    } else if (character === '#' && (index === 0 || /\s/.test(raw[index - 1]))) {
+      end = index
+      break
+    } else syntax += character
+  }
+  return { line: raw.slice(0, end).trim(), syntax: syntax.replace(/\$\{[^}]*\}/g, '').trim(), incompleteQuote: quote !== undefined }
+}
+
 function hasDynamicStartupSyntax(line: string): boolean {
-  const command = /(?:^|[;&|]\s*|\b(?:builtin|command)\s+)(?:source|eval)\b/.test(line)
-    || /(?:^|[;&|]\s*|\b(?:builtin|command)\s+)\.\s+/.test(line)
   const control = /^(?:if|for|while|until|case|select|function|begin|switch)\b/.test(line)
-  // `${HOME}` is the only brace expansion accepted by resolveStartupRoot below. Every other
-  // brace, subshell, operator, redirection, or line continuation is a compound shell statement.
-  const composition = /(?:&&|\|\||[|<>]|[()\\])/.test(line)
-    || /[{}]/.test(line.replaceAll('${HOME}', ''))
-  return command || control || composition
+  return control || /[;&|<>(){}\\]/.test(line)
 }
 
 function resolveStartupRoot(raw: string, home: string): string | undefined {
   const trimmed = raw.trim()
   const quote = trimmed[0]
   const quoted = quote === '"' || quote === "'"
-  if (quoted && !trimmed.endsWith(quote)) return undefined
-  const value = quoted ? trimmed.slice(1, -1) : trimmed.replace(/\s+#.*$/, '')
+  if (quoted && (!trimmed.endsWith(quote) || trimmed.slice(1, -1).includes(quote))) return undefined
+  const value = quoted ? trimmed.slice(1, -1) : trimmed
   // A bare shell token cannot contain whitespace. Quoted static paths may contain whitespace,
   // but neither form may carry an unexpanded variable or executable shell syntax.
   if (value === '' || !quoted && (/\s/.test(value) || /[*?\u005B\u005D]/.test(value))) return undefined
-  const expanded = value === '~' || value === '$HOME' || value === '${HOME}' ? home
-    : value.startsWith('~/') ? join(home, value.slice(2))
-      : value.startsWith('$HOME/') ? join(home, value.slice(6))
-        : value.startsWith('${HOME}/') ? join(home, value.slice(8)) : value
+  const expanded = !quoted && (value === '~' || value.startsWith('~/')) ? join(home, value.slice(2))
+    : quote !== "'" && (value === '$HOME' || value === '${HOME}') ? home
+      : quote !== "'" && value.startsWith('$HOME/') ? join(home, value.slice(6))
+        : quote !== "'" && value.startsWith('${HOME}/') ? join(home, value.slice(8)) : value
   if (/[$\\;`&|<>(){}]/.test(expanded)) return undefined
   if (!posix.isAbsolute(expanded)) return undefined
   return posix.normalize(expanded)
@@ -317,7 +347,7 @@ async function observeProcessOverrides(
     try {
       const output = await run('/bin/ps', ['-axww', '-o', 'pid=,ppid=,command='])
       const processes = output.split(/\r?\n/).map(posixProcess)
-      const macDesktopRoots = platform === 'darwin' ? macCodexDesktopRoots(processes) : new Map<string, MacCodexDesktopApp>()
+      const macDesktopRoots = platform === 'darwin' ? macCodexDesktopRoots(processes, home) : new Map<string, MacCodexDesktopApp>()
       const processByPid = new Map(processes.flatMap(process => process.pid === undefined ? [] : [[process.pid, process] as const]))
       const result: Partial<Record<AiAccessShell, ConfigurationExecutionContext>> = {}
       for (const process of processes) {
@@ -496,7 +526,7 @@ function knownClientInvocation(shell: AiAccessShell, line: string, home: string,
   const normalized = line.replace(/\\/g, '/')
   const homePath = home.replace(/\\/g, '/')
   if (shell === 'codex') {
-    return /\/(?:Codex|ChatGPT)\.app\/Contents\/Resources\/codex(?:\s|$)/.test(normalized) ||
+    return /\/(?:Codex|ChatGPT)\.app\/Contents\/Resources\/(?:codex|codex-cli\/bin\/codex|codex-cli\/CodexCLI\.app\/Contents\/MacOS\/codex)(?:\s|$)/.test(normalized) ||
       (normalized.includes('/@openai/codex/') && normalized.includes('/vendor/') && /\/codex(?:\s|$)/.test(normalized)) ||
       normalized.includes(path.join(home, '.local', 'lib', 'node_modules').replace(/\\/g, '/')) && normalized.includes('/@openai/codex/')
   }
@@ -518,26 +548,25 @@ function posixProcess(line: string): PosixProcess {
   return match === null ? { command: line } : { pid: match[1], ppid: match[2], command: match[3] }
 }
 
-const macCodexDesktopApps = [
-  {
-    bundle: '/Applications/ChatGPT.app',
-    executable: '/Applications/ChatGPT.app/Contents/MacOS/ChatGPT',
-    appServer: '/Applications/ChatGPT.app/Contents/Resources/codex -c features.code_mode_host=true app-server --analytics-default-enabled -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true',
-    sandbox: '/Applications/ChatGPT.app/Contents/Resources/codex sandbox'
-  },
-  {
-    bundle: '/Applications/Codex.app',
-    executable: '/Applications/Codex.app/Contents/MacOS/Codex',
-    appServer: '/Applications/Codex.app/Contents/Resources/codex -c features.code_mode_host=true app-server --analytics-default-enabled -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true',
-    sandbox: '/Applications/Codex.app/Contents/Resources/codex sandbox'
-  }
-] as const
+function macCodexDesktopApps(home: string) {
+  return ['/Applications', posix.join(home, 'Applications')].flatMap(root => ['ChatGPT', 'Codex'].map(name => {
+    const bundle = posix.join(root, `${name}.app`)
+    const binaries = ['codex', 'codex-cli/bin/codex', 'codex-cli/CodexCLI.app/Contents/MacOS/codex']
+      .map(relative => `${bundle}/Contents/Resources/${relative}`)
+    return {
+      bundle, executable: `${bundle}/Contents/MacOS/${name}`,
+      appServers: binaries.map(binary => `${binary} -c features.code_mode_host=true app-server --analytics-default-enabled -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true`),
+      sandboxes: binaries.map(binary => `${binary} sandbox`)
+    }
+  }))
+}
 
-type MacCodexDesktopApp = typeof macCodexDesktopApps[number]
+type MacCodexDesktopApp = ReturnType<typeof macCodexDesktopApps>[number]
 
-function macCodexDesktopRoots(processes: readonly PosixProcess[]): Map<string, MacCodexDesktopApp> {
+function macCodexDesktopRoots(processes: readonly PosixProcess[], home: string): Map<string, MacCodexDesktopApp> {
+  const apps = macCodexDesktopApps(home)
   return new Map(processes.flatMap(process => {
-    const app = macCodexDesktopApps.find(candidate => process.command === candidate.executable)
+    const app = apps.find(candidate => process.command === candidate.executable)
     return process.pid !== undefined && process.ppid === '1' && app !== undefined
       ? [[process.pid, app] as const] : []
   }))
@@ -549,17 +578,19 @@ function knownMacCodexDesktopProcess(
   roots: ReadonlyMap<string, MacCodexDesktopApp>
 ): boolean {
   const command = process.command.trim()
-  const appServer = macCodexDesktopApps.find(app => command === app.appServer)
+  const apps = [...roots.values()]
+  const appServer = apps.find(app => app.appServers.includes(command))
   if (appServer !== undefined) return process.ppid !== undefined && roots.get(process.ppid) === appServer
-  const sandbox = macCodexDesktopApps.find(app => knownMacCodexDesktopSandbox(command, app))
+  const sandbox = apps.find(app => knownMacCodexDesktopSandbox(command, app))
   return sandbox !== undefined && macCodexDesktopSandboxParentChain(process, processByPid, roots, sandbox)
 }
 
 function knownMacCodexDesktopSandbox(command: string, app: MacCodexDesktopApp): boolean {
-  if (command === app.sandbox || command === `${app.sandbox} -c default_permissions=node_repl`) return true
-  const prefix = `${app.sandbox} -c shell_environment_policy.inherit="all" -c default_permissions="node_repl" -c permissions.node_repl={`
+  if (app.sandboxes.some(sandbox => command === sandbox || command === `${sandbox} -c default_permissions=node_repl`)) return true
+  const prefix = app.sandboxes.map(sandbox => `${sandbox} -c shell_environment_policy.inherit="all" -c default_permissions="node_repl" -c permissions.node_repl={`)
+    .find(candidate => command.startsWith(candidate))
   const separator = '} -- '
-  if (!command.startsWith(prefix)) return false
+  if (prefix === undefined) return false
   const separatorAt = command.lastIndexOf(separator)
   if (separatorAt < prefix.length) return false
   const worker = command.slice(separatorAt + separator.length)
@@ -579,7 +610,7 @@ function macCodexDesktopSandboxParentChain(
     visited.add(parent)
     const candidate = processByPid.get(parent)
     if (candidate === undefined) return false
-    if (candidate.command.trim() === app.appServer) {
+    if (app.appServers.includes(candidate.command.trim())) {
       return candidate.ppid !== undefined && roots.get(candidate.ppid) === app
     }
     if (!knownMacCodexDesktopCodeModeHelper(candidate.command.trim(), app)) return false

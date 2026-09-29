@@ -9,8 +9,8 @@ afterEach(async () => {
   await Promise.all(fixtures.splice(0).map(fixture => fixture.dispose()))
 })
 
-async function connected(shells: readonly ('codex' | 'claude')[] = ['codex', 'claude']) {
-  const f = shellConfigFixture()
+async function connected(shells: readonly ('codex' | 'claude')[] = ['codex', 'claude'], extras: Parameters<typeof shellConfigFixture>[1] = {}) {
+  const f = shellConfigFixture(undefined, extras)
   fixtures.push(f)
   for (const shell of shells) {
     await f.service.saveProviderKey(shell, 'deepseek', `sk-fixture-recovery-${shell}-0123456789`)
@@ -54,6 +54,42 @@ describe('重开 / 唤醒 / 断网恢复后的接入核对', () => {
     expect((await f.service.serviceStatus()).running).toBe(true)
   })
 
+  it('手动恢复需要改写 Claude 配置时，先撤销应用隔离租约再写入新端口', async () => {
+    const order: string[] = []
+    const f = await connected(['claude'], { beforeRecoveryRewrite: async shells => {
+      expect(shells).toEqual(['claude'])
+      order.push('revoke')
+    } })
+    const write = f.file.write
+    f.file.write = async (path, contents) => {
+      if (path === f.claudePath && contents.includes('127.0.0.1:')) order.push('write')
+      await write(path, contents)
+    }
+    const original = port(f)
+    await f.gateway.stop()
+    const blocker = new AiGateway({ fetch: f.fetcher })
+    blockers.push(blocker)
+    await blocker.start(original, 'laixin-fixture-blocker-token-0123456789')
+
+    await expect(f.service.recoverAccess('manual')).resolves.toMatchObject({ outcome: 'repaired', rewroteShells: ['claude'] })
+    expect(order).toEqual(['revoke', 'write'])
+  })
+
+  it('Claude 隔离不能安全撤销时，恢复不改写其 settings 或把新端口持久化', async () => {
+    const f = await connected(['claude'], { beforeRecoveryRewrite: async () => { throw new Error('fixture revoke failed') } })
+    const original = port(f)
+    const before = f.data.get(f.claudePath)
+    const write = vi.spyOn(f.file, 'write')
+    await f.gateway.stop()
+    const blocker = new AiGateway({ fetch: f.fetcher })
+    blockers.push(blocker)
+    await blocker.start(original, 'laixin-fixture-blocker-token-0123456789')
+
+    await expect(f.service.recoverAccess('manual')).resolves.toMatchObject({ outcome: 'still_failing', code: 'configuration_failed' })
+    expect(f.data.get(f.claudePath)).toBe(before)
+    expect(write).not.toHaveBeenCalled()
+  })
+
   it('换端口之后客户端用新地址能通，旧地址不再是我们的服务', async () => {
     const f = await connected(['codex'])
     const original = port(f)
@@ -71,13 +107,38 @@ describe('重开 / 唤醒 / 断网恢复后的接入核对', () => {
     await response.text()
   })
 
-  it('本机服务完全起不来就报本机服务未运行，⛔ 说成服务商的问题', async () => {
+  it('本机服务完全起不来就报启动失败，⛔ 说成服务商的问题', async () => {
     const f = await connected(['codex'])
     await f.gateway.stop()
     vi.spyOn(f.gateway, 'start').mockRejectedValue(new Error('fixture cannot listen'))
     const result = await f.service.recoverAccess('periodic')
-    expect(result).toMatchObject({ outcome: 'still_failing', code: 'local_service_down' })
+    expect(result).toMatchObject({ outcome: 'still_failing', code: 'local_service_start_failed' })
     expect(result.message).toContain('本机 API 服务')
+  })
+
+  it('非端口占用的监听失败不换端口或改写客户端配置，并保留安全的失败类别', async () => {
+    const f = await connected(['codex'])
+    const before = { relay: f.state().relay, config: f.data.get(f.codexPath) }
+    await f.gateway.stop()
+    const start = vi.spyOn(f.gateway, 'start').mockRejectedValue(Object.assign(new Error('private listen detail'), { code: 'EACCES' }))
+    const result = await f.service.recoverAccess('periodic')
+    expect(result).toMatchObject({ outcome: 'still_failing', code: 'local_service_start_failed' })
+    expect(start).toHaveBeenCalledTimes(1)
+    expect(f.state().relay).toEqual(before.relay)
+    expect(f.data.get(f.codexPath)).toBe(before.config)
+    expect(await f.service.serviceStatus()).toMatchObject({ running: false, routes: [], startupError: 'local_service_start_failed' })
+    expect(JSON.stringify(result)).not.toContain('private listen detail')
+  })
+
+  it('工具箱启动时保留真实的网关失败类别，后续恢复成功清除旧错误', async () => {
+    const f = await connected(['codex'])
+    await f.gateway.stop()
+    const start = vi.spyOn(f.gateway, 'start').mockRejectedValueOnce(Object.assign(new Error('private listen detail'), { code: 'EACCES' }))
+    await f.service.initialize()
+    expect(await f.service.serviceStatus()).toMatchObject({ running: false, startupError: 'local_service_start_failed' })
+    start.mockRestore()
+    expect(await f.service.recoverAccess('periodic')).toMatchObject({ outcome: 'ok' })
+    expect((await f.service.serviceStatus()).startupError).toBeUndefined()
   })
 
   it('服务在跑但配置被别的工具改了，恢复结论是仍有问题并指名是哪个 AI', async () => {

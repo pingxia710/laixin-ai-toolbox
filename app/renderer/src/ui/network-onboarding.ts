@@ -13,11 +13,26 @@ export interface NetworkOnboardingView {
   terms: CommercialTerms | null
 }
 
+function accountEntry(terms: CommercialTerms | null): Pick<NetworkOnboardingView, 'title' | 'description' | 'label' | 'action'> {
+  return {
+    title: '先注册或登录',
+    description: terms?.wechatLoginAvailable === true
+      ? '可以先扫码，再在网页注册或登录来信账号；也可以先用账号密码登录，再扫码绑定微信。原套餐和记录仍归原账号。'
+      : '微信扫码暂不可用。可以使用账号密码登录或注册，稍后再绑定微信。',
+    label: '前往账号入口',
+    action: 'account'
+  }
+}
+
 export function buildNetworkOnboarding(account: AccountView, status: TunnelStatusView | null | undefined): NetworkOnboardingView {
   const terms = account.terms ?? null
   const view = (step: NetworkOnboardingView['step'], title: string, description: string, label: string, action: OnboardingAction): NetworkOnboardingView => ({ step, title, description, label, action, terms })
   if (status?.unrestored || status?.componentMissing || status?.state === '异常') {
     return view(3, '连接遇到问题，先处理再继续', status.unrestored || status.componentMissing || status.message || '请到网络页查看原因；也可以联系来信客服。', '查看连接问题', 'tunnel')
+  }
+  if (status?.state === '断开中') {
+    return view(3, status.pauseReason === 'entitlement-denied' ? '权益校验未通过，正在暂停网络' : '正在断开网络',
+      '正在恢复你的原网络设置。请等待完成后再连接。', '查看连接状态', 'tunnel')
   }
   if (status?.state === '通道待确认' || status?.authorization === '保留先前连接，等待重新核验') {
     return view(3, '正在重新确认网络', status.message, '查看连接状态', 'tunnel')
@@ -32,7 +47,8 @@ export function buildNetworkOnboarding(account: AccountView, status: TunnelStatu
     return view(1, account.code ? '暂时读不到账号状态' : '正在读取账号状态', account.code ? '请重试；仍不成功可以联系来信客服。' : '稍等一下，工具箱会找到你当前该做的步骤。', account.code ? '重新检查' : '读取中…', account.code ? 'refresh' : 'none')
   }
   if (account.state !== 'signed-in') {
-    return view(1, '先注册账号', '账号自己取名，不需要手机或邮箱。注册后请保存恢复码，忘记密码时用它找回；保存后会回到这里继续。', '注册并继续', 'register')
+    const entry = accountEntry(terms)
+    return view(1, entry.title, entry.description, entry.label, entry.action)
   }
   const overview = account.overview
   if (!overview || !overview.networkAvailable) {
@@ -70,7 +86,7 @@ export function buildNetworkOnboarding(account: AccountView, status: TunnelStatu
 }
 
 const stepDescriptions = (terms: CommercialTerms | null) => ({
-  1: { label: '注册或登录', title: '先注册账号', description: '注册来信账号，用于领取体验流量和管理网络套餐。' },
+  1: { label: '注册或登录', title: accountEntry(terms).title, description: accountEntry(terms).description },
   2: trialStepCopy(terms),
   3: { label: '连接网络', title: '连接网络', description: '领取流量后，工具箱会准备网络配置。点击连接，等状态显示“已连接”后即可使用。' },
   4: { label: '下载与版本', title: '查看 Codex 下载与版本', description: '到 Codex 的“下载/版本信息”查看本机版本，或打开官方下载页；完成安装后即可登录使用。' }

@@ -14,8 +14,12 @@ export function sanitizeMatrixReport(value: unknown): ModelMatrixReport | undefi
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
   const raw = value as Record<string, unknown>
   if (typeof raw.at !== 'string' || !Number.isFinite(Date.parse(raw.at)) || !Array.isArray(raw.entries)) return undefined
+  // 指纹可选，但出现就必须是 16 位十六进制——形状不对整份作废（与其余字段同一口径）。
+  const stateFingerprint = raw.stateFingerprint === undefined ? undefined
+    : typeof raw.stateFingerprint === 'string' && /^[a-f0-9]{16}$/.test(raw.stateFingerprint) ? raw.stateFingerprint : null
+  if (stateFingerprint === null) return undefined
   const entries = raw.entries.map(sanitizeMatrixEntry).filter((entry): entry is ModelMatrixEntry => entry !== undefined)
-  return { at: raw.at, entries }
+  return { at: raw.at, entries, ...(stateFingerprint === undefined ? {} : { stateFingerprint }) }
 }
 
 function sanitizeMatrixEntry(value: unknown): ModelMatrixEntry | undefined {

@@ -42,6 +42,8 @@ export interface ResidentBridge {
   wake(): Promise<boolean>
   /** daemon.lock 里的持有者还活着吗——常驻模式下这是「守护在不在」的唯一事实来源。 */
   alive(): boolean
+  /** 当前在席守护的本轮身份；锁不可读、持有者不活或身份缺失时不信任旧 state。 */
+  seatRunId(): string | undefined
   /** 甲-10 补刀:最近一次校准落在「注册被拒、由存量管理员任务承载」上(armed 照答「在」,
    *  但那份任务与本版定义对不上)。supervisor 的叫醒周期耗尽而席位仍空时,据此回落到
    *  主进程自己 spawn——任务拉不起守护,就不会冒出第二份;网络硬标准:⛔ 放弃式处理。 */
@@ -161,6 +163,10 @@ export class DaemonSupervisor {
     return this.residentActive() && this.deps.resident?.alive() === true
   }
 
+  isResidentOnlyRunning(): boolean {
+    return this.daemon === undefined && this.residentActive() && this.deps.resident?.alive() === true
+  }
+
   /** 本轮守护归不归常驻管。⛔ 直接用 armed():客户运行中把开关拨到关会当场卸掉常驻项,
    *  但这一轮常驻守护还在跑(交界约定:关开关不断当前连接)——只看 armed() 会把连着的界面抹成未连接。
    *  校准完成前同理(Windows 开机校准有 ~1 秒延迟,开机接续确定性地抢跑):armed() 还是假的,
@@ -179,10 +185,9 @@ export class DaemonSupervisor {
   }
 
   lastUnexpectedExitAt(state?: DaemonStateView): number | undefined {
-    // 常驻守护的 runId 是它自己生成的,主进程不知道,⛔ 拿 this.runId 去比(永远不等,异常标记永远清不掉)。
-    const connectedNow = this.residentActive()
-      ? state?.state === 'connected' && this.isRunning()
-      : this.daemon !== undefined && state?.runId === this.runId && state.state === 'connected'
+    const connectedNow = this.daemon !== undefined
+      ? state?.runId === this.runId && state.state === 'connected'
+      : this.residentActive() && this.currentState(state)?.state === 'connected'
     if (connectedNow) {
       this.unexpectedExit = undefined
       this.resetRestartState()
@@ -308,8 +313,12 @@ export class DaemonSupervisor {
   currentState(state: DaemonStateView | undefined): DaemonStateView | undefined {
     // 「守护在不在」走 isRunning(常驻模式下问席位锁),⛔ 只看句柄——否则常驻连着时界面会被抹成未连接。
     if (!this.isRunning() && (state?.state === 'connected' || state?.state === 'connecting')) return undefined
-    // runId 比对只在 spawn 模式成立:那时 runId 是本进程发的。常驻守护的 runId 本进程不知道,比了会永远卡「连接中」。
+    // spawn 的 runId 由本进程发；常驻守护自己发，但主进程可从当前在席锁核对，不能拿旧代 state 冒充已连。
     if (this.daemon && state?.runId && state.runId !== this.runId) return { state: 'connecting' }
+    if (!this.daemon && this.residentActive() && this.deps.resident?.alive() === true) {
+      const seatRunId = this.deps.resident.seatRunId()
+      if (!seatRunId || state?.runId !== seatRunId) return { state: 'connecting' }
+    }
     return state
   }
 

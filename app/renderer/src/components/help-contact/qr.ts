@@ -134,7 +134,7 @@ function drawFinder(set: (x: number, y: number, dark: boolean) => void, x: numbe
     for (let deltaX = -1; deltaX <= 7; deltaX += 1) {
       const inBox = deltaX >= 0 && deltaX <= 6 && deltaY >= 0 && deltaY <= 6
       const distance = Math.max(Math.abs(deltaX - 3), Math.abs(deltaY - 3))
-      set(x + deltaX, y + deltaY, inBox && (distance !== 1 && distance !== 2))
+      set(x + deltaX, y + deltaY, inBox && distance !== 2)
     }
   }
 }

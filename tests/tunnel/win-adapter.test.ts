@@ -145,6 +145,59 @@ describe('WinINET 适配器纯逻辑(放行闸内,子进程)', () => {
 
 })
 
+function pathIdentityProbe() {
+  const script = `
+    process.env.TOOLBOX_REAL_NETWORK_ADAPTER = '1'
+    const mod = await import(${JSON.stringify(ADAPTER_URL)})
+    const paths = [
+      [
+        { metric: 10, interfaceIndex: 12, interfaceGuid: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', kind: 'network-interface' },
+        { metric: 10, interfaceIndex: 27, interfaceGuid: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', kind: 'virtual-tun' }
+      ],
+      [
+        { metric: 10, interfaceIndex: 12, interfaceGuid: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', kind: 'network-interface' },
+        { metric: 11, interfaceIndex: 27, interfaceGuid: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', kind: 'virtual-tun' }
+      ],
+      [{ metric: 10, interfaceIndex: 27, interfaceGuid: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', kind: 'virtual-tun' }],
+      [{ metric: 10, interfaceIndex: 27, interfaceGuid: 'not-a-guid', kind: 'virtual-tun' }]
+    ]
+    const adapter = mod.createAdapter({
+      execFile: (command, _args, options) => {
+        if (command !== 'powershell.exe') throw new Error('UNEXPECTED_COMMAND')
+        const request = JSON.parse(options.input)
+        if (request.operation !== 'path') throw new Error('UNEXPECTED_REQUEST')
+        return JSON.stringify(paths.shift())
+      },
+      sleep: () => undefined
+    })
+    let ambiguous = false
+    try { adapter.currentPathIdentity() } catch (error) { ambiguous = error.code === '系统设置暂不可达' }
+    const first = adapter.currentPathIdentity()
+    const second = adapter.currentPathIdentity()
+    let rejected = false
+    try { adapter.currentPathIdentity() } catch (error) { rejected = error.code === '系统设置暂不可达' }
+    console.log(JSON.stringify({ ambiguous, first, second, rejected }))
+  `
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 20_000 })
+  if (result.status !== 0) throw new Error(`路径身份探针失败:${result.stderr}`)
+  return JSON.parse(result.stdout) as { ambiguous: boolean; first: { id: string; kind: string }; second: { id: string; kind: string }; rejected: boolean }
+}
+
+describe('WinINET 默认路径身份（N-55 复用证据）', () => {
+  const result = pathIdentityProbe()
+
+  it('真实适配器以唯一最低度量默认路由接口 GUID 区分物理路径与 TUN，不能用固定 WinINET 身份蒙混', () => {
+    expect(result.first).toEqual({ id: 'if:12:guid:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', kind: 'network-interface' })
+    expect(result.second).toEqual({ id: 'if:27:guid:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', kind: 'virtual-tun' })
+    expect(result.first.id).not.toBe(result.second.id)
+  })
+
+  it('默认路径缺少可验证接口 GUID 时受控拒绝，不制造稳定 sentinel', () => {
+    expect(result.ambiguous).toBe(true)
+    expect(result.rejected).toBe(true)
+  })
+})
+
 describe('WinINET 写序与瞬时重试(收敛包2 件5,放行闸内,子进程注入)', () => {
   const result = behaviorProbe()
 

@@ -33,11 +33,14 @@ interface UpdaterOptions {
   wait?: (ms: number) => Promise<void>
   /** ⛔ 只为行为测试注入,生产不传:起助手用的 spawn(测试拿它钉「助手是怎么被起的」)。 */
   spawn?: typeof spawn
+  /** Stops only the verified AI router before the updater can replace its executable. */
+  prepareAiRouterUpdate?: () => Promise<(() => Promise<void>) | undefined>
 }
 
 interface PreviousUpdateFailure {
   readonly version: string
   readonly code: string
+  readonly message: string
 }
 
 const updateFailureMessages: Record<string, string> = {
@@ -49,19 +52,33 @@ const updateFailureMessages: Record<string, string> = {
   UPDATE_STARTUP_UNCONFIRMED: '新版未能正常启动'
 }
 
-function updateFailureView(failure: PreviousUpdateFailure, notes = ''): UpdateView {
-  const reason = updateFailureMessages[failure.code] ?? '上一次更新未完成'
-  return { state: 'error', version: failure.version, notes, progress: 0,
-    message: `${reason}。原版本、账号和配置已保留；请点击“重新下载”重试，仍失败请复制诊断给客服。` }
+const updateHelperFailureMessages = new Map([
+  ['新版已启动，但网络恢复提交未确认。原版本备份已保留，请联系来信客服协助。', '新版已启动，但网络恢复提交未确认'],
+  ['新版已启动，网络恢复已提交，但最终更新结果未能写入。原版本备份已保留，请联系来信客服协助。', '新版已启动，网络已恢复，但更新结果未能确认']
+])
+
+function updateFailureView(failure: PreviousUpdateFailure, installedVersion: string, retryRelease?: UpdateRelease): UpdateView {
+  const reason = updateFailureMessages[failure.code] ?? updateHelperFailureMessages.get(failure.message) ?? '上一次更新未完成'
+  const current = failure.version === installedVersion
+  const retry = retryRelease === undefined ? '' : `现可下载 ${displayReleaseVersion(retryRelease.version)} 重试，仍失败请复制诊断给客服。`
+  return { state: 'error', version: retryRelease?.version ?? failure.version, notes: retryRelease?.notes ?? '', progress: 0,
+    retryDownload: retryRelease !== undefined,
+    message: current
+      ? `${reason}。当前版本已启动，但更新收尾仍需核对；${retry || '请检查网络状态并复制诊断给客服。'}`
+      : `${reason}（${failure.version}）。原版本、账号和配置已保留；${retry || '当前没有可重试的更新，请复制诊断给客服。'}` }
 }
 
-function readPreviousUpdateFailure(directory: string): PreviousUpdateFailure | undefined {
+function readPreviousUpdateFailure(directory: string, installedVersion: string): PreviousUpdateFailure | undefined {
   try {
     const raw = physicalFs.readFileSync(join(directory, 'result.json'), 'utf8')
     // 助手(PowerShell 5.1)的 Set-Content -Encoding UTF8 写出的是带 BOM 的 UTF-8,JSON.parse 对 BOM 直接抛,
-    const value = JSON.parse(raw.replace(/^\uFEFF/, '')) as { version?: unknown; state?: unknown; code?: unknown }
+    const value = JSON.parse(raw.replace(/^\uFEFF/, '')) as { version?: unknown; state?: unknown; code?: unknown; message?: unknown }
     if (value.state !== 'error' || typeof value.version !== 'string' || value.version.length === 0 || value.version.length > 100) return undefined
-    return { version: value.version, code: typeof value.code === 'string' && /^[A-Z0-9_]{1,80}$/.test(value.code) ? value.code : 'UPDATE_PREVIOUS_ATTEMPT_FAILED' }
+    if (value.version !== installedVersion && !newerVersion(value.version, installedVersion) && !newerVersion(installedVersion, value.version)) return undefined
+    if (newerVersion(installedVersion, value.version)) return undefined
+    return { version: value.version,
+      code: typeof value.code === 'string' && /^[A-Z0-9_]{1,80}$/.test(value.code) ? value.code : 'UPDATE_PREVIOUS_ATTEMPT_FAILED',
+      message: typeof value.message === 'string' && value.message.length <= 200 ? value.message : '' }
   } catch { return undefined }
 }
 
@@ -73,8 +90,8 @@ export class ToolboxUpdater {
   private busy = false
   private disposed = false
   constructor(private readonly options: UpdaterOptions) {
-    const failure = readPreviousUpdateFailure(options.directory)
-    if (failure !== undefined) this.view = updateFailureView(failure)
+    const failure = readPreviousUpdateFailure(options.directory, options.version)
+    if (failure !== undefined) this.view = updateFailureView(failure, options.version)
   }
   status(): UpdateView { return { ...this.view } }
 
@@ -95,18 +112,21 @@ export class ToolboxUpdater {
           message: `${displayReleaseVersion(release.version)} 安装后 AI网络无法连接，已自动还原到当前版本。可稍后再试，或联系来信客服。` }
         return this.status()
       }
-      this.release = release
       const available = newerVersion(release.version, this.options.version)
-      const failure = readPreviousUpdateFailure(this.options.directory)
-      if (available && failure?.version === release.version) {
-        this.view = updateFailureView(failure, release.notes)
+      const failure = readPreviousUpdateFailure(this.options.directory, this.options.version)
+      if (failure) {
+        this.release = available ? release : undefined
+        this.view = updateFailureView(failure, this.options.version, this.release)
         return this.status()
       }
+      this.release = release
       this.view = { state: available ? 'available' : 'current', version: release.version, notes: release.notes, progress: 0,
         message: available ? `发现新版 ${displayReleaseVersion(release.version)}` : '当前已是最新可用版本。' }
     } catch (error) {
       this.release = undefined
-      this.fail(error instanceof Error && error.message === 'UPDATE_FEED_UNAVAILABLE' ? '更新服务暂未提供版本信息，请稍后再检查。' : '暂时无法检查更新，请稍后重试。')
+      const failure = readPreviousUpdateFailure(this.options.directory, this.options.version)
+      if (failure) this.view = updateFailureView(failure, this.options.version)
+      else this.fail(error instanceof Error && error.message === 'UPDATE_FEED_UNAVAILABLE' ? '更新服务暂未提供版本信息，请稍后再检查。' : '暂时无法检查更新，请稍后重试。')
     } finally { clearTimeout(timeout); this.busy = false }
     return this.status()
   }
@@ -147,6 +167,8 @@ export class ToolboxUpdater {
     if (this.busy || this.disposed || this.view.state !== 'ready' || !this.release || !this.downloaded) return this.status()
     if (!this.options.packaged) { this.fail('请在已安装的工具箱中使用更新功能。'); return this.status() }
     this.busy = true; this.view = { ...this.view, state: 'installing', message: '正在准备更新并重启…' }
+    let restoreAiRouter: (() => Promise<void>) | undefined
+    let helperReady = false
     try {
       const asset = this.release.assets[this.options.platform]
       if ((await stat(this.downloaded)).size !== asset.size || await fileDigest(this.downloaded) !== asset.sha256) throw new Error('UPDATE_DIGEST_INVALID')
@@ -169,12 +191,14 @@ export class ToolboxUpdater {
         if (bundle !== 'com.laixin.ai-toolbox.ui-capabilities' || version !== this.release.version ||
             await fileDigest(join(staged, 'Contents', 'Resources', 'app.asar')) !== asset.asarSha256) throw new Error('UPDATE_BUNDLE_INVALID')
       }
+      restoreAiRouter = await this.options.prepareAiRouterUpdate?.()
       const userData = dirname(this.options.directory)
       const residentHandoff = residentHandoffFields(userData)
       const job = { parentPid: process.pid, platform: mac ? 'mac' : 'win', target, staged, installer: this.downloaded,
         userData,
         ...residentHandoff,
-        executable: this.options.executable, version: this.release.version, asarSha256: asset.asarSha256,
+        executable: this.options.executable, version: this.release.version,
+        previous: this.options.version, notes: this.release.notes, asarSha256: asset.asarSha256,
         assetSha256: asset.sha256, assetSize: asset.size,
         // 助手等回执的上限:客户本来没连着就照旧 45 秒,⛔ 多等一秒;本来连着的要容下
         // 「新版起来 → 装常驻 → 首连(含守护自己 42 秒的退避梯子)」,再留 30 秒给新版退出。
@@ -184,7 +208,8 @@ export class ToolboxUpdater {
         acknowledgement: join(this.options.directory, 'acknowledgement.json') }
       const jobPath = join(jobDirectory, 'job.json')
       await writeFile(jobPath, JSON.stringify(job), { mode: 0o600 })
-      await Promise.all([rm(job.ready, { force: true }), rm(join(this.options.directory, 'result.json'), { force: true })])
+      await Promise.all([rm(job.ready, { force: true }), rm(join(this.options.directory, 'result.json'), { force: true }),
+        rm(join(this.options.directory, 'success-dismissed.json'), { force: true })])
       // requireConnected:更新前客户是连着的 ⇒ 新版「起来了」还不算数,要等网络真的连上才写回执。
       // previous/notes 给「更新成功」弹窗用:新版第一次启动要能告诉客户「从哪版升上来的、这版改了什么」,
       // 只带在 pending 里这一条路 —— 助手装完会删掉工作目录,清单源那时也可能已经改版。
@@ -201,12 +226,24 @@ export class ToolboxUpdater {
       // 连程序都没重启,pending.json 永远留在盘上)。放宽到 30 秒:helper-ready 是脚本第 9 行就写的,
       // 真正死掉/被拦的助手照样会以 ENOENT 或到点失败收场,⛔ 把冷启动误判成「更新包坏了」。
       await this.waitForHelperReady(job.ready)
+      helperReady = true
       // Let the IPC reply reach the window before normal shutdown starts.
       setTimeout(() => this.options.quit(), 100)
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code ?? (error as Error).message
+      let restoreFailed = code === 'AI_ROUTER_UPDATE_RESTORE_FAILED'
+      if (!helperReady && restoreAiRouter) {
+        try { await restoreAiRouter() } catch {
+          restoreFailed = true
+        }
+      }
+      if (restoreFailed) await writeFile(join(this.options.directory, 'result.json'), JSON.stringify({
+        version: this.release.version, state: 'error', code: 'AI_ROUTER_UPDATE_RESTORE_FAILED',
+        message: 'AI router restore failed'
+      }), { mode: 0o600 }).catch(() => undefined)
       const location = ['EACCES', 'EPERM', 'UPDATE_LOCATION_UNWRITABLE'].includes(code)
-      this.fail(location ? '暂时无法替换程序，请将工具箱移至可写的应用目录后重试。账号和配置已保留。'
+      this.fail(restoreFailed ? '更新已停止，旧 AI 路由未能自动恢复。配置和 Key 已保留，请重开工具箱或联系客服。'
+        : location ? '暂时无法替换程序，请将工具箱移至可写的应用目录后重试。账号和配置已保留。'
         : code === 'UPDATE_HELPER_FAILED' ? '更新程序没能启动（可能被安全软件拦截）。账号和配置已保留；请重试一次，仍失败请把诊断发给客服。'
         : '更新包未能完成校验或准备，请重新下载。原版本和账号数据已保留。')
     } finally { this.busy = false }
@@ -214,7 +251,10 @@ export class ToolboxUpdater {
   }
 
   dispose(): void { this.disposed = true; this.controller?.abort() }
-  private fail(message: string): void { this.view = { ...this.view, state: 'error', message } }
+  private fail(message: string): void {
+    this.view = { ...this.view, state: 'error', message,
+      retryDownload: this.release !== undefined && newerVersion(this.release.version, this.options.version) }
+  }
 
   /** 等助手把 ready 文件写出来;到点没等到就 UPDATE_HELPER_FAILED(文案在 install 的 catch 里区分)。
    *  now/wait/时长注入出来只为行为测试能钉住「29 秒 ready 要放行、30 秒没 ready 要判死、立即 ready 不白等」,
@@ -320,6 +360,8 @@ function tunnelConnectedNow(tunnelDataDir: string): boolean {
  *  · abandoned  = 客户自己不要连接了（点了断开 / 退出账号），**也认**——那不是更新的锅
  *  · waiting    = 还在试，继续等 */
 export type UpdateOutcome = 'connected' | 'abandoned' | 'waiting'
+/** AI 路由恢复的结论；只有当前有效多模型路由才会返回 waiting/ready/failed。 */
+export type AiRouterUpdateOutcome = 'ready' | 'not_configured' | 'failed' | 'waiting'
 
 export interface AcknowledgeDeps {
   /** 通道当下算哪一种。⛔ 用 supervisor 的 surrendered 判：那个只管「守护起没起来」，
@@ -327,10 +369,14 @@ export interface AcknowledgeDeps {
   readonly outcome: () => UpdateOutcome
   /** 放弃这一版：退出自己，把台让给更新助手——它等不到回执、又看见进程走了，就会把旧版换回来。 */
   readonly giveUp: () => void
+  /** 新版本只在已验证的 headless router 重新取得 HMAC/runtime/seat owner 后确认更新。 */
+  readonly routerOutcome?: () => AiRouterUpdateOutcome | Promise<AiRouterUpdateOutcome>
   readonly timeoutMs?: number
   readonly pollMs?: number
   readonly wait?: (ms: number) => Promise<void>
   readonly now?: () => number
+  /** Windows 的启动回执只放行助手提交；它本身不是最终更新成功。 */
+  readonly deferSuccessUntilCommit?: boolean
 }
 
 /** 新版这边等多久才判「这一版连不上」。按 spawn 模式守护自己的退避梯子（2+10+30≈42 秒）留余量——
@@ -347,8 +393,7 @@ export async function readRejectedVersion(directory: string): Promise<{ version:
   } catch { return undefined }
 }
 
-/** 这次启动确实是「更新装好了」的第一眼时,给界面弹「更新成功」用的两样。
- *  只在写回执的那一次启动有值:pending.json 被助手装完删掉,重启就不会再弹。 */
+/** 启动回执携带的展示信息；Windows 要另等助手的最终 complete 结果。 */
 export interface UpdateSuccess { previous: string; notes: string }
 
 export async function acknowledgeUpdate(directory: string, version: string, deps?: AcknowledgeDeps): Promise<UpdateSuccess | undefined> {
@@ -364,8 +409,14 @@ export async function acknowledgeUpdate(directory: string, version: string, deps
       if (settled === 'waiting') {
         // 到点没连上:记下这一版别再自动装,然后退出自己。助手等不到回执、看见进程走了，
         // 会用既有的两个 rename 把旧版换回来并拉起 —— ⛔ 在这里自己搬 bundle。
-        await writeFile(rejectedVersionPath(directory), JSON.stringify({ version, at: (deps.now ?? Date.now)() }), { mode: 0o600 })
-        deps.giveUp()
+        await rejectUpdateVersion(directory, version, deps)
+        return undefined
+      }
+    }
+    if (deps?.routerOutcome !== undefined) {
+      const settled = await waitForAiRouterOutcome(deps)
+      if (settled === 'failed' || settled === 'waiting') {
+        await rejectUpdateVersion(directory, version, deps)
         return undefined
       }
     }
@@ -387,7 +438,58 @@ export async function acknowledgeUpdate(directory: string, version: string, deps
       .filter((entry) => entry.isDirectory() && entry.name.startsWith('download-'))
       .map((entry) => rm(join(directory, entry.name), { recursive: true, force: true })))
   } catch { /* 清理失败不影响更新确认。 */ }
-  return success
+  return deps?.deferSuccessUntilCommit ? undefined : success
+}
+
+interface CommitWait { readonly now?: () => number; readonly wait?: (ms: number) => Promise<void>; readonly timeoutMs?: number }
+
+function completedUpdate(directory: string, version: string): UpdateSuccess | 'error' | 'unreadable' | undefined {
+  try {
+    const raw = JSON.parse(physicalFs.readFileSync(join(directory, 'result.json'), 'utf8').replace(/^\uFEFF/, '')) as
+      { version?: unknown; state?: unknown; previous?: unknown; notes?: unknown }
+    if (raw.version !== version) return undefined
+    if (raw.state === 'error') return 'error'
+    if (raw.state !== 'complete') return undefined
+    return { previous: typeof raw.previous === 'string' ? raw.previous : '',
+      notes: typeof raw.notes === 'string' ? raw.notes : '' }
+  } catch (error) { return (error as NodeJS.ErrnoException).code === 'ENOENT' ? undefined : 'unreadable' }
+}
+
+/** Windows 的 final commit 已落结果后才通知；结果留在盘上，崩溃重启仍可补显。 */
+export async function waitForCommittedUpdate(directory: string, version: string, options: CommitWait = {}): Promise<UpdateSuccess | undefined> {
+  const now = options.now ?? Date.now
+  const wait = options.wait ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+  const deadline = now() + (options.timeoutMs ?? 5 * 60_000)
+  let unreadableSince: number | undefined
+  for (;;) {
+    try {
+      const dismissed = JSON.parse(await readFile(join(directory, 'success-dismissed.json'), 'utf8')) as { version?: unknown }
+      if (dismissed.version === version) return undefined
+    } catch { /* No user acknowledgement yet. */ }
+    const result = completedUpdate(directory, version)
+    if (result === 'error') return undefined
+    if (result === 'unreadable') {
+      unreadableSince ??= now()
+      if (now() >= deadline || now() - unreadableSince >= 2_000) return undefined
+      await wait(500)
+      continue
+    }
+    unreadableSince = undefined
+    if (result !== undefined) return result
+    try {
+      const pending = JSON.parse(await readFile(join(directory, 'pending.json'), 'utf8')) as { version?: unknown }
+      if (pending.version !== version) return undefined
+    } catch { return undefined }
+    if (now() >= deadline) return undefined
+    await wait(500)
+  }
+}
+
+/** 仅用户关闭成功窗口时记账；关闭前崩溃不会吞掉最终成功提示。 */
+export async function dismissCommittedUpdate(directory: string, version: string): Promise<void> {
+  const result = completedUpdate(directory, version)
+  if (result === undefined || result === 'error' || result === 'unreadable') return
+  await writeFile(join(directory, 'success-dismissed.json'), JSON.stringify({ version }), { mode: 0o600 })
 }
 
 /** 盯到「连上」或「客户自己不要连了」为止；到点仍在试就返回 waiting。 */
@@ -401,6 +503,24 @@ async function waitForConnectedOutcome(deps: AcknowledgeDeps): Promise<UpdateOut
     if (now() >= deadline) return 'waiting'
     await wait(deps.pollMs ?? 500)
   }
+}
+
+async function waitForAiRouterOutcome(deps: AcknowledgeDeps): Promise<AiRouterUpdateOutcome> {
+  const now = deps.now ?? Date.now
+  const wait = deps.wait ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+  const deadline = now() + (deps.timeoutMs ?? UPDATE_CONNECT_TIMEOUT_MS)
+  for (;;) {
+    let outcome: AiRouterUpdateOutcome
+    try { outcome = await deps.routerOutcome!() } catch { return 'failed' }
+    if (outcome !== 'waiting') return outcome
+    if (now() >= deadline) return 'waiting'
+    await wait(deps.pollMs ?? 500)
+  }
+}
+
+async function rejectUpdateVersion(directory: string, version: string, deps: AcknowledgeDeps): Promise<void> {
+  await writeFile(rejectedVersionPath(directory), JSON.stringify({ version, at: (deps.now ?? Date.now)() }), { mode: 0o600 }).catch(() => undefined)
+  deps.giveUp()
 }
 
 async function pathExists(path: string): Promise<boolean> { try { await access(path); return true } catch { return false } }

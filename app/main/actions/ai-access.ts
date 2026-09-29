@@ -1,4 +1,4 @@
-import { app, dialog, shell } from 'electron'
+import { app, dialog, shell, session } from 'electron'
 import { join } from 'node:path'
 import type { BridgeRegistry } from '../bridge/bridge-registry'
 import { schema } from '../bridge/schema'
@@ -9,7 +9,9 @@ import { createManagedTextFile } from '../ai-access/file'
 import { createRestartGuidanceReader, restartMessage, type ShellRestartGuidance } from '../ai-access/restart-guidance'
 import { environmentChecklist, type EnvironmentChecklistItem } from '../ai-access/environment-checklist'
 import { createAiAccessStore } from '../ai-access/store'
-import { AiAccessService, aiAccessProviders, aiAccessShells, type AiAccessProvider, type AiAccessShell } from '../ai-access/service'
+import { AiRouterController } from '../ai-access/router-controller'
+import { deactivateCodexWorkspaceProviders, readCodexWorkspaceCatalogStatus } from '../ai-access/codex-workspace-config'
+import { AiAccessService, aiAccessProviders, aiAccessShells, type AiAccessProvider, type AiAccessShell, type AiAccessStatus } from '../ai-access/service'
 import { CodexOfficialLoginController, startCodexChatGptLogin } from '../ai-access/codex-official-login'
 import { sharedAddedOfficialAccounts } from '../ai-access/added-accounts'
 import { readCodexUsage } from '../codex-usage/client'
@@ -30,12 +32,25 @@ import { downloadTunnelSnapshot } from '../download/tunnel-runtime'
 import { createUsageReceiptFileStore, createUsageReceiptRecorder, gatewayUsageEventToReceipt, normalizeClientVersion,
   type UsageReceiptRecorder } from '../ai-access/usage-receipt'
 import { release } from 'node:os'
+import { CodexAppIsolationController } from '../ai-access/codex-app-isolation'
+import { CodexIsolationTransport } from '../ai-access/codex-isolation-transport'
+import { ApplicationIsolationLeaseController, type ApplicationIsolationLeaseStatus } from '../ai-access/application-isolation-lease'
+import { ApplicationIsolationHttpConnectTransport } from '../ai-access/application-isolation-transport'
+import { readDiagnosticPathContext } from '../network-diagnostics/electron-probe'
+import { domesticDiagnosticUrl } from '../network-diagnostics/service'
+import { readLaixinNetworkDiagnosticProxy } from '../tunnel/runtime-owner'
 
 const resultSchema = schema.object({ snapshot: schema.string({ maxLength: 100_000 }) })
 /** 配置被别的工具改掉、睡醒后端口变了，都要在客户下次用之前被发现。 */
 export const RECOVERY_INTERVAL_MS = 600_000
+/** Active leases only: bounded target health reads never rewrite configuration or restart a client. */
+export const CODEX_ISOLATION_HEALTH_INTERVAL_MS = 60_000
+export const HERMES_ISOLATION_HEALTH_INTERVAL_MS = 60_000
 const shellSchema = schema.object({ shell: schema.string({ maxLength: 20 }) })
 const providerKeySchema = schema.object({ shell: schema.string({ maxLength: 20 }), provider: schema.string({ maxLength: 20 }), key: schema.string({ maxLength: 512 }) })
+const codexMultiModelKeySchema = schema.object({ provider: schema.string({ maxLength: 20 }), key: schema.string({ maxLength: 512 }) })
+const codexModeSchema = schema.object({ mode: schema.string({ maxLength: 10 }) })
+const codexMultiModelConfigurationSchema = schema.object({ provider: schema.string({ maxLength: 20 }), key: schema.string({ maxLength: 512 }), model: schema.string({ maxLength: 128 }) })
 const providerShellSchema = schema.object({ provider: schema.string({ maxLength: 20 }), shell: schema.string({ maxLength: 20 }) })
 const configurationTargetSchema = schema.object({ shell: schema.string({ maxLength: 20 }), scope: schema.string({ maxLength: 10 }) })
 const providerConfigurationSchema = schema.object({ shell: schema.string({ maxLength: 20 }), provider: schema.string({ maxLength: 20 }), key: schema.string({ maxLength: 512 }), model: schema.string({ maxLength: 128 }) })
@@ -43,6 +58,9 @@ const providerConfigurationSchema = schema.object({ shell: schema.string({ maxLe
 const remedySchema = schema.object({ shell: schema.string({ maxLength: 20 }), action: schema.string({ maxLength: 20 }), provider: schema.string({ maxLength: 20 }) })
 
 type ModelApiAccessActions = Pick<AiAccessService, 'status' | 'saveProviderKey' | 'useProvider' | 'useOfficial' | 'cancelTests'>
+type CodexIsolationActions = Pick<CodexAppIsolationController, 'status' | 'enable' | 'disable' | 'recover' | 'reverify'>
+type ClaudeIsolationActions = Pick<ApplicationIsolationLeaseController, 'status' | 'enable' | 'disable' | 'recover' | 'reverify'>
+type HermesIsolationActions = Pick<ApplicationIsolationLeaseController, 'status' | 'enable' | 'disable' | 'recover' | 'reverify'>
 type ProjectConfigurationDirectoryPicker = () => Promise<string | undefined>
 type RestartGuidanceReader = { read(shell: AiAccessShell): Promise<ShellRestartGuidance> }
 
@@ -52,6 +70,12 @@ export interface AiAccessActionRuntime {
   /** Mac 使用回执（API-04）：注入替代生产单例，测试里配 showSaveDialog 验证取消与落盘。 */
   readonly usageReceipt?: UsageReceiptRecorder
   readonly showSaveDialog?: () => Promise<{ readonly canceled: boolean; readonly filePath?: string }>
+  /** Test seam only; production always composes the fixed private-session controller below. */
+  readonly codexIsolation?: CodexIsolationActions
+  /** Test seam only; production binds Claude only to its own private HTTP/CONNECT session. */
+  readonly claudeIsolation?: ClaudeIsolationActions
+  /** Test seam only; production binds Hermes to its own non-persistent session. */
+  readonly hermesIsolation?: HermesIsolationActions
 }
 
 export function registerAiAccessActions(
@@ -63,6 +87,25 @@ export function registerAiAccessActions(
   runtime: AiAccessActionRuntime = {}
 ): void {
   const resolvedAccess = access ?? productionAiAccessService()
+  const respondAccessStatus = async (status: Promise<AiAccessStatus>) => respond(publicAiAccessStatus(await status))
+  const codexIsolation = runtime.codexIsolation ?? (access === undefined ? productionCodexAppIsolation() : undefined)
+  const codexIsolationHealth = codexIsolation === undefined ? undefined : createCodexIsolationHealthScheduler(codexIsolation)
+  const claudeIsolation = runtime.claudeIsolation ?? (access === undefined ? productionClaudeAppIsolation() : undefined)
+  const claudeIsolationHealth = claudeIsolation === undefined ? undefined : createClaudeIsolationHealthScheduler(claudeIsolation)
+  const revokeClaudeIsolation = async (shell: AiAccessShell): Promise<void> => {
+    if (shell !== 'claude' || claudeIsolation === undefined) return
+    claudeIsolationHealth?.stop()
+    const status = await claudeIsolation.disable()
+    if (status.code !== 'RESTORED' && status.code !== 'EXTERNAL_VALUE_PRESERVED') throw new Error('CLAUDE_ISOLATION_REVOKE_FAILED')
+  }
+  const hermesIsolation = runtime.hermesIsolation ?? (access === undefined ? productionHermesAppIsolation() : undefined)
+  const hermesIsolationHealth = hermesIsolation === undefined ? undefined : createHermesIsolationHealthScheduler(hermesIsolation)
+  const hermesMutations = hermesIsolation === undefined ? undefined : createHermesIsolationMutationGate(hermesIsolation, hermesIsolationHealth)
+  if (access === undefined) productionHermesMutationGate = hermesMutations
+  const runHermesRouteMutation = <T>(shell: AiAccessShell, task: () => Promise<T>): Promise<T> =>
+    shell === 'hermes' && hermesMutations !== undefined ? hermesMutations.runRouteMutation(task) : task()
+  const runGatewayRecoveryMutation = <T>(task: () => Promise<T>): Promise<T> =>
+    hermesMutations === undefined ? task() : hermesMutations.run(task)
   const restartGuidance = runtime.restartGuidance ?? (access === undefined ? productionRestartGuidanceReader() : undefined)
   // Mac 使用回执的两个手动动作：生成预览、（预览后）保存为本地文件。⛔ 没有上传或任何自动发送动作。
   const usageReceipt = runtime.usageReceipt ?? (access === undefined ? productionUsageReceiptRecorder() : undefined)
@@ -81,7 +124,55 @@ export function registerAiAccessActions(
         return respond(await usageReceipt.save(picked.filePath, snapshotId))
       } })
   }
-  registry.registerAction({ name: 'aiaccess.status', paramsSchema: schema.undefined(), resultSchema, handler: () => respond(resolvedAccess.status()) })
+  registry.registerAction({ name: 'aiaccess.status', paramsSchema: schema.undefined(), resultSchema,
+    handler: () => respondAccessStatus(resolvedAccess.status()) })
+  if (codexIsolation !== undefined) {
+    registry.registerAction({ name: 'aiaccess.codexIsolationStatus', paramsSchema: schema.undefined(), resultSchema,
+      handler: () => respond(publicCodexIsolationStatus(codexIsolation.status())) })
+    registry.registerAction({ name: 'aiaccess.enableCodexIsolation', paramsSchema: schema.undefined(), resultSchema,
+      handler: async () => {
+        const status = await codexIsolation.enable()
+        codexIsolationHealth?.observe(status)
+        return respond(publicCodexIsolationStatus(status))
+      } })
+    registry.registerAction({ name: 'aiaccess.disableCodexIsolation', paramsSchema: schema.undefined(), resultSchema,
+      handler: async () => {
+        codexIsolationHealth?.stop()
+        return respond(publicCodexIsolationStatus(await codexIsolation.disable()))
+      } })
+  }
+  if (claudeIsolation !== undefined) {
+    registry.registerAction({ name: 'aiaccess.claudeIsolationStatus', paramsSchema: schema.undefined(), resultSchema,
+      handler: () => respond(publicClaudeIsolationStatus(claudeIsolation.status())) })
+    registry.registerAction({ name: 'aiaccess.enableClaudeIsolation', paramsSchema: schema.undefined(), resultSchema,
+      handler: async () => {
+        const status = await claudeIsolation.enable()
+        claudeIsolationHealth?.observe(status)
+        return respond(publicClaudeIsolationStatus(status))
+      } })
+    registry.registerAction({ name: 'aiaccess.disableClaudeIsolation', paramsSchema: schema.undefined(), resultSchema,
+      handler: async () => {
+        claudeIsolationHealth?.stop()
+        return respond(publicClaudeIsolationStatus(await claudeIsolation.disable()))
+      } })
+  }
+  if (hermesIsolation !== undefined) {
+    registry.registerAction({ name: 'aiaccess.hermesIsolationStatus', paramsSchema: schema.undefined(), resultSchema,
+      handler: () => respond(publicHermesIsolationStatus(hermesIsolation.status())) })
+    registry.registerAction({ name: 'aiaccess.enableHermesIsolation', paramsSchema: schema.undefined(), resultSchema,
+      handler: async () => {
+        const status = await hermesMutations!.run(() => hermesIsolation.enable())
+        hermesIsolationHealth?.observe(status)
+        return respond(publicHermesIsolationStatus(status))
+      } })
+    registry.registerAction({ name: 'aiaccess.disableHermesIsolation', paramsSchema: schema.undefined(), resultSchema,
+      handler: async () => {
+        return respond(publicHermesIsolationStatus(await hermesMutations!.run(async () => {
+          hermesIsolationHealth?.stop()
+          return hermesIsolation.disable()
+        })))
+      } })
+  }
   registry.registerAction({ name: 'aiaccess.environmentChecklist', paramsSchema: schema.undefined(), resultSchema,
     handler: () => respond(publicEnvironmentChecklist(environmentChecklist)) })
   if (restartGuidance !== undefined) {
@@ -94,21 +185,31 @@ export function registerAiAccessActions(
     handler: async params => { await shell.openExternal(modelProviders[readProvider((params as { provider: string }).provider)].keyUrl); return { snapshot: '{}' } } })
   registry.registerAction({
     name: 'aiaccess.saveProviderKey', paramsSchema: providerKeySchema, resultSchema,
-    handler: (params) => {
+    handler: async (params) => {
       const input = params as { readonly shell: string; readonly provider: string; readonly key: string }
-      return respond(resolvedAccess.saveProviderKey(readShell(input.shell), readProvider(input.provider), input.key))
+      const shell = readShell(input.shell)
+      await revokeClaudeIsolation(shell)
+      return respondAccessStatus(runHermesRouteMutation(shell,
+        () => resolvedAccess.saveProviderKey(shell, readProvider(input.provider), input.key)))
     }
   })
     registry.registerAction({
       name: 'aiaccess.useProvider', paramsSchema: providerShellSchema, resultSchema,
-      handler: (params) => {
+      handler: async (params) => {
         const input = params as { readonly provider: string; readonly shell: string }
-        return respond(resolvedAccess.useProvider(readShell(input.shell), readProvider(input.provider)))
+        const shell = readShell(input.shell)
+        await revokeClaudeIsolation(shell)
+        return respondAccessStatus(runHermesRouteMutation(shell,
+          () => resolvedAccess.useProvider(shell, readProvider(input.provider))))
       }
     })
   registry.registerAction({
     name: 'aiaccess.useOfficial', paramsSchema: shellSchema, resultSchema,
-    handler: (params) => respond(resolvedAccess.useOfficial(readShell((params as { readonly shell: string }).shell)))
+    handler: async (params) => {
+      const shell = readShell((params as { readonly shell: string }).shell)
+      await revokeClaudeIsolation(shell)
+      return respondAccessStatus(runHermesRouteMutation(shell, () => resolvedAccess.useOfficial(shell)))
+    }
   })
   const resolvedLogin = codexLogin ?? (access === undefined ? productionCodexLogin(resolvedAccess) : undefined)
   if (resolvedLogin !== undefined) {
@@ -116,7 +217,7 @@ export function registerAiAccessActions(
     registry.registerAction({ name: 'aiaccess.startCodexOfficialLogin', paramsSchema: schema.undefined(), resultSchema, handler: () => respond(resolvedLogin.start()) })
     registry.registerAction({ name: 'aiaccess.cancelCodexOfficialLogin', paramsSchema: schema.undefined(), resultSchema, handler: () => respond(resolvedLogin.cancel()) })
   }
-  const resolvedClaudeLogin = claudeLogin ?? (access === undefined ? productionClaudeLogin(resolvedAccess) : undefined)
+  const resolvedClaudeLogin = claudeLogin ?? (access === undefined ? productionClaudeLogin(resolvedAccess, () => revokeClaudeIsolation('claude')) : undefined)
   if (resolvedClaudeLogin !== undefined) {
     registry.registerAction({ name: 'aiaccess.claudeOfficialStatus', paramsSchema: schema.undefined(), resultSchema, handler: () => respond(resolvedClaudeLogin.status()) })
     registry.registerAction({ name: 'aiaccess.startClaudeOfficialLogin', paramsSchema: schema.undefined(), resultSchema, handler: () => respond(resolvedClaudeLogin.start()) })
@@ -124,32 +225,66 @@ export function registerAiAccessActions(
     registry.registerAction({ name: 'aiaccess.cancelClaudeOfficialLogin', paramsSchema: schema.undefined(), resultSchema, handler: () => respond(resolvedClaudeLogin.cancel()) })
   }
   if (resolvedAccess instanceof AiAccessService) {
-    registry.registerAction({ name: 'aiaccess.selectConfigurationTarget', paramsSchema: configurationTargetSchema, resultSchema, handler: params => {
+    registry.registerAction({ name: 'aiaccess.aiRouterStatus', paramsSchema: schema.undefined(), resultSchema,
+      handler: () => respond(resolvedAccess.aiRouterStatus()) })
+    registry.registerAction({ name: 'aiaccess.repairCodexMultiModelRouter', paramsSchema: schema.undefined(), resultSchema,
+      handler: () => respond(resolvedAccess.repairCodexMultiModelRouter()) })
+    registry.registerAction({ name: 'aiaccess.removeCodexMultiModel', paramsSchema: schema.object({ provider: schema.string({ maxLength: 20 }) }), resultSchema,
+      handler: params => respond(resolvedAccess.removeCodexMultiModel(readProvider((params as { provider: string }).provider))) })
+    registry.registerAction({ name: 'aiaccess.setCodexMode', paramsSchema: codexModeSchema, resultSchema, handler: params => {
+      const mode = (params as { mode: string }).mode
+      if (mode !== 'single' && mode !== 'multi') throw new Error('AI_ACCESS_CODEX_MODE_INVALID')
+      return respond(resolvedAccess.setCodexMode(mode))
+    } })
+    registry.registerAction({ name: 'aiaccess.configureCodexMultiModel', paramsSchema: codexMultiModelConfigurationSchema, resultSchema, handler: params => {
+      const input = params as { provider: string; key: string; model: string }
+      return respond(resolvedAccess.configureCodexMultiModel(readProvider(input.provider), input.key, input.model))
+    } })
+    registry.registerAction({ name: 'aiaccess.verifyAndAddCodexMultiModel', paramsSchema: codexMultiModelKeySchema, resultSchema, handler: params => {
+      const input = params as { provider: string; key: string }
+      return respond(resolvedAccess.verifyAndAddCodexMultiModel(readProvider(input.provider), input.key))
+    } })
+    registry.registerAction({ name: 'aiaccess.selectConfigurationTarget', paramsSchema: configurationTargetSchema, resultSchema, handler: async params => {
       const input = params as { shell: string; scope: string }
       if (input.scope !== 'user' && input.scope !== 'project') throw new Error('AI_ACCESS_CONFIGURATION_TARGET_SCOPE_INVALID')
-      return respond(resolvedAccess.selectConfigurationTarget(readShell(input.shell), input.scope))
+      const shell = readShell(input.shell)
+      await revokeClaudeIsolation(shell)
+      const scope = input.scope
+      return respondAccessStatus(runHermesRouteMutation(shell,
+        () => resolvedAccess.selectConfigurationTarget(shell, scope)))
     } })
     registry.registerAction({ name: 'aiaccess.selectConfigurationProject', paramsSchema: shellSchema, resultSchema, handler: async params => {
       const shell = readShell((params as { shell: string }).shell)
       // Native Codex never reads a project provider config. Reject before opening a file picker so
       // a stale renderer or direct bridge call cannot suggest a repair that the client ignores.
       if (shell !== 'claude') throw new Error('AI_ACCESS_CONFIGURATION_TARGET_UNSUPPORTED')
+      await revokeClaudeIsolation(shell)
       const projectDir = await (projectDirectoryPicker ?? pickProjectConfigurationDirectory)()
-      return respond(projectDir === undefined
+      return respondAccessStatus(projectDir === undefined
         ? resolvedAccess.status()
         : resolvedAccess.selectConfigurationProject(shell, projectDir))
     } })
     registry.registerAction({ name: 'aiaccess.restorePreviousConnection', paramsSchema: shellSchema, resultSchema,
-      handler: params => respond(resolvedAccess.restorePreviousConnection(readShell((params as { shell: string }).shell))) })
-    registry.registerAction({ name: 'aiaccess.configureProvider', paramsSchema: providerConfigurationSchema, resultSchema, handler: params => {
+      handler: async params => {
+        const shell = readShell((params as { shell: string }).shell)
+        await revokeClaudeIsolation(shell)
+        return respondAccessStatus(runHermesRouteMutation(shell, () => resolvedAccess.restorePreviousConnection(shell)))
+      } })
+    registry.registerAction({ name: 'aiaccess.configureProvider', paramsSchema: providerConfigurationSchema, resultSchema, handler: async params => {
       const input = params as { shell: string; provider: string; key: string; model: string }
-      return respond(resolvedAccess.configureProvider(readShell(input.shell), readProvider(input.provider), input.key, input.model))
+      const shell = readShell(input.shell)
+      await revokeClaudeIsolation(shell)
+      return respondAccessStatus(runHermesRouteMutation(shell,
+        () => resolvedAccess.configureProvider(shell, readProvider(input.provider), input.key, input.model)))
     } })
     // API-06：快捷 Key 表单的原子入口——候选 Key 先验证，任一步失败都回到原 Key、原模型、原路由。
     registry.registerAction({ name: 'aiaccess.useProviderWithKey', paramsSchema: providerKeySchema, resultSchema,
-      handler: (params) => {
+      handler: async (params) => {
         const input = params as { readonly shell: string; readonly provider: string; readonly key: string }
-        return respond(resolvedAccess.useProviderWithKey(readShell(input.shell), readProvider(input.provider), input.key))
+        const shell = readShell(input.shell)
+        await revokeClaudeIsolation(shell)
+        return respondAccessStatus(runHermesRouteMutation(shell,
+          () => resolvedAccess.useProviderWithKey(shell, readProvider(input.provider), input.key)))
       } })
     registry.registerAction({ name: 'aiaccess.measureProviderLatency', paramsSchema: providerConfigurationSchema, resultSchema, handler: params => {
       const input = params as { shell: string; provider: string; key: string; model: string }
@@ -160,11 +295,22 @@ export function registerAiAccessActions(
       return respond(resolvedAccess.providerConfiguration(readShell(input.shell), readProvider(input.provider)))
     } })
     registry.registerAction({ name: 'aiaccess.serviceStatus', paramsSchema: schema.undefined(), resultSchema, handler: () => respond(resolvedAccess.serviceStatus()) })
+    registry.registerAction({ name: 'aiaccess.probeDiagnosticPath',
+      paramsSchema: schema.object({ shell: schema.string({ maxLength: 12 }), revision: schema.string({ maxLength: 64 }) }),
+      resultSchema, handler: params => {
+        const input = params as { shell: string; revision: string }
+        return respond(resolvedAccess.probeDiagnosticPath(readShell(input.shell), input.revision))
+      } })
     registry.registerAction({ name: 'aiaccess.remedy', paramsSchema: remedySchema, resultSchema, handler: async params => {
       const input = params as { shell: string; action: string; provider: string }
       const software = readShell(input.shell), action = readRemedyAction(input.action)
       const intended = input.provider === '' ? undefined : readProvider(input.provider)
-      if (action !== 'openConsole') return respond(resolvedAccess.remedy(software, action, intended))
+      if (action !== 'openConsole') {
+        if (software === 'claude' && (action === 'useOfficial' || action === 'reapply' || action === 'restartGateway')) await revokeClaudeIsolation(software)
+        const operation = () => resolvedAccess.remedy(software, action, intended)
+        return respond(software === 'hermes' || action === 'restartGateway'
+          ? hermesMutations === undefined ? operation() : hermesMutations.runRouteMutation(operation) : operation())
+      }
       // 打开控制台没有可复验的结果：老实说「不能确认」，⛔ 当成已修好。
       const selected = intended ?? (await resolvedAccess.status()).shells[software].selected
       const provider = aiAccessProviders.includes(selected as AiAccessProvider) ? selected as AiAccessProvider : null
@@ -201,15 +347,35 @@ export function registerAiAccessActions(
     registry.registerAction({ name: 'aiaccess.matrixStatus', paramsSchema: schema.undefined(), resultSchema,
       handler: () => respond({ ...resolvedAccess.matrixStatus(), running: matrix !== undefined }) })
     registry.registerAction({ name: 'aiaccess.recover', paramsSchema: schema.undefined(), resultSchema,
-      handler: () => respond(resolvedAccess.recoverAccess('manual')) })
+      handler: () => respond(runGatewayRecoveryMutation(() => resolvedAccess.recoverAccess('manual'))) })
+    if (codexIsolation !== undefined) registry.registerShutdownHook('aiaccess.codex-isolation', () => {
+      codexIsolationHealth?.stop()
+      return codexIsolation.recover().then(() => undefined)
+    })
+    if (claudeIsolation !== undefined) registry.registerShutdownHook('aiaccess.claude-isolation', () => {
+      claudeIsolationHealth?.stop()
+      return claudeIsolation.recover().then(() => undefined)
+    })
+    if (hermesIsolation !== undefined) registry.registerShutdownHook('aiaccess.hermes-isolation', () => {
+      hermesIsolationHealth?.stop()
+      return hermesIsolation.recover().then(() => undefined)
+    })
     registry.registerShutdownHook('aiaccess.gateway', () => resolvedAccess.stop())
     // No requests to providers and no shell writes occur during restoration.
     const restored = resolvedAccess.initialize()
     void restored
     // 生产合成才起后台核对：重开后先对一次，之后每 10 分钟一次，顺带覆盖唤醒与断网恢复。
     if (access === undefined) {
-      void restored.then(() => resolvedAccess.recoverAccess('startup')).catch(() => undefined)
-      const timer = setInterval(() => { void resolvedAccess.recoverAccess('periodic').catch(() => undefined) }, RECOVERY_INTERVAL_MS)
+      void restored.then(async () => {
+        await codexIsolation?.recover()
+        await claudeIsolation?.recover()
+        await hermesIsolation?.recover()
+        await runGatewayRecoveryMutation(() => resolvedAccess.recoverAccess('startup'))
+      }).catch(() => undefined)
+      const timer = setInterval(() => {
+        const recover = runGatewayRecoveryMutation(() => resolvedAccess.recoverAccess('periodic'))
+        void recover.catch(() => undefined)
+      }, RECOVERY_INTERVAL_MS)
       timer.unref?.()
       registry.registerShutdownHook('aiaccess.recovery', () => { clearInterval(timer); return Promise.resolve() })
     }
@@ -321,34 +487,77 @@ async function productionShowSaveDialog(): Promise<{ readonly canceled: boolean;
 }
 
 let productionAccess: AiAccessService | undefined
+
+/** Called only after Desktop's update gate has verified the current HMAC/runtime/seat owner. */
+export async function acceptVerifiedProductionAiRouterRecovery(): Promise<void> {
+  await productionAiAccessService().acceptVerifiedAiRouterRecovery()
+}
+
+let productionCodexIsolation: CodexAppIsolationController | undefined
+let productionCodexIsolationTransport: CodexIsolationTransport | undefined
+let productionClaudeIsolation: ApplicationIsolationLeaseController | undefined
+let productionClaudeIsolationTransport: ApplicationIsolationHttpConnectTransport | undefined
+let productionHermesIsolation: ApplicationIsolationLeaseController | undefined
+let productionHermesIsolationTransport: ApplicationIsolationHttpConnectTransport | undefined
+let productionHermesMutationGate: HermesIsolationMutationGate | undefined
 export function productionAiAccessService(): AiAccessService {
   if (productionAccess) return productionAccess
   const home = app.getPath('home')
   const environment = shellInventory().environment()
   const file = createManagedTextFile()
+  // The generated Codex catalogue retains trusted Desktop model metadata and can exceed the
+  // normal config-file cap. This read-only status adapter uses the same bounded cap as writing.
+  const catalogFile = createManagedTextFile({ maxBytes: 4 * 1024 * 1024 })
   // API-11：观察器结果带 10 秒时间窗——登录等待等高频 status 读取不再每轮 spawn profiles＋ps；
   // 窗口过期或观察失败即重查，写路径判定的失效语义见 configuration-execution-observer。
   const observeConfigurationExecution = createConfigurationExecutionObserver({ platform: process.platform, home, ttlMs: configurationObservationTtlMs })
   // Mac 使用回执（API-04）：主进程侧五个固定阶段的白名单记录；⛔ 因记录失败影响主流程。
   const usageReceipt = productionUsageReceiptRecorder()
-  productionAccess = new AiAccessService(
-    createAiAccessStore(join(app.getPath('userData'), 'ai-access')),
-    createDeepSeekAdapters({
+  const codexIsolationTransport = productionCodexIsolationTransport ??= new CodexIsolationTransport({
+    // No `persist:` prefix: the isolated egress holds no cookies, cache or customer login state.
+    create: () => session.fromPartition('toolbox-codex-isolation', { cache: false })
+  })
+  const claudeIsolationTransport = productionClaudeIsolationTransport ??= new ApplicationIsolationHttpConnectTransport({
+    // This is deliberately a separate non-persistent session; it never shares Codex cookies, cache or connections.
+    create: () => session.fromPartition('toolbox-claude-isolation', { cache: false })
+  })
+  const hermesIsolationTransport = productionHermesIsolationTransport ??= new ApplicationIsolationHttpConnectTransport({
+    // Hermes has a dedicated, non-persistent session and never shares Codex cookies/cache.
+    create: () => session.fromPartition('toolbox-hermes-isolation', { cache: false })
+  })
+  const adapters = createDeepSeekAdapters({
       home,
       platform: process.platform,
       localAppData: environment.LOCALAPPDATA,
       hermesHome: environment.HERMES_HOME,
+      // The locator contains only a main-process HERMES_HOME needed to settle an unfinished
+      // lease after the environment selects a different target; it never enters state or IPC.
+      hermesIsolationRegistryPath: join(app.getPath('userData'), 'ai-access', 'hermes-isolation-targets.json'),
       // No process.cwd(): it is the Toolbox process, not evidence of a customer's project.
       configurationExecution: observedConfigurationExecution(home, process.platform, environment),
       observeConfigurationExecution,
       // The selected project root is retained only in this 0600 main-process file. Status and
       // renderer messages receive target scope/reason evidence, never the customer path.
       projectTargetStore: createProjectConfigurationTargetStore(file, join(app.getPath('userData'), 'ai-access', 'private-project-targets.json'), process.platform),
+      // One opaque lease pointer lets restart recovery reject a changed Claude target without
+      // inspecting a recorded path or writing the newly selected settings file.
+      claudeIsolationLeaseRegistryPath: join(app.getPath('userData'), 'ai-access', 'laixin-claude-isolation-target.json'),
       file
-    }),
+  })
+  const codexAdapter = adapters.find(adapter => adapter.shell === 'codex')
+  productionAccess = new AiAccessService(
+    createAiAccessStore(join(app.getPath('userData'), 'ai-access')),
+    adapters,
     // The generic request ledger accepts all native clients; this stricter macOS observer is
     // attached only in production to tell Codex Desktop apart from the CLI without reading data.
     new AiGateway({
+      fetch: (input, init, route) => {
+        const url = typeof input === 'string' ? input : input.toString()
+        if (route?.shell === 'codex' && route.isolated === true) return codexIsolationTransport.fetch(url, init)
+        if (route?.shell === 'claude' && route.isolated === true) return claudeIsolationTransport.fetch(url, init)
+        if (route?.shell === 'hermes' && route.isolated === true) return hermesIsolationTransport.fetch(url, init)
+        return fetch(input, init)
+      },
       desktopAttestor: createDesktopRouteAttestor(),
       onUsageEvent: event => usageReceipt.record(gatewayUsageEventToReceipt(event))
     }),
@@ -358,15 +567,99 @@ export function productionAiAccessService(): AiAccessService {
       resolveRoute: (shell, provider) => resolveProviderRoute(recipeStore().current(), shell, provider,
         { endpoint: modelProviders[provider].endpoints[shell], model: modelProviders[provider].models[shell] }),
       recordFault,
+      // The function is installed by the action composition after the Hermes controller exists.
+      // Until then no isolation lease can have been enabled, so a missing gate cannot leave one live.
+      beforeHermesRouteMutation: () => productionHermesMutationGate?.releaseForRouteMutation() ?? Promise.resolve(),
       recordUsageEvent: event => usageReceipt.record(event),
+      beforeRecoveryRewrite: async shells => {
+        if (!shells.includes('claude') || productionClaudeIsolation === undefined) return
+        const status = await productionClaudeIsolation.disable()
+        if (status.code !== 'RESTORED' && status.code !== 'EXTERNAL_VALUE_PRESERVED') throw new Error('CLAUDE_ISOLATION_REVOKE_FAILED')
+      },
       // 真 Key 矩阵只做受信任安装位置的存在性检查。不能为此调用通用盘点，
       // 因为它会执行 PATH 中未知包装器的 --version。
       shellInstalled: async (software) => trustedCliInstalled(software === 'claude' ? 'claude-code' : software,
         process.platform, home, environment),
-      saveMatrix: (report) => productionModelMatrixStore().save(report)
-    }
+      saveMatrix: (report) => productionModelMatrixStore().save(report),
+      readCodexMultiModelCatalog: async multiModel => {
+        const codexHome = await codexAdapter?.codexOfficialLoginRoot?.()
+        if (!codexHome) return { state: 'unreadable' }
+        return readCodexWorkspaceCatalogStatus({ codexHome, toolboxExecutable: process.execPath, multiModel, file: catalogFile })
+      },
+      deactivateCodexMultiModel: async commitState => {
+        const codexHome = await codexAdapter?.codexOfficialLoginRoot?.()
+        if (!codexHome) throw new Error('AI_ACCESS_CONFIGURATION_TARGET_BLOCKED')
+        await deactivateCodexWorkspaceProviders({ codexHome, file: catalogFile }, commitState)
+      }
+    },
+    new AiRouterController(app.getPath('userData'), {
+      executable: process.execPath,
+      ...(app.isPackaged ? {} : { appPath: app.getAppPath() }),
+      logDir: join(app.getPath('userData'), 'logs')
+    })
   )
   return productionAccess
+}
+
+function productionCodexAppIsolation(): CodexAppIsolationController {
+  if (productionCodexIsolation !== undefined) return productionCodexIsolation
+  const access = productionAiAccessService()
+  const transport = productionCodexIsolationTransport
+  if (transport === undefined) throw new Error('CODEX_ISOLATION_TRANSPORT_UNAVAILABLE')
+  productionCodexIsolation = new CodexAppIsolationController({
+    applicationId: 'codex',
+    adapter: access.createCodexIsolationAdapter(transport),
+    // This private Electron probe is N-55's read-only path fingerprint: it covers the system
+    // proxy/PAC resolution plus active-path evidence before/after, without touching OS settings.
+    system: { snapshot: () => readDiagnosticPathContext(domesticDiagnosticUrl) },
+    entry: async () => {
+      const proxyUrl = readLaixinNetworkDiagnosticProxy()
+      return proxyUrl === undefined ? undefined : {
+        capability: 'http-connect', id: 'n55-owned-local-entry', proxyUrl
+      }
+    }
+  })
+  return productionCodexIsolation
+}
+
+function productionClaudeAppIsolation(): ApplicationIsolationLeaseController {
+  if (productionClaudeIsolation !== undefined) return productionClaudeIsolation
+  const access = productionAiAccessService()
+  const transport = productionClaudeIsolationTransport
+  if (transport === undefined) throw new Error('CLAUDE_ISOLATION_TRANSPORT_UNAVAILABLE')
+  productionClaudeIsolation = new ApplicationIsolationLeaseController({
+    applicationId: 'claude',
+    adapter: access.createClaudeIsolationAdapter(transport),
+    // This N-55 probe is read-only and only guards against a changed system path; it cannot write a proxy, PAC, DNS or route.
+    system: { snapshot: () => readDiagnosticPathContext(domesticDiagnosticUrl) },
+    entry: async () => {
+      const proxyUrl = readLaixinNetworkDiagnosticProxy()
+      return proxyUrl === undefined ? undefined : {
+        capability: 'http-connect', id: 'n55-owned-local-entry', proxyUrl
+      }
+    }
+  })
+  return productionClaudeIsolation
+}
+
+function productionHermesAppIsolation(): ApplicationIsolationLeaseController {
+  if (productionHermesIsolation !== undefined) return productionHermesIsolation
+  const access = productionAiAccessService()
+  const transport = productionHermesIsolationTransport
+  if (transport === undefined) throw new Error('HERMES_ISOLATION_TRANSPORT_UNAVAILABLE')
+  productionHermesIsolation = new ApplicationIsolationLeaseController({
+    applicationId: 'hermes',
+    adapter: access.createHermesIsolationAdapter(transport),
+    // N-55-derived read-only path evidence; this controller has no system write capability.
+    system: { snapshot: () => readDiagnosticPathContext(domesticDiagnosticUrl) },
+    entry: async () => {
+      const proxyUrl = readLaixinNetworkDiagnosticProxy()
+      return proxyUrl === undefined ? undefined : {
+        capability: 'http-connect', id: 'n55-owned-local-entry', proxyUrl
+      }
+    }
+  })
+  return productionHermesIsolation
 }
 
 /** The native dialog keeps the raw directory inside the main process; the renderer receives only status evidence. */
@@ -413,7 +706,7 @@ function productionCodexLogin(access: ModelApiAccessActions): CodexOfficialLogin
   })
 }
 
-function productionClaudeLogin(access: ModelApiAccessActions): ClaudeOfficialLoginController {
+function productionClaudeLogin(access: ModelApiAccessActions, releaseIsolation?: () => Promise<void>): ClaudeOfficialLoginController {
   if (!(access instanceof AiAccessService)) throw new Error('AI_ACCESS_SERVICE_INVALID')
   const home = app.getPath('home')
   const addedAccounts = sharedAddedOfficialAccounts()
@@ -432,6 +725,7 @@ function productionClaudeLogin(access: ModelApiAccessActions): ClaudeOfficialLog
     startLogin: (command) => startClaudeLogin(command, { cwd: home, env: environment(), openExternal: (url) => shell.openExternal(url),
       statusCheck: () => readClaudeAuthStatus({ executable: command.executable, args: [] }, environment()) }),
     useOfficial: async (software) => {
+      await releaseIsolation?.()
       await access.useOfficial(software)
       // 与 Codex 一致：登录完成即由主进程登记账号指纹，之后身份与用量只对在案账号读取。
       try {
@@ -489,8 +783,156 @@ function publicRestartGuidance(shell: AiAccessShell, value: unknown): ShellResta
   return { shell, process: value.process, message: restartMessage(shell, value.process) }
 }
 
+function createApplicationIsolationHealthScheduler(isolation: Pick<ApplicationIsolationLeaseController, 'reverify'>, intervalMs: number): {
+  observe(value: { readonly available: boolean }): void
+  stop(): void
+} {
+  let timer: ReturnType<typeof setInterval> | undefined
+  const stop = () => {
+    if (timer !== undefined) clearInterval(timer)
+    timer = undefined
+  }
+  return {
+    observe: value => {
+      if (!value.available) { stop(); return }
+      if (timer !== undefined) return
+      timer = setInterval(() => {
+        void isolation.reverify().then(next => { if (!next.available) stop() }, () => stop())
+      }, intervalMs)
+      timer.unref?.()
+    },
+    stop
+  }
+}
+
+function createCodexIsolationHealthScheduler(isolation: Pick<CodexAppIsolationController, 'reverify'>): {
+  observe(value: { readonly available: boolean }): void
+  stop(): void
+} {
+  return createApplicationIsolationHealthScheduler(isolation, CODEX_ISOLATION_HEALTH_INTERVAL_MS)
+}
+
+function createClaudeIsolationHealthScheduler(isolation: Pick<ApplicationIsolationLeaseController, 'reverify'>, intervalMs = CODEX_ISOLATION_HEALTH_INTERVAL_MS): {
+  observe(value: { readonly available: boolean }): void
+  stop(): void
+} {
+  return createApplicationIsolationHealthScheduler(isolation, intervalMs)
+}
+
+function createHermesIsolationHealthScheduler(isolation: Pick<ApplicationIsolationLeaseController, 'reverify'>): {
+  observe(value: { readonly available: boolean }): void
+  stop(): void
+} {
+  return createApplicationIsolationHealthScheduler(isolation, HERMES_ISOLATION_HEALTH_INTERVAL_MS)
+}
+
+/**
+ * Serializes a Hermes configuration mutation with enable/disable.  The service owns the exact
+ * write point, while bridge actions acquire this gate first so an enable cannot appear between
+ * release and the route/configuration write.
+ */
+interface HermesIsolationMutationGate {
+  run<T>(task: () => Promise<T>): Promise<T>
+  runRouteMutation<T>(task: () => Promise<T>): Promise<T>
+  releaseForRouteMutation(): Promise<void>
+}
+
+function createHermesIsolationMutationGate(
+  isolation: Pick<ApplicationIsolationLeaseController, 'disable'>,
+  health: { stop(): void } | undefined
+): HermesIsolationMutationGate {
+  let pending: Promise<void> = Promise.resolve()
+  let taskActive = false
+  let releasedInTask = false
+  const run = <T>(task: () => Promise<T>): Promise<T> => {
+    const result = pending.then(async () => {
+      taskActive = true
+      releasedInTask = false
+      try { return await task() } finally { taskActive = false; releasedInTask = false }
+    })
+    pending = result.then(() => undefined, () => undefined)
+    return result
+  }
+  const releaseForRouteMutation = async (): Promise<void> => {
+    if (taskActive && releasedInTask) return
+    health?.stop()
+    const status = publicHermesIsolationStatus(await isolation.disable())
+    if (status.available || status.mode !== 'disabled' || status.code === 'RESTORE_FAILED') {
+      throw new Error('HERMES_ISOLATION_RELEASE_FAILED')
+    }
+    if (taskActive) releasedInTask = true
+  }
+  return {
+    run,
+    runRouteMutation: task => run(async () => {
+      await releaseForRouteMutation()
+      return task()
+    }),
+    releaseForRouteMutation
+  }
+}
+
+/** Fixed isolation IPC vocabulary: no local endpoint, configuration, keys or raw exception crosses this boundary. */
+function publicApplicationIsolationStatus(application: ApplicationIsolationLeaseStatus['application'], value: unknown): Readonly<Record<string, string | boolean | number>> {
+  const modes = ['application-only', 'disabled'] as const
+  const phases = ['idle', 'configuring', 'verifying', 'available', 'restoring', 'restored', 'limited'] as const
+  const actions = ['idle', 'enable', 'disable', 'recover', 'health'] as const
+  const codes = ['AVAILABLE', 'RESTORED', 'EXTERNAL_VALUE_PRESERVED', 'ENTRY_UNAVAILABLE', 'CONFIG_PATH_UNKNOWN', 'CONFIG_WRITE_FAILED', 'CONFIG_READBACK_MISMATCH', 'TARGET_UNREACHABLE', 'SYSTEM_NETWORK_CHANGED', 'RESTORE_FAILED', 'STALE_OPERATION'] as const
+  if (!record(value) || value.application !== application || value.scope !== 'model-api-egress' || value.capability !== 'http-connect' || !isOneOf(value.mode, modes) || value.systemNetwork !== 'unmanaged' ||
+    !isOneOf(value.phase, phases) || !isOneOf(value.action, actions) || !Number.isSafeInteger(value.intentGeneration) ||
+    (value.intentGeneration as number) < 0 || typeof value.available !== 'boolean' || !isOneOf(value.code, codes)) {
+    throw new Error('APPLICATION_ISOLATION_STATUS_INVALID')
+  }
+  if (!isCoherentIsolationStatus(value)) throw new Error('APPLICATION_ISOLATION_STATUS_INVALID')
+  return {
+    application, scope: 'model-api-egress', capability: 'http-connect', mode: value.mode, systemNetwork: 'unmanaged', phase: value.phase,
+    action: value.action, intentGeneration: value.intentGeneration as number, available: value.available, code: value.code
+  }
+}
+
+function publicCodexIsolationStatus(value: unknown): Readonly<Record<string, string | boolean | number>> {
+  return publicApplicationIsolationStatus('codex', value)
+}
+
+function publicClaudeIsolationStatus(value: unknown): Readonly<Record<string, string | boolean | number>> {
+  return publicApplicationIsolationStatus('claude', value)
+}
+
+function publicHermesIsolationStatus(value: unknown): Readonly<Record<string, string | boolean | number>> {
+  return publicApplicationIsolationStatus('hermes', value)
+}
+
+/** Hermes isolation never needs the target path to state a safe refusal; keep HERMES_HOME out of IPC. */
+function publicAiAccessStatus(value: AiAccessStatus): AiAccessStatus {
+  const hermes = value.configurationTargets?.hermes
+  const redactedHermes = hermes?.symlink === undefined ? undefined : {
+    shell: hermes.shell, scope: hermes.scope, override: hermes.override, writable: hermes.writable,
+    ...(hermes.reason === undefined ? {} : { reason: hermes.reason })
+  }
+  // A configuration-target rejection may also be cached as an attempt notice. Never forward
+  // its former path-bearing text merely because the target itself was redacted above.
+  const redactedAttempt = value.attempt?.shell === 'hermes' && value.attempt.notice !== undefined
+    ? { ...value.attempt, notice: 'Hermes 的有效受控配置无法确认；没有改写任何配置。' } : undefined
+  if (redactedHermes === undefined && redactedAttempt === undefined) return value
+  return {
+    ...value,
+    ...(redactedAttempt === undefined ? {} : { attempt: redactedAttempt }),
+    ...(redactedHermes === undefined ? {} : { configurationTargets: { ...value.configurationTargets, hermes: redactedHermes } })
+  }
+}
+
 function isOneOf<const T extends readonly string[]>(value: unknown, values: T): value is T[number] {
   return typeof value === 'string' && (values as readonly string[]).includes(value)
+}
+
+/** `available` is a verified lease state, never a free-standing UI boolean. */
+function isCoherentIsolationStatus(value: Record<string, unknown>): boolean {
+  if (value.available === true) return value.mode === 'application-only' && value.phase === 'available' && value.code === 'AVAILABLE'
+  if (value.code === 'AVAILABLE') return value.mode === 'application-only' &&
+    (value.phase === 'configuring' || value.phase === 'verifying' || value.phase === 'restoring')
+  if (value.code === 'RESTORED' || value.code === 'EXTERNAL_VALUE_PRESERVED') return value.mode === 'disabled' &&
+    (value.phase === 'idle' || value.phase === 'restoring' || value.phase === 'restored')
+  return value.mode === 'application-only' && value.phase === 'limited'
 }
 
 function record(value: unknown): value is Record<string, unknown> {

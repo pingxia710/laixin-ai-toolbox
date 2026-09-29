@@ -39,7 +39,7 @@ describe('未恢复项汇总不再撑爆 tunnel.status 的结果限长', () => {
   })
 
   it('汇总截断保持在上限内；单项超长也能收敛', () => {
-    const many = Array.from({ length: 40 }, (_, index) => `Service-${index}/item:未恢复:未完成(进程中断)`)
+    const many = Array.from({ length: 40 }, (_, index) => `Service-${index}/item:未恢复:待恢复确认`)
     expect(summarizeUnresolved(many)).toMatch(/等40项$/)
     expect(summarizeUnresolved(many).length).toBeLessThanOrEqual(300)
     expect(summarizeUnresolved(many.slice(0, 3)).endsWith(';等3项')).toBe(false)

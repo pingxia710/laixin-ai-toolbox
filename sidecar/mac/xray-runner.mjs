@@ -2,13 +2,15 @@
 // 停止主通道:bridge 关闭本进程的 stdin 管道,收到 EOF 即停 xray(跨平台可靠;
 // Windows 上 SIGTERM 等于 TerminateProcess,清理钩子不会跑,⛔ 作为停止信号依赖)。
 import { spawn } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { rmSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { currentProcessStartedAt } from './ledger.mjs'
 
 export function startXrayRunner(options) {
   const {
-    executable, config, parent,
+    executable, config, parent, runId = randomUUID(),
     stdin = process.stdin,
     ppid = process.ppid,
     platform = process.platform,
@@ -18,7 +20,8 @@ export function startXrayRunner(options) {
     timers = { setInterval, clearInterval, setTimeout, clearTimeout },
     stderr = process.stderr
   } = options
-  if (!executable || !config || !Number.isSafeInteger(parent) || ppid !== parent) {
+  if (!executable || !config || !Number.isSafeInteger(parent) || ppid !== parent ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(runId)) {
     exit(64)
     return { stopped: true }
   }
@@ -41,10 +44,13 @@ export function startXrayRunner(options) {
     stderrPending = lines.pop() ?? ''
     for (const line of lines) forwardStderrLine(line)
   })
-  // xray pid 落盘:bridge 停止兜底与下一次启动的孤儿清扫都按它找内核进程。
-  // 记档带启动时刻与映像名:PID 会被系统复用,只凭 pid 强杀可能误杀无关进程。
-  const pidPath = `${config}.pid`
-  const record = { pid: child.pid, startedAt: Date.now(), image: imageNameOf(executable) }
+  // 每代独占 pid 文件:旧 runner 的 close 即使与新 runner 的写入交错,也只会删自己的文件。
+  // owner 用于下次启动清扫时识别仍在工作的 runner,⛔ 把活内核当孤儿强杀。
+  const pidPath = `${config}.${runId}.pid`
+  const record = {
+    pid: child.pid, startedAt: Date.now(), image: imageNameOf(executable), runId,
+    owner: { pid: process.pid, startedAt: currentProcessStartedAt(), at: Date.now() }
+  }
   try { writeFileSync(pidPath, `${JSON.stringify(record)}\n`, { mode: 0o600 }) } catch { /* 兜底通道缺席时主通道仍在。 */ }
   let stopping = false
   let killTimer
@@ -74,7 +80,7 @@ export function startXrayRunner(options) {
     if (stderrPending !== '') forwardStderrLine(stderrPending) // 没有换行收尾的遗言也要转出去
     if (pollTimer !== undefined) timers.clearInterval(pollTimer)
     timers.clearTimeout(killTimer)
-    try { rmSync(pidPath, { force: true }) } catch { /* 残留 pid 文件无危害:重启会覆写。 */ }
+    try { rmSync(pidPath, { force: true }) } catch { /* 残留独占记录会由下次启动清扫。 */ }
     exit(stopping ? 0 : (code || 70))
   })
   return { stop, child }
@@ -82,8 +88,8 @@ export function startXrayRunner(options) {
 
 const entry = process.argv[1] === undefined ? '' : resolve(process.argv[1])
 if (entry !== '' && entry === resolve(dirname(fileURLToPath(import.meta.url)), 'xray-runner.mjs')) {
-  const [executable, config, parentText] = process.argv.slice(2)
-  startXrayRunner({ executable, config, parent: Number(parentText) })
+  const [executable, config, parentText, runId] = process.argv.slice(2)
+  startXrayRunner({ executable, config, parent: Number(parentText), runId })
 }
 
 // 映像名按两种分隔符取尾:记档在 Windows 上写、可能在别处读,⛔ 依赖当前平台的 path 语义。

@@ -73,17 +73,23 @@ function restoreMacProxy(
 }
 
 describe('真实适配器的命令与读数协议（系统调用已封闭替换）', () => {
-  // D5:mac 侧此前没有连接前的所有权判断,别的代理软件开着时会被直接顶掉,
-  // 而且它的设置会被当成「原值」记进账本。判据与 Windows 的 WinINET 适配器一致。
-  it('macOS 连接前不再凭「有代理」拒绝:只报出电脑上别的代理给守护判能不能复用;我们自己的地址与已关闭的不算(发布审查 R4)', () => {
-    const script = (proxies: Record<string, { enabled: boolean; host: string; port: number }>) => `
+  it('macOS 只报告默认路由对应服务的 Secure Web Proxy；非活动服务与普通 Web Proxy 都不能冒充', () => {
+    const script = (proxies: Record<string, { enabled: boolean; host: string; port: number }>, activeDevice = 'en0') => `
       const services = ${JSON.stringify(Object.keys(proxies))}
       const proxies = ${JSON.stringify(proxies)}
+      const activeDevice = ${JSON.stringify(activeDevice)}
       execute = (file, args) => {
+        if (file === '/sbin/route' && args.join(' ') === '-n get default') return '   interface: ' + activeDevice + '\\n'
         if (file !== 'networksetup') throw new Error('UNEXPECTED_SYSTEM_COMMAND')
+        if (args[0] === '-listnetworkserviceorder') return services.map((service, index) =>
+          '(' + String(index + 1) + ') ' + service + '\\n(Hardware Port: ' + service + ', Device: en' + String(index) + ')'
+        ).join('\\n') + '\\n'
         if (args[0] === '-listallnetworkservices') return 'An asterisk (*) denotes...\\n' + services.join('\\n') + '\\n'
+        if (args[0] === '-getautoproxyurl') return 'URL: (null)\\nEnabled: No\\n'
         const proxy = proxies[args[1]]
         if (proxy === undefined) throw new Error('UNEXPECTED_SYSTEM_COMMAND')
+        if (args[0] === '-getwebproxy') return 'Enabled: Yes\\nServer: first-proxy.invalid\\nPort: 7000\\nAuthenticated Proxy Enabled: 0\\n'
+        if (args[0] !== '-getsecurewebproxy') return 'Enabled: No\\nServer: \\nPort: 0\\nAuthenticated Proxy Enabled: 0\\n'
         return 'Enabled: ' + (proxy.enabled ? 'Yes' : 'No') + '\\nServer: ' + proxy.host + '\\nPort: ' + proxy.port + '\\nAuthenticated Proxy Enabled: 0\\n'
       }
       let conflict = null
@@ -92,7 +98,7 @@ describe('真实适配器的命令与读数协议（系统调用已封闭替换�
     `
     const clash = probe('mac', script({ 'Wi-Fi': { enabled: true, host: '127.0.0.1', port: 7890 } }))
     expect(clash.conflict).toBeNull()
-    expect(clash.existing).toMatchObject({ kind: 'http', host: '127.0.0.1', port: 7890, source: 'Wi-Fi/web-proxy' })
+    expect(clash.existing).toMatchObject({ kind: 'http', host: '127.0.0.1', port: 7890, source: 'Wi-Fi/secure-web-proxy' })
 
     const ours = probe('mac', script({ 'Wi-Fi': { enabled: true, host: '127.0.0.1', port: 18080 } }))
     expect(ours.conflict).toBeNull()
@@ -101,13 +107,13 @@ describe('真实适配器的命令与读数协议（系统调用已封闭替换�
     const disabled = probe('mac', script({ 'Wi-Fi': { enabled: false, host: '127.0.0.1', port: 7890 } }))
     expect(disabled.existing).toBeNull()
 
-    // 多张网卡:任何一张开着别的代理都报出来
+    // Wi-Fi(en0) 排在清单第一且开着 A，默认路由实际走以太网(en1)的 B：只能报告 B。
     const second = probe('mac', script({
-      'Wi-Fi': { enabled: false, host: '', port: 0 },
+      'Wi-Fi': { enabled: true, host: '10.0.0.8', port: 7001 },
       '以太网': { enabled: true, host: '192.168.1.9', port: 8080 }
-    }))
+    }, 'en1'))
     expect(second.conflict).toBeNull()
-    expect(second.existing).toMatchObject({ host: '192.168.1.9', port: 8080 })
+    expect(second.existing).toMatchObject({ host: '192.168.1.9', port: 8080, source: '以太网/secure-web-proxy' })
   })
 
   // D5:网络服务消失(VPN 断开、蓝牙 PAN 关掉、USB 网卡拔掉)与「没权限」必须分开。
@@ -181,7 +187,9 @@ describe('真实适配器的命令与读数协议（系统调用已封闭替换�
       const services = ['Wi-Fi']
       const pac = ${JSON.stringify(pac)}
       execute = (file, args) => {
+        if (file === '/sbin/route' && args.join(' ') === '-n get default') return '   interface: en0\\n'
         if (file !== 'networksetup') throw new Error('UNEXPECTED_SYSTEM_COMMAND')
+        if (args[0] === '-listnetworkserviceorder') return '(1) Wi-Fi\\n(Hardware Port: Wi-Fi, Device: en0)\\n'
         if (args[0] === '-listallnetworkservices') return 'An asterisk (*) denotes...\\n' + services.join('\\n') + '\\n'
         if (args[0] === '-getautoproxyurl') {
           const value = pac[args[1]] ?? { url: '(null)', enabled: false }
@@ -310,10 +318,12 @@ describe('真实适配器的命令与读数协议（系统调用已封闭替换�
   it('macOS 已有代理主机名含 error 词:如实读出交守护判复用,接管列项照常', () => {
     const result = probe('mac', `
       execute = (file, args) => {
+        if (file === '/sbin/route' && args.join(' ') === '-n get default') return '   interface: en0\\n'
         if (file !== 'networksetup') throw new Error('UNEXPECTED_SYSTEM_COMMAND')
+        if (args[0] === '-listnetworkserviceorder') return '(1) Wi-Fi\\n(Hardware Port: Wi-Fi, Device: en0)\\n'
         if (args[0] === '-listallnetworkservices') return 'An asterisk (*) denotes that a network service is disabled.\\nWi-Fi\\n'
         if (args[0] === '-getautoproxyurl') return 'URL: (null)\\nEnabled: No\\n'
-        if (args[0] === '-getwebproxy') return 'Enabled: Yes\\nServer: proxy.error.corp.local\\nPort: 8080\\nAuthenticated Proxy Enabled: 0\\n'
+        if (args[0] === '-getwebproxy' || args[0] === '-getsecurewebproxy') return 'Enabled: Yes\\nServer: proxy.error.corp.local\\nPort: 8080\\nAuthenticated Proxy Enabled: 0\\n'
         return 'Enabled: No\\nServer: \\nPort: 0\\nAuthenticated Proxy Enabled: 0\\n'
       }
       const outcome = (fn) => { try { return { ok: fn() } } catch (error) { return { code: error?.code ?? null } } }
@@ -323,7 +333,7 @@ describe('真实适配器的命令与读数协议（系统调用已封闭替换�
         managed: outcome(() => adapter.managedItems(${JSON.stringify(managedProxy)}).length)
       }))
     `)
-    expect(result.existing).toEqual({ ok: { kind: 'http', host: 'proxy.error.corp.local', port: 8080, source: 'Wi-Fi/web-proxy' } })
+    expect(result.existing).toEqual({ ok: { kind: 'http', host: 'proxy.error.corp.local', port: 8080, source: 'Wi-Fi/secure-web-proxy' } })
     expect(result.original).toEqual({ ok: { enabled: true, host: 'proxy.error.corp.local', port: 8080 } })
     expect(result.managed).toEqual({ ok: 4 })
   })
@@ -333,7 +343,9 @@ describe('真实适配器的命令与读数协议（系统调用已封闭替换�
   it('macOS PAC 地址含 error 词:报成 pac 交守护处理,接管列项照常并记下原地址', () => {
     const result = probe('mac', `
       execute = (file, args) => {
+        if (file === '/sbin/route' && args.join(' ') === '-n get default') return '   interface: en0\\n'
         if (file !== 'networksetup') throw new Error('UNEXPECTED_SYSTEM_COMMAND')
+        if (args[0] === '-listnetworkserviceorder') return '(1) Wi-Fi\\n(Hardware Port: Wi-Fi, Device: en0)\\n'
         if (args[0] === '-listallnetworkservices') return 'An asterisk (*) denotes that a network service is disabled.\\nWi-Fi\\n'
         if (args[0] === '-getautoproxyurl') return 'URL: http://error.corp.local/x.pac\\nEnabled: Yes\\n'
         return 'Enabled: No\\nServer: \\nPort: 0\\nAuthenticated Proxy Enabled: 0\\n'

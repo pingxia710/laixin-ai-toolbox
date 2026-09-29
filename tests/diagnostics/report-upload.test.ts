@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, expect, it } from 'vitest'
 import { generateReceipt, loopsBackToTunnel, saveReportLocally, uploadReport, type ReportRoute, type ReportTransport } from '../../app/main/diagnostics/report-upload'
@@ -68,6 +68,22 @@ it('两条路都不通：整包落到本机文件，回执号还是同一个', a
   const path = await saveReportLocally(join(root, 'reports'), receipt, JSON.stringify({ receipt, body: {} }))
   expect(path.endsWith(`${receipt}.json`)).toBe(true)
   expect(JSON.parse(readFileSync(path, 'utf8')) as { receipt: string }).toMatchObject({ receipt })
+})
+
+it('本机报告目录或目标文件是符号链接时拒绝写入目录外', async () => {
+  const root = makeTempDir('report-upload-symlink-'); roots.push(root)
+  const outside = join(root, 'outside'); mkdirSync(outside)
+  const linkedDirectory = join(root, 'reports-linked'); symlinkSync(outside, linkedDirectory)
+  const receipt = 'LX-AAAA-BBBB'
+
+  await expect(saveReportLocally(linkedDirectory, receipt, '{}')).rejects.toThrow('REPORT_DIRECTORY_INVALID')
+  expect(readdirSync(outside)).toEqual([])
+
+  const reports = join(root, 'reports'); mkdirSync(reports)
+  const victim = join(root, 'victim.json'); writeFileSync(victim, 'ORIGINAL')
+  symlinkSync(victim, join(reports, `${receipt}.json`))
+  await expect(saveReportLocally(reports, receipt, '{}')).rejects.toThrow()
+  expect(readFileSync(victim, 'utf8')).toBe('ORIGINAL')
 })
 
 it('回执号念得出来、写得下，且不会两次一样', () => {

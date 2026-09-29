@@ -3,10 +3,12 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { createDeepSeekAdapters, observedConfigurationExecution, type HermesModelKey } from '../../app/main/ai-access/adapters'
+import type { ConfigurationExecutionContext } from '../../app/main/ai-access/configuration-target'
 import type { ManagedTextFile } from '../../app/main/ai-access/deepseek-config'
 import { createProjectConfigurationTargetStore } from '../../app/main/ai-access/configuration-target'
 import type { AiGateway, GatewayRoute } from '../../app/main/ai-access/gateway'
 import { AiAccessService, type AiAccessState } from '../../app/main/ai-access/service'
+import { ApplicationIsolationLeaseController } from '../../app/main/ai-access/application-isolation-lease'
 import { trustedHermesCommandCandidates } from '../../app/main/shells/inventory'
 
 function files() {
@@ -48,7 +50,7 @@ function acceptingGateway(options: { readonly failFixedPort?: boolean; readonly 
   const gateway = {
     baseUrl: null as string | null,
     async start(port: number): Promise<number> {
-      if (options.failFixedPort && port !== 0) throw new Error('fixture port is occupied')
+      if (options.failFixedPort && port !== 0) throw Object.assign(new Error('fixture port is occupied'), { code: 'EADDRINUSE' })
       const allocated = port || options.allocatedPort || 19_361
       gateway.baseUrl = `http://127.0.0.1:${String(allocated)}`
       running = true
@@ -119,6 +121,591 @@ describe('三个壳的 DeepSeek 适配器', () => {
 
     expect(f.data.get('/customer/.codex/config.toml')).toContain('model_provider = "laixin-deepseek"')
     expect(f.data.get(projectPath)).toBe(projectContents)
+  })
+
+  it('Codex 隔离只条件恢复工具箱标记块，保留客户后来写入的无关字段且不读取官方登录凭据', async () => {
+    const f = files()
+    const read = vi.spyOn(f.io, 'read')
+    const configPath = '/customer/.codex/config.toml'
+    const authPath = '/customer/.codex/auth.json'
+    f.data.set(configPath, 'approval_policy = "on-request"\n')
+    f.data.set(authPath, '{"tokens":{"access_token":"customer-login"}}')
+    const codex = createDeepSeekAdapters({ home: '/customer', platform: 'darwin', file: f.io }).find(adapter => adapter.shell === 'codex')!
+    const original = { baseUrl: 'http://127.0.0.1:19361/codex/deepseek/v1', apiKey: 'local-token-original', model: 'deepseek-v4-flash' }
+    const isolated = { ...original, baseUrl: 'http://127.0.0.1:19362/codex/deepseek/v1' }
+
+    await codex.applyConnection!('deepseek', original)
+    const capture = await codex.captureIsolation!()
+    await codex.applyConnection!('deepseek', isolated)
+    const expected = await codex.readIsolationFingerprint!()
+    f.data.set(configPath, `${f.data.get(configPath)!}\n[projects."customer"]\ncustomer_note = "keep-this"\n`)
+
+    await expect(capture.restoreIfOwned(expected!)).resolves.toBe('restored')
+    expect(f.data.get(configPath)).toContain(original.baseUrl)
+    expect(f.data.get(configPath)).toContain('customer_note = "keep-this"')
+    expect(read).not.toHaveBeenCalledWith(authPath)
+    await codex.clearIsolationLease!(capture.leaseId)
+
+    await codex.applyConnection!('deepseek', isolated)
+    const second = await codex.captureIsolation!()
+    const secondExpected = await codex.readIsolationFingerprint!()
+    f.data.set(configPath, f.data.get(configPath)!.replace('19362', '19999'))
+    await expect(second.restoreIfOwned(secondExpected!)).resolves.toBe('preserved-external')
+    expect(f.data.get(configPath)).toContain('19999')
+    await codex.clearIsolationLease!(second.leaseId)
+  })
+
+  it('Codex 隔离租约在进程重启后只恢复仍归来信所有的标记块，重复恢复保持幂等', async () => {
+    const f = files()
+    const configPath = '/customer/.codex/config.toml'
+    f.data.set(configPath, 'approval_policy = "on-request"\n')
+    const original = { baseUrl: 'http://127.0.0.1:19361/codex/deepseek/v1', apiKey: 'local-token-original', model: 'deepseek-v4-flash' }
+    const isolated = { ...original, baseUrl: 'http://127.0.0.1:19362/codex/deepseek/v1' }
+    const first = createDeepSeekAdapters({ home: '/customer', platform: 'darwin', file: f.io }).find(adapter => adapter.shell === 'codex')!
+
+    await first.applyConnection!('deepseek', original)
+    const capture = await first.captureIsolation!()
+    await expect(first.applyIsolationConnection!('deepseek', isolated, capture.beforeIsolationFingerprint, capture.leaseId)).resolves.toMatchObject({ outcome: 'applied' })
+    expect(f.data.get('/customer/.codex/laixin-codex-isolation-lease.json')).toContain('"expectedFingerprint":"')
+
+    const restarted = createDeepSeekAdapters({ home: '/customer', platform: 'darwin', file: f.io }).find(adapter => adapter.shell === 'codex')!
+    await expect(restarted.recoverIsolationLease!()).resolves.toBe('restored')
+    await expect(restarted.recoverIsolationLease!()).resolves.toBe('none')
+    expect(f.data.get(configPath)).toContain(original.baseUrl)
+    expect(f.data.get('/customer/.codex/laixin-codex-isolation-lease.json')).toBeUndefined()
+  })
+
+  const claudeIsolationTargets: readonly [string, { readonly projectDir?: string; readonly selectProject?: boolean; readonly execution?: ReturnType<typeof observedConfigurationExecution> }, string][] = [
+    ['用户级 settings.json', {}, '/customer/.claude/settings.json'],
+    ['项目级 settings.local.json', { projectDir: '/customer/project', selectProject: true }, '/customer/project/.claude/settings.local.json'],
+    ['项目级 settings.json', { projectDir: '/customer/project', selectProject: true }, '/customer/project/.claude/settings.json'],
+    ['静态确认的 CLAUDE_CONFIG_DIR', { execution: observedConfigurationExecution('/customer', 'darwin', { CLAUDE_CONFIG_DIR: '/other/.claude' }) }, '/other/.claude/settings.json']
+  ]
+  it.each(claudeIsolationTargets)('Claude 隔离租约只管理来信拥有的 env，保留其他 env 与 settings：%s', async (_name, options, configPath) => {
+    const f = files()
+    if (options.selectProject) f.data.set(configPath, JSON.stringify({ env: { PROJECT_VALUE: 'keep' } }))
+    const claude = createDeepSeekAdapters({
+      home: '/customer', platform: 'darwin', file: f.io,
+      ...(options.projectDir ? { projectDir: options.projectDir } : {}),
+      ...(options.execution ? { configurationExecution: options.execution } : {})
+    }).find(adapter => adapter.shell === 'claude')!
+    if (options.selectProject) await claude.selectConfigurationProject!('/customer/project')
+    const original = { baseUrl: 'http://127.0.0.1:19361/claude/deepseek', apiKey: 'local-token-original', model: 'deepseek-v4-flash' }
+    const isolated = { ...original, baseUrl: 'http://127.0.0.1:19362/claude/deepseek' }
+
+    await claude.applyConnection!('deepseek', original)
+    const capture = await claude.captureIsolation!()
+    await expect(claude.applyIsolationConnection!('deepseek', isolated, capture.beforeIsolationFingerprint, capture.leaseId)).resolves.toMatchObject({ outcome: 'applied' })
+    const expected = await claude.readIsolationFingerprint!()
+    const settings = JSON.parse(f.data.get(configPath)!) as { env: Record<string, string>; permissions?: { allow?: string[] } }
+    expect(settings.env).not.toHaveProperty('HTTP_PROXY')
+    expect(settings.env).not.toHaveProperty('HTTPS_PROXY')
+    expect(settings.env).not.toHaveProperty('NO_PROXY')
+    settings.env.THIRD_PARTY_ENV = 'preserve-me'
+    settings.permissions = { allow: ['Read'] }
+    f.data.set(configPath, `${JSON.stringify(settings, null, 2)}\n`)
+
+    await expect(capture.restoreIfOwned(expected!)).resolves.toBe('restored')
+    const restored = JSON.parse(f.data.get(configPath)!) as { env: Record<string, string>; permissions?: { allow?: string[] } }
+    expect(restored.env.THIRD_PARTY_ENV).toBe('preserve-me')
+    expect(restored.permissions).toEqual({ allow: ['Read'] })
+    expect(restored.env.ANTHROPIC_BASE_URL).toBe(original.baseUrl)
+    await capture.clearIsolationLease!()
+  })
+
+  it('Claude 隔离在同一锁内复验、外改受控 env 时保留客户最终值，崩溃恢复不重建入口', async () => {
+    const f = files()
+    const configPath = '/customer/.claude/settings.json'
+    const leasePath = '/customer/.claude/laixin-claude-isolation-lease.json'
+    const claude = createDeepSeekAdapters({ home: '/customer', platform: 'darwin', file: f.io }).find(adapter => adapter.shell === 'claude')!
+    const original = { baseUrl: 'http://127.0.0.1:19361/claude/deepseek', apiKey: 'local-token-original', model: 'deepseek-v4-flash' }
+    const isolated = { ...original, baseUrl: 'http://127.0.0.1:19362/claude/deepseek' }
+
+    await claude.applyConnection!('deepseek', original)
+    const capture = await claude.captureIsolation!()
+    const before = f.data.get(configPath)
+    const external = JSON.parse(before!) as { env: Record<string, string> }
+    external.env.ANTHROPIC_MODEL = 'customer-final-model'
+    f.data.set(configPath, `${JSON.stringify(external, null, 2)}\n`)
+    const customerFinal = f.data.get(configPath)
+    await expect(claude.applyIsolationConnection!('deepseek', isolated, capture.beforeIsolationFingerprint, capture.leaseId)).resolves.toBe('stale')
+    await expect(capture.restoreIfOwned()).resolves.toBe('preserved-external')
+    expect(f.data.get(configPath)).toBe(customerFinal)
+    await capture.clearIsolationLease!()
+
+    const second = await claude.captureIsolation!()
+    await claude.applyIsolationConnection!('deepseek', isolated, second.beforeIsolationFingerprint, second.leaseId)
+    expect(f.data.get(leasePath)).toContain('"expectedFingerprint":"')
+    const restarted = createDeepSeekAdapters({ home: '/customer', platform: 'darwin', file: f.io }).find(adapter => adapter.shell === 'claude')!
+    await expect(restarted.recoverIsolationLease!()).resolves.toBe('restored')
+    expect(f.data.get(leasePath)).toBeUndefined()
+    expect(f.data.get(configPath)).toContain('customer-final-model')
+  })
+
+  it('Claude 隔离写入失败时回滚 settings 与租约，重启恢复不建立网络入口', async () => {
+    const f = files()
+    const configPath = '/customer/.claude/settings.json'
+    const leasePath = '/customer/.claude/laixin-claude-isolation-lease.json'
+    const claude = createDeepSeekAdapters({ home: '/customer', platform: 'darwin', file: f.io }).find(adapter => adapter.shell === 'claude')!
+    const original = { baseUrl: 'http://127.0.0.1:19361/claude/deepseek', apiKey: 'local-token-original', model: 'deepseek-v4-flash' }
+    const isolated = { ...original, baseUrl: 'http://127.0.0.1:19362/claude/deepseek' }
+
+    await claude.applyConnection!('deepseek', original)
+    const capture = await claude.captureIsolation!()
+    const write = f.io.write
+    const writes: string[] = []
+    f.io.write = async (path, contents) => {
+      if (path === leasePath && contents.includes('"expectedFingerprint":"')) writes.push('lease')
+      if (path === configPath && contents.includes('19362')) {
+        writes.push('settings')
+        throw new Error('fixture settings write failed')
+      }
+      await write(path, contents)
+    }
+
+    await expect(claude.applyIsolationConnection!('deepseek', isolated, capture.beforeIsolationFingerprint, capture.leaseId)).rejects.toThrow('AI_ACCESS_CONFIG_TRANSACTION_FAILED')
+    expect(writes).toEqual(['lease', 'settings'])
+    expect(f.data.get(configPath)).toContain(original.baseUrl)
+    const restarted = createDeepSeekAdapters({ home: '/customer', platform: 'darwin', file: f.io }).find(adapter => adapter.shell === 'claude')!
+    await expect(restarted.recoverIsolationLease!()).resolves.toBe('restored')
+    expect(f.data.get(leasePath)).toBeUndefined()
+  })
+
+  const blockedClaudeIsolationExecutions: readonly [string, ConfigurationExecutionContext][] = [
+    ['受管策略', { managed: true }],
+    ['命令行 settings 覆盖', { commandLine: true }],
+    ['动态配置目录', { configDirectory: '/customer/dynamic/.claude' }],
+    ['未知启动上下文', { source: 'unknown' }]
+  ]
+  it.each(blockedClaudeIsolationExecutions)('Claude 隔离遇到 %s 时 fail closed 且零写入', async (_name, execution) => {
+    const f = files()
+    const write = vi.spyOn(f.io, 'write')
+    const claude = createDeepSeekAdapters({
+      home: '/customer', platform: 'darwin', file: f.io,
+      configurationExecution: { claude: execution }
+    }).find(adapter => adapter.shell === 'claude')!
+
+    await expect(claude.captureIsolation!()).rejects.toThrow('AI_ACCESS_CONFIGURATION_TARGET_BLOCKED')
+    expect(write).not.toHaveBeenCalled()
+    expect(f.data).toEqual(new Map())
+  })
+
+  it('Claude 实际有效目标在捕获前已变化时，目标守卫在创建租约前零写入', async () => {
+    const f = files()
+    const claude = createDeepSeekAdapters({ home: '/customer', platform: 'darwin', file: f.io }).find(adapter => adapter.shell === 'claude')!
+    await claude.applyConnection!('deepseek', { baseUrl: 'http://127.0.0.1:19361/claude/deepseek', apiKey: 'local-token-original', model: 'deepseek-v4-flash' })
+    const write = vi.spyOn(f.io, 'write')
+
+    await expect(claude.captureIsolation!('different-opaque-target')).rejects.toThrow('AI_ACCESS_CONFIGURATION_TARGET_BLOCKED')
+
+    expect(write).not.toHaveBeenCalled()
+    expect(f.data.get('/customer/.claude/laixin-claude-isolation-lease.json')).toBeUndefined()
+  })
+
+  it('Claude 捕获后的目标变化会让租约写入返回 stale，且不改写另一 settings 目标', async () => {
+    const f = files()
+    const configPath = '/customer/.claude/settings.json'
+    const claude = createDeepSeekAdapters({ home: '/customer', platform: 'darwin', file: f.io }).find(adapter => adapter.shell === 'claude')!
+    const connection = { baseUrl: 'http://127.0.0.1:19361/claude/deepseek', apiKey: 'local-token-original', model: 'deepseek-v4-flash' }
+    await claude.applyConnection!('deepseek', connection)
+    const target = await claude.configurationTargetIdentity!()
+    const capture = await claude.captureIsolation!(target)
+    const before = f.data.get(configPath)
+    const write = vi.spyOn(f.io, 'write')
+
+    await expect(claude.applyIsolationConnection!('deepseek', { ...connection, baseUrl: 'http://127.0.0.1:19362/claude/deepseek' }, capture.beforeIsolationFingerprint, capture.leaseId, 'different-opaque-target')).resolves.toBe('stale')
+
+    expect(write).not.toHaveBeenCalled()
+    expect(f.data.get(configPath)).toBe(before)
+    write.mockRestore()
+    await capture.clearIsolationLease!()
+  })
+
+  it('Claude 在写锁内重新观察到目标变化时，连同目标 B 的 settings 和租约都零写入', async () => {
+    const f = files()
+    const targetA = '/customer/a/.claude/settings.json'
+    const targetB = '/customer/b/.claude/settings.json'
+    let observations = 0
+    const claude = createDeepSeekAdapters({
+      home: '/customer', platform: 'darwin', file: f.io,
+      observeConfigurationExecution: async () => {
+        observations++
+        return { claude: { source: 'observed', userConfigPath: observations >= 5 ? targetB : targetA } }
+      }
+    }).find(adapter => adapter.shell === 'claude')!
+    const connection = { baseUrl: 'http://127.0.0.1:19361/claude/deepseek', apiKey: 'local-token-original', model: 'deepseek-v4-flash' }
+    await claude.applyConnection!('deepseek', connection) // observation 1: target A
+    const target = await claude.configurationTargetIdentity!() // 2: target A
+    const capture = await claude.captureIsolation!(target) // 3: target A, lease A only
+    const write = vi.spyOn(f.io, 'write')
+
+    await expect(claude.applyIsolationConnection!('deepseek', { ...connection, baseUrl: 'http://127.0.0.1:19362/claude/deepseek' }, capture.beforeIsolationFingerprint, capture.leaseId, target)).resolves.toBe('stale')
+
+    expect(observations).toBe(5)
+    expect(write).not.toHaveBeenCalled()
+    expect(f.data.get(targetB)).toBeUndefined()
+    expect(f.data.get('/customer/b/.claude/laixin-claude-isolation-lease.json')).toBeUndefined()
+  })
+
+  it('Claude 捕获 A、切到 B 后恢复和清理仍只结算 A 的本租约', async () => {
+    const f = files()
+    const targetA = '/customer/a/.claude/settings.json'
+    const targetB = '/customer/b/.claude/settings.json'
+    const leaseA = '/customer/a/.claude/laixin-claude-isolation-lease.json'
+    const registryPath = '/customer/.laixin-ai-access/laixin-claude-isolation-target.json'
+    let effective = targetA
+    const claude = createDeepSeekAdapters({
+      home: '/customer', platform: 'darwin', file: f.io,
+      observeConfigurationExecution: async () => ({ claude: { source: 'observed', userConfigPath: effective } })
+    }).find(adapter => adapter.shell === 'claude')!
+    const original = { baseUrl: 'http://127.0.0.1:19361/claude/deepseek', apiKey: 'local-token-original', model: 'deepseek-v4-flash' }
+    await claude.applyConnection!('deepseek', original)
+    const capture = await claude.captureIsolation!()
+    await claude.applyIsolationConnection!('deepseek', { ...original, baseUrl: 'http://127.0.0.1:19362/claude/deepseek' }, capture.beforeIsolationFingerprint, capture.leaseId)
+    const expected = await claude.readIsolationFingerprint!()
+    effective = targetB
+
+    await expect(capture.restoreIfOwned(expected)).resolves.toBe('restored')
+    await capture.clearIsolationLease!()
+
+    expect(f.data.get(leaseA)).toBeUndefined()
+    expect(f.data.get(registryPath)).toBeUndefined()
+    expect(f.data.get(targetB)).toBeUndefined()
+    expect(f.data.get('/customer/b/.claude/laixin-claude-isolation-lease.json')).toBeUndefined()
+  })
+
+  it('Claude 捕获 A 后在启动前被新代次淘汰，仍只丢弃 A 的租约且 B 零写入', async () => {
+    const f = files()
+    const targetA = '/customer/a/.claude/settings.json'
+    const targetB = '/customer/b/.claude/settings.json'
+    const leaseA = '/customer/a/.claude/laixin-claude-isolation-lease.json'
+    const registryPath = '/customer/.laixin-ai-access/laixin-claude-isolation-target.json'
+    let effective = targetA
+    const claude = createDeepSeekAdapters({
+      home: '/customer', platform: 'darwin', file: f.io,
+      observeConfigurationExecution: async () => ({ claude: { source: 'observed', userConfigPath: effective } })
+    }).find(adapter => adapter.shell === 'claude')!
+    const original = { baseUrl: 'http://127.0.0.1:19361/claude/deepseek', apiKey: 'local-token-original', model: 'deepseek-v4-flash' }
+    await claude.applyConnection!('deepseek', original)
+    const originalCapture = claude.captureIsolation!
+    let resolveCaptured!: () => void
+    const captured = new Promise<void>(resolve => { resolveCaptured = resolve })
+    let releaseCapture!: () => void
+    const captureRelease = new Promise<void>(resolve => { releaseCapture = resolve })
+    claude.captureIsolation = async (expected) => {
+      const snapshot = await originalCapture(expected)
+      resolveCaptured()
+      await captureRelease
+      return snapshot
+    }
+    const state: AiAccessState = {
+      version: 1, selected: { claude: 'deepseek' }, relay: { port: 19_361, token: 'a'.repeat(64) }, relayShells: ['claude'],
+      shellKeys: { claude: { deepseek: 'sk-toolbox-fixture-key-1234567890' } }
+    }
+    const inert = (shell: 'codex' | 'hermes') => ({ shell, applyDeepSeek: async () => undefined })
+    const service = new AiAccessService({ read: async () => state, write: async () => undefined }, [inert('codex'), claude, inert('hermes')], acceptingGateway())
+    const activate = vi.fn(async () => undefined)
+    const controller = new ApplicationIsolationLeaseController({
+      applicationId: 'claude', adapter: service.createClaudeIsolationAdapter({ activate, deactivate: async () => undefined }),
+      system: { snapshot: async () => 'n55-read-only-path' },
+      entry: async () => ({ capability: 'http-connect', id: 'n55-proven-entry', proxyUrl: 'http://127.0.0.1:18080' })
+    })
+
+    const enabling = controller.enable()
+    await captured
+    effective = targetB
+    const disabling = controller.disable()
+    releaseCapture()
+    await enabling
+    await disabling
+
+    expect(f.data.get(leaseA)).toBeUndefined()
+    expect(f.data.get(registryPath)).toBeUndefined()
+    expect(f.data.get(targetB)).toBeUndefined()
+    expect(f.data.get('/customer/b/.claude/laixin-claude-isolation-lease.json')).toBeUndefined()
+    expect(activate).not.toHaveBeenCalled()
+  })
+
+  it('Claude 在 A 完成写入后崩溃、重启时有效目标为 B，不能把 A 租约说成 none；切回 A 可自动结算', async () => {
+    const f = files()
+    const targetA = '/customer/a/.claude/settings.json'
+    const targetB = '/customer/b/.claude/settings.json'
+    const leaseA = '/customer/a/.claude/laixin-claude-isolation-lease.json'
+    const registryPath = '/customer/.laixin-ai-access/laixin-claude-isolation-target.json'
+    let effective = targetA
+    const build = () => createDeepSeekAdapters({
+      home: '/customer', platform: 'darwin', file: f.io,
+      observeConfigurationExecution: async () => ({ claude: { source: 'observed', userConfigPath: effective } })
+    }).find(adapter => adapter.shell === 'claude')!
+    const original = { baseUrl: 'http://127.0.0.1:19361/claude/deepseek', apiKey: 'local-token-original', model: 'deepseek-v4-flash' }
+    const first = build()
+    await first.applyConnection!('deepseek', original)
+    const capture = await first.captureIsolation!()
+    await first.applyIsolationConnection!('deepseek', { ...original, baseUrl: 'http://127.0.0.1:19362/claude/deepseek' }, capture.beforeIsolationFingerprint, capture.leaseId)
+    expect(f.data.get(leaseA)).toBeDefined()
+
+    effective = targetB
+    const atB = build()
+    await expect(atB.recoverIsolationLease!()).rejects.toThrow('AI_ACCESS_ISOLATION_RECOVERY_REQUIRED')
+    expect(f.data.get(registryPath)).toBeDefined()
+    expect(f.data.get(targetB)).toBeUndefined()
+    expect(f.data.get('/customer/b/.claude/laixin-claude-isolation-lease.json')).toBeUndefined()
+
+    effective = targetA
+    const atA = build()
+    await expect(atA.recoverIsolationLease!()).resolves.toBe('restored')
+    expect(f.data.get(leaseA)).toBeUndefined()
+    expect(f.data.get(registryPath)).toBeUndefined()
+    await expect(atA.captureIsolation!()).resolves.toMatchObject({ leaseId: expect.any(String) })
+  })
+
+  it('Claude 崩溃恢复等待 A 锁时切到 B，锁内复验阻止修改 A 或 B', async () => {
+    const f = files()
+    const targetA = '/customer/a/.claude/settings.json'
+    const targetB = '/customer/b/.claude/settings.json'
+    const leaseA = '/customer/a/.claude/laixin-claude-isolation-lease.json'
+    const registryPath = '/customer/.laixin-ai-access/laixin-claude-isolation-target.json'
+    let effective = targetA
+    let switchInRecoveryLock = false
+    f.io.withConfigWriteLock = async (_lockPath, task) => {
+      if (switchInRecoveryLock) effective = targetB
+      return task()
+    }
+    const build = () => createDeepSeekAdapters({
+      home: '/customer', platform: 'darwin', file: f.io,
+      observeConfigurationExecution: async () => ({ claude: { source: 'observed', userConfigPath: effective } })
+    }).find(adapter => adapter.shell === 'claude')!
+    const original = { baseUrl: 'http://127.0.0.1:19361/claude/deepseek', apiKey: 'local-token-original', model: 'deepseek-v4-flash' }
+    const first = build()
+    await first.applyConnection!('deepseek', original)
+    const capture = await first.captureIsolation!()
+    await first.applyIsolationConnection!('deepseek', { ...original, baseUrl: 'http://127.0.0.1:19362/claude/deepseek' }, capture.beforeIsolationFingerprint, capture.leaseId)
+    const [beforeA, beforeLease, beforeRegistry] = [f.data.get(targetA), f.data.get(leaseA), f.data.get(registryPath)]
+
+    switchInRecoveryLock = true
+    await expect(build().recoverIsolationLease!()).rejects.toThrow('AI_ACCESS_ISOLATION_RECOVERY_REQUIRED')
+
+    expect(f.data.get(targetA)).toBe(beforeA)
+    expect(f.data.get(leaseA)).toBe(beforeLease)
+    expect(f.data.get(registryPath)).toBe(beforeRegistry)
+    expect(f.data.get(targetB)).toBeUndefined()
+    expect(f.data.get('/customer/b/.claude/laixin-claude-isolation-lease.json')).toBeUndefined()
+  })
+
+  it('Claude A 的受控字段被外部修改时保留最终值，但切到 B 后仍结算 A 的本租约', async () => {
+    const f = files()
+    const targetA = '/customer/a/.claude/settings.json'
+    const targetB = '/customer/b/.claude/settings.json'
+    const leaseA = '/customer/a/.claude/laixin-claude-isolation-lease.json'
+    const registryPath = '/customer/.laixin-ai-access/laixin-claude-isolation-target.json'
+    let effective = targetA
+    const claude = createDeepSeekAdapters({
+      home: '/customer', platform: 'darwin', file: f.io,
+      observeConfigurationExecution: async () => ({ claude: { source: 'observed', userConfigPath: effective } })
+    }).find(adapter => adapter.shell === 'claude')!
+    const original = { baseUrl: 'http://127.0.0.1:19361/claude/deepseek', apiKey: 'local-token-original', model: 'deepseek-v4-flash' }
+    await claude.applyConnection!('deepseek', original)
+    const capture = await claude.captureIsolation!()
+    await claude.applyIsolationConnection!('deepseek', { ...original, baseUrl: 'http://127.0.0.1:19362/claude/deepseek' }, capture.beforeIsolationFingerprint, capture.leaseId)
+    const expected = await claude.readIsolationFingerprint!()
+    const external = JSON.parse(f.data.get(targetA)!) as { env: Record<string, string> }
+    external.env.ANTHROPIC_MODEL = 'customer-final-model'
+    f.data.set(targetA, `${JSON.stringify(external, null, 2)}\n`)
+    const finalValue = f.data.get(targetA)
+    effective = targetB
+
+    await expect(capture.restoreIfOwned(expected)).resolves.toBe('preserved-external')
+    await capture.clearIsolationLease!()
+
+    expect(f.data.get(targetA)).toBe(finalValue)
+    expect(f.data.get(leaseA)).toBeUndefined()
+    expect(f.data.get(registryPath)).toBeUndefined()
+    expect(f.data.get(targetB)).toBeUndefined()
+  })
+
+  it('硬崩溃在写后租约落盘、配置尚未落盘之间时，恢复只清理本租约而不改客户原值', async () => {
+    const f = files()
+    const configPath = '/customer/.codex/config.toml'
+    const leasePath = '/customer/.codex/laixin-codex-isolation-lease.json'
+    f.data.set(configPath, 'approval_policy = "on-request"\n')
+    const original = { baseUrl: 'http://127.0.0.1:19361/codex/deepseek/v1', apiKey: 'local-token-original', model: 'deepseek-v4-flash' }
+    const isolated = { ...original, baseUrl: 'http://127.0.0.1:19362/codex/deepseek/v1' }
+    const first = createDeepSeekAdapters({ home: '/customer', platform: 'darwin', file: f.io }).find(adapter => adapter.shell === 'codex')!
+
+    await first.applyConnection!('deepseek', original)
+    const beforeConfig = f.data.get(configPath)!
+    const capture = await first.captureIsolation!()
+    await first.applyIsolationConnection!('deepseek', isolated, capture.beforeIsolationFingerprint, capture.leaseId)
+    expect(f.data.get(leasePath)).toContain('"expectedFingerprint":"')
+    // Construct the exact durable state of power loss after the first (lease) write and before
+    // config.toml: the pre-write document survives, but its recoverable expected identity exists.
+    f.data.set(configPath, beforeConfig)
+
+    const restarted = createDeepSeekAdapters({ home: '/customer', platform: 'darwin', file: f.io }).find(adapter => adapter.shell === 'codex')!
+    await expect(restarted.recoverIsolationLease!()).resolves.toBe('restored')
+    expect(f.data.get(configPath)).toBe(beforeConfig)
+    expect(f.data.get(leasePath)).toBeUndefined()
+  })
+
+  it('Codex 隔离写入在同一配置锁内复核快照，客户在捕获后修改时不覆盖最终值', async () => {
+    const f = files()
+    const configPath = '/customer/.codex/config.toml'
+    f.data.set(configPath, 'approval_policy = "on-request"\n')
+    const codex = createDeepSeekAdapters({ home: '/customer', platform: 'darwin', file: f.io }).find(adapter => adapter.shell === 'codex')!
+    const original = { baseUrl: 'http://127.0.0.1:19361/codex/deepseek/v1', apiKey: 'local-token-original', model: 'deepseek-v4-flash' }
+    const isolated = { ...original, baseUrl: 'http://127.0.0.1:19362/codex/deepseek/v1' }
+
+    await codex.applyConnection!('deepseek', original)
+    const capture = await codex.captureIsolation!()
+    f.data.set(configPath, f.data.get(configPath)!.replace('19361', '19999'))
+    const customerFinal = f.data.get(configPath)
+
+    await expect(codex.applyIsolationConnection!('deepseek', isolated, capture.beforeIsolationFingerprint, capture.leaseId)).resolves.toBe('stale')
+    expect(f.data.get(configPath)).toBe(customerFinal)
+    await codex.clearIsolationLease!(capture.leaseId)
+  })
+
+  it('写后租约身份先于配置落盘；随后写入失败回滚时不会留下死配置', async () => {
+    const f = files()
+    const configPath = '/customer/.codex/config.toml'
+    const leasePath = '/customer/.codex/laixin-codex-isolation-lease.json'
+    f.data.set(configPath, 'approval_policy = "on-request"\n')
+    const original = { baseUrl: 'http://127.0.0.1:19361/codex/deepseek/v1', apiKey: 'local-token-original', model: 'deepseek-v4-flash' }
+    const isolated = { ...original, baseUrl: 'http://127.0.0.1:19362/codex/deepseek/v1' }
+    const codex = createDeepSeekAdapters({ home: '/customer', platform: 'darwin', file: f.io }).find(adapter => adapter.shell === 'codex')!
+
+    await codex.applyConnection!('deepseek', original)
+    const capture = await codex.captureIsolation!()
+    const write = f.io.write
+    const writes: string[] = []
+    f.io.write = async (path, contents) => {
+      if (path === leasePath && contents.includes('"expectedFingerprint":"')) writes.push('lease')
+      if (path === configPath && contents.includes('19362')) {
+        writes.push('config')
+        throw new Error('fixture config write failed')
+      }
+      await write(path, contents)
+    }
+
+    await expect(codex.applyIsolationConnection!('deepseek', isolated, capture.beforeIsolationFingerprint, capture.leaseId)).rejects.toThrow('AI_ACCESS_CONFIG_TRANSACTION_FAILED')
+    expect(writes).toEqual(['lease', 'config'])
+    expect(f.data.get(configPath)).toContain(original.baseUrl)
+    const restarted = createDeepSeekAdapters({ home: '/customer', platform: 'darwin', file: f.io }).find(adapter => adapter.shell === 'codex')!
+    await expect(restarted.recoverIsolationLease!()).resolves.toBe('restored')
+    expect(f.data.get(leasePath)).toBeUndefined()
+  })
+
+  it('隔离配置写完后、服务记录预期指纹前客户改 Key 或模型时，不把客户最终值认作本租约', async () => {
+    let managed = 'before-managed'
+    let isolation = 'before-exact'
+    const codex = {
+      shell: 'codex' as const,
+      applyDeepSeek: async () => undefined,
+      configurationTargetStatus: async () => ({ shell: 'codex' as const, scope: 'user' as const, override: 'none' as const, writable: true }),
+      configurationTargetIdentity: async () => 'codex-user-target',
+      readManagedFingerprint: async () => managed,
+      readIsolationFingerprint: async () => isolation,
+      captureIsolation: async () => ({
+        beforeFingerprint: 'before-managed', beforeIsolationFingerprint: 'before-exact', configurationTargetIdentity: 'codex-user-target', leaseId: 'a'.repeat(32),
+        restoreIfOwned: async () => 'preserved-external' as const
+      }),
+      applyIsolationConnection: async () => {
+        // The config transaction computed and returned these values while locked. A customer
+        // write immediately after it unlocks must not become the service's expected snapshot.
+        managed = 'customer-final-managed'
+        isolation = 'customer-final-exact'
+        return { outcome: 'applied' as const, managedFingerprint: 'transaction-managed', isolationFingerprint: 'transaction-exact' }
+      }
+    }
+    const inert = (shell: 'claude' | 'hermes') => ({ shell, applyDeepSeek: async () => undefined })
+    const state: AiAccessState = {
+      version: 1,
+      selected: { codex: 'deepseek' },
+      relay: { port: 19_361, token: 'a'.repeat(64) }, relayShells: ['codex'],
+      shellKeys: { codex: { deepseek: 'sk-toolbox-fixture-key-1234567890' } }
+    }
+    const service = new AiAccessService({ read: async () => state, write: async () => undefined }, [codex, inert('claude'), inert('hermes')], acceptingGateway())
+    const isolationAdapter = service.createCodexIsolationAdapter({ activate: async () => undefined, deactivate: async () => undefined })
+
+    await isolationAdapter.capture()
+    await expect(isolationAdapter.apply()).resolves.toBe('applied')
+    await expect(isolationAdapter.readback()).resolves.toBe(false)
+  })
+
+  it('Claude 项目目标在同一 scope 内变更时，健康检查撤销旧租约而不把它继续宣称为可用', async () => {
+    let target = 'opaque-project-a'
+    let managed = 'before-managed'
+    let isolation = 'before-isolation'
+    const apply = vi.fn(async () => {
+      managed = 'after-managed'
+      isolation = 'after-isolation'
+      return { outcome: 'applied' as const, managedFingerprint: managed, isolationFingerprint: isolation }
+    })
+    const claude = {
+      shell: 'claude' as const,
+      applyDeepSeek: async () => undefined,
+      configurationTargetStatus: async () => ({ shell: 'claude' as const, scope: 'project' as const, override: 'project' as const, writable: true }),
+      configurationTargetIdentity: async () => target,
+      readManagedFingerprint: async () => managed,
+      readIsolationFingerprint: async () => isolation,
+      captureIsolation: async () => ({
+        beforeFingerprint: 'before-managed', beforeIsolationFingerprint: 'before-isolation', configurationTargetIdentity: target, leaseId: 'd'.repeat(32),
+        restoreIfOwned: async () => 'restored' as const
+      }),
+      applyIsolationConnection: apply,
+      clearIsolationLease: async () => undefined
+    }
+    const inert = (shell: 'codex' | 'hermes') => ({ shell, applyDeepSeek: async () => undefined })
+    const state: AiAccessState = {
+      version: 1,
+      selected: { claude: 'deepseek' },
+      relay: { port: 19_361, token: 'a'.repeat(64) }, relayShells: ['claude'],
+      shellKeys: { claude: { deepseek: 'sk-toolbox-fixture-key-1234567890' } }
+    }
+    const deactivate = vi.fn(async () => undefined)
+    const service = new AiAccessService({ read: async () => state, write: async () => undefined }, [inert('codex'), claude, inert('hermes')], acceptingGateway())
+    const controller = new ApplicationIsolationLeaseController({
+      applicationId: 'claude', adapter: service.createClaudeIsolationAdapter({ activate: async () => undefined, deactivate }),
+      system: { snapshot: async () => 'n55-read-only-path' },
+      entry: async () => ({ capability: 'http-connect', id: 'n55-proven-entry', proxyUrl: 'http://127.0.0.1:18080' })
+    })
+
+    await expect(controller.enable()).resolves.toMatchObject({ available: true, code: 'AVAILABLE' })
+    target = 'opaque-project-b'
+    await expect(controller.reverify()).resolves.toMatchObject({ available: false, code: 'CONFIG_READBACK_MISMATCH' })
+    expect(apply).toHaveBeenCalledOnce()
+    expect(deactivate).toHaveBeenCalledOnce()
+  })
+
+  it('Claude 捕获时发现同一 project scope 已切到另一有效目标，则在零入口写入前 fail closed', async () => {
+    const apply = vi.fn(async () => ({ outcome: 'applied' as const, managedFingerprint: 'after', isolationFingerprint: 'after-isolation' }))
+    const claude = {
+      shell: 'claude' as const,
+      applyDeepSeek: async () => undefined,
+      configurationTargetStatus: async () => ({ shell: 'claude' as const, scope: 'project' as const, override: 'project' as const, writable: true }),
+      configurationTargetIdentity: async () => 'opaque-project-a',
+      readManagedFingerprint: async () => 'before',
+      readIsolationFingerprint: async () => 'before-isolation',
+      captureIsolation: async () => ({
+        beforeFingerprint: 'before', beforeIsolationFingerprint: 'before-isolation', configurationTargetIdentity: 'opaque-project-b', leaseId: 'e'.repeat(32),
+        restoreIfOwned: async () => 'restored' as const
+      }),
+      applyIsolationConnection: apply,
+      clearIsolationLease: async () => undefined
+    }
+    const inert = (shell: 'codex' | 'hermes') => ({ shell, applyDeepSeek: async () => undefined })
+    const state: AiAccessState = {
+      version: 1, selected: { claude: 'deepseek' }, relay: { port: 19_361, token: 'a'.repeat(64) }, relayShells: ['claude'],
+      shellKeys: { claude: { deepseek: 'sk-toolbox-fixture-key-1234567890' } }
+    }
+    const service = new AiAccessService({ read: async () => state, write: async () => undefined }, [inert('codex'), claude, inert('hermes')], acceptingGateway())
+    const controller = new ApplicationIsolationLeaseController({
+      applicationId: 'claude', adapter: service.createClaudeIsolationAdapter({ activate: async () => undefined, deactivate: async () => undefined }),
+      system: { snapshot: async () => 'n55-read-only-path' }, entry: async () => ({ capability: 'http-connect', id: 'n55-proven-entry', proxyUrl: 'http://127.0.0.1:18080' })
+    })
+
+    await expect(controller.enable()).resolves.toMatchObject({ available: false, code: 'CONFIG_PATH_UNKNOWN' })
+    expect(apply).not.toHaveBeenCalled()
   })
 
   it('历史 Codex 私有项目选择在适配器重建后被忽略，仍读取和写入用户级配置', async () => {
@@ -825,8 +1412,10 @@ describe('三个壳的 DeepSeek 适配器', () => {
 })
 
 /** Hermes 生产适配器的原生 CLI 状态夹具：settings 即 config.yaml 里六个 model.* 键的语义。 */
-function hermesExitFixture(customerSettings: readonly (readonly [HermesModelKey, string])[]) {
+function hermesExitFixture(customerSettings: readonly (readonly [HermesModelKey, string])[], initialYaml?: string) {
   const f = files()
+  const configPath = '/customer/.hermes/config.yaml'
+  if (initialYaml !== undefined) f.data.set(configPath, initialYaml)
   const settings = new Map<HermesModelKey, string | undefined>(customerSettings)
   const build = () => createDeepSeekAdapters({
     home: '/customer', platform: 'darwin', file: f.io,
@@ -834,6 +1423,8 @@ function hermesExitFixture(customerSettings: readonly (readonly [HermesModelKey,
     runHermes: async (_command, args) => {
       if (args[1] === 'set') settings.set(args[2] as HermesModelKey, args[3])
       else settings.delete(args[2] as HermesModelKey)
+      if (initialYaml !== undefined) f.data.set(configPath, `model:\n${[...settings]
+        .map(([key, value]) => `  ${key.slice('model.'.length)}: ${JSON.stringify(value)}`).join('\n')}\n`)
     },
     readHermesConfig: async (_command, key) => settings.get(key)
   }).find((adapter) => adapter.shell === 'hermes')!
@@ -880,6 +1471,20 @@ describe('Hermes 解除工具箱接管与接入前恢复（API-02 · 先解除�
     // 显式恢复：找回接入前原配置，恢复点用完即消费。
     await rebuild().restorePreviousConnection!()
     expectSettings(settings, Object.fromEntries(customerA))
+    expect(f.data.has(backupPath)).toBe(false)
+  })
+
+  it.each([['"', true], ["'", true], ['"', false], ["'", false], ['', true]] as const)('引号 %s、行尾注释 %s 的原 YAML 值经过备份与恢复后不混入引号/注释', async (quote, comment) => {
+    const original = customerA.map(([key, value]) => [key, key === 'model.base_url'
+      ? 'https://customer.example/v1#route' : key === 'model.default' && quote ? 'customer model # literal' : value] as const)
+    const yaml = `model:\n${original.map(([key, value]) => `  ${key.slice('model.'.length)}: ${quote}${value}${quote}${comment ? ' # customer note' : ''}`).join('\n')}\n`
+    const { f, settings, hermes, rebuild } = hermesExitFixture(original, yaml)
+    await expect(hermes.readCurrentBaseUrl!()).resolves.toBe('https://customer.example/v1#route')
+    await hermes.applyConnection!('deepseek', customerRoute('deepseek', 'deepseek-flash'))
+    expect(JSON.parse(JSON.parse(f.data.get(backupPath)!).original)).toEqual(Object.fromEntries(original))
+    await rebuild().deactivateToolboxConnection!()
+    await rebuild().restorePreviousConnection!()
+    expectSettings(settings, Object.fromEntries(original))
     expect(f.data.has(backupPath)).toBe(false)
   })
 

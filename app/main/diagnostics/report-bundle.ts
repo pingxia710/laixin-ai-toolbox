@@ -9,10 +9,12 @@
 //  2. 账本**原值内容**（originalValue / writtenValue）—— 只出条目的类别、项目、状态与时刻；
 //  3. 客户的浏览记录、请求网址、报文 —— 守护本来就不记（log.access = none），这里也不去别处捞。
 import { credentialFindings, pickRedacted, redactText, redactValue } from './report-redact'
+import { basename } from 'node:path'
 import type { FaultRecord } from '../../shared/fault-log-types'
 import { REPORT_MAX_BYTES } from '../../report-types'
-import { supportDiagnosticAttemptLimit } from '../../network-diagnostics-types'
+import { supportDiagnosticAttemptLimit, type DiagnosticSoftware } from '../../network-diagnostics-types'
 import type { SupportDiagnosis } from './support-snapshot'
+import { normalizeLocalEgressEvidence } from '../../shared/local-egress-evidence'
 
 /** 通道状态里能出去的字段。⛔ authorization：它是句固定说明，没有诊断价值，反而会被字段名闸抹成问号。 */
 const tunnelStatusFields = ['state', 'message', 'source', 'backend', 'nodeLabel', 'exitIp', 'pathSource',
@@ -36,6 +38,8 @@ const MAX_ERROR_CODES = 20
 export interface ReportSources {
   /** 客户刚才在界面看到并可复制的那一次诊断；上报不得重新跑一遍替换它。 */
   readonly diagnosis?: SupportDiagnosis
+  /** 诊断失败时，客户这次选择检查的软件；不附带任何假造的五项结论。 */
+  readonly diagnosisUnavailableSoftware?: DiagnosticSoftware
   /** 其余机器读数可以稍后采集，但必须单独标时，不能冒充 diagnosis.checkedAt。 */
   readonly supplementalCollectedAt?: string
   /** tunnel.status 的读数（已是白名单视图，这里再挑一遍）。 */
@@ -81,22 +85,29 @@ export interface ReportBody extends Record<string, unknown> {
   readonly filtered: number
 }
 
-function diagnosisSection(diagnosis: SupportDiagnosis | undefined): Record<string, unknown> {
-  if (!diagnosis) return { available: false }
+function diagnosisSection(diagnosis: SupportDiagnosis | undefined, unavailableSoftware: DiagnosticSoftware | undefined): Record<string, unknown> {
+  if (!diagnosis) return { available: false, status: '未完成', ...(unavailableSoftware ? { software: unavailableSoftware } : {}) }
   const report = diagnosis.report
   const conclusion = report?.conclusion
+  const localEgress = normalizeLocalEgressEvidence(diagnosis.localEgress)
   return {
     available: true,
     ...pickRedacted(diagnosis, ['id']),
     ...pickRedacted(report, ['software', 'checkedAt', 'validUntil']),
     target: pickRedacted(report?.target, ['label', 'route']),
+    pathMatrix: report?.pathMatrix === undefined ? undefined : {
+      ...pickRedacted(report.pathMatrix, ['checkedAt', 'valid']),
+      entries: report.pathMatrix.entries.slice(0, 3).map((entry) =>
+        pickRedacted(entry, ['path', 'state', 'phase', 'elapsedMs', 'message']))
+    },
+    ...(localEgress ? { localEgress } : {}),
     conclusion: {
       ...pickRedacted(conclusion, ['status', 'scope', 'ruleId', 'title', 'summary', 'nextStep']),
       evidence: Array.isArray(conclusion?.evidence)
         ? conclusion.evidence.slice(0, 5).map((item) => pickRedacted(item, ['checkId', 'code', 'statement'])) : []
     },
     checks: Array.isArray(report?.checks)
-      ? report.checks.slice(0, 5).map((check) => pickRedacted(check, ['id', 'label', 'state', 'code', 'message', 'elapsedMs'])) : [],
+      ? report.checks.slice(0, 5).map((check) => pickRedacted(check, ['id', 'label', 'state', 'code', 'message', 'phase', 'elapsedMs'])) : [],
     attempts: Array.isArray(diagnosis.attempts)
       ? diagnosis.attempts.slice(0, supportDiagnosticAttemptLimit).map((attempt) => pickRedacted(attempt, ['at', 'software', 'action', 'outcome', 'detail'])) : [],
     attemptsTotal: Number.isSafeInteger(diagnosis.attemptsTotal) && diagnosis.attemptsTotal >= diagnosis.attempts.length
@@ -123,13 +134,14 @@ function ledgerSummary(ledger: unknown, unrestored: unknown): Record<string, unk
 }
 
 function daemonLogSection(log: ReportSources['daemonLog'], absence: ReportSources['daemonLogAbsence']): Record<string, unknown> {
+  const source = log ? redactText(basename(log.source.replaceAll('\\', '/'))) : ''
   if (!log || log.lines.length === 0) {
-    const note = log ? `${log.source}：文件在但没有内容`
+    const note = log ? `${source || '守护日志'}：文件在但没有内容`
       : absence === 'unreadable' ? '守护日志读不出来（文件在，但打不开或读失败）——这台机器另有毛病，⛔ 当成「没日志」放过'
       : '守护日志未生成（常驻守护未接入或本次由主进程带起）'
     return { available: false, reason: log ? 'empty' : absence ?? 'not-generated', note }
   }
-  return { available: true, source: redactText(log.source), lines: log.lines.slice(-MAX_LOG_LINES).map((line) => redactValue(line, { maxStringLength: 500 })) }
+  return { available: true, source: source || 'tunnel-daemon.log', lines: log.lines.slice(-MAX_LOG_LINES).map((line) => redactValue(line, { maxStringLength: 500 })) }
 }
 
 /**
@@ -139,7 +151,7 @@ function daemonLogSection(log: ReportSources['daemonLog'], absence: ReportSource
 export function buildReportBody(sources: ReportSources): ReportBody {
   const notes = [...(sources.notes ?? [])]
   const draft = {
-    diagnosis: diagnosisSection(sources.diagnosis),
+    diagnosis: diagnosisSection(sources.diagnosis, sources.diagnosisUnavailableSoftware),
     supplemental: pickRedacted({ collectedAt: sources.supplementalCollectedAt }, ['collectedAt']),
     network: {
       status: pickRedacted(sources.tunnel, [...tunnelStatusFields]),

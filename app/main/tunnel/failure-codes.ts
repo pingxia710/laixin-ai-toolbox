@@ -76,11 +76,30 @@ export const KNOWN_FAILURE_CODES: ReadonlySet<string> = new Set([
   'TUNNEL_REPAIR_TIMEOUT',
   'TUNNEL_REPAIR_UNCONFIRMED',
   'TUNNEL_RESTORE_INCOMPLETE',
+  // N-44:离线恢复可观测的代理读取失败与归属不明，需保留精确原因供后台聚合。
+  'TUNNEL_PROXY_INSPECTION_FAILED',
+  'TUNNEL_PROXY_OWNERSHIP_UNKNOWN',
   // N-23:一次性恢复子进程的两类受控失败(supervisor 落盘 state.json)。基线静默吞掉,
   // 客户对着「未完成(进程中断)」永远转圈;给独立码,后台才分得清「超时」和「没起来」。
   'TUNNEL_RESTORE_TIMEOUT',
   'TUNNEL_RESTORE_SPAWN_FAILED',
   'TUNNEL_SETTINGS_NOT_APPLIED',
+  // N-55:控制器的受控限制码必须原样进入 N-53 队列；对象详情、快照和路径仍只留在本机。
+  'TUNNEL_AVAILABILITY_EVIDENCE_CHANGED',
+  'TUNNEL_AVAILABILITY_OBJECT_IDENTITY_MISSING',
+  'TUNNEL_AVAILABILITY_POLICY_LOCKED',
+  'TUNNEL_AVAILABILITY_PROCESS_OWNERSHIP_UNPROVEN',
+  'TUNNEL_AVAILABILITY_READBACK_MISMATCH',
+  'TUNNEL_AVAILABILITY_RECLAIM_LIMIT',
+  'TUNNEL_AVAILABILITY_RECOVERY_CONTRACT_MISSING',
+  'TUNNEL_AVAILABILITY_RESTORE_READBACK_MISMATCH',
+  'TUNNEL_AVAILABILITY_STALE_OPERATION',
+  'TUNNEL_AVAILABILITY_TARGET_UNREACHABLE',
+  'TUNNEL_AVAILABILITY_TARGET_UNCONFIRMED',
+  'TUNNEL_AVAILABILITY_WRITE_FAILED',
+  // Existing proxy/direct-path evidence changed after a successful probe. The
+  // code is a fixed category only; endpoint, PAC and credential details stay local.
+  'TUNNEL_ACTIVE_PROXY_CHANGED',
   // 连接争抢止损(2026-09-15)。这四个码本身就是「点名冲突方」的载体:后台按码聚合即可分出
   // 「另一份来信」「其他软件」「认不出」三类,⛔ 上传路径/命令行来说明是谁。
   'TUNNEL_PEER_LAIXIN_RUNNING',
@@ -88,6 +107,8 @@ export const KNOWN_FAILURE_CODES: ReadonlySet<string> = new Set([
   'TUNNEL_WRITE_RIGHT_HELD',
   'TUNNEL_WRITE_RIGHT_UNKNOWN',
   'TUNNEL_START_CANCELLED',
+  'TUNNEL_STOP_INCOMPLETE',
+  'TUNNEL_STOP_UNCONFIRMED',
   'TUNNEL_STATE_NOT_ALLOWED',
   // 守护写进 state.json 的受控码(connectors CONTROL_CODES + daemon-core)
   '端口占用',

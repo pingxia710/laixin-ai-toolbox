@@ -1,4 +1,4 @@
-import { writeFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { EventEmitter } from 'node:events'
@@ -7,6 +7,7 @@ import { downloadTunnelSnapshot } from '../../app/main/download/tunnel-runtime'
 import type { ArtifactDigest, DownloadArtifactInspector, DownloadCatalog, DownloadTaskStore, StoredDownloadTask } from '../../app/main/download/types'
 import { initializeTunnelRuntime } from '../../app/main/tunnel/runtime-owner'
 import { TunnelService, type TunnelServiceDeps } from '../../app/main/tunnel/tunnel-service'
+import { layout } from '../../app/main/tunnel/paths'
 import { buildPackageEntries, writePackageDir } from '../tunnel/fixtures/package-builder'
 import { makeTempDir, removeTempDir } from '../tunnel/helpers'
 
@@ -116,8 +117,10 @@ describe('下载读取片 3 通道运行时', () => {
         picker: () => Promise.resolve(packagePath),
         trust: { whitelistDigests: [built.digest], signingPublicKeys: [] },
         now: () => NOW,
-        spawnDaemon: (dir) => {
-          writeFileSync(join(dir, 'state.json'), JSON.stringify({ state: 'connected', exitIp: '203.0.113.7' }))
+        spawnDaemon: (dir, runId) => {
+          const intent = JSON.parse(readFileSync(layout.intent(dir), 'utf8')) as { sessionToken: string }
+          writeFileSync(join(dir, 'state.json'), JSON.stringify({ state: 'connected', runId,
+            intentToken: intent.sessionToken, exitIp: '203.0.113.7' }))
           return daemon
         },
         spawnRestore: () => undefined,

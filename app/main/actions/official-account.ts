@@ -6,6 +6,7 @@ import { readClaudeOfficialAccount, readCodexOfficialAccount } from '../ai-acces
 import { shellInventory } from '../shells/context'
 import { trustedCliExecutable, trustedCliExecutables } from '../shells/inventory'
 import type { OfficialAccount, OfficialAccountState } from '../../shared/official-account'
+import { productionAiAccessService } from './ai-access'
 
 /** 闸口的登记表来源；结构化接口让测试可以直接喂临时实例。 */
 export interface OfficialAccountGate {
@@ -35,12 +36,14 @@ export function registerActions(registry: BridgeRegistry): void {
   registerOfficialAccountActions(registry, productionRead, sharedAddedOfficialAccounts())
 }
 
-function productionRead(shell: 'codex' | 'claude'): Promise<OfficialAccount> {
+async function productionRead(shell: 'codex' | 'claude'): Promise<OfficialAccount> {
   const home = app.getPath('home')
   const environment = shellInventory().environment()
   if (shell === 'codex') {
-    return trustedCliExecutables('codex', process.platform, home, environment).then(executables =>
-      readCodexOfficialAccount(executables.map(executable => ({ executable, args: ['app-server', '--listen', 'stdio://'] })), home))
+    // Use the login/config resolver as Finder may not inherit CODEX_HOME from startup files.
+    const commandEnvironment = { ...environment, CODEX_HOME: await productionAiAccessService().codexOfficialLoginRoot() }
+    return trustedCliExecutables('codex', process.platform, home, commandEnvironment).then(executables =>
+      readCodexOfficialAccount(executables.map(executable => ({ executable, args: ['app-server', '--listen', 'stdio://'] })), home, commandEnvironment))
   }
   return trustedCliExecutable('claude-code', process.platform, home, environment).then(executable =>
     readClaudeOfficialAccount(executable ?? null, home, environment))
