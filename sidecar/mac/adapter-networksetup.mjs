@@ -5,6 +5,7 @@
 import { execFileSync } from 'node:child_process'
 import { ConnectorError, CONTROL_CODES } from './connectors.mjs'
 import { isOurProxy } from './proxy-identity.mjs'
+import { resolveActiveNetworkPath } from './active-network-path.mjs'
 
 if (process.env.TOOLBOX_REAL_NETWORK_ADAPTER !== '1') {
   throw new Error('REAL_ADAPTER_GUARD:真实网络适配器未获放行(TOOLBOX_REAL_NETWORK_ADAPTER!=1)')
@@ -21,28 +22,47 @@ const PROXY_ITEMS = Object.freeze([
 ])
 
 export function createAdapter() {
+  const proxySnapshots = new WeakMap()
   return {
     // 已有代理不再是拒绝理由(发布审查 R4 / 创始人 09-13 晚标准):能出外网就复用(守护先探),出不了就接管,
     // 原值记进账本、退出还回去。这里只保留「读不到系统代理」这类真正的前置失败。
     preflight() {},
-    // 电脑上别的代理(不是我们的)当前开着吗:守护据此决定复用还是接管。PAC 也报,由守护按不可判定处理。
+    // N-55:接管动作取证和目标实测结束后都读取默认路由与唯一映射服务；切到另一条网络服务即作废旧路径证据。
+    currentPathIdentity() {
+      const active = activeNetworkPath()
+      assertActiveNetworkPath(active)
+      return { id: `service:${active.service}:device:${active.device}`, kind: 'mac-network-service' }
+    },
+    // 只报告系统当前默认路由实际使用的网络服务。目标是 HTTPS AI 服务，所以只读该服务的
+    // Secure Web Proxy；普通 Web Proxy、SOCKS、清单第一项或其他网卡都不能替它拿绿灯。
+    // 返回普通候选 DTO；异步探测完成后由守护显式调用 validateExistingProxy 二次核验。
+    // 快照只放 WeakMap，绝不把会长期抛错的 getter 存进 reusedProxy。
     existingProxy(ours) {
       const isOurs = (value) => isOurProxy(value, ours)
-      for (const service of listNetworkServices()) {
-        try {
-          const pac = readAutoProxyUrl(service)
-          if (pac.enabled && pac.url !== '') return { kind: 'pac', url: pac.url, source: service }
-          for (const { item } of PROXY_ITEMS) {
-            const current = this.read({ service, item })
-            if (current?.enabled !== true || isOurs(current)) continue
-            return { kind: item === 'socks-proxy' ? 'socks' : 'http', host: current.host, port: current.port, source: `${service}/${item}` }
-          }
-        } catch (error) {
-          if (error?.code === 'TUNNEL_SETTING_TARGET_ABSENT') continue
-          throw error
-        }
+      const active = activeNetworkPath()
+      const pac = readAutoProxyUrl(active.service)
+      if (pac.enabled && pac.url !== '') {
+        assertActiveNetworkPath(active)
+        return { kind: 'pac', url: pac.url, source: active.service }
+      }
+      const current = this.read({ service: active.service, item: 'secure-web-proxy' })
+      assertActiveNetworkPath(active)
+      if (current?.enabled === true && !isOurs(current)) {
+        const candidate = Object.freeze({
+          kind: 'http', host: current.host, port: current.port, source: active.service + '/secure-web-proxy'
+        })
+        proxySnapshots.set(candidate, { active, snapshot: { pac, proxy: current } })
+        return candidate
       }
       return undefined
+    },
+    validateExistingProxy(candidate) {
+      const expected = proxySnapshots.get(candidate)
+      if (expected === undefined) throw activeProxyChangedError()
+      assertActiveProxySnapshot(expected.active, expected.snapshot)
+    },
+    materializeExistingProxy(candidate) {
+      return Object.freeze({ kind: candidate.kind, host: candidate.host, port: candidate.port, source: candidate.source })
     },
     // 系统代理被改了就修回;退出时别人改过的保留(与 Windows 同一语义)。PAC 开关同样受管。
     reapplyOnChange: (ref) => isManagedItem(ref?.item),
@@ -159,6 +179,50 @@ function listNetworkServices() {
     .filter((line) => line !== '' && !line.startsWith('An asterisk') && !line.startsWith('*'))
 }
 
+// networksetup 的“服务顺序”只给配置对象与设备名的映射；当前真正承载缺省流量的设备
+// 必须以 route 的默认路由为准。两次读取默认路由夹住映射读取，避免切网窗口里拼出一条
+// 从未同时成立过的“活动服务”。匹配不到或同一设备对应多个服务时宁可未知，也不猜第一项。
+function activeNetworkPath() {
+  const resolution = resolveActiveNetworkPath(run)
+  if (resolution.status === 'resolved') return resolution.path
+  if (resolution.status === 'changed') throw activeNetworkChangedError()
+  throw activeNetworkUnknownError()
+}
+
+function assertActiveNetworkPath(expected) {
+  const current = activeNetworkPath()
+  if (current.device !== expected.device || current.service !== expected.service) throw activeNetworkChangedError()
+}
+
+function assertActiveProxySnapshot(active, expected) {
+  try {
+    assertActiveNetworkPath(active)
+    const pac = readAutoProxyUrl(active.service)
+    if (pac.enabled !== expected.pac.enabled || pac.url !== expected.pac.url) throw activeProxyChangedError()
+    const proxy = parseProxy(run('networksetup', ['-getsecurewebproxy', active.service]))
+    if (proxy.enabled !== expected.proxy.enabled || proxy.host !== expected.proxy.host || proxy.port !== expected.proxy.port) {
+      throw activeProxyChangedError()
+    }
+    assertActiveNetworkPath(active)
+  } catch (error) {
+    if (error?.code === 'TUNNEL_ACTIVE_NETWORK_CHANGED' || error?.code === 'TUNNEL_ACTIVE_NETWORK_UNKNOWN' ||
+        error?.code === 'TUNNEL_ACTIVE_PROXY_CHANGED') throw error
+    throw activeProxyChangedError()
+  }
+}
+
+function activeNetworkUnknownError() {
+  return Object.assign(new Error('无法可靠判断当前活动网络服务'), { code: 'TUNNEL_ACTIVE_NETWORK_UNKNOWN' })
+}
+
+function activeNetworkChangedError() {
+  return Object.assign(new Error('探测期间活动网络服务已变化'), { code: 'TUNNEL_ACTIVE_NETWORK_CHANGED' })
+}
+
+function activeProxyChangedError() {
+  return Object.assign(new Error('探测期间活动服务的 HTTPS 代理路径已变化'), { code: 'TUNNEL_ACTIVE_PROXY_CHANGED' })
+}
+
 function parseFields(output) {
   const fields = {}
   for (const line of output.split('\n')) {
@@ -185,7 +249,10 @@ function parseProxy(output) {
       (fields.Enabled === 'Yes' && (!fields.Server || port === 0))) {
     throw settingsError('无法核对系统代理读数')
   }
-  if (fields['Authenticated Proxy Enabled'] === '1') throw settingsError('当前代理使用身份验证，请先关闭该代理再连接')
+  if (fields.Enabled === 'Yes' && fields['Authenticated Proxy Enabled'] !== '0') {
+    if (['1', 'Yes'].includes(fields['Authenticated Proxy Enabled'])) throw settingsError('当前代理使用身份验证，请先关闭该代理再连接')
+    throw settingsError('无法核对系统代理是否使用身份验证')
+  }
   return { enabled: fields.Enabled === 'Yes', host: fields.Server, port }
 }
 
@@ -250,4 +317,3 @@ function run(executable, args) {
     throw settingsError('无法读取或修改系统代理，请检查系统权限后重试')
   }
 }
-

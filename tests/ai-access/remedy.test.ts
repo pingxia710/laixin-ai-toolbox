@@ -69,6 +69,29 @@ describe('处理动作与自动复验', () => {
     expect((await f.service.serviceStatus()).running).toBe(true)
   })
 
+  it('本机服务因非端口原因启动失败时不触发换端口，并显示安全的失败类别', async () => {
+    const f = await connected()
+    const before = f.state().relay
+    await f.gateway.stop()
+    const start = vi.spyOn(f.gateway, 'start').mockRejectedValue(Object.assign(new Error('private listen detail'), { code: 'EACCES' }))
+    const result = await f.service.remedy('codex', 'restartGateway')
+    expect(result).toMatchObject({ outcome: 'still_failing', code: 'local_service_start_failed' })
+    expect(start).toHaveBeenCalledTimes(1)
+    expect(f.state().relay).toEqual(before)
+    expect(JSON.stringify(result)).not.toContain('private listen detail')
+  })
+
+  it('首次启用时保存本机端口失败应报配置失败，不误报端口占用', async () => {
+    const f = fixture()
+    await f.service.saveProviderKey('codex', 'deepseek', 'sk-fixture-state-write-0123456789')
+    f.store.write = async () => { throw new Error('private disk detail') }
+    const status = await f.service.useProvider('codex', 'deepseek')
+    expect(status.attempt).toMatchObject({ ok: false, code: 'configuration_failed' })
+    expect(f.state().relay).toBeUndefined()
+    expect((await f.service.serviceStatus()).running).toBe(false)
+    expect(JSON.stringify(status)).not.toContain('private disk detail')
+  })
+
   it('重新写入配置：写不进去就报配置失败，写得进去就复验通过', async () => {
     const f = await connected()
     f.adapters[0].applyConnection.mockRejectedValueOnce(new Error('private disk detail'))

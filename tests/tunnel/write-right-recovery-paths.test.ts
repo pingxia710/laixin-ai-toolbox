@@ -67,7 +67,7 @@ describe('一次性恢复路径必须持有写入权', () => {
   })
 
   it('restore 子命令:持权在自己手上时照常还原(正向证据,⛔ 只证明「不写」)', async () => {
-    const { code } = await runDaemon(['restore'], { FAKE_WRITE_RIGHT: 'free' })
+    const { code } = await runDaemon(['restore'], { FAKE_WRITE_RIGHT: 'free', FAKE_PORT_OWNER: 'none' })
     expect(registry()['WinINET/ProxyServer'].data).toBe('127.0.0.1:7890')
     expect(code).toBe(0)
   })
@@ -90,11 +90,12 @@ describe('一次性恢复路径必须持有写入权', () => {
     expect(output).toContain('写入权不在本进程')
   })
 
-  it('空账本 + 代理指向来信端口 + 权在自己手上:残留照常清理(正向证据)', async () => {
+  it('空账本 + 候选口 + 权在自己手上:仍不能证明归属，不自动关闭第三方同端口代理', async () => {
     emptyLedgerWithOurProxy()
-    await runDaemon(['restore'], { FAKE_WRITE_RIGHT: 'free' })
-    // ⛔ 只断言上一条「没写」——那在清理功能整个坏掉时也成立。
-    expect(registry()['WinINET/ProxyEnable'].data).toBe('0')
+    const { code, output } = await runDaemon(['restore'], { FAKE_WRITE_RIGHT: 'free' })
+    expect(registry()['WinINET/ProxyEnable'].data).toBe('1')
+    expect(code).toBe(65)
+    expect(output).toContain('ownershipUnknown')
   })
 
   it('损坏账本恢复:持权方存在时不写系统设置', async () => {

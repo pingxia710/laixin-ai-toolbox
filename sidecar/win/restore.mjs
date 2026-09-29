@@ -46,6 +46,75 @@ function repairQuarantinedEntry(entry, status, note) {
   }
 }
 
+// 同一连接会话的 WinINET 路由项是一组：Server 看似仍是我们写的值时，第三方也可能
+// 已接管同端口或 PAC。bypass 改动只保护该项，不能让死代理入口留在系统里。
+function wininetGroupOwnership(entries, sessionToken, adapter, equal) {
+  if (typeof sessionToken !== 'string' || sessionToken === '') return { kind: 'unknown', note: '会话身份缺失' }
+  const latest = new Map()
+  for (const entry of entries) {
+    if (isSettingLikeEntry(entry) && entry.service === 'WinINET' && entry.sessionToken === sessionToken) {
+      latest.set(entry.item, entry)
+    }
+  }
+  const server = latest.get('ProxyServer')
+  if (server === undefined && latest.has('ProxyEnable')) {
+    return { kind: 'unknown', note: '缺少同会话代理地址' }
+  }
+  const current = new Map()
+  for (const [item, entry] of latest) {
+    let value
+    try { value = adapter.read({ service: 'WinINET', item }) } catch (error) {
+      return { kind: 'unknown', retryable: true, note: `读取 ${item} 失败:${messageOf(error)}` }
+    }
+    current.set(item, value)
+    if (!Object.hasOwn(entry, 'originalValue')) {
+      return { kind: 'unknown', note: `${item} 账目缺少原值` }
+    }
+    const isOriginal = equal(value, entry.originalValue, entry) ||
+      adapter.restoredValueMatches?.(value, entry.originalValue, entry.writtenValue) === true
+    if (!Object.hasOwn(entry, 'writtenValue') && !isOriginal) {
+      return { kind: 'unknown', note: `${item} 账目缺少写入值` }
+    }
+  }
+  for (const [item, entry] of latest) {
+    if (item === 'ProxyOverride') continue
+    const value = current.get(item)
+    if (entry.status === ENTRY_STATUS.preserved) {
+      return { kind: 'external', note: `${item} 已保留第三方改动` }
+    }
+    const isOriginal = equal(value, entry.originalValue, entry) ||
+      adapter.restoredValueMatches?.(value, entry.originalValue, entry.writtenValue) === true
+    if (!isOriginal && !equal(value, entry.writtenValue, entry)) {
+      return { kind: 'external', note: `${item} 已被其他软件改动` }
+    }
+  }
+  // 历史账本可只有 WPAD/PAC 等独立项；没有启用手工代理的账目时沿用逐项所有权恢复。
+  if (server === undefined) return { kind: 'ours' }
+  const serverValue = current.get('ProxyServer')
+  const address = typeof serverValue === 'string' ? serverValue : serverValue?.data
+  const match = /^127\.0\.0\.1:([1-9][0-9]{0,4})$/.exec(typeof address === 'string' ? address : '')
+  const port = Number(match?.[1])
+  if (match === null || port > 65535) {
+    if (equal(serverValue, server.writtenValue, server) && serverValue !== null) {
+      if (equal(server.originalValue, server.writtenValue, server)) {
+        return { kind: 'external', note: '代理地址为第三方现值' }
+      }
+      return { kind: 'unknown', note: '来信代理地址格式无法核实端口归属' }
+    }
+    return { kind: 'ours' }
+  }
+  if (typeof adapter.identifyPortOwner !== 'function') return { kind: 'unknown', note: '端口归属查询不可用' }
+  let owner
+  try { owner = adapter.identifyPortOwner(port) } catch (error) {
+    return { kind: 'unknown', retryable: true, note: `读取代理端口归属失败:${messageOf(error)}` }
+  }
+  if (owner?.pid === process.pid && (owner.kind === 'other' || owner.kind === 'laixin')) return { kind: 'ours' }
+  if (owner?.kind === 'other') return { kind: 'external', note: '代理端口已被其他软件监听' }
+  if (owner?.kind === 'none') return { kind: 'ours' }
+  return { kind: 'unknown', retryable: owner?.kind === 'unknown',
+    note: '代理端口由另一进程监听或查询结果不明' }
+}
+
 // 损坏账本的恢复流程(收敛包3·件4):恢复标记存在时,把隔离坏账本里能识别的
 // 未恢复设置按所有权规则恢复;全部落定(已恢复或确认他人所有)即重建干净账本、清标记,
 // 坏账本原样留证;有任何失败保留标记并返回可复制诊断。⛔ 静默清砖。
@@ -73,9 +142,30 @@ function recoverLedgerLocked(dataDir, adapter) {
   // 待恢复项按「是不是设置账目」挑,⛔ 只认 kind === 'setting':kind 丢失或拼坏的条目
   // (审计 R1 形态 C/D)同样带着原值,漏过去就是系统代理仍指向本机桥却被标记清除。
   const pending = entries.filter((candidate) => isSettingLikeEntry(candidate) && !isSettledSetting(candidate))
+  const wininetGroups = new Map()
+  for (const entry of pending) {
+    if (entry.service === 'WinINET' && !wininetGroups.has(entry.sessionToken)) {
+      wininetGroups.set(entry.sessionToken, wininetGroupOwnership(entries, entry.sessionToken, adapter, equal))
+    }
+  }
   for (const entry of [...pending].reverse()) {
     const intact = isIntactLedgerEntry(entry)
     const label = `${entry.service}/${entry.item}`
+    const ownership = entry.service === 'WinINET' ? wininetGroups.get(entry.sessionToken) : undefined
+    if (ownership?.kind === 'external') {
+      if (!adapter.preserveExternalChanges?.(entry)) {
+        failed.push(`${label}:${ownership.note},未获准结算外部改动`)
+        continue
+      }
+      const settled = repairQuarantinedEntry(entry, ENTRY_STATUS.preserved, `损坏恢复:${ownership.note},保留整组现值`)
+      outcomes.set(entry, settled)
+      keptModified.push(settled)
+      continue
+    }
+    if (ownership?.kind === 'unknown') {
+      failed.push(`${label}:${ownership.note},未改动整组现值`)
+      continue
+    }
     let current
     try {
       current = adapter.read({ service: entry.service, item: entry.item })
@@ -117,7 +207,11 @@ function recoverLedgerLocked(dataDir, adapter) {
     }
     if (intact) {
       // 现值既非我们写入的、也非原值:第三方所有,保留现值并留痕。
-      const settled = repairQuarantinedEntry(entry, ENTRY_STATUS.restored, '损坏恢复:当前值已被其他软件修改,保留现值')
+      if (entry.service === 'WinINET' && !adapter.preserveExternalChanges?.(entry)) {
+        failed.push(`${label}:当前值已被其他软件修改,未获准结算外部改动`)
+        continue
+      }
+      const settled = repairQuarantinedEntry(entry, ENTRY_STATUS.preserved, '损坏恢复:当前值已被其他软件修改,保留现值')
       outcomes.set(entry, settled)
       keptModified.push(settled)
       continue
@@ -170,8 +264,29 @@ function restoreLedgerLocked(dataDir, adapter) {
     .map((entry, index) => ({ entry, index }))
     .filter(({ entry }) => entry.kind === 'setting' && !isSettledSetting(entry))
     .reverse()
+  const wininetGroups = new Map()
+  for (const { entry } of pending) {
+    if (entry.service === 'WinINET' && !wininetGroups.has(entry.sessionToken)) {
+      wininetGroups.set(entry.sessionToken, wininetGroupOwnership(entries, entry.sessionToken, adapter, adapter.valuesEqual ?? deepEqual))
+    }
+  }
 
   for (const { entry, index } of pending) {
+    const ownership = entry.service === 'WinINET' ? wininetGroups.get(entry.sessionToken) : undefined
+    if (ownership?.kind === 'external') {
+      entries[index] = { ...entry,
+        status: adapter.preserveExternalChanges?.(entry) ? ENTRY_STATUS.preserved : ENTRY_STATUS.keptModified,
+        note: `${ownership.note},保留整组现值` }
+      result.keptModified.push(entries[index])
+      continue
+    }
+    if (ownership?.kind === 'unknown') {
+      entries[index] = { ...entry, status: ownership.retryable ? ENTRY_STATUS.restoreFailed : ENTRY_STATUS.keptModified,
+        note: `${ownership.note},未改动整组现值` }
+      if (ownership.retryable) result.failed.push(entries[index])
+      else result.keptModified.push(entries[index])
+      continue
+    }
     let current
     try {
       current = adapter.read({ service: entry.service, item: entry.item })

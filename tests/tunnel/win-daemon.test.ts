@@ -311,7 +311,7 @@ describe('Windows 守护(WinINET 四键,账本驱动)', () => {
     const daemon = spawnDaemon(h)
     await daemon.run()
     expect(stateOf().state).toBe('error')
-    expect(stateOf().message).toBe('受管理环境')
+    expect(stateOf()).toMatchObject({ code: 'TUNNEL_AVAILABILITY_POLICY_LOCKED' })
     expect(settingEntries()).toHaveLength(0)
     expect(readFakeOps(storePath).some((op) => op.op === 'write')).toBe(false)
   })
@@ -485,12 +485,20 @@ describe('Windows 守护(WinINET 四键,账本驱动)', () => {
     await daemon.run()
     await waitFor(() => stateOf().state === 'error')
     expect(stateOf().code).toBe('组件缺失')
+    expect(stateOf().message).toBe('组件缺失')
     expect(h.startCalls).toHaveLength(1) // 首发 1 次
+
+    // 首次错误写盘早于异步停止收尾；先让停止 Promise 结算，再推进假时钟。
+    await flushMicrotasks()
+    expect(stateOf().code).toBe('组件缺失')
+    expect(stateOf().message).toBe('组件缺失')
 
     // 推进远超快速退避 + 低频周期:致命停止后不再有任何重连尝试
     clock.advance(10 * 60_000)
     await flushMicrotasks()
     expect(h.startCalls).toHaveLength(1)
+    expect(stateOf().code).toBe('组件缺失')
+    expect(stateOf().message).toBe('组件缺失')
 
     // 唤醒 / 网络事件同样推不动(致命态只有意图驱动的新 connect 清除)
     daemon.notifyEvent('wake')
@@ -529,10 +537,10 @@ describe('Windows 守护(WinINET 四键,账本驱动)', () => {
     writeIntentFile(dataDir, connectIntent())
     const conflictDaemon = spawnDaemon(conflict)
     await conflictDaemon.run()
-    expect(stateOf().message).toBe('受管理环境')
+    expect(stateOf()).toMatchObject({ code: 'TUNNEL_AVAILABILITY_POLICY_LOCKED' })
     conflictDaemon.notifyEvent('wake')
     await flushMicrotasks()
     expect(conflict.startCalls).toHaveLength(0)
-    expect(stateOf().message).toBe('受管理环境')
+    expect(stateOf()).toMatchObject({ code: 'TUNNEL_AVAILABILITY_POLICY_LOCKED' })
   })
 })

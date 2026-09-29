@@ -77,4 +77,21 @@ describe('真实客户端调用验收', () => {
     expect(tracker.record({ ...claude, model: 'deepseek-v4-flash' }, '2026-09-13T08:00:00.000Z')).toBe(true)
     expect(tracker.acceptances().claude).toMatchObject({ provider: 'deepseek', model: 'deepseek-v4-flash', revision: 'route-claude-1' })
   })
+
+  it('最近一次成败只属于当前路由版本，迟到的旧请求不能覆盖', () => {
+    const tracker = new ClientAcceptanceTracker()
+    tracker.replaceRoutes([deepseek])
+    tracker.recordAttempt(deepseek, '2026-09-13T08:00:00.000Z', true)
+    tracker.recordAttempt(deepseek, '2026-09-13T08:00:01.000Z', false, 'network_error')
+    expect(tracker.latestAttempts().codex).toMatchObject({ provider: 'deepseek', ok: false, code: 'network_error' })
+
+    const kimi: ClientAcceptanceRoute = { ...deepseek, provider: 'kimi', endpoint: 'https://api.kimi.com/coding/v1/responses', revision: 'route-kimi-2' }
+    tracker.replaceRoutes([kimi])
+    expect(tracker.latestAttempts()).toEqual({})
+    expect(tracker.recordAttempt(deepseek, '2026-09-13T08:00:02.000Z', false, 'timeout')).toBe(false)
+    tracker.recordAttempt(kimi, '2026-09-13T08:00:03.000Z', true)
+    expect(tracker.latestAttempts().codex).toMatchObject({ provider: 'kimi', ok: true })
+    tracker.invalidate('codex')
+    expect(tracker.latestAttempts()).toEqual({})
+  })
 })

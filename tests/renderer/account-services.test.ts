@@ -103,7 +103,7 @@ it('已登录不展示工具箱购买动作;旧购买历史只读展示', () => 
   expect(JSON.stringify(view)).toBe(before)
 })
 
-it('付款订单里网络订单保留继续付款,toolbox 历史订单只读不再提供付款入口', async () => {
+it('付款订单都只作历史记录，不从旧订单继续本次付款', async () => {
   const orders: PaymentOrderView[] = [
     { orderId: 'a'.repeat(32), applicationId: 'lx-' + 'b'.repeat(32), planId: 'toolbox', channel: 'alipay', amountFen: 1990, status: 'open', paidAt: null, redirect: null, confirmError: null },
     { orderId: 'c'.repeat(32), applicationId: 'lx-' + 'd'.repeat(32), planId: '20g', channel: 'wechat', amountFen: 1990, status: 'open', paidAt: null, redirect: null, confirmError: null }
@@ -115,9 +115,24 @@ it('付款订单里网络订单保留继续付款,toolbox 历史订单只读不�
   const text = root.allText()
   expect(text).toContain('工具箱使用权（历史订单）')
   expect(text).toContain('工具箱已免费')
-  // 只有网络待付款订单保留继续付款;取消动作两者都在。
-  expect(text.split('继续付款').length - 1).toBe(1)
+  expect(text).toContain('如需购买，请回到套餐列表重新点击购买')
+  expect(text.split('继续付款').length - 1).toBe(0)
   expect(text.split('取消此订单').length - 1).toBe(2)
+})
+
+it('已付款网络订单在摘要中按订单事实显示，不再展示待接续', async () => {
+  const applicationId = 'lx-' + 'e'.repeat(32)
+  const orders: PaymentOrderView[] = [{ orderId: 'f'.repeat(32), applicationId, planId: '20g', channel: 'wechat',
+    amountFen: 1990, status: 'confirmed', paidAt: Date.now(), redirect: null, confirmError: null }]
+  stubWindow({ paymentOrders: async () => ({ orders: JSON.stringify(orders) }) })
+  const base = signedInView()
+  const root = new Element()
+  mountAccountServices(root as unknown as HTMLElement,
+    { ...base, overview: { ...base.overview!, queuedSubscriptions: [{ id: applicationId, planId: '20g' }] } })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  expect(root.allText()).toContain('付款已确认')
+  expect(root.allText()).not.toContain('待接续')
+  expect(root.allText()).not.toContain('已交付')
 })
 
 it('AC-03:网络订单显示产品标签与创建时间,不再只给原始 planId', async () => {

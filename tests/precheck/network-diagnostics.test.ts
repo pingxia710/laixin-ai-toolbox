@@ -6,11 +6,11 @@ const connected: DiagnosticTunnel = { state: '已连', lastVerifiedAt: new Date(
 const options = (status = connected) => ({ status: () => status, now: () => now, probe: vi.fn(async () => ({ status: 204, durationMs: 47 })) })
 
 describe('AI 打不开的分层检查', () => {
-  it('未连接时不试连、不把目标软件失败误报为账号问题', async () => {
+  it('未连接时只比较独立路径、不试建链，不把目标软件失败误报为账号问题', async () => {
     const deps = options({ ...connected, state: '未配置', lastVerifiedAt: '' })
     const report = await runNetworkDiagnostics('codex', deps)
-    expect(deps.probe).toHaveBeenCalledTimes(1)
-    expect(report.checks.find((check) => check.id === 'service')).toMatchObject({ state: 'not-checked', code: 'AI_DIAG_TUNNEL_REQUIRED' })
+    expect(deps.probe).toHaveBeenCalledTimes(3)
+    expect(report.checks.find((check) => check.id === 'service')).toMatchObject({ state: 'unknown', code: 'AI_DIAG_PRIMARY_PATH_UNAVAILABLE' })
     expect(report.checks.find((check) => check.id === 'account')?.state).toBe('not-checked')
   })
 
@@ -46,7 +46,7 @@ describe('AI 打不开的分层检查', () => {
 
   it('过期出口读数不充当当前连接，DeepSeek 可独立直连检查', async () => {
     const stale = options({ ...connected, lastVerifiedAt: new Date(now - 300_000).toISOString() })
-    expect((await runNetworkDiagnostics('codex', stale)).checks.find((check) => check.id === 'service')?.state).toBe('not-checked')
+    expect((await runNetworkDiagnostics('codex', stale)).checks.find((check) => check.id === 'service')?.state).toBe('unknown')
     const direct = options({ ...connected, state: '未配置', lastVerifiedAt: '' })
     const report = await runNetworkDiagnostics('hermes', direct)
     expect(direct.probe.mock.calls[1]).toEqual(['https://api.deepseek.com/', 'direct'])
@@ -85,6 +85,24 @@ describe('AI 打不开的分层检查', () => {
       state: 'attention', code: 'AI_DIAG_SERVICE_RESTRICTED', elapsedMs: 63
     })
     expect(refused.checks.find((check) => check.id === 'service')?.message).toContain('63 ms')
+  })
+
+  it.each([
+    ['dns', 'AI_DIAG_INTERNET_DNS_FAILED'],
+    ['connection', 'AI_DIAG_INTERNET_CONNECTION_FAILED'],
+    ['tls', 'AI_DIAG_INTERNET_TLS_FAILED'],
+    ['http', 'AI_DIAG_INTERNET_HTTP_FAILED']
+  ] as const)('基础网络失败阶段 %s 同样结构化记录，但不据此伪造整机断网结论', async (phase, code) => {
+    const report = await runNetworkDiagnostics('codex', {
+      ...options(), probe: vi.fn(async (url: string) => {
+        if (url.includes('generate_204')) throw new DiagnosticProbeError('unavailable', 19, phase)
+        return { status: 200, durationMs: 31, phase: 'http' as const }
+      })
+    })
+    expect(report.checks.find(check => check.id === 'internet')).toMatchObject({
+      state: 'unknown', code, phase, elapsedMs: 19
+    })
+    expect(`${report.conclusion.title}${report.conclusion.summary}`).not.toContain('整机断网')
   })
 })
 
@@ -130,7 +148,7 @@ describe('按这个软件实际在用的服务检查', () => {
     const noTunnel = withSelection({ mode: 'official' }, { ...connected, state: '未配置', lastVerifiedAt: '' })
     const tunnelReport = await runNetworkDiagnostics('codex', noTunnel)
     expect(tunnelReport.checks.find((check) => check.id === 'tunnel')?.state).toBe('attention')
-    expect(tunnelReport.checks.find((check) => check.id === 'service')).toMatchObject({ state: 'not-checked', code: 'AI_DIAG_TUNNEL_REQUIRED' })
+    expect(tunnelReport.checks.find((check) => check.id === 'service')).toMatchObject({ state: 'unknown', code: 'AI_DIAG_PRIMARY_PATH_UNAVAILABLE' })
 
     const rejected = { ...withSelection({ mode: 'deepseek' }), probe: vi.fn(async () => ({ status: 401, durationMs: 9 })) }
     expect((await runNetworkDiagnostics('hermes', rejected)).checks.find((check) => check.id === 'service')).toMatchObject({ state: 'attention', code: 'AI_DIAG_SERVICE_AUTH' })

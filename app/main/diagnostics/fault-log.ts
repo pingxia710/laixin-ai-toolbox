@@ -1,4 +1,5 @@
-import { appendFile, lstat, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { lstat, mkdir, open, readdir, rename, rm, writeFile, type FileHandle } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import { sanitizeFaultRecord, type FaultRecord } from '../../shared/fault-log-types'
@@ -150,16 +151,36 @@ export function createFaultLogFiles(root: string): FaultLogFiles {
     const info = await lstat(root)
     if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('FAULT_LOG_ROOT_INVALID')
   }
+  const invalidFile = (): Error & { code: string } => Object.assign(new Error('FAULT_LOG_FILE_INVALID'), { code: 'FAULT_LOG_FILE_INVALID' })
+  const noFollow = typeof constants.O_NOFOLLOW === 'number' ? constants.O_NOFOLLOW : 0
+  const checkedOpen = async (path: string, flags: number): Promise<FileHandle> => {
+    const before = await lstat(path)
+    if (!before.isFile() || before.isSymbolicLink()) throw invalidFile()
+    let handle: FileHandle
+    try { handle = await open(path, flags | noFollow) }
+    catch (error) {
+      if (error && typeof error === 'object' && 'code' in error && error.code === 'ELOOP') throw invalidFile()
+      throw error
+    }
+    try {
+      const current = await handle.stat()
+      if (!current.isFile() || current.dev !== before.dev || current.ino !== before.ino) throw invalidFile()
+      return handle
+    } catch (error) {
+      await handle.close().catch(() => undefined)
+      throw error
+    }
+  }
   return {
     async list() {
-      try { return await readdir(root) } catch { return [] }
+      try { await ensureRoot(); return await readdir(root) } catch { return [] }
     },
     async read(name) {
       try {
+        await ensureRoot()
         const path = resolve(name)
-        const info = await lstat(path)
-        if (!info.isFile() || info.isSymbolicLink()) return undefined
-        return await readFile(path, 'utf8')
+        const handle = await checkedOpen(path, constants.O_RDONLY)
+        try { return await handle.readFile('utf8') } finally { await handle.close() }
       } catch { return undefined }
     },
     async write(name, contents) {
@@ -176,9 +197,21 @@ export function createFaultLogFiles(root: string): FaultLogFiles {
     },
     async append(name, line) {
       await ensureRoot()
-      await appendFile(resolve(name), line, { mode: 0o600 })
+      const path = resolve(name)
+      let handle: FileHandle
+      try {
+        handle = await open(path, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_EXCL | noFollow, 0o600)
+      } catch (error) {
+        if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'EEXIST') {
+          if (error && typeof error === 'object' && 'code' in error && error.code === 'ELOOP') throw invalidFile()
+          throw error
+        }
+        handle = await checkedOpen(path, constants.O_WRONLY | constants.O_APPEND)
+      }
+      try { await handle.writeFile(line) } finally { await handle.close() }
     },
     async remove(name) {
+      await ensureRoot()
       await rm(resolve(name), { force: true })
     }
   }

@@ -21,7 +21,8 @@ import { icon } from '../icons'
 import { openProviderEditor } from './provider-editor'
 import { measureProviderLatency } from './provider-latency'
 import { openOfficialDownloadPage } from './install-card'
-import { createCodexWorkspaceViewState, renderCodexWorkspaces } from './codex-workspaces'
+import { codexWorkspaceIsMultiView, createCodexWorkspaceViewState, readCodexRouterViewState,
+  renderCodexWorkspaces, restoreCodexWorkspaceFocus } from './codex-workspaces'
 
 function node<K extends keyof HTMLElementTagNameMap>(tag: K, text = '', className = ''): HTMLElementTagNameMap[K] {
   return Object.assign(document.createElement(tag), { textContent: text, className })
@@ -37,6 +38,199 @@ export function codexProjectConfigurationNotice(shell: AiAccessShell, target: No
   return shell === 'codex' && target?.reason === 'project-configuration-ignored'
     ? '检测到项目目录里的 Codex 配置；模型 API 仍使用用户级配置，工具箱会写入有效的用户级配置。'
     : undefined
+}
+
+export interface CodexIsolationView {
+  readonly application: 'codex'
+  readonly scope: 'model-api-egress'
+  readonly capability: 'http-connect'
+  readonly mode: 'application-only' | 'disabled'
+  readonly systemNetwork: 'unmanaged'
+  readonly phase: 'idle' | 'configuring' | 'verifying' | 'available' | 'restoring' | 'restored' | 'limited'
+  readonly action: 'idle' | 'enable' | 'disable' | 'recover' | 'health'
+  readonly intentGeneration: number
+  readonly available: boolean
+  readonly code: 'AVAILABLE' | 'RESTORED' | 'EXTERNAL_VALUE_PRESERVED' | 'ENTRY_UNAVAILABLE' | 'CONFIG_PATH_UNKNOWN' | 'CONFIG_WRITE_FAILED' | 'CONFIG_READBACK_MISMATCH' | 'TARGET_UNREACHABLE' | 'SYSTEM_NETWORK_CHANGED' | 'RESTORE_FAILED' | 'STALE_OPERATION'
+}
+
+export const codexIsolationCopy = {
+  title: 'Codex 模型 API 隔离',
+  enable: '仅让 Codex 模型请求使用来信通道',
+  disable: '停止 Codex 模型 API 隔离'
+} as const
+
+export interface HermesIsolationView {
+  readonly application: 'hermes'
+  readonly scope: 'model-api-egress'
+  readonly capability: 'http-connect'
+  readonly mode: CodexIsolationView['mode']
+  readonly systemNetwork: 'unmanaged'
+  readonly phase: CodexIsolationView['phase']
+  readonly action: CodexIsolationView['action']
+  readonly intentGeneration: number
+  readonly available: boolean
+  readonly code: CodexIsolationView['code']
+}
+
+export const hermesIsolationCopy = {
+  title: 'Hermes 模型 API 隔离',
+  enable: '仅让 Hermes 模型请求使用来信通道',
+  disable: '停止 Hermes 模型 API 隔离'
+} as const
+
+/** The bridge carries only a small fixed status vocabulary; malformed or extended data stays hidden. */
+export function readCodexIsolationStatus(snapshot: string): CodexIsolationView | null {
+  return readApplicationIsolationStatus(snapshot, 'codex')
+}
+
+export function readHermesIsolationStatus(snapshot: string): HermesIsolationView | null {
+  return readApplicationIsolationStatus(snapshot, 'hermes')
+}
+
+function readApplicationIsolationStatus<T extends 'codex' | 'claude' | 'hermes'>(snapshot: string, application: T): Extract<CodexIsolationView | ClaudeIsolationView | HermesIsolationView, { application: T }> | null {
+  try {
+    const value = JSON.parse(snapshot) as Partial<CodexIsolationView>
+    const modes = ['application-only', 'disabled'] as const
+    const phases = ['idle', 'configuring', 'verifying', 'available', 'restoring', 'restored', 'limited'] as const
+    const actions = ['idle', 'enable', 'disable', 'recover', 'health'] as const
+    const codes = ['AVAILABLE', 'RESTORED', 'EXTERNAL_VALUE_PRESERVED', 'ENTRY_UNAVAILABLE', 'CONFIG_PATH_UNKNOWN', 'CONFIG_WRITE_FAILED', 'CONFIG_READBACK_MISMATCH', 'TARGET_UNREACHABLE', 'SYSTEM_NETWORK_CHANGED', 'RESTORE_FAILED', 'STALE_OPERATION'] as const
+    if (value.application !== application || value.scope !== 'model-api-egress' || value.capability !== 'http-connect' || !modes.includes(value.mode as typeof modes[number]) || value.systemNetwork !== 'unmanaged' ||
+      !phases.includes(value.phase as typeof phases[number]) || !actions.includes(value.action as typeof actions[number]) ||
+      !Number.isSafeInteger(value.intentGeneration) || (value.intentGeneration as number) < 0 || typeof value.available !== 'boolean' ||
+      !codes.includes(value.code as typeof codes[number]) || !coherentApplicationIsolationView(value)) return null
+    return {
+      application, scope: 'model-api-egress', capability: 'http-connect', mode: value.mode as CodexIsolationView['mode'], systemNetwork: 'unmanaged',
+      phase: value.phase as CodexIsolationView['phase'], available: value.available,
+      action: value.action as CodexIsolationView['action'], intentGeneration: value.intentGeneration as number,
+      code: value.code as CodexIsolationView['code']
+    } as Extract<CodexIsolationView | ClaudeIsolationView | HermesIsolationView, { application: T }>
+  } catch { return null }
+}
+
+/** Reject impossible combinations rather than rendering a stale `available` flag as usable. */
+function coherentApplicationIsolationView(value: Partial<CodexIsolationView>): boolean {
+  if (value.available === true) return value.mode === 'application-only' && value.phase === 'available' && value.code === 'AVAILABLE'
+  if (value.code === 'AVAILABLE') return value.mode === 'application-only' &&
+    (value.phase === 'configuring' || value.phase === 'verifying' || value.phase === 'restoring')
+  if (value.code === 'RESTORED' || value.code === 'EXTERNAL_VALUE_PRESERVED') {
+    return value.mode === 'disabled' && (value.phase === 'idle' || value.phase === 'restoring' || value.phase === 'restored')
+  }
+  return value.mode === 'application-only' && value.phase === 'limited'
+}
+
+export function codexIsolationMessage(value: CodexIsolationView | null): string {
+  if (value === null || value.phase === 'idle') return '可让 Codex 的模型 API 请求单独使用来信通道；工具箱不会因此接管系统网络或其他应用。'
+  if (value.phase === 'configuring') return '正在配置 Codex 模型 API 请求的隔离通道；此功能不更改系统网络设置。'
+  if (value.phase === 'verifying') return '正在通过 Codex 模型 API 隔离通道验证目标服务；写入配置不等于网络可用。'
+  if (value.phase === 'restoring') return '正在恢复来信拥有的 Codex 配置；此功能不更改系统网络设置。'
+  if (value.available) return 'Codex 模型 API 请求已通过隔离通道验证；此功能仅作用于 Codex 模型请求，系统连接状态请查看首页。'
+  switch (value.code) {
+    case 'EXTERNAL_VALUE_PRESERVED': return '已停止 Codex 模型 API 隔离。检测到客户或其他工具的后续修改，已原样保留。'
+    case 'ENTRY_UNAVAILABLE': return '来信本机入口当前不可用；没有保留死代理配置。'
+    case 'CONFIG_PATH_UNKNOWN': return 'Codex 的有效受控配置无法确认；没有改写任何配置。'
+    case 'CONFIG_WRITE_FAILED': return 'Codex 配置未写入完成，原配置已恢复。'
+    case 'CONFIG_READBACK_MISMATCH': return 'Codex 配置写后核对不一致，原配置已恢复。'
+    case 'TARGET_UNREACHABLE': return '隔离路径未能验证到 Codex 目标，原配置已恢复。'
+    case 'SYSTEM_NETWORK_CHANGED': return '检测到系统网络状态变化，隔离操作已停止并恢复 Codex 配置。'
+    case 'RESTORE_FAILED': return 'Codex 配置或隔离会话恢复失败；暂不能重新启用。请重新打开工具箱重试恢复；系统连接状态请查看首页。'
+    case 'STALE_OPERATION': return '较早的隔离操作已失效，不会覆盖你刚刚的选择。'
+    default: return 'Codex 模型 API 隔离已停止并恢复配置；此功能不更改系统网络设置。'
+  }
+}
+
+function renderCodexIsolationControl(value: CodexIsolationView | null, busy: boolean, toggle: () => void): HTMLElement {
+  const section = node('section', '', 'platform-actions codex-isolation')
+  const working = value?.phase === 'configuring' || value?.phase === 'verifying' || value?.phase === 'restoring'
+  const button = node('button', value?.available ? codexIsolationCopy.disable : codexIsolationCopy.enable, value?.available ? 'secondary-action' : 'primary-action')
+  if (value?.code === 'RESTORE_FAILED') button.textContent = '恢复未完成，暂不能启用'
+  button.type = 'button'; button.disabled = busy || working || value?.code === 'RESTORE_FAILED'
+  button.onclick = toggle
+  section.append(node('h2', codexIsolationCopy.title), node('p', codexIsolationMessage(value), 'platform-muted'), button)
+  return section
+}
+
+export interface ClaudeIsolationView {
+  readonly application: 'claude'
+  readonly scope: 'model-api-egress'
+  readonly capability: 'http-connect'
+  readonly mode: 'application-only' | 'disabled'
+  readonly systemNetwork: 'unmanaged'
+  readonly phase: 'idle' | 'configuring' | 'verifying' | 'available' | 'restoring' | 'restored' | 'limited'
+  readonly action: 'idle' | 'enable' | 'disable' | 'recover' | 'health'
+  readonly intentGeneration: number
+  readonly available: boolean
+  readonly code: 'AVAILABLE' | 'RESTORED' | 'EXTERNAL_VALUE_PRESERVED' | 'ENTRY_UNAVAILABLE' | 'CONFIG_PATH_UNKNOWN' | 'CONFIG_WRITE_FAILED' | 'CONFIG_READBACK_MISMATCH' | 'TARGET_UNREACHABLE' | 'SYSTEM_NETWORK_CHANGED' | 'RESTORE_FAILED' | 'STALE_OPERATION'
+}
+
+export const claudeIsolationCopy = {
+  title: 'Claude Code 模型 API 隔离',
+  enable: '仅让 Claude Code 模型请求使用来信通道',
+  disable: '停止 Claude Code 模型 API 隔离'
+} as const
+
+/** Claude has its own fixed capability contract; a Codex or broader egress snapshot is never accepted. */
+export function readClaudeIsolationStatus(snapshot: string): ClaudeIsolationView | null {
+  return readApplicationIsolationStatus(snapshot, 'claude')
+}
+
+export function claudeIsolationMessage(value: ClaudeIsolationView | null): string {
+  if (value === null || value.phase === 'idle') return '可让 Claude Code 的模型 API 请求单独使用来信通道；不会因此接管官方登录、更新、遥测、插件或系统网络。'
+  if (value.phase === 'configuring') return '正在配置 Claude Code 模型 API 请求的隔离通道；系统网络未接管。'
+  if (value.phase === 'verifying') return '正在通过 Claude Code 模型 API 隔离通道验证目标服务；写入配置不等于网络可用。'
+  if (value.phase === 'restoring') return '正在恢复来信拥有的 Claude Code 模型 API 配置；系统网络未接管。'
+  if (value.available) return 'Claude Code 模型 API 请求已通过隔离通道验证；这不表示官方登录、更新、遥测或插件流量已隔离。'
+  switch (value.code) {
+    case 'EXTERNAL_VALUE_PRESERVED': return '已停止 Claude Code 模型 API 隔离。检测到客户或其他工具的后续修改，已原样保留。'
+    case 'ENTRY_UNAVAILABLE': return '来信本机入口当前不可用；没有保留死代理配置。'
+    case 'CONFIG_PATH_UNKNOWN': return 'Claude Code 的有效受控配置无法确认；没有改写任何配置。'
+    case 'CONFIG_WRITE_FAILED': return 'Claude Code 配置未写入完成，原配置已恢复。'
+    case 'CONFIG_READBACK_MISMATCH': return 'Claude Code 配置写后核对不一致，原配置已恢复。'
+    case 'TARGET_UNREACHABLE': return '隔离路径未能验证到 Claude Code 模型目标，原配置已恢复。'
+    case 'SYSTEM_NETWORK_CHANGED': return '检测到系统网络状态变化，隔离操作已停止并恢复 Claude Code 配置。'
+    case 'RESTORE_FAILED': return 'Claude Code 配置或隔离会话恢复失败；系统网络未接管，请先不要重新启用。'
+    case 'STALE_OPERATION': return '较早的隔离操作已失效，不会覆盖你刚刚的选择。'
+    default: return 'Claude Code 模型 API 隔离已恢复；系统网络未接管。'
+  }
+}
+
+function renderClaudeIsolationControl(value: ClaudeIsolationView | null, busy: boolean, toggle: () => void): HTMLElement {
+  const section = node('section', '', 'platform-actions claude-isolation')
+  const working = value?.phase === 'configuring' || value?.phase === 'verifying' || value?.phase === 'restoring'
+  const button = node('button', value?.available ? claudeIsolationCopy.disable : claudeIsolationCopy.enable, value?.available ? 'secondary-action' : 'primary-action')
+  button.type = 'button'; button.disabled = busy || working
+  button.onclick = toggle
+  section.append(node('h2', claudeIsolationCopy.title), node('p', claudeIsolationMessage(value), 'platform-muted'), button)
+  return section
+}
+
+export function hermesIsolationMessage(value: HermesIsolationView | null): string {
+  if (value === null || value.phase === 'idle') return '可让 Hermes 的模型 API 请求单独使用来信通道；工具箱不会因此接管系统网络或其他应用。'
+  if (value.phase === 'configuring') return '正在配置 Hermes 模型 API 请求的隔离通道；系统网络未接管。'
+  if (value.phase === 'verifying') return '正在通过 Hermes 模型 API 隔离通道验证上游模型目标；这不代表 Hermes 客户端已经完成回答。'
+  if (value.phase === 'restoring') return '正在停止 Hermes 模型 API 隔离；不会恢复接入前第三方配置。'
+  if (value.available) return 'Hermes 模型网关配置已核对，并且上游模型目标已通过隔离通道验证；这不代表 Hermes 客户端已经完成回答。'
+  switch (value.code) {
+    case 'EXTERNAL_VALUE_PRESERVED': return '已停止 Hermes 模型 API 隔离。检测到客户或其他工具的后续修改，已原样保留。'
+    case 'ENTRY_UNAVAILABLE': return '来信本机入口当前不可用；没有保留死配置。'
+    case 'CONFIG_PATH_UNKNOWN': return 'Hermes 的有效受控配置无法确认；没有改写任何配置。'
+    case 'CONFIG_WRITE_FAILED': return 'Hermes 配置未写入完成，原配置已恢复。'
+    case 'CONFIG_READBACK_MISMATCH': return 'Hermes 配置写后核对不一致，原配置已恢复。'
+    case 'TARGET_UNREACHABLE': return '隔离路径未能验证到 Hermes 上游模型目标，原配置已恢复。'
+    case 'SYSTEM_NETWORK_CHANGED': return '检测到系统网络状态变化，隔离操作已停止并恢复 Hermes 配置。'
+    case 'RESTORE_FAILED': return 'Hermes 配置或隔离会话恢复失败；系统网络未接管，请先不要重新启用。'
+    case 'STALE_OPERATION': return '较早的隔离操作已失效，不会覆盖你刚刚的选择。'
+    default: return 'Hermes 模型 API 隔离已恢复；系统网络未接管。'
+  }
+}
+
+function renderHermesIsolationControl(value: HermesIsolationView | null, busy: boolean, toggle: () => void): HTMLElement {
+  const section = node('section', '', 'platform-actions hermes-isolation')
+  const working = value?.phase === 'configuring' || value?.phase === 'verifying' || value?.phase === 'restoring'
+  const button = node('button', value?.available ? hermesIsolationCopy.disable : hermesIsolationCopy.enable, value?.available ? 'secondary-action' : 'primary-action')
+  button.type = 'button'; button.disabled = busy || working
+  button.onclick = toggle
+  section.append(node('h2', hermesIsolationCopy.title), node('p', hermesIsolationMessage(value), 'platform-muted'), button)
+  return section
 }
 
 // 平台只在启动后取一次；回执入口只在 macOS 渲染，其余平台连按钮都不出现。
@@ -225,6 +419,7 @@ export function mountModelApi(element: HTMLElement, platform: UsagePlatformId, a
   let suggestedKey: { from: AiAccessProvider; to: AiAccessProvider; value: string } | null = null
   // 本机 API 服务停了是「当前故障」，与「上次接入测试失败」是两件事，各自留各自的复验结果。
   let startupError: ApiFailure | null = null
+  let configurationGeneration = 0
   let serviceRemedy: ApiRemedyResult | null = null
   // 这一页没有这家的行（非接入壳平台）就当没带：⛔ 把客户留在一个不存在的定位上。
   let editing: AiAccessProvider | null = shell !== null && focusProvider !== undefined ? focusProvider : null
@@ -238,6 +433,9 @@ export function mountModelApi(element: HTMLElement, platform: UsagePlatformId, a
   let receiptResult: UsageReceiptResult | null = null
   const workspaceState = createCodexWorkspaceViewState()
   let claudeEditions: ClaudeEditionsView | null = null
+  let codexIsolation: CodexIsolationView | null = null
+  let claudeIsolation: ClaudeIsolationView | null = null
+  let hermesIsolation: HermesIsolationView | null = null
   const stopPoll = (): void => { if (poll !== undefined) clearInterval(poll); poll = undefined }
   const action = (text: string, run: () => void, primary = false): HTMLButtonElement => {
     const button = node('button', text, primary ? 'primary-action' : 'secondary-action')
@@ -307,6 +505,14 @@ export function mountModelApi(element: HTMLElement, platform: UsagePlatformId, a
       : ''
     const notice = node('p', message || failure || (!status ? '正在读取模型配置…' : ''), 'platform-notice')
     notice.setAttribute('role', 'status'); notice.setAttribute('aria-live', 'polite'); root.append(notice)
+    if (shell === 'codex') {
+      root.append(renderCodexWorkspaces(window.toolbox.codexworkspaces, api, status, workspaceState, render, refresh, login))
+      if (codexWorkspaceIsMultiView(status, workspaceState)) {
+        element.replaceChildren(root)
+        restoreCodexWorkspaceFocus(root, workspaceState)
+        return
+      }
+    }
     const desktopOnly = shell === 'claude' ? claudeDesktopOnlyNotice(claudeEditions) : undefined
     if (desktopOnly) {
       const row = node('div', '', 'platform-actions claude-desktop-only-notice')
@@ -325,7 +531,13 @@ export function mountModelApi(element: HTMLElement, platform: UsagePlatformId, a
     if (legacyDirect) {
       root.append(node('p', `检测到旧版 ${modelProviders[legacyDirect.provider].title} 直连记录；它未由当前工具箱网关接管。原 Key 保留在本机，确认后点击“启用”可迁移到当前安全路由。`, 'platform-notice'))
     }
-    if (shell === 'codex') root.append(renderCodexWorkspaces(window.toolbox.codexworkspaces, status, workspaceState, render, refresh))
+    if (shell === 'codex') {
+      root.append(renderCodexIsolationControl(codexIsolation, busy, () => { void toggleCodexIsolation() }))
+    }
+    if (shell === 'claude') root.append(renderClaudeIsolationControl(claudeIsolation, busy, () => { void toggleClaudeIsolation() }))
+    if (shell === 'hermes') {
+      root.append(renderHermesIsolationControl(hermesIsolation, busy, () => { void toggleHermesIsolation() }))
+    }
     const target = status?.configurationTargets?.[shell]
     const claudeConfigurationBound = shell === 'claude' && hasClaudeConfigurationBinding(status)
     const codexProjectNotice = codexProjectConfigurationNotice(shell, target)
@@ -406,11 +618,11 @@ export function mountModelApi(element: HTMLElement, platform: UsagePlatformId, a
       if (lingering) {
         // 保留期一到就自己重画一次把这一行收走，⛔ 让它永远赖在页面上。
         clearTimeout(remedyTimer)
-        remedyTimer = setTimeout(() => { remedy = null; remedyCode = null; render() }, Math.max(0, REMEDY_LINGER_MS - (Date.now() - Date.parse(remedy!.at))))
+        remedyTimer = setTimeout(() => { remedy = null; remedyCode = null; suggestedKey = null; render() }, Math.max(0, REMEDY_LINGER_MS - (Date.now() - Date.parse(remedy!.at))))
       }
     }
     if (shell !== 'hermes') {
-      const official = provider('official', shell === 'codex' ? 'OpenAI 官方' : 'Claude 官方', shell === 'codex'
+      const official = provider('official', shell === 'codex' ? 'OpenAI 官方套餐' : 'Claude 官方', shell === 'codex'
         ? codexOfficialDescription(status, login)
         : claudeLogin === 'pending' ? '正在等待浏览器授权；登录前请先连上 AI网络。' : claudeLogin === 'code-required' ? '官方页面显示了登录码，请粘到下面提交。' : claudeLogin === 'connected' ? '本次官方登录已完成；模型来源以当前配置为准。' : claudeLogin === 'not-installed' ? '未找到已安装的 Claude Code，请到「下载/版本信息」打开官方下载页。' : '使用 Claude 官方账号套餐，登录由工具箱发起、官方页面完成。', platform)
       const use = startAction('official')
@@ -481,7 +693,11 @@ export function mountModelApi(element: HTMLElement, platform: UsagePlatformId, a
           root.append(row.row)
           continue
         }
-        const start = startAction(option.id); start.disabled ||= !keySaved
+        const start = startAction(option.id)
+        if (!keySaved) {
+          start.onclick = () => editProvider(option.id)
+          start.title = '先添加 API Key，再验证并启用'
+        }
         row.actions.append(start)
         const edit = action('', () => editProvider(option.id))
         edit.classList.add('api-service-small', 'api-edit'); edit.setAttribute('aria-label', '编辑')
@@ -518,6 +734,7 @@ export function mountModelApi(element: HTMLElement, platform: UsagePlatformId, a
       const retry = action('重试读取', () => { void refresh() }); retry.disabled = !api; root.append(retry)
     }
     element.replaceChildren(root)
+    if (shell === 'codex') restoreCodexWorkspaceFocus(root, workspaceState)
     // 客户自己去编辑别的行（或把这一行关了）之后，定位就不再属于任何一行。
     if (focusedRow !== null && editing !== focusedRow) { focusedRow = null; pendingScroll = false }
     if (focusedRow !== null) focusProviderRow(focusedRow)
@@ -577,7 +794,10 @@ export function mountModelApi(element: HTMLElement, platform: UsagePlatformId, a
     form.onsubmit = event => {
       event.preventDefault()
       const key = input.value.trim(); input.value = ''; keyDraft = null
-      void saveKeyFlow(provider, key)
+      void saveKeyFlow(provider, key).then(started => {
+        // 守卫拦下提交（如官方登录等待恰好开始）时，Key 留在表单里等状态恢复，⛔ 静默清空逼客户重输。
+        if (!started && mounted) { keyDraft = { provider, value: key }; render() }
+      })
     }
     return form
   }
@@ -587,12 +807,13 @@ export function mountModelApi(element: HTMLElement, platform: UsagePlatformId, a
  * ⛔ 未启用来源先把 Key 写进本地再验证（旧返工的两步 saveProviderKey→useProvider 有此回归）。
  * 模型由主进程内部沿用该来源已存选择，⛔ 表单把默认模型写死。
  */
-const saveKeyFlow = async (provider: AiAccessProvider, key: string): Promise<void> => {
-  if (!api || !shell || !status || busy || login === 'pending' || claudeBusy()) return
+const saveKeyFlow = async (provider: AiAccessProvider, key: string): Promise<boolean> => {
+  if (!api || !shell || !status || busy || login === 'pending' || claudeBusy()) return false
+  configurationGeneration++
   busy = true; message = '正在验证并切换，请稍候…'; render()
   try {
     status = readAccessStatus((await api.useProviderWithKey({ shell, provider, key })).snapshot)
-    if (!mounted) return
+    if (!mounted) return true
     const attempt = status?.attempt
     editing = null
     if (attempt?.shell === shell && attempt.provider === provider && !attempt.ok) {
@@ -605,8 +826,24 @@ const saveKeyFlow = async (provider: AiAccessProvider, key: string): Promise<voi
     }
   } catch {
     message = '切换未完成，工具箱没有用这次输入覆盖已有配置。请检查软件安装及已有配置后重试。'
-  } finally { busy = false; if (mounted) render() }
+  } finally {
+    if (mounted) ({ usage, startupError } = await readServiceState())
+    busy = false
+    if (mounted) render()
+  }
+  return true
 }
+  const readServiceState = async (): Promise<{ usage: readonly ApiUsageStage[]; startupError: ApiFailure | null }> => {
+    if (!api) return { usage: [], startupError: null }
+    try {
+      const service = JSON.parse((await api.serviceStatus()).snapshot) as { usage?: unknown; startupError?: unknown }
+      return {
+        usage: readUsageStages(service.usage),
+        startupError: typeof service.startupError === 'string' && Object.hasOwn(apiFailureMessages, service.startupError)
+          ? service.startupError as ApiFailure : null
+      }
+    } catch { return { usage: [], startupError: null } }
+  }
   // API-11：登录等待/输登录码期间只轻量轮询官方登录态端点，不刷配置目标、不读用量——
   // 每轮全量 status 会让主进程 spawn profiles＋ps 读 7 个 shell 文件，把登录页的电脑拖卡。
   // 登录态没有变化就不重绘整页；出结果后停轮询并全量刷一次，把配置目标与用量一起对齐。
@@ -625,28 +862,33 @@ const saveKeyFlow = async (provider: AiAccessProvider, key: string): Promise<voi
   }
   const refresh = async (): Promise<void> => {
     if (!mounted || busy || !api) return
+    const generation = configurationGeneration
     try {
       const next = readAccessStatus((await api.status()).snapshot)
       // 三态与配置一致性在服务快照里；读不到就先不显示，⛔ 让整页报错。
-      let nextUsage: readonly ApiUsageStage[] = []
-      let nextStartupError: ApiFailure | null = null
-      try {
-        const service = JSON.parse((await api.serviceStatus()).snapshot) as { usage?: unknown; startupError?: unknown }
-        nextUsage = readUsageStages(service.usage)
-        nextStartupError = typeof service.startupError === 'string' && Object.hasOwn(apiFailureMessages, service.startupError)
-          ? service.startupError as ApiFailure : null
-      } catch { nextUsage = []; nextStartupError = null }
+      const { usage: nextUsage, startupError: nextStartupError } = await readServiceState()
+      const nextRouter = shell === 'codex' && api.aiRouterStatus
+        ? await api.aiRouterStatus().then(result => readCodexRouterViewState(result.snapshot), () => undefined)
+        : undefined
       const nextLogin = shell === 'codex' ? readCodexLoginStatus((await api.codexOfficialStatus()).snapshot) : 'idle'
       const nextClaude: ClaudeOfficialLoginStatus = shell === 'claude' && api.claudeOfficialStatus ? readClaudeLoginStatus((await api.claudeOfficialStatus()).snapshot) : 'idle'
+      const nextCodexIsolation = shell === 'codex' && api.codexIsolationStatus
+        ? readCodexIsolationStatus((await api.codexIsolationStatus()).snapshot) : null
+      const nextClaudeIsolation = shell === 'claude' && api.claudeIsolationStatus
+        ? readClaudeIsolationStatus((await api.claudeIsolationStatus()).snapshot) : null
+      const nextHermesIsolation = shell === 'hermes' && api.hermesIsolationStatus
+        ? readHermesIsolationStatus((await api.hermesIsolationStatus()).snapshot) : null
       // 只看文件在不在，不运行软件；客户装上命令行版后下一次刷新说明就会消失。
       const editionsApi = shell === 'claude' ? (window.toolbox as { shells?: { claudeEditions?: () => Promise<{ snapshot: string }> } } | undefined)?.shells?.claudeEditions : undefined
       const nextEditions = editionsApi === undefined ? null : await editionsApi().then(result => readClaudeEditions(result.snapshot), () => null)
-      if (!mounted || busy) return
+      if (!mounted || busy || generation !== configurationGeneration) return
       status = next; login = nextLogin; claudeLogin = nextClaude; usage = nextUsage; startupError = nextStartupError; claudeEditions = nextEditions
+      workspaceState.runtime = nextRouter
+      codexIsolation = nextCodexIsolation; claudeIsolation = nextClaudeIsolation; hermesIsolation = nextHermesIsolation
       if ((login === 'pending' || claudeBusy()) && poll === undefined) poll = setInterval(() => { void pollLogin() }, 1500)
       if (login !== 'pending' && !claudeBusy()) stopPoll()
     } catch {
-      if (!mounted) return
+      if (!mounted || generation !== configurationGeneration) return
       status = null; startupError = null; message = '模型配置暂时无法读取，请重试。'; stopPoll()
     }
     render()
@@ -672,6 +914,57 @@ const saveKeyFlow = async (provider: AiAccessProvider, key: string): Promise<voi
       return fallbackRestartGuidanceMessage(shell)
     }
   }
+  const toggleCodexIsolation = async (): Promise<void> => {
+    if (!api || shell !== 'codex' || busy || codexIsolation?.code === 'RESTORE_FAILED') return
+    const action = codexIsolation?.available ? api.disableCodexIsolation : api.enableCodexIsolation
+    if (action === undefined) return
+    busy = true
+    message = codexIsolation?.available ? '正在恢复 Codex 模型 API 配置…' : '正在配置并验证 Codex 模型 API 隔离通道…'
+    render()
+    try {
+      codexIsolation = readCodexIsolationStatus((await action()).snapshot)
+      message = codexIsolationMessage(codexIsolation)
+    } catch {
+      message = 'Codex 模型 API 隔离未完成；请刷新后查看隔离状态。系统连接状态请查看首页。'
+    } finally {
+      busy = false
+      if (mounted) { render(); void refresh() }
+    }
+  }
+  const toggleClaudeIsolation = async (): Promise<void> => {
+    if (!api || shell !== 'claude' || busy) return
+    const action = claudeIsolation?.available ? api.disableClaudeIsolation : api.enableClaudeIsolation
+    if (action === undefined) return
+    busy = true
+    message = claudeIsolation?.available ? '正在恢复 Claude Code 模型 API 配置…' : '正在配置并验证 Claude Code 模型 API 隔离通道…'
+    render()
+    try {
+      claudeIsolation = readClaudeIsolationStatus((await action()).snapshot)
+      message = claudeIsolationMessage(claudeIsolation)
+    } catch {
+      message = 'Claude Code 模型 API 隔离未完成；系统网络没有被接管。'
+    } finally {
+      busy = false
+      if (mounted) { render(); void refresh() }
+    }
+  }
+  const toggleHermesIsolation = async (): Promise<void> => {
+    if (!api || shell !== 'hermes' || busy) return
+    const action = hermesIsolation?.available ? api.disableHermesIsolation : api.enableHermesIsolation
+    if (action === undefined) return
+    busy = true
+    message = hermesIsolation?.available ? '正在停止 Hermes 模型 API 隔离…' : '正在配置并验证 Hermes 模型 API 隔离通道…'
+    render()
+    try {
+      hermesIsolation = readHermesIsolationStatus((await action()).snapshot)
+      message = hermesIsolationMessage(hermesIsolation)
+    } catch {
+      message = 'Hermes 模型 API 隔离未完成；系统网络没有被接管。'
+    } finally {
+      busy = false
+      if (mounted) { render(); void refresh() }
+    }
+  }
   const switchProvider = async (mode: 'official' | AiAccessProvider, key?: string, model?: string): Promise<boolean> => {
     if (!api || !shell || !status || busy || login === 'pending' || claudeBusy()) return false
     const contract = mode === 'official' ? undefined : providerShellContract(mode, shell)
@@ -683,6 +976,7 @@ const saveKeyFlow = async (provider: AiAccessProvider, key: string): Promise<voi
     const enteredKey = key
     suggestedKey = null
     const selectedModel = contract === undefined ? undefined : enteredKey === undefined ? model : model ?? contract.defaultModel
+    configurationGeneration++
     busy = true; message = '正在验证并切换，请稍候…'; render()
     let succeeded = false
     try {
@@ -703,7 +997,11 @@ const saveKeyFlow = async (provider: AiAccessProvider, key: string): Promise<voi
       } else if (mode === 'official') message = officialSwitchMessage(shell, status)
     } catch {
       message = '切换未完成，工具箱没有用这次输入覆盖已有配置。请检查软件安装及已有配置后重试。'
-    } finally { busy = false; render() }
+    } finally {
+      if (mounted) ({ usage, startupError } = await readServiceState())
+      busy = false
+      if (mounted) render()
+    }
     return succeeded
   }
   // 显式恢复接入前配置（解除是第一步，这是第二步）：失败时说明没有可用备份，⛔ 假装恢复成功。
@@ -762,5 +1060,5 @@ const saveKeyFlow = async (provider: AiAccessProvider, key: string): Promise<voi
   render()
   if (shell && api) void refresh()
   else if (shell) { message = '当前客户端暂不支持模型配置，请更新工具箱。'; render() }
-  return () => { mounted = false; keyDraft = null; suggestedKey = null; claudeCodeDraft = ''; stopPoll(); closeEditor(); closeProviderServices.forEach(close => close()); element.querySelectorAll<HTMLInputElement>('input').forEach(input => { input.value = '' }); element.replaceChildren() }
+  return () => { mounted = false; keyDraft = null; suggestedKey = null; claudeCodeDraft = ''; clearTimeout(remedyTimer); stopPoll(); closeEditor(); workspaceState.closeEditor?.(); closeProviderServices.forEach(close => close()); element.querySelectorAll<HTMLInputElement>('input').forEach(input => { input.value = '' }); element.replaceChildren() }
 }

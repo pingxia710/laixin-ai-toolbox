@@ -141,3 +141,30 @@ it('可选的 cmd AutoRun 注册表读失败，不应阻止系统代理网络连
     expect(connectorStarts).toBe(1)
   } finally { daemon.requestShutdown(); await flushMicrotasks() }
 })
+
+it('终端注册表读取失败时状态说明应保留注册表原因，系统代理仍可连接', async () => {
+  const root = directory()
+  const clock = new FakeClock()
+  const network = createAdapter({ FAKE_WININET_STORE: join(root, 'registry.json') })
+  const terminal = {
+    service: 'TerminalEnvironment' as const, enabled: true, owns: () => true, preflight: () => {},
+    managedItems: () => [{ ref: { service: 'TerminalEnvironment' as const, item: 'win-cmd-autorun' }, value: null }],
+    read: () => { throw Object.assign(new Error('private registry detail'), { code: 'TERMINAL_ENVIRONMENT_REGISTRY_READ_FAILED' }) },
+    write: () => {}, valuesEqual: () => true, restoredValueMatches: () => true
+  }
+  const adapter = composeManagedAdapters(network, terminal)
+  writeIntentFile(root, { desired: 'connected', sessionToken: 'terminal-read-failure', bridgePort: 18080,
+    connector: { kind: 'loopback-probe', host: '127.0.0.1', port: 1, exitIp: '203.0.113.1' } })
+  const daemon = createDaemon({ dataDir: root, adapter, clock, parentAlive: () => true, onExit: () => {},
+    connectorFactory: () => ({ kind: 'loopback-probe', start: async () => {}, stop: async () => {},
+      localProxyPort: () => 1, onLost: () => {}, verify: async () => ({ exitIp: '203.0.113.1' }) }),
+    bridgeFactory: () => ({ listen: async () => {}, close: async () => {}, isAlive: () => true, onLost: () => {} }) })
+  try {
+    await daemon.run()
+    for (let attempt = 0; attempt < 6; attempt++) { clock.advance(10_000); await flushMicrotasks() }
+    const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'))
+    expect(state.state).toBe('connected')
+    expect(state.note).toContain('注册表读取失败')
+    expect(state.note).not.toContain('private registry detail')
+  } finally { daemon.requestShutdown(); await flushMicrotasks() }
+})

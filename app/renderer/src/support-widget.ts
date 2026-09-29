@@ -16,7 +16,8 @@ function networkSupportContext(status: TunnelStatusView | undefined): Pick<HelpS
   const reasonCodes: string[] = []
   if (status.unrestored) reasonCodes.push('NETWORK_RESTORE_INCOMPLETE')
   else if (status.state === '已停止并恢复原设置') reasonCodes.push('NETWORK_RESTORED')
-  else if (status.state === '用户主动断开') reasonCodes.push('NETWORK_RESTORE_PENDING')
+  else if (status.state === '用户主动断开' || status.state === '断开中') reasonCodes.push('NETWORK_RESTORE_PENDING')
+  if (status.pauseReason === 'entitlement-denied') reasonCodes.push('NETWORK_AUTHORIZATION_UNAVAILABLE')
   if (status.componentMissing) reasonCodes.push('NETWORK_COMPONENT_MISSING')
   if (status.authorization === '等待重新确认账号权益') reasonCodes.push('NETWORK_ACCOUNT_RECHECK')
   if (status.authorization === '保留先前连接，等待重新核验') reasonCodes.push('NETWORK_ACCOUNT_LEASE')

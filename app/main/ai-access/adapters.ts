@@ -1,4 +1,5 @@
 import { execFile as execFileCallback } from 'node:child_process'
+import { createHash, randomUUID } from 'node:crypto'
 import { join, posix, win32 } from 'node:path'
 import { promisify } from 'node:util'
 import { modelProvider, providerModelWindow, type ApiServiceConnection, type ModelProviderId } from '../../shared/model-providers'
@@ -7,18 +8,25 @@ import {
   captureManagedTextFiles,
   claudeManagedSection,
   codexManagedSection,
+  createApplicationIsolationLease,
   createClaudeModelApiConfig,
   createCodexModelApiConfig,
+  createCodexIsolationLease,
   createHermesModelApiConfig,
   hasHermesManagedEnvBlock,
   hermesManagedEnvOwner,
   hermesManagedSection,
   inspectModelApiBackup,
   managedFingerprint,
+  parseCodexIsolationLease,
+  parseApplicationIsolationLease,
   removeHermesManagedEnvBlock,
+  renderApplicationIsolationLease,
+  renderCodexIsolationLease,
+  restoreClaudeManagedSection,
   type ManagedTextFile
 } from './deepseek-config'
-import { replaceConfigurationTransaction } from './config-write-guard'
+import { replaceConfigurationTransaction, withConfigWriteLock } from './config-write-guard'
 import {
   configurationTargetEvidence,
   discoverConfigurationTargets,
@@ -30,6 +38,7 @@ import {
   type ConfigurationTargetShell
 } from './configuration-target'
 import { baseUrlFromCodexToml } from './residual-address'
+import { codexToolboxConnectionBlock, parseCodexTomlDocument } from './codex-toml-document'
 import type { ConfigurationExecutionObservation } from './configuration-execution-observer'
 import type { AiAccessAdapter, AiAccessShell, ExplicitConfigurationTargetScope } from './service'
 
@@ -40,6 +49,8 @@ export interface DeepSeekAdapterOptions {
   readonly platform: NodeJS.Platform
   readonly localAppData?: string
   readonly hermesHome?: string
+  /** Main-process-private locator for an unfinished Hermes isolation lease; never sent through IPC. */
+  readonly hermesIsolationRegistryPath?: string
   /** A caller may supply a real project root only when it obtained it from an explicit user choice. */
   readonly projectDir?: string
   /** Main-process private storage for a project directory the customer explicitly selected. */
@@ -48,6 +59,8 @@ export interface DeepSeekAdapterOptions {
   readonly configurationExecution?: Readonly<Partial<Record<AiAccessShell, ConfigurationExecutionContext>>>
   /** Fresh local policy/launch observation before every read or write. Failures block the target. */
   readonly observeConfigurationExecution?: () => Promise<ConfigurationExecutionObservation>
+  /** Private Toolbox record for the one Claude target that owns an unsettled isolation lease. */
+  readonly claudeIsolationLeaseRegistryPath?: string
   readonly file: ManagedTextFile
   readonly findHermesCommand?: () => Promise<string | undefined>
   readonly runHermes?: (command: string, args: readonly string[], hermesHome?: string) => Promise<void>
@@ -94,8 +107,14 @@ export function createDeepSeekAdapters(options: DeepSeekAdapterOptions): readonl
     ? resolveHermesHome(options.platform, options.home, options.localAppData, options.hermesHome)
     : directoryOf(initialHermesConfigPath, options.platform)
   const hermesPath = initialHermesConfigPath ?? hermesEnvPath(options.platform, hermesRoot)
+  const hermesIsolationRegistryPath = options.hermesIsolationRegistryPath ??
+    joinPath(options.platform, options.home, '.laixin-hermes-isolation-targets.json')
   const codexTarget = createConfigurationTargetManager('codex', options, options.configurationExecution?.codex?.userConfigPath)
   const claudeTarget = createConfigurationTargetManager('claude', options, options.configurationExecution?.claude?.userConfigPath)
+  // This record is an opaque identity pointer, never a raw Claude path. It lets crash recovery
+  // fail closed when the current effective target no longer matches the captured lease target.
+  const claudeIsolationLeaseRegistryPath = options.claudeIsolationLeaseRegistryPath ??
+    joinPath(options.platform, options.home, '.laixin-ai-access', 'laixin-claude-isolation-target.json')
   const hermesTarget = createConfigurationTargetManager('hermes', options, hermesPath)
   const findHermesForTarget = (target: ConfigurationTarget) => options.findHermesCommand ??
     (() => findHermesCommand(options.platform, directoryOf(configurationPath(target), options.platform)))
@@ -132,18 +151,126 @@ export function createDeepSeekAdapters(options: DeepSeekAdapterOptions): readonl
     return { config, runHermes, readHermesSettings }
   }
 
+  const codexConfigForTarget = (provider: ModelProviderId, connection: ApiServiceConnection | undefined, target: ConfigurationTarget) =>
+    createCodexModelApiConfig(provider, options.home, options.file, connection, target)
+  const claudeConfigForTarget = (provider: ModelProviderId, connection: ApiServiceConnection | undefined, target: ConfigurationTarget) =>
+    createClaudeModelApiConfig(provider, options.home, options.file, connection, target)
+  const hermesIsolationFiles = async (target: ConfigurationTarget): Promise<HermesIsolationFiles> => {
+    const execution = hermesExecution(target)
+    const root = directoryOf(configurationPath(target), options.platform)
+    const command = await findHermesForTarget(target)()
+    if (command === undefined) throw new Error('AI_ACCESS_HERMES_NOT_INSTALLED')
+    return {
+      file: options.file,
+      lockPath: joinPath(options.platform, root, 'laixin-config.lock'),
+      leasePath: joinPath(options.platform, root, 'laixin-hermes-isolation-lease.json'),
+      targetIdentity: hermesIsolationTargetIdentity(options.platform, root),
+      command,
+      run: execution.runHermes,
+      read: execution.readHermesSettings
+    }
+  }
+  const hermesIsolationTarget = async (targetIdentity: string): Promise<ConfigurationTarget> => {
+    const root = await readHermesIsolationTarget(options.file, hermesIsolationRegistryPath, options.platform, targetIdentity)
+    return { shell: 'hermes', scope: 'user', path: hermesEnvPath(options.platform, root), override: 'none', writable: true }
+  }
+  const currentHermesIsolationTargetIdentity = async (): Promise<string> => {
+    const target = await hermesTarget.forRead()
+    return hermesIsolationTargetIdentity(options.platform, directoryOf(configurationPath(target), options.platform))
+  }
   const codexConfig = async (provider: ModelProviderId, connection?: ApiServiceConnection) =>
-    createCodexModelApiConfig(provider, options.home, options.file, connection, await codexTarget.forWrite())
+    codexConfigForTarget(provider, connection, await codexTarget.forWrite())
   const claudeConfig = async (provider: ModelProviderId, connection?: ApiServiceConnection) =>
-    createClaudeModelApiConfig(provider, options.home, options.file, connection, await claudeTarget.forWrite())
+    claudeConfigForTarget(provider, connection, await claudeTarget.forWrite())
 
   return [{
     shell: 'codex',
     applyDeepSeek: async (key) => (await codexConfig('deepseek')).apply(key),
     applyProvider: async (provider, key) => (await codexConfig(provider)).apply(key),
     applyConnection: async (provider, connection) => (await codexConfig(provider, connection)).apply('local-token-unused'),
+    applyIsolationConnection: async (provider, connection, expectedIsolationFingerprint, leaseId, expectedConfigurationTargetIdentity) => {
+      const target = await codexTarget.forWrite()
+      if (expectedConfigurationTargetIdentity !== undefined && configurationTargetIdentityFor(target) !== expectedConfigurationTargetIdentity) return 'stale'
+      const config = codexConfigForTarget(provider, connection, target)
+      if (config.applyIfIsolationFingerprint === undefined) throw new Error('AI_ACCESS_CONFIG_UNMANAGED')
+      return config.applyIfIsolationFingerprint(expectedIsolationFingerprint, leaseId, 'local-token-unused', () => targetMatches(codexTarget, expectedConfigurationTargetIdentity))
+    },
     captureConnection: async () => captureManagedTextFiles(options.file, codexManagedPaths(await codexTarget.forWrite(), options.platform)),
+    captureIsolation: async (expectedConfigurationTargetIdentity) => {
+      const target = await codexTarget.forWrite()
+      if (expectedConfigurationTargetIdentity !== undefined && configurationTargetIdentityFor(target) !== expectedConfigurationTargetIdentity) {
+        throw new Error('AI_ACCESS_CONFIGURATION_TARGET_BLOCKED')
+      }
+      const path = configurationPath(target)
+      const lockPath = joinPath(options.platform, directoryOf(path, options.platform), 'laixin-config.lock')
+      const leasePath = joinPath(options.platform, directoryOf(path, options.platform), 'laixin-codex-isolation-lease.json')
+      return withAdapterConfigWriteLock(options.file, lockPath, async () => {
+        const [before, previousLease] = await Promise.all([options.file.read(path), options.file.read(leasePath)])
+        if (before === undefined || previousLease !== undefined) throw new Error('AI_ACCESS_ISOLATION_RECOVERY_REQUIRED')
+        const block = codexToolboxConnectionBlock(before)
+        const beforeIsolationFingerprint = managedFingerprint(block)!
+        const lease = createCodexIsolationLease(block, beforeIsolationFingerprint)
+        await replaceConfigurationTransaction(options.file, [{ path: leasePath, before: previousLease, after: renderCodexIsolationLease(lease) }], { backupAction: 'apply' })
+        return {
+          beforeFingerprint: managedFingerprint(codexManagedSection(before))!,
+          beforeIsolationFingerprint,
+          configurationTargetIdentity: configurationTargetIdentityFor(target),
+          leaseId: lease.id,
+          restoreIfOwned: async (expectedFingerprint?: string) => withAdapterConfigWriteLock(options.file, lockPath, async () => {
+            const [current, rawLease] = await Promise.all([options.file.read(path), options.file.read(leasePath)])
+            let currentLease
+            try { currentLease = parseCodexIsolationLease(rawLease) } catch { return 'preserved-external' as const }
+            if (currentLease.id !== lease.id || current === undefined || !sameCodexIsolationFingerprint(current, expectedFingerprint ?? beforeIsolationFingerprint)) return 'preserved-external' as const
+            const candidate = parseCodexTomlDocument(current).replaceToolboxConnection(block)
+            await replaceConfigurationTransaction(options.file, [{ path, before: current, after: candidate, validate: value => { if (value !== undefined) parseCodexTomlDocument(value) } }], { backupAction: 'restore' })
+            return 'restored' as const
+          })
+        }
+      })
+    },
     readManagedFingerprint: async () => readCodexManagedFingerprint(options.file, await codexTarget.forRead()),
+    readIsolationFingerprint: async () => {
+      try {
+        const contents = await options.file.read(configurationPath(await codexTarget.forRead()))
+        return contents === undefined ? undefined : managedFingerprint(codexToolboxConnectionBlock(contents))
+      } catch { return undefined }
+    },
+    recoverIsolationLease: async () => {
+      const target = await codexTarget.forWrite()
+      const path = configurationPath(target)
+      const lockPath = joinPath(options.platform, directoryOf(path, options.platform), 'laixin-config.lock')
+      const leasePath = joinPath(options.platform, directoryOf(path, options.platform), 'laixin-codex-isolation-lease.json')
+      return withAdapterConfigWriteLock(options.file, lockPath, async () => {
+        const [current, rawLease] = await Promise.all([options.file.read(path), options.file.read(leasePath)])
+        if (rawLease === undefined) return 'none' as const
+        const lease = parseCodexIsolationLease(rawLease)
+        const currentFingerprint = current === undefined ? undefined : safeCodexIsolationFingerprint(current)
+        const owned = currentFingerprint !== undefined && (currentFingerprint === lease.beforeFingerprint || currentFingerprint === lease.expectedFingerprint)
+        if (!owned) {
+          await replaceConfigurationTransaction(options.file, [{ path: leasePath, before: rawLease, after: undefined }], { backupAction: 'restore' })
+          return 'preserved-external' as const
+        }
+        const restored = currentFingerprint === lease.beforeFingerprint ? current : parseCodexTomlDocument(current!).replaceToolboxConnection(lease.beforeBlock)
+        await replaceConfigurationTransaction(options.file, [
+          { path, before: current, after: restored, validate: value => { if (value !== undefined) parseCodexTomlDocument(value) } },
+          { path: leasePath, before: rawLease, after: undefined }
+        ], { backupAction: 'restore' })
+        return 'restored' as const
+      })
+    },
+    clearIsolationLease: async (leaseId) => {
+      const target = await codexTarget.forWrite()
+      const path = configurationPath(target)
+      const lockPath = joinPath(options.platform, directoryOf(path, options.platform), 'laixin-config.lock')
+      const leasePath = joinPath(options.platform, directoryOf(path, options.platform), 'laixin-codex-isolation-lease.json')
+      await withAdapterConfigWriteLock(options.file, lockPath, async () => {
+        const rawLease = await options.file.read(leasePath)
+        if (rawLease === undefined) return
+        const lease = parseCodexIsolationLease(rawLease)
+        if (lease.id !== leaseId) return
+        await replaceConfigurationTransaction(options.file, [{ path: leasePath, before: rawLease, after: undefined }], { backupAction: 'restore' })
+      })
+    },
     readCurrentBaseUrl: async () => {
       try {
         const contents = await options.file.read(configurationPath(await codexTarget.forRead()))
@@ -151,6 +278,7 @@ export function createDeepSeekAdapters(options: DeepSeekAdapterOptions): readonl
       } catch { return undefined }
     },
     configurationTargetStatus: () => codexTarget.status(),
+    configurationTargetIdentity: () => configurationTargetIdentity(codexTarget),
     deactivateToolboxConnection: async () => (await codexConfig('deepseek')).deactivateToolboxConnection(),
     restorePreviousConnection: async () => (await codexConfig('deepseek')).restorePreviousConnection(),
     officialAuthenticationStatus: async () => (await codexConfig('deepseek')).officialAuthenticationStatus!(),
@@ -164,8 +292,151 @@ export function createDeepSeekAdapters(options: DeepSeekAdapterOptions): readonl
     applyDeepSeek: async (key) => (await claudeConfig('deepseek')).apply(key),
     applyProvider: async (provider, key) => (await claudeConfig(provider)).apply(key),
     applyConnection: async (provider, connection) => (await claudeConfig(provider, connection)).apply('local-token-unused'),
+    applyIsolationConnection: async (provider, connection, expectedIsolationFingerprint, leaseId, expectedConfigurationTargetIdentity) => {
+      const target = await claudeTarget.forWrite()
+      if (expectedConfigurationTargetIdentity !== undefined && configurationTargetIdentityFor(target) !== expectedConfigurationTargetIdentity) return 'stale'
+      const config = claudeConfigForTarget(provider, connection, target)
+      if (config.applyIfIsolationFingerprint === undefined) throw new Error('AI_ACCESS_CONFIG_UNMANAGED')
+      const targetIdentity = configurationTargetIdentityFor(target)
+      return config.applyIfIsolationFingerprint(expectedIsolationFingerprint, leaseId, 'local-token-unused', async () => {
+        if (!await targetMatches(claudeTarget, expectedConfigurationTargetIdentity)) return false
+        try {
+          const registry = parseClaudeIsolationLeaseTarget(await options.file.read(claudeIsolationLeaseRegistryPath))
+          return registry?.leaseId === leaseId && registry.targetIdentity === targetIdentity
+        } catch { return false }
+      })
+    },
     captureConnection: async () => captureManagedTextFiles(options.file, claudeManagedPaths(await claudeTarget.forWrite(), options.platform)),
+    captureIsolation: async (expectedConfigurationTargetIdentity) => {
+      const target = await claudeTarget.forWrite()
+      if (expectedConfigurationTargetIdentity !== undefined && configurationTargetIdentityFor(target) !== expectedConfigurationTargetIdentity) {
+        throw new Error('AI_ACCESS_CONFIGURATION_TARGET_BLOCKED')
+      }
+      const path = configurationPath(target)
+      const lockPath = joinPath(options.platform, directoryOf(path, options.platform), 'laixin-config.lock')
+      const leasePath = joinPath(options.platform, directoryOf(path, options.platform), 'laixin-claude-isolation-lease.json')
+      return withAdapterConfigWriteLock(options.file, lockPath, async () => {
+        const [before, previousLease, previousRegistry] = await Promise.all([
+          options.file.read(path), options.file.read(leasePath), options.file.read(claudeIsolationLeaseRegistryPath)
+        ])
+        if (before === undefined || previousLease !== undefined || previousRegistry !== undefined) throw new Error('AI_ACCESS_ISOLATION_RECOVERY_REQUIRED')
+        const block = claudeManagedSection(before)
+        const beforeIsolationFingerprint = managedFingerprint(block)
+        if (block === undefined || beforeIsolationFingerprint === undefined) throw new Error('AI_ACCESS_CONFIG_UNMANAGED')
+        const lease = createApplicationIsolationLease(block, beforeIsolationFingerprint)
+        const targetIdentity = configurationTargetIdentityFor(target)
+        const registry = renderClaudeIsolationLeaseTarget({ leaseId: lease.id, targetIdentity })
+        // The durable pointer is written first. A crash before the target sidecar exists is
+        // settled only after this exact target is selected again; another target never guesses.
+        await replaceConfigurationTransaction(options.file, [
+          { path: claudeIsolationLeaseRegistryPath, before: previousRegistry, after: registry, validate: validateClaudeIsolationLeaseTarget },
+          { path: leasePath, before: previousLease, after: renderApplicationIsolationLease(lease) }
+        ], { backupAction: 'apply' })
+
+        const capturedRegistryMatches = (rawRegistry: string | undefined): boolean => {
+          try {
+            const current = parseClaudeIsolationLeaseTarget(rawRegistry)
+            return current?.leaseId === lease.id && current.targetIdentity === targetIdentity
+          } catch { return false }
+        }
+        const clearCapturedLease = async () => withAdapterConfigWriteLock(options.file, lockPath, async () => {
+          const [rawLease, rawRegistry] = await Promise.all([options.file.read(leasePath), options.file.read(claudeIsolationLeaseRegistryPath)])
+          let ownsLease = false
+          try { ownsLease = parseApplicationIsolationLease(rawLease).id === lease.id } catch { /* An unknown sidecar remains untouched. */ }
+          const ownsRegistry = capturedRegistryMatches(rawRegistry)
+          const changes = [
+            ...(ownsLease ? [{ path: leasePath, before: rawLease, after: undefined }] : []),
+            ...(ownsRegistry ? [{ path: claudeIsolationLeaseRegistryPath, before: rawRegistry, after: undefined }] : [])
+          ]
+          if (changes.length !== 0) await replaceConfigurationTransaction(options.file, changes, { backupAction: 'restore' })
+        })
+        return {
+          beforeFingerprint: beforeIsolationFingerprint,
+          beforeIsolationFingerprint,
+          configurationTargetIdentity: targetIdentity,
+          leaseId: lease.id,
+          restoreIfOwned: async (expectedFingerprint?: string) => withAdapterConfigWriteLock(options.file, lockPath, async () => {
+            const [current, rawLease, rawRegistry] = await Promise.all([
+              options.file.read(path), options.file.read(leasePath), options.file.read(claudeIsolationLeaseRegistryPath)
+            ])
+            let ownsLease = false
+            try { ownsLease = parseApplicationIsolationLease(rawLease).id === lease.id } catch { /* Preserve an unknown sidecar. */ }
+            const ownsRegistry = capturedRegistryMatches(rawRegistry)
+            const changes = [
+              ...(ownsLease && current !== undefined && sameClaudeIsolationFingerprint(current, expectedFingerprint ?? beforeIsolationFingerprint)
+                ? [{ path, before: current, after: restoreClaudeManagedSection(current, block), validate: (value: string | undefined) => { if (value !== undefined) JSON.parse(value) } }]
+                : []),
+              ...(ownsLease ? [{ path: leasePath, before: rawLease, after: undefined }] : []),
+              ...(ownsRegistry ? [{ path: claudeIsolationLeaseRegistryPath, before: rawRegistry, after: undefined }] : [])
+            ]
+            if (changes.length !== 0) await replaceConfigurationTransaction(options.file, changes, { backupAction: 'restore' })
+            return ownsLease && current !== undefined && sameClaudeIsolationFingerprint(current, expectedFingerprint ?? beforeIsolationFingerprint)
+              ? 'restored' as const : 'preserved-external' as const
+          }),
+          clearIsolationLease: clearCapturedLease
+        }
+      })
+    },
     readManagedFingerprint: async () => readClaudeManagedFingerprint(options.file, await claudeTarget.forRead()),
+    readIsolationFingerprint: async () => {
+      try { return managedFingerprint(claudeManagedSection(await options.file.read(configurationPath(await claudeTarget.forRead())))) } catch { return undefined }
+    },
+    recoverIsolationLease: async () => {
+      const target = await claudeTarget.forWrite()
+      const targetIdentity = configurationTargetIdentityFor(target)
+      const path = configurationPath(target)
+      const lockPath = joinPath(options.platform, directoryOf(path, options.platform), 'laixin-config.lock')
+      const leasePath = joinPath(options.platform, directoryOf(path, options.platform), 'laixin-claude-isolation-lease.json')
+      const rawRegistry = await options.file.read(claudeIsolationLeaseRegistryPath)
+      if (rawRegistry !== undefined) {
+        let registry: ClaudeIsolationLeaseTarget
+        try { registry = parseClaudeIsolationLeaseTarget(rawRegistry)! } catch { throw new Error('AI_ACCESS_ISOLATION_RECOVERY_REQUIRED') }
+        // Do not scan or open a recorded target path. The only allowed recovery target is the
+        // current path after its opaque identity proves it is the captured one.
+        if (registry.targetIdentity !== targetIdentity) throw new Error('AI_ACCESS_ISOLATION_RECOVERY_REQUIRED')
+      }
+      return withAdapterConfigWriteLock(options.file, lockPath, async () => {
+        // The target may have changed while waiting for this target's lock. Re-observe before
+        // opening or settling any A file so recovery never acts on an outdated effective target.
+        const lockedTarget = await claudeTarget.forWrite()
+        if (configurationTargetIdentityFor(lockedTarget) !== targetIdentity) throw new Error('AI_ACCESS_ISOLATION_RECOVERY_REQUIRED')
+        const [current, rawLease, currentRegistry] = await Promise.all([
+          options.file.read(path), options.file.read(leasePath), options.file.read(claudeIsolationLeaseRegistryPath)
+        ])
+        let registry: ClaudeIsolationLeaseTarget | undefined
+        try { registry = parseClaudeIsolationLeaseTarget(currentRegistry) } catch { throw new Error('AI_ACCESS_ISOLATION_RECOVERY_REQUIRED') }
+        if (registry !== undefined && registry.targetIdentity !== targetIdentity) throw new Error('AI_ACCESS_ISOLATION_RECOVERY_REQUIRED')
+        if (rawLease === undefined) {
+          if (registry === undefined) return 'none' as const
+          await replaceConfigurationTransaction(options.file, [{ path: claudeIsolationLeaseRegistryPath, before: currentRegistry, after: undefined }], { backupAction: 'restore' })
+          return 'none' as const
+        }
+        let lease
+        try { lease = parseApplicationIsolationLease(rawLease) } catch { throw new Error('AI_ACCESS_ISOLATION_RECOVERY_REQUIRED') }
+        // A registry and sidecar that disagree are never jointly owned. Preserve the unknown
+        // sidecar but settle the Toolbox registry so it cannot authorize a later write.
+        if (registry !== undefined && registry.leaseId !== lease.id) {
+          await replaceConfigurationTransaction(options.file, [{ path: claudeIsolationLeaseRegistryPath, before: currentRegistry, after: undefined }], { backupAction: 'restore' })
+          return 'preserved-external' as const
+        }
+        const currentFingerprint = current === undefined ? undefined : safeClaudeIsolationFingerprint(current)
+        const owned = currentFingerprint !== undefined && (currentFingerprint === lease.beforeFingerprint || currentFingerprint === lease.expectedFingerprint)
+        if (!owned) {
+          await replaceConfigurationTransaction(options.file, [
+            { path: leasePath, before: rawLease, after: undefined },
+            ...(registry === undefined ? [] : [{ path: claudeIsolationLeaseRegistryPath, before: currentRegistry, after: undefined }])
+          ], { backupAction: 'restore' })
+          return 'preserved-external' as const
+        }
+        const restored = currentFingerprint === lease.beforeFingerprint ? current : restoreClaudeManagedSection(current!, lease.beforeBlock)
+        await replaceConfigurationTransaction(options.file, [
+          { path, before: current, after: restored, validate: value => { if (value !== undefined) JSON.parse(value) } },
+          { path: leasePath, before: rawLease, after: undefined },
+          ...(registry === undefined ? [] : [{ path: claudeIsolationLeaseRegistryPath, before: currentRegistry, after: undefined }])
+        ], { backupAction: 'restore' })
+        return 'restored' as const
+      })
+    },
     readCurrentBaseUrl: async () => {
       try {
         const contents = await options.file.read(configurationPath(await claudeTarget.forRead()))
@@ -175,6 +446,7 @@ export function createDeepSeekAdapters(options: DeepSeekAdapterOptions): readonl
       } catch { return undefined }
     },
     configurationTargetStatus: () => claudeTarget.status(),
+    configurationTargetIdentity: () => configurationTargetIdentity(claudeTarget),
     selectConfigurationTarget: (scope) => claudeTarget.select(scope),
     selectConfigurationProject: (projectDir) => claudeTarget.selectProject(projectDir),
     deactivateToolboxConnection: async () => (await claudeConfig('deepseek')).deactivateToolboxConnection(),
@@ -196,6 +468,18 @@ export function createDeepSeekAdapters(options: DeepSeekAdapterOptions): readonl
       const target = await hermesTarget.forWrite()
       const execution = hermesExecution(target)
       await applyHermesConnection(provider, connection, options.file, hermesEnvPath(options.platform, directoryOf(configurationPath(target), options.platform)), hermesBackupPath(options.platform, directoryOf(configurationPath(target), options.platform)), findHermesForTarget(target), execution.runHermes, execution.readHermesSettings)
+    },
+    applyIsolationConnection: async (provider, connection, expectedIsolationFingerprint, leaseId, capturedTargetIdentity) => {
+      if (capturedTargetIdentity === undefined || capturedTargetIdentity !== await currentHermesIsolationTargetIdentity()) return 'stale'
+      return applyHermesIsolationConnection(await hermesIsolationFiles(await hermesIsolationTarget(capturedTargetIdentity)),
+        provider, connection, expectedIsolationFingerprint, leaseId)
+    },
+    captureIsolation: async () => {
+      const target = await hermesTarget.forWrite()
+      const files = await hermesIsolationFiles(target)
+      await retainHermesIsolationTarget(options.file, hermesIsolationRegistryPath, options.platform,
+        directoryOf(configurationPath(target), options.platform))
+      return captureHermesIsolation(files)
     },
     captureConnection: async () => {
       const target = await hermesTarget.forWrite()
@@ -232,6 +516,7 @@ export function createDeepSeekAdapters(options: DeepSeekAdapterOptions): readonl
       return inspectModelApiBackup(await options.file.read(hermesBackupPath(options.platform, directoryOf(configurationPath(target), options.platform)))).kind === 'valid'
     },
     configurationTargetStatus: () => hermesTarget.status(),
+    configurationTargetIdentity: () => configurationTargetIdentity(hermesTarget),
     selectConfigurationTarget: (scope) => hermesTarget.select(scope),
     readCurrentBaseUrl: async () => {
       try {
@@ -248,6 +533,31 @@ export function createDeepSeekAdapters(options: DeepSeekAdapterOptions): readonl
       // The explicit apply/capture flows retain the serial CLI fallback below.
       if (yaml === undefined) throw new Error('AI_ACCESS_CONFIGURATION_FINGERPRINT_UNAVAILABLE')
       return managedFingerprint(hermesManagedSection(yaml))
+    },
+    readIsolationFingerprint: async (capturedTargetIdentity) => {
+      const target = capturedTargetIdentity === undefined ? await hermesTarget.forRead() : await hermesIsolationTarget(capturedTargetIdentity)
+      const execution = hermesExecution(target)
+      const yaml = await readHermesConfigYamlSettings(options.file, execution.config)
+      if (yaml === undefined) throw new Error('AI_ACCESS_CONFIGURATION_FINGERPRINT_UNAVAILABLE')
+      return hermesSettingsFingerprint(yaml)
+    },
+    isolationTargetIdentity: currentHermesIsolationTargetIdentity,
+    recoverIsolationLease: async () => {
+      const targets = await readHermesIsolationTargets(options.file, hermesIsolationRegistryPath, options.platform)
+      if (targets.length === 0) return 'none'
+      let outcome: 'none' | 'restored' | 'preserved-external' = 'none'
+      for (const target of targets) {
+        const result = await recoverHermesIsolationLease(await hermesIsolationFiles(await hermesIsolationTarget(target.identity)))
+        await removeHermesIsolationTarget(options.file, hermesIsolationRegistryPath, options.platform, target.identity)
+        if (result === 'preserved-external') outcome = 'preserved-external'
+        else if (result === 'restored' && outcome === 'none') outcome = 'restored'
+      }
+      return outcome
+    },
+    clearIsolationLease: async (leaseId, capturedTargetIdentity) => {
+      if (capturedTargetIdentity === undefined) throw new Error('AI_ACCESS_HERMES_ISOLATION_TARGET_UNKNOWN')
+      await clearHermesIsolationLease(await hermesIsolationFiles(await hermesIsolationTarget(capturedTargetIdentity)), leaseId)
+      await removeHermesIsolationTarget(options.file, hermesIsolationRegistryPath, options.platform, capturedTargetIdentity)
     }
   }]
 }
@@ -456,8 +766,71 @@ function configurationPath(target: ConfigurationTarget): string {
   return target.path
 }
 
+/** The raw target path stays in the adapter; consumers receive only this opaque, per-target identity. */
+async function configurationTargetIdentity(target: { forRead(): Promise<ConfigurationTarget> }): Promise<string | undefined> {
+  try {
+    const current = await target.forRead()
+    return configurationTargetIdentityFor(current)
+  } catch { return undefined }
+}
+
+function configurationTargetIdentityFor(target: ConfigurationTarget): string {
+  if (target.path === undefined) throw new Error('AI_ACCESS_CONFIGURATION_TARGET_BLOCKED')
+  return createHash('sha256').update(JSON.stringify([target.shell, target.scope, target.path])).digest('hex')
+}
+
+async function targetMatches(target: { forWrite(): Promise<ConfigurationTarget> }, expected: string | undefined): Promise<boolean> {
+  if (expected === undefined) return true
+  try { return configurationTargetIdentityFor(await target.forWrite()) === expected } catch { return false }
+}
+
 async function readCodexManagedFingerprint(file: ManagedTextFile, target: ConfigurationTarget): Promise<string | undefined> {
   return managedFingerprint(codexManagedSection(await file.read(configurationPath(target))))
+}
+
+function sameCodexIsolationFingerprint(contents: string, expected: string): boolean {
+  return safeCodexIsolationFingerprint(contents) === expected
+}
+
+function safeCodexIsolationFingerprint(contents: string): string | undefined {
+  try { return managedFingerprint(codexToolboxConnectionBlock(contents)) } catch { return undefined }
+}
+
+function sameClaudeIsolationFingerprint(contents: string, expected: string): boolean {
+  return safeClaudeIsolationFingerprint(contents) === expected
+}
+
+function safeClaudeIsolationFingerprint(contents: string): string | undefined {
+  return managedFingerprint(claudeManagedSection(contents))
+}
+
+/** Private, opaque pointer to the one Claude target with an unsettled Toolbox lease. */
+interface ClaudeIsolationLeaseTarget {
+  readonly version: 1
+  readonly leaseId: string
+  readonly targetIdentity: string
+}
+
+function renderClaudeIsolationLeaseTarget(target: Omit<ClaudeIsolationLeaseTarget, 'version'>): string {
+  return JSON.stringify({ version: 1, ...target })
+}
+
+function validateClaudeIsolationLeaseTarget(contents: string | undefined): void {
+  parseClaudeIsolationLeaseTarget(contents)
+}
+
+function parseClaudeIsolationLeaseTarget(raw: string | undefined): ClaudeIsolationLeaseTarget | undefined {
+  if (raw === undefined) return undefined
+  const value = JSON.parse(raw) as Record<string, unknown>
+  if (value.version !== 1 || typeof value.leaseId !== 'string' || typeof value.targetIdentity !== 'string' ||
+    Object.keys(value).length !== 3 || !/^[a-f0-9]{32}$/.test(value.leaseId) || !/^[a-f0-9]{64}$/.test(value.targetIdentity)) {
+    throw new Error('AI_ACCESS_ISOLATION_RECOVERY_REQUIRED')
+  }
+  return { version: 1, leaseId: value.leaseId, targetIdentity: value.targetIdentity }
+}
+
+function withAdapterConfigWriteLock<T>(file: ManagedTextFile, lockPath: string, task: () => Promise<T>): Promise<T> {
+  return file.withConfigWriteLock === undefined ? withConfigWriteLock(lockPath, task) : file.withConfigWriteLock(lockPath, task)
 }
 
 async function readClaudeManagedFingerprint(file: ManagedTextFile, target: ConfigurationTarget): Promise<string | undefined> {
@@ -560,6 +933,239 @@ interface HermesConnectionFiles {
   readonly read: HermesSettingsReader
   readonly envPath: string
   readonly backupPath: string
+}
+
+/**
+ * N-58 keeps its lease separate from Hermes' pre-Toolbox recovery point. The durable record
+ * contains only opaque identities and six-field digests: customer Keys, models, protocol values
+ * and endpoint text remain in Hermes' existing configuration/state rather than becoming lease data.
+ */
+interface HermesIsolationLease {
+  readonly version: 1
+  readonly id: string
+  readonly targetIdentity: string
+  readonly beforeFingerprint: string
+  readonly expectedFingerprint?: string
+}
+
+interface HermesIsolationFiles {
+  readonly file: ManagedTextFile
+  readonly lockPath: string
+  readonly leasePath: string
+  readonly targetIdentity: string
+  readonly command: string
+  readonly run: (command: string, args: readonly string[]) => Promise<void>
+  readonly read: HermesSettingsReader
+}
+
+/** Main-process-only locator for an unfinished lease whose HERMES_HOME later changed. */
+interface HermesIsolationTargetRecord {
+  readonly identity: string
+  readonly root: string
+}
+interface HermesIsolationTargetRegistry {
+  readonly version: 1
+  readonly targets: readonly HermesIsolationTargetRecord[]
+}
+
+function hermesIsolationTargetIdentity(platform: NodeJS.Platform, root: string): string {
+  return createHash('sha256').update(`${platform}:${root}`).digest('hex')
+}
+
+function isAbsoluteHermesRoot(platform: NodeJS.Platform, root: string): boolean {
+  return platform === 'win32' ? win32.isAbsolute(root) : posix.isAbsolute(root)
+}
+
+function parseHermesIsolationTargets(contents: string | undefined, platform: NodeJS.Platform): HermesIsolationTargetRegistry {
+  if (contents === undefined) return { version: 1, targets: [] }
+  let value: unknown
+  try { value = JSON.parse(contents) } catch { throw new Error('AI_ACCESS_HERMES_ISOLATION_TARGET_UNKNOWN') }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('AI_ACCESS_HERMES_ISOLATION_TARGET_UNKNOWN')
+  const record = value as Record<string, unknown>
+  if (record.version !== 1 || !Array.isArray(record.targets) || !Object.keys(record).every(key => key === 'version' || key === 'targets')) {
+    throw new Error('AI_ACCESS_HERMES_ISOLATION_TARGET_UNKNOWN')
+  }
+  const targets: HermesIsolationTargetRecord[] = []
+  for (const item of record.targets) {
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) throw new Error('AI_ACCESS_HERMES_ISOLATION_TARGET_UNKNOWN')
+    const target = item as Record<string, unknown>
+    if (typeof target.identity !== 'string' || !/^[0-9a-f]{64}$/.test(target.identity) ||
+        typeof target.root !== 'string' || !isAbsoluteHermesRoot(platform, target.root) ||
+        target.identity !== hermesIsolationTargetIdentity(platform, target.root) ||
+        !Object.keys(target).every(key => key === 'identity' || key === 'root')) {
+      throw new Error('AI_ACCESS_HERMES_ISOLATION_TARGET_UNKNOWN')
+    }
+    if (targets.some(existing => existing.identity === target.identity)) throw new Error('AI_ACCESS_HERMES_ISOLATION_TARGET_UNKNOWN')
+    targets.push({ identity: target.identity, root: target.root })
+  }
+  return { version: 1, targets }
+}
+
+function renderHermesIsolationTargets(targets: readonly HermesIsolationTargetRecord[]): string {
+  return `${JSON.stringify({ version: 1, targets })}\n`
+}
+
+async function readHermesIsolationTargets(file: ManagedTextFile, registryPath: string, platform: NodeJS.Platform): Promise<readonly HermesIsolationTargetRecord[]> {
+  return parseHermesIsolationTargets(await file.read(registryPath), platform).targets
+}
+
+async function readHermesIsolationTarget(file: ManagedTextFile, registryPath: string, platform: NodeJS.Platform, identity: string): Promise<string> {
+  const target = (await readHermesIsolationTargets(file, registryPath, platform)).find(item => item.identity === identity)
+  if (target === undefined) throw new Error('AI_ACCESS_HERMES_ISOLATION_TARGET_UNKNOWN')
+  return target.root
+}
+
+async function retainHermesIsolationTarget(file: ManagedTextFile, registryPath: string, platform: NodeJS.Platform, root: string): Promise<void> {
+  if (!isAbsoluteHermesRoot(platform, root)) throw new Error('AI_ACCESS_HERMES_ISOLATION_TARGET_UNKNOWN')
+  const identity = hermesIsolationTargetIdentity(platform, root)
+  await withAdapterConfigWriteLock(file, `${registryPath}.lock`, async () => {
+    const before = await file.read(registryPath)
+    const registry = parseHermesIsolationTargets(before, platform)
+    if (registry.targets.some(target => target.identity === identity)) return
+    const after = renderHermesIsolationTargets([...registry.targets, { identity, root }])
+    await replaceConfigurationTransaction(file, [{ path: registryPath, before, after }], { backupAction: 'apply' })
+  })
+}
+
+async function removeHermesIsolationTarget(file: ManagedTextFile, registryPath: string, platform: NodeJS.Platform, identity: string): Promise<void> {
+  await withAdapterConfigWriteLock(file, `${registryPath}.lock`, async () => {
+    const before = await file.read(registryPath)
+    const registry = parseHermesIsolationTargets(before, platform)
+    const targets = registry.targets.filter(target => target.identity !== identity)
+    if (targets.length === registry.targets.length) throw new Error('AI_ACCESS_HERMES_ISOLATION_TARGET_UNKNOWN')
+    await replaceConfigurationTransaction(file, [{ path: registryPath, before,
+      after: targets.length === 0 ? undefined : renderHermesIsolationTargets(targets) }], { backupAction: 'restore' })
+  })
+}
+
+function hermesSettingsFingerprint(settings: HermesModelSettings): string {
+  return createHash('sha256').update(JSON.stringify(hermesModelKeys.map(key => [key, settings[key]]))).digest('hex')
+}
+
+function sameHermesSettings(left: HermesModelSettings, right: HermesModelSettings): boolean {
+  return hermesModelKeys.every(key => left[key] === right[key])
+}
+
+function renderHermesIsolationLease(lease: HermesIsolationLease): string {
+  return `${JSON.stringify(lease)}\n`
+}
+
+function parseHermesIsolationLease(contents: string | undefined): HermesIsolationLease {
+  let value: unknown
+  try { value = contents === undefined ? undefined : JSON.parse(contents) } catch { throw new Error('AI_ACCESS_HERMES_ISOLATION_LEASE_CORRUPT') }
+  if (value === undefined || value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('AI_ACCESS_HERMES_ISOLATION_LEASE_CORRUPT')
+  const record = value as Record<string, unknown>
+  if (record.version !== 1 || typeof record.id !== 'string' || !/^[0-9a-f-]{36}$/i.test(record.id) ||
+      typeof record.targetIdentity !== 'string' || !/^[0-9a-f]{64}$/.test(record.targetIdentity) ||
+      typeof record.beforeFingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(record.beforeFingerprint) ||
+      (record.expectedFingerprint !== undefined && (typeof record.expectedFingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(record.expectedFingerprint))) ||
+      !Object.keys(record).every(key => ['version', 'id', 'targetIdentity', 'beforeFingerprint', 'expectedFingerprint'].includes(key))) {
+    throw new Error('AI_ACCESS_HERMES_ISOLATION_LEASE_CORRUPT')
+  }
+  return record as unknown as HermesIsolationLease
+}
+
+async function captureHermesIsolation(input: HermesIsolationFiles): Promise<{
+  readonly beforeFingerprint: string
+  readonly beforeIsolationFingerprint: string
+  readonly leaseId: string
+  readonly targetIdentity: string
+  readonly restoreIfOwned: (expectedFingerprint?: string) => Promise<'restored' | 'preserved-external'>
+}> {
+  return withAdapterConfigWriteLock(input.file, input.lockPath, async () => {
+    const [previous, rawLease] = await Promise.all([input.read(input.command), input.file.read(input.leasePath)])
+    if (rawLease !== undefined) throw new Error('AI_ACCESS_ISOLATION_RECOVERY_REQUIRED')
+    const beforeIsolationFingerprint = hermesSettingsFingerprint(previous)
+    const beforeFingerprint = managedFingerprint(hermesManagedSection(previous))
+    if (beforeFingerprint === undefined) throw new Error('AI_ACCESS_CONFIG_UNMANAGED')
+    const lease: HermesIsolationLease = {
+      version: 1,
+      id: randomUUID(),
+      targetIdentity: input.targetIdentity,
+      beforeFingerprint: beforeIsolationFingerprint
+    }
+    await replaceConfigurationTransaction(input.file, [{ path: input.leasePath, before: rawLease, after: renderHermesIsolationLease(lease) }], { backupAction: 'apply' })
+    return {
+      beforeFingerprint,
+      beforeIsolationFingerprint,
+      leaseId: lease.id,
+      targetIdentity: input.targetIdentity,
+      restoreIfOwned: async (expectedFingerprint) => withAdapterConfigWriteLock(input.file, input.lockPath, async () => {
+        const raw = await input.file.read(input.leasePath)
+        let currentLease: HermesIsolationLease
+        try { currentLease = parseHermesIsolationLease(raw) } catch { return 'preserved-external' as const }
+        if (currentLease.id !== lease.id || currentLease.targetIdentity !== input.targetIdentity) return 'preserved-external' as const
+        const current = await input.read(input.command)
+        const expected = expectedFingerprint ?? lease.beforeFingerprint
+        if (hermesSettingsFingerprint(current) !== expected) return 'preserved-external' as const
+        // N-58 writes the already-active local-gateway six-field binding. A failed in-process
+        // update is reversed before this callback; a matching readback means there is nothing to
+        // recreate, and the controller may safely clear only this lease.
+        return 'restored' as const
+      })
+    }
+  })
+}
+
+async function applyHermesIsolationConnection(
+  input: HermesIsolationFiles,
+  provider: ModelProviderId,
+  connection: ApiServiceConnection,
+  capturedFingerprint: string,
+  leaseId: string
+): Promise<'stale' | { readonly outcome: 'applied'; readonly managedFingerprint: string; readonly isolationFingerprint: string }> {
+  if (!new RegExp(`^http://127\\.0\\.0\\.1:[0-9]{1,5}/hermes/${provider}/v1$`).test(connection.baseUrl)) {
+    throw new Error('AI_ACCESS_CONNECTION_INVALID')
+  }
+  return withAdapterConfigWriteLock(input.file, input.lockPath, async () => {
+    const [rawLease, current] = await Promise.all([input.file.read(input.leasePath), input.read(input.command)])
+    const lease = parseHermesIsolationLease(rawLease)
+    const expected = localHermesSettings(provider, connection)
+    if (lease.id !== leaseId || lease.targetIdentity !== input.targetIdentity || lease.beforeFingerprint !== capturedFingerprint ||
+        lease.expectedFingerprint !== undefined || hermesSettingsFingerprint(current) !== capturedFingerprint || !sameHermesSettings(current, expected)) {
+      return 'stale'
+    }
+    const expectedFingerprint = hermesSettingsFingerprint(expected)
+    const managedFingerprintAfterWrite = managedFingerprint(hermesManagedSection(expected))
+    if (managedFingerprintAfterWrite === undefined) throw new Error('AI_ACCESS_CONFIG_UNMANAGED')
+    await replaceConfigurationTransaction(input.file, [{
+      path: input.leasePath,
+      before: rawLease,
+      after: renderHermesIsolationLease({ ...lease, expectedFingerprint })
+    }], { backupAction: 'apply' })
+    await syncHermesModelSettingsWithRollback(input.command, expected, current, input.run, input.read)
+    await assertHermesSettings(input.command, input.read, expected)
+    return { outcome: 'applied', managedFingerprint: managedFingerprintAfterWrite, isolationFingerprint: expectedFingerprint }
+  })
+}
+
+async function recoverHermesIsolationLease(input: HermesIsolationFiles): Promise<'none' | 'restored' | 'preserved-external'> {
+  return withAdapterConfigWriteLock(input.file, input.lockPath, async () => {
+    const rawLease = await input.file.read(input.leasePath)
+    if (rawLease === undefined) return 'none' as const
+    const lease = parseHermesIsolationLease(rawLease)
+    const current = await input.read(input.command)
+    const currentFingerprint = hermesSettingsFingerprint(current)
+    const owned = lease.targetIdentity === input.targetIdentity &&
+      (currentFingerprint === lease.beforeFingerprint || currentFingerprint === lease.expectedFingerprint)
+    await replaceConfigurationTransaction(input.file, [{ path: input.leasePath, before: rawLease, after: undefined }], { backupAction: 'restore' })
+    // Startup recovery never recreates a session or writes six fields. A nonmatching customer
+    // final value is left intact; a matching value was already the pre-isolation binding.
+    return owned ? 'restored' as const : 'preserved-external' as const
+  })
+}
+
+async function clearHermesIsolationLease(input: HermesIsolationFiles, leaseId: string): Promise<void> {
+  await withAdapterConfigWriteLock(input.file, input.lockPath, async () => {
+    const rawLease = await input.file.read(input.leasePath)
+    if (rawLease === undefined) return
+    const lease = parseHermesIsolationLease(rawLease)
+    // A different durable lease is not ours to discard. Keep its target locator so startup can
+    // settle it at the exact captured root instead of silently losing the recovery path.
+    if (lease.id !== leaseId) throw new Error('AI_ACCESS_ISOLATION_RECOVERY_REQUIRED')
+    if (lease.targetIdentity !== input.targetIdentity) throw new Error('AI_ACCESS_HERMES_ISOLATION_TARGET_UNKNOWN')
+    await replaceConfigurationTransaction(input.file, [{ path: input.leasePath, before: rawLease, after: undefined }], { backupAction: 'restore' })
+  })
 }
 
 /**
@@ -797,8 +1403,8 @@ function parseHermesModelSettingsYaml(contents: string): HermesModelSettings | u
 function yamlScalar(raw: string): string | undefined {
   const value = raw.trim()
   if (value === '' || value.startsWith('#')) return undefined
-  const quote = value[0]
-  if ((quote === '"' || quote === "'") && value.endsWith(quote)) return value.slice(1, -1)
+  const quoted = /^("(?:[^"\\]|\\.)*"|'(?:[^']|'')*')(?:\s+#.*)?$/.exec(value)
+  if (quoted) return quoted[1].slice(1, -1)
   const comment = value.search(/\s+#/)
   return (comment === -1 ? value : value.slice(0, comment)).trim() || undefined
 }
@@ -845,18 +1451,61 @@ async function syncHermesModelSettings(
   run: (command: string, args: readonly string[]) => Promise<void>,
   read: HermesSettingsReader
 ): Promise<void> {
-  for (const key of hermesModelKeys) {
-    const value = next[key]
-    if (value !== undefined) {
-      await run(command, ['config', 'set', key, value])
-      continue
+  for (const key of hermesModelKeys) await syncHermesModelSetting(command, key, next[key], run, read)
+}
+
+async function syncHermesModelSettingsWithRollback(
+  command: string,
+  next: HermesModelSettings,
+  previous: HermesModelSettings,
+  run: (command: string, args: readonly string[]) => Promise<void>,
+  read: HermesSettingsReader
+): Promise<void> {
+  const attempted: HermesModelKey[] = []
+  try {
+    for (const key of hermesModelKeys) {
+      // Record before the CLI call: a process may mutate then report failure.
+      attempted.push(key)
+      await syncHermesModelSetting(command, key, next[key], run, read)
     }
+    await assertHermesSettings(command, read, next)
+  } catch (error) {
     try {
-      await run(command, ['config', 'unset', key])
-    } catch (error) {
-      const current = await read(command)
-      if (current[key] !== undefined) throw error
+      const afterFailure = await read(command)
+      for (const key of [...attempted].reverse()) {
+        // A field that no longer equals our just-written target was changed by the customer or
+        // Hermes during the command/readback window. It is no longer ours to roll back.
+        if (afterFailure[key] !== next[key]) continue
+        await syncHermesModelSetting(command, key, previous[key], run, read)
+      }
+      const afterRollback = await read(command)
+      // When every field is still ours, retain the old strict rollback/readback contract. A
+      // customer final value instead remains in place; the controller will release the lease
+      // and transport as EXTERNAL_VALUE_PRESERVED.
+      if (sameHermesSettings(afterRollback, previous)) await assertHermesSettings(command, read, previous)
+    } catch (rollbackError) {
+      throw new Error('AI_ACCESS_HERMES_ROLLBACK_FAILED', { cause: rollbackError })
     }
+    throw error
+  }
+}
+
+async function syncHermesModelSetting(
+  command: string,
+  key: HermesModelKey,
+  value: string | undefined,
+  run: (command: string, args: readonly string[]) => Promise<void>,
+  read: HermesSettingsReader
+): Promise<void> {
+  if (value !== undefined) {
+    await run(command, ['config', 'set', key, value])
+    return
+  }
+  try {
+    await run(command, ['config', 'unset', key])
+  } catch (error) {
+    const current = await read(command)
+    if (current[key] !== undefined) throw error
   }
 }
 

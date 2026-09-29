@@ -29,7 +29,8 @@ import {
 const DAEMON_PATH = fileURLToPath(new URL('../../sidecar/mac/tunnel-daemon.mjs', import.meta.url))
 const FAKE_ADAPTER = fileURLToPath(new URL('./fixtures/fake-adapter.mjs', import.meta.url))
 const SIDECAR_DIR = fileURLToPath(new URL('../../sidecar/mac', import.meta.url))
-const NOW = Date.parse('2026-10-01T00:00:00Z')
+// 守护意外退出使用真实时钟，主进程意图时间也要处于同一时钟域。
+const NOW = Date.now()
 const EXIT_IP = '203.0.113.7'
 
 describe('五动作与桥注册(判据 3②③主进程侧、6 IPC 负向、12 状态行、17 服务级互斥)', () => {
@@ -70,7 +71,7 @@ describe('五动作与桥注册(判据 3②③主进程侧、6 IPC 负向、12 �
       picker,
       trust: { whitelistDigests: trustDigests, signingPublicKeys: [] },
       now: () => NOW,
-      spawnDaemon: (dir: string) => {
+      spawnDaemon: (dir: string, runId?: string) => {
         forceTunnelPathForTest(dir)
         const child = spawn(
           process.execPath,
@@ -86,7 +87,9 @@ describe('五动作与桥注册(判据 3②③主进程侧、6 IPC 负向、12 �
             '--parent-poll-ms',
             '50',
             '--verify-interval-ms',
-            '60000'
+            '60000',
+            '--run-id',
+            runId ?? ''
           ],
           { env: { ...process.env, ...fakeAdapterEnv(storePath) } }
         )

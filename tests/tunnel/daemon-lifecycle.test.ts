@@ -115,7 +115,7 @@ describe('守护核心(判据 1/2/8,连接时指纹核验)', () => {
     return readJsonFile<DaemonState>(`${dataDir}/state.json`)
   }
 
-  it('复验未返回时不重复发起，用户断开后的迟到成功不能重新显示已连', async () => {
+  it('建链前验证、写后验证和周期复验各自独立；迟到周期结果不能重新显示已连', async () => {
     const h = harness()
     let verifyCalls = 0
     let finishVerify: ((value: { exitIp: string }) => void) | undefined
@@ -124,18 +124,20 @@ describe('守护核心(判据 1/2/8,连接时指纹核验)', () => {
       connectorFactory: connectorFactory(h, (connector) => {
         connector.verify = async () => {
           verifyCalls += 1
-          if (verifyCalls === 1) return { exitIp: EXIT_IP }
+          // 建链前先验一次，写入和读回后还必须再验一次；只有第三次才是周期复验。
+          if (verifyCalls <= 2) return { exitIp: EXIT_IP }
           return new Promise((resolve) => { finishVerify = resolve })
         }
       }),
       bridgeFactory: fakeBridgeFactory(), parentAlive: () => true, onExit: () => undefined, verifyIntervalMs: 100, intentPollMs: 50
     })
     await daemon.run()
-    clock.advance(100)
-    await flushMicrotasks()
-    clock.advance(100)
-    await flushMicrotasks()
     expect(verifyCalls).toBe(2)
+    clock.advance(100)
+    await flushMicrotasks()
+    clock.advance(100)
+    await flushMicrotasks()
+    expect(verifyCalls).toBe(3)
     writeIntentFile(dataDir, { desired: 'user-disconnected' })
     clock.advance(50)
     await waitFor(() => stateOf().state === 'stopped-restored')
@@ -367,6 +369,8 @@ describe('守护核心(判据 1/2/8,连接时指纹核验)', () => {
       }
     })
     await daemon.run()
+    await flushMicrotasks() // 并行停止先结算微任务，再推进虚拟的 10 分钟。
+    expect(stateOf().code).toBe('节点身份不符')
     h.clock.advance(600_000)
     await flushMicrotasks()
 

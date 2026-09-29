@@ -55,7 +55,8 @@ describe('Windows Command Processor 可选键', () => {
     const f = build('access-denied')
     expect(() => f.terminal.read({ service: 'TerminalEnvironment', item: 'win-cmd-autorun' })).toThrow(expect.objectContaining({ code: 'TERMINAL_ENVIRONMENT_REGISTRY_READ_FAILED' }))
     expect(() => f.composed.preflight!({ host: '127.0.0.1', port: 18080 })).not.toThrow()
-    expect(f.composed.optionalNote?.()).toContain('终端自动接入这次没启用')
+    expect(f.composed.optionalNote?.()).toContain('注册表读取失败')
+    expect(f.composed.optionalNote?.()).not.toContain('配置文件无法访问')
   })
   it('reg.exe 起不来 → 注册表不可读', () => {
     const f = build('registry-unreadable')

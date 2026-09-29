@@ -17,6 +17,9 @@ export function registerDesktopActions(registry: BridgeRegistry, desktop: Deskto
     resultSchema: schema.object({ version: schema.string({ maxLength: 40 }), previous: schema.string({ maxLength: 40 }),
       notes: schema.string({ maxLength: 20_000 }) }),
     handler: () => desktop.updateSuccess() })
+  registry.registerAction({ name: 'desktop.dismissUpdateSuccess',
+    paramsSchema: schema.object({ version: schema.string({ maxLength: 40 }) }), resultSchema: schema.boolean(),
+    handler: async (params) => { await desktop.dismissUpdateSuccess((params as { version: string }).version); return true } })
   registry.registerAction({ name: 'desktop.configure', paramsSchema: schema.object({ zoom: schema.string({ maxLength: 8 }), quotaNotifications: schema.boolean(), autoUpdate: schema.boolean() }), resultSchema,
     handler: async (params) => { const { zoom, quotaNotifications, autoUpdate } = params as { zoom: string; quotaNotifications: boolean; autoUpdate: boolean }
       return { snapshot: JSON.stringify(await desktop.configure(zoom, quotaNotifications, autoUpdate)) } } })

@@ -2,7 +2,7 @@ import { app, shell } from 'electron'
 import { join } from 'node:path'
 import type { BridgeRegistry } from '../bridge/bridge-registry'
 import { schema } from '../bridge/schema'
-import { AccountClient } from '../account/client'
+import { AccountClient, accountMessages } from '../account/client'
 import { createSessionStore } from '../account/store'
 import { isAlipayCheckoutUrl } from '../account/payment-url'
 import { setNetworkAccountAccess } from '../tunnel/runtime'
@@ -10,6 +10,7 @@ import { registerSubscriptionActions } from '../account/subscription-actions'
 import { registerSharingActions } from '../account/sharing-actions'
 import { setInstallationReporter, setDownloadReporter } from '../account/installation-report'
 import { collectDeviceFacts } from '../account/device-report'
+import { createFailureLog, daemonLogPath } from '../tunnel/failure-log'
 
 declare const __TOOLBOX_ACCOUNT_ORIGIN__: string
 
@@ -64,6 +65,17 @@ export function registerAccountActions(registry: BridgeRegistry, client: Account
         const view = await client.authenticate(mode, username, password, (code) => { recoveryCode = code }, inviteCode)
         return { snapshot: JSON.stringify(view), recoveryCode } } })
   }
+  registry.registerAction({ name: 'account.wechatLogin', paramsSchema: schema.object({
+    mode: schema.string({ maxLength: 8 }) }), resultSchema: recoverySchema,
+    handler: async (params) => {
+      const { mode } = params as { mode: 'login' | 'bind' }
+      if (!['login', 'bind'].includes(mode)) throw new Error('ACCOUNT_REQUEST_INVALID')
+      let recoveryCode = ''
+      const view = await client.wechatLogin(mode, (code) => { recoveryCode = code })
+      return { snapshot: JSON.stringify(view), recoveryCode }
+    } })
+  registry.registerAction({ name: 'account.cancelWechatLogin', paramsSchema: schema.undefined(),
+    resultSchema: schema.object({ cancelled: schema.boolean() }), handler: () => client.cancelWechatLogin().then((cancelled) => ({ cancelled })) })
   registry.registerAction({ name: 'account.recover', paramsSchema: schema.object({ username: schema.string(),
     recoveryCode: schema.string({ maxLength: 80 }), password: schema.string() }), resultSchema: recoverySchema,
     handler: async (params) => {
@@ -79,12 +91,17 @@ export function registerAccountActions(registry: BridgeRegistry, client: Account
   registry.registerAction({ name: 'account.apply', paramsSchema: schema.object({ planId: schema.string({ maxLength: 40 }) }), resultSchema,
     handler: async (params) => ({ snapshot: JSON.stringify(await client.apply((params as { planId: string }).planId)) }) })
   const paymentResultSchema = schema.object({ snapshot: schema.string({ maxLength: 150_000 }), order: schema.string({ maxLength: 4000 }), openedBrowser: schema.boolean() })
-  registry.registerAction({ name: 'account.pay', paramsSchema: schema.object({ planId: schema.string({ maxLength: 40 }), channel: schema.string({ maxLength: 12 }) }),
+  registry.registerAction({ name: 'account.pay', paramsSchema: schema.object({ planId: schema.string({ maxLength: 40 }), channel: schema.string({ maxLength: 12 }),
+    amountFen: schema.string({ maxLength: 16 }) }),
     resultSchema: paymentResultSchema,
     handler: async (params) => {
-      const { planId, channel } = params as { planId: string; channel: string }
-      if (!['alipay', 'wechat'].includes(channel)) throw new Error('ACCOUNT_REQUEST_INVALID')
-      const result = await client.pay(planId, channel as 'alipay' | 'wechat')
+      const { planId, channel, amountFen } = params as { planId: string; channel: string; amountFen: string }
+      if (!['alipay', 'wechat'].includes(channel) || !/^[1-9][0-9]{0,15}$/.test(amountFen) || !Number.isSafeInteger(Number(amountFen))) throw new Error('ACCOUNT_REQUEST_INVALID')
+      const result = await client.pay(planId, channel as 'alipay' | 'wechat', Number(amountFen))
+      if (result.order && (result.order.planId !== planId || result.order.channel !== channel || result.order.amountFen !== Number(amountFen))) {
+        return { snapshot: JSON.stringify({ ...result.view, code: 'PAYMENT_TERMS_CHANGED', message: accountMessages.PAYMENT_TERMS_CHANGED,
+          overview: null, terms: null }), order: 'null', openedBrowser: false }
+      }
       let openedBrowser = false
       // Server responses still need validation before crossing into OS protocol handlers.
       if (result.order?.redirect?.kind === 'url') {
@@ -103,8 +120,12 @@ export function registerAccountActions(registry: BridgeRegistry, client: Account
 }
 
 export function registerActions(registry: BridgeRegistry): void {
-  const client = new AccountClient(__TOOLBOX_ACCOUNT_ORIGIN__, createSessionStore(join(app.getPath('userData'), 'account')), setNetworkAccountAccess,
-    () => collectDeviceFacts(app.getVersion(), app.getPath('userData')))
+  const accountLog = createFailureLog(daemonLogPath(app.getPath('userData')))
+  const client = new AccountClient(__TOOLBOX_ACCOUNT_ORIGIN__, createSessionStore(join(app.getPath('userData'), 'account')), async (...args) => {
+    const result = await setNetworkAccountAccess(...args)
+    if (result.outcome === 'rejected' && /^[A-Z][A-Z0-9_]{1,79}$/.test(result.code)) accountLog('account-network-sync-failed', result.code)
+    return result
+  }, () => collectDeviceFacts(app.getVersion(), app.getPath('userData')), (url) => shell.openExternal(url), undefined, accountLog)
   setInstallationReporter((confirmed) => client.captureInstallationReport(confirmed))
   setDownloadReporter((passive) => client.captureDownloadReport(passive))
   registerAccountActions(registry, client)

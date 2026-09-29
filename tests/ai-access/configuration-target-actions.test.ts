@@ -20,6 +20,8 @@ describe('项目配置目标主进程动作', () => {
     )
     const registry = new BridgeRegistry()
     registerAiAccessActions(registry, service, undefined, undefined, async () => '/customer/selected-project')
+    await service.initialize()
+    write.mockClear()
 
     await expect(registry.execute('aiaccess.selectConfigurationProject', { shell: 'codex' }))
       .rejects.toMatchObject({ code: 'ACTION_FAILED' })

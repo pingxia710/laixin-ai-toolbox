@@ -49,6 +49,37 @@ function seedLedger(root: string, entries: unknown[]): void {
   writeFileSync(join(root, 'ledger.json'), `${JSON.stringify(entries, null, 1)}\n`, { mode: 0o600 })
 }
 
+it('桥接关闭卡住时先还原代理，关闭确认前不声称已完全停止', async () => {
+  vi.useFakeTimers()
+  const root = directory()
+  const base = createAdapter({ FAKE_WININET_STORE: join(root, 'registry.json') })
+  let finishClose: (() => void) | undefined
+  let bridgeClosed = false
+  const slowBridge = () => ({
+    listen: async () => {},
+    close: () => new Promise<void>((resolve) => { finishClose = () => { bridgeClosed = true; resolve() } }),
+    isAlive: () => !bridgeClosed,
+    onLost: () => {}
+  })
+  writeIntentFile(root, connectedIntent)
+  const daemon = createDaemon({ dataDir: root, adapter: base, clock: fakeWallClock(), parentAlive: () => true,
+    onExit: () => {}, connectorFactory: connector, bridgeFactory: slowBridge, intentPollMs: 100 })
+  await daemon.run()
+  expect(proxyServer(base)).toBe('127.0.0.1:18080')
+
+  writeIntentFile(root, { desired: 'user-disconnected' as const, sessionToken: 'slow-stop-1' })
+  await vi.advanceTimersByTimeAsync(150)
+  expect(finishClose).toBeDefined()
+  expect(proxyServer(base) ?? null).toBe(null)
+  expect(proxyEnable(base) ?? null).not.toBe('1')
+  expect(pendingSettingEntries(root)).toEqual([])
+  expect(readState(root).state).not.toBe('stopped-restored')
+
+  finishClose?.()
+  await vi.advanceTimersByTimeAsync(100)
+  expect(readState(root).state).toBe('stopped-restored')
+})
+
 it('断开后恢复写失败:按梯子重试,故障解除后原设置实际还回、销账、状态如实走到 stopped-restored(基线:一次失败永久卡死)', async () => {
   vi.useFakeTimers()
   const root = directory()
@@ -83,6 +114,37 @@ it('断开后恢复写失败:按梯子重试,故障解除后原设置实际还�
   expect(restoreWriteAttempts).toBe(2)
   expect(proxyServer(base) ?? null).toBe(null)
   expect(pendingSettingEntries(root)).toEqual([])
+})
+
+it('桥接收尾停住后重复断开:先还原代理并有界结束异常守护', async () => {
+  vi.useFakeTimers()
+  const root = directory()
+  const base = createAdapter({ FAKE_WININET_STORE: join(root, 'registry.json') })
+  const exits: number[] = []
+  let closeCalls = 0
+  writeIntentFile(root, connectedIntent)
+  const daemon = createDaemon({ dataDir: root, adapter: base, clock: fakeWallClock(), parentAlive: () => true,
+    onExit: (code: number) => { exits.push(code) }, connectorFactory: connector,
+    bridgeFactory: () => ({ listen: async () => {}, close: () => { closeCalls += 1; return new Promise<void>(() => {}) },
+      isAlive: () => true, onLost: () => {} }), intentPollMs: 100 })
+  await daemon.run()
+  expect(proxyServer(base)).toBe('127.0.0.1:18080')
+
+  writeIntentFile(root, { desired: 'user-disconnected' as const, sessionToken: 'stop-1' })
+  await vi.advanceTimersByTimeAsync(200)
+  expect(readState(root).state).toBe('user-disconnected')
+  expect(proxyServer(base) ?? null).toBe(null)
+  expect(proxyEnable(base) ?? null).not.toBe('1')
+  expect(pendingSettingEntries(root)).toEqual([])
+  writeIntentFile(root, { desired: 'user-disconnected' as const, sessionToken: 'stop-2' })
+  await vi.advanceTimersByTimeAsync(200)
+  expect(closeCalls).toBe(1) // 第二次断开仍在等待同一桥接收尾
+  expect(proxyServer(base) ?? null).toBe(null)
+  expect(proxyEnable(base) ?? null).not.toBe('1')
+  expect(pendingSettingEntries(root)).toEqual([])
+  await vi.advanceTimersByTimeAsync(60_000)
+  expect(exits).toContain(65) // runner 管道随守护退出关闭,常驻任务重新拉起并核对账本
+  expect(readState(root).code).toBe('TUNNEL_STOP_INCOMPLETE')
 })
 
 it('kept-modified(第三方改过,责任已了结)不挡恢复收尾:首轮即走人,梯子不空等(护栏,基线即绿)', async () => {

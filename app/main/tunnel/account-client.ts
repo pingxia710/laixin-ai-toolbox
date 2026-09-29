@@ -1,5 +1,6 @@
 import { platformForRuntime } from './sidecar-path'
 import type { Platform } from '../precheck/software-platform'
+import type { DiagnosticEvent } from '../../diagnostic-event-types'
 
 export interface NetworkAccountSession { readonly accountId: string; readonly accessToken: string; readonly deviceId?: string }
 export interface NetworkAccountAccess { readonly client: NetworkAccountClient; readonly session: NetworkAccountSession }
@@ -50,7 +51,7 @@ export class NetworkAccountClient {
     if (!data || typeof data !== 'object' || !Object.hasOwn(data, 'application')) throw new NetworkAccountError('NETWORK_RESPONSE_INVALID')
     if (data.application === null) throw new NetworkAccountError('NETWORK_NO_APPLICATION')
     const app = data.application
-    if (!app || typeof app.id !== 'string' || !/^lx-[a-f0-9]{32}$/.test(app.id) || !['pending', 'provisioning', 'ready'].includes(String(app.status))) {
+    if (!app || typeof app.id !== 'string' || !/^lx-[a-f0-9]{32}$/.test(app.id) || !['pending', 'queued', 'provisioning', 'ready'].includes(String(app.status))) {
       throw new NetworkAccountError('NETWORK_RESPONSE_INVALID')
     }
     if (app.status !== 'ready') throw new NetworkAccountError('NETWORK_APPLICATION_PENDING')
@@ -80,6 +81,22 @@ export class NetworkAccountClient {
     } catch (error) {
       if (error instanceof NetworkAccountError && ['NETWORK_ROUTE_NOT_FOUND', 'NETWORK_LOGIN_REQUIRED'].includes(error.message)) {
         throw Object.assign(error, { diagnosisPermanent: error.message === 'NETWORK_ROUTE_NOT_FOUND' ? 'route' : 'auth' })
+      }
+      throw error
+    }
+  }
+
+  /** N-53 闭环事件走独立、可幂等的合同；旧六字段 diagnosis 合同保持原样。 */
+  async reportDiagnosticEvent(session: NetworkAccountSession, signal: AbortSignal, event: DiagnosticEvent): Promise<void> {
+    if (!session.deviceId) throw new NetworkAccountError('NETWORK_LOGIN_REQUIRED')
+    try {
+      await this.request('diagnostic-events', session, signal, 2048, 'application/json', undefined, event)
+    } catch (error) {
+      if (error instanceof NetworkAccountError && ['NETWORK_ROUTE_NOT_FOUND', 'NETWORK_LOGIN_REQUIRED'].includes(error.message)) {
+        throw Object.assign(error, {
+          // 旧后台没有路由时不随 UI 状态轮询空转；新会话就位会主动解锁重试。
+          diagnosticRetryAfterMs: error.message === 'NETWORK_ROUTE_NOT_FOUND' ? 6 * 60 * 60_000 : 30_000
+        })
       }
       throw error
     }
@@ -124,20 +141,21 @@ export class NetworkAccountClient {
         return { body: Buffer.alloc(0), etag, unchanged: true, ...metadata }
       }
       if (!response.ok) {
-        if (path === 'connection' && [404, 409].includes(response.status) || path === 'diagnosis' && response.status === 404) {
+        if ([409, 410].includes(response.status) || path === 'connection' && response.status === 404 ||
+            ['diagnosis', 'diagnostic-events'].includes(path) && response.status === 404) {
           // Older account servers have no connection route. A missing application on a new server is distinct.
           // diagnosis 同理:老后台没有这个端点(404)必须与「后台一时不可达」分开,⛔ 让回传空转入队。
           let size = 0; const chunks: Uint8Array[] = []
           if (response.body) for await (const chunk of response.body) { size += chunk.length; if (size > 2048) throw new NetworkAccountError('NETWORK_RESPONSE_INVALID'); chunks.push(chunk) }
           let code: unknown
           try { code = JSON.parse(Buffer.concat(chunks).toString('utf8')).code } catch { /* A legacy 404 may have no JSON body. */ }
-          if (response.status === 409) throw new NetworkAccountError(code === 'NETWORK_APPLICATION_PENDING'
-            ? 'NETWORK_APPLICATION_PENDING' : 'NETWORK_AUTHORIZATION_UNAVAILABLE')
-          throw new NetworkAccountError(code === 'NETWORK_NO_APPLICATION' ? 'NETWORK_NO_APPLICATION' : 'NETWORK_ROUTE_NOT_FOUND')
+          if (response.status === 404) throw new NetworkAccountError(code === 'NETWORK_NO_APPLICATION' ? 'NETWORK_NO_APPLICATION' : 'NETWORK_ROUTE_NOT_FOUND')
+          if (code === 'NETWORK_APPLICATION_PENDING') throw new NetworkAccountError('NETWORK_APPLICATION_PENDING')
+          if (code === 'NETWORK_AUTHORIZATION_UNAVAILABLE' || code === 'CONFIG_EXPIRED') throw new NetworkAccountError('NETWORK_AUTHORIZATION_UNAVAILABLE')
+          throw new NetworkAccountError('NETWORK_SERVICE_UNAVAILABLE')
         }
         await response.body?.cancel()
-        throw new NetworkAccountError(response.status === 401 ? 'NETWORK_LOGIN_REQUIRED' : response.status === 409 || response.status === 410
-          ? 'NETWORK_AUTHORIZATION_UNAVAILABLE' : 'NETWORK_SERVICE_UNAVAILABLE')
+        throw new NetworkAccountError(response.status === 401 ? 'NETWORK_LOGIN_REQUIRED' : 'NETWORK_SERVICE_UNAVAILABLE')
       }
       if (response.headers.get('content-type')?.split(';')[0] !== contentType || !response.body) {
         await response.body?.cancel(); throw new NetworkAccountError('NETWORK_RESPONSE_INVALID')

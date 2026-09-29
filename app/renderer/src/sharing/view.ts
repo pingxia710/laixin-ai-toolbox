@@ -139,7 +139,9 @@ export function mountSharing(root: HTMLElement): () => void {
         qrStop = countdown.stop
         block.append(qr)
       }
-      if (payment?.payment?.redirect?.kind === 'url') block.append(el('p', '已在系统浏览器打开支付宝，请完成付款后返回这里。'))
+      if (payment?.payment?.redirect?.kind === 'url') block.append(el('p', payment.browserOpened === false
+        ? '未能自动打开支付宝付款页，租单已保留。请点击「继续付款」重试，或检查电脑默认浏览器设置。'
+        : '已在系统浏览器打开支付宝，请完成付款后返回这里。'))
     }
     if (['ready', 'active', 'problem'].includes(order.status) && order.deliveredAt) {
       block.append(button(secret ? '隐藏账号资料' : '查看交付的账号资料', () => secret ? clearSecret() : run(async () => {

@@ -7,14 +7,13 @@ import { revealSupport } from '../support-widget'
 import { statusLabels as sharingStatusLabels } from '../sharing/view'
 import { statusLabels as subscriptionStatusLabels } from '../subscription/view'
 import { actionButton, textNode } from './account-overview'
-import { openPaymentDialog } from './payment-dialog'
 
 const money = (fen: number) => `¥${(fen / 100).toFixed(2)}`
 const day = (value?: number | null) => value ? new Date(value).toLocaleDateString('zh-CN') : ''
 const channelLabels: Record<string, string> = { alipay: '支付宝', wechat: '微信支付', manual: '人工办理' }
 
 const networkStatusLabels: Record<PaymentOrderView['status'], string> = {
-  open: '待付款', paid: '已付款，待交付', confirmed: '已交付', partially_refunded: '部分退款', refunded: '全部退款', cancelled: '已取消'
+  open: '待付款', paid: '付款异常，套餐未开通', confirmed: '付款已确认', partially_refunded: '部分退款', refunded: '全部退款', cancelled: '已取消'
 }
 const networkActive = (status: PaymentOrderView['status']): boolean => status === 'open' || status === 'paid'
 const subscriptionActive = (status: SubscriptionOrderView['status']): boolean => !['completed', 'refunded', 'cancelled'].includes(status)
@@ -70,7 +69,7 @@ export function mountAccountServices(element: HTMLElement, view: AccountView): v
   mountSharingServices(services)
 }
 
-/** 网络套餐付款：待付款可继续付款或取消；toolbox 旧单只读为历史售后记录。 */
+/** 网络套餐订单只作历史与售后记录；新购买统一从套餐卡片创建新订单。 */
 function mountNetworkServices(parent: HTMLElement, planLabel: (planId: string) => string): void {
   const body = serviceGroup(parent, '网络套餐')
   const load = (): void => {
@@ -106,11 +105,10 @@ function networkRow(order: PaymentOrderView, planLabel: (planId: string) => stri
     return row
   }
   if (order.status === 'open') {
-    row.append(textNode('p', order.cancelPending ? '等待渠道确认取消，请稍后刷新。' : `付款截止：${order.expiresAt ? new Date(order.expiresAt).toLocaleString('zh-CN') : '以支付渠道为准'}`, 'account-note'),
+    row.append(textNode('p', order.cancelPending ? '等待渠道确认取消，请稍后刷新。' : '这是未完成的历史订单；如需购买，请回到套餐列表重新点击购买。', 'account-note'),
       actionButton('取消此订单', () => { void accountAction(() => window.toolbox.account.cancelPayment({ orderId: order.orderId })) }))
-    if (!order.cancelPending) row.append(actionButton('继续付款', () => openPaymentDialog({ id: order.planId, label: planLabel(order.planId), bytes: 0, priceCents: order.amountFen }, order.channel)))
   } else if (order.status === 'paid') {
-    row.append(textNode('p', '付款已确认，正在开通；可用上方“刷新权益”查看结果。', 'account-note'))
+    row.append(textNode('p', '付款已确认，但本订单套餐未正常写入，这是处理异常；请联系客服核对，勿重复付款。', 'account-note'))
   }
   return row
 }

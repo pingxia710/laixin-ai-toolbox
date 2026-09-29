@@ -70,7 +70,8 @@ function makeHarness(options: HarnessOptions = {}) {
       return made.child as never
     },
     // 常驻接线:席位上有活人(硬重启后被计划任务拉起的守护)。
-    resident: { armed: () => options.residentArmed ?? true, wake: async () => true, alive: () => options.residentAlive ?? true },
+    resident: { armed: () => options.residentArmed ?? true, wake: async () => true,
+      alive: () => options.residentAlive ?? true, seatRunId: () => undefined },
     ...(options.restoreDeadlineMs !== undefined ? { restoreDeadlineMs: options.restoreDeadlineMs } : {})
   })
   return { root, supervisor, restoreChildren }

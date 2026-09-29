@@ -5,6 +5,7 @@ import { icon, type IconName } from './icons'
 import { initializeTheme } from './theme'
 import { TAB_NAVIGATION_EVENT, markServiceAvailability, requestedDiagnosticSoftware, requestedTab, requestedModelApiPlatform, requestedModelApiProvider, requestedPlatformDownloadPlatform } from './navigation'
 import type { DiagnosticSoftware } from '../../network-diagnostics-types'
+import type { UpdateSuccessNotice } from '../../desktop-types'
 import type { SubscriptionCatalog } from '../../subscription-types'
 import type { SharingCatalog } from '../../sharing-types'
 import type { ModelProviderId } from '../../shared/model-providers'
@@ -47,6 +48,7 @@ let platform = 'loading'
 let mountedPages = [] as ReturnType<typeof pageRegistry.modulesFor>
 let unmountSupport = (): void => undefined
 const tabButtons: HTMLButtonElement[] = []
+let closeMorePlatforms = (): void => undefined
 const tabIcons: Record<(typeof skeletonTabs)[number]['id'], IconName> = {
   dashboard: 'dashboard', tunnel: 'network', usage: 'usage',
   'platform-layout': 'settings', purchase: 'receipt', sharing: 'share', account: 'account', referral: 'gift', settings: 'settings'
@@ -159,6 +161,7 @@ function appendMorePlatforms(container: HTMLElement, marker: HTMLElement): void 
     popover.hidden = !value
     positionPopover()
   }
+  closeMorePlatforms = () => setExpanded(false)
   const clearDragState = (): void => {
     pinnedEntries.querySelectorAll('.is-dragging, .is-drop-before, .is-drop-after').forEach((entry) => {
       entry.classList.remove('is-dragging', 'is-drop-before', 'is-drop-after')
@@ -304,6 +307,9 @@ function appendMorePlatforms(container: HTMLElement, marker: HTMLElement): void 
       trigger.focus()
     }
   })
+  document.addEventListener('change', (event) => {
+    if (expanded && event.target instanceof HTMLElement && event.target.id === 'theme-select') setExpanded(false)
+  })
   document.addEventListener('scroll', (event) => {
     if (expanded && event.target !== popover && event.target !== control) setExpanded(false)
     positionControl()
@@ -321,6 +327,7 @@ function appendMorePlatforms(container: HTMLElement, marker: HTMLElement): void 
 
 function selectTab(index: number, usagePlatform: UsagePlatformId = 'codex', platformSection?: 'model-api' | 'download', diagnosticSoftware?: DiagnosticSoftware,
   modelApiProvider?: ModelProviderId): void {
+  closeMorePlatforms()
   activeIndex = index
   activeUsagePlatform = usagePlatform
   activePlatformSection = platformSection
@@ -425,8 +432,11 @@ void window.toolbox.app.info().then((info) => {
   mountDesktopStatus(headerAppState)
   void window.toolbox.desktop?.ready().catch(() => { /* An ordinary launch has no pending update. */ })
   // 「更新成功」弹窗:推送为主(回执可能晚于启动才写好),ready 后再拉一次兜底;弹窗模块自己去重。
-  window.toolbox.desktop?.onUpdateSucceeded((notice) => showUpdateSuccessNotice(notice))
-  window.toolbox.desktop?.updateSuccess().then((notice) => showUpdateSuccessNotice(notice)).catch(() => { /* Ordinary launch. */ })
+  const showCompletedUpdate = (notice: UpdateSuccessNotice) => showUpdateSuccessNotice(notice, () => {
+    void window.toolbox.desktop?.dismissUpdateSuccess(notice.version).catch(() => { /* Reoffer after restart. */ })
+  })
+  window.toolbox.desktop?.onUpdateSucceeded(showCompletedUpdate)
+  window.toolbox.desktop?.updateSuccess().then(showCompletedUpdate).catch(() => { /* Ordinary launch. */ })
   const stopAccountRefresh = startAccountRefreshLoop()
   void window.toolbox.subscription?.catalog().then((response) => {
     if (response.error || !response.data) return

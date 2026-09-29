@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { randomBytes } from 'node:crypto'
 import { afterEach, expect, it } from 'vitest'
@@ -79,6 +79,41 @@ it('打出来的包里没有任何凭据：state.json 的令牌、VLESS 三件�
   expect(serialized).toContain('AI_DIAG_TUNNEL_UNREACHABLE')
   expect(serialized).toContain('203.0.113.7')
   expect(body.daemonLog).toMatchObject({ available: true })
+})
+
+it('采集本机诊断文件不跟随符号链接', async () => {
+  const root = makeTempDir('report-symlink-'); roots.push(root)
+  const outside = join(root, 'outside.json')
+  const linked = join(root, 'linked.json')
+  writeFileSync(outside, 'OUTSIDE-MARKER')
+  symlinkSync(outside, linked)
+
+  await expect(nodeReportFiles.readText(linked)).rejects.toThrow('REPORT_FILE_UNSAFE')
+  await expect(nodeReportFiles.readTail(linked, 1024)).rejects.toThrow('REPORT_FILE_UNSAFE')
+})
+
+it('守护日志的父目录是符号链接时不采集目录外的个人文本', async () => {
+  const root = makeTempDir('report-log-parent-link-'); roots.push(root)
+  const userDataPath = join(root, 'userData')
+  const tunnelDataDir = join(userDataPath, 'tunnel')
+  const outside = join(root, 'private-documents')
+  mkdirSync(tunnelDataDir, { recursive: true })
+  mkdirSync(outside)
+  writeFileSync(join(outside, 'tunnel-daemon.log'), 'truncated-prefix\nPRIVATE-TEXT-MUST-NOT-LEAVE\n')
+  symlinkSync(outside, join(userDataPath, 'logs'))
+
+  const files = await collectLocalFiles({ userDataPath, tunnelDataDir, files: nodeReportFiles })
+  expect(JSON.stringify(files)).not.toContain('PRIVATE-TEXT-MUST-NOT-LEAVE')
+  expect(files.daemonLogAbsence).toBe('unreadable')
+  expect(files.notes).toContain('守护日志读取失败：REPORT_FILE_UNSAFE')
+})
+
+it('客服报告只保留日志文件名，不带客户用户名所在的绝对路径', () => {
+  const body = buildReportBody({ daemonLog: { source: '/Users/private-customer/Library/Application Support/来信/logs/tunnel-daemon.log', lines: ['正常日志'] } })
+  const serialized = JSON.stringify(body.daemonLog)
+  expect(serialized).toContain('tunnel-daemon.log')
+  expect(serialized).not.toContain('private-customer')
+  expect(serialized).not.toContain('/Users/')
 })
 
 it('账本只出类别/项目/状态/时刻，⛔ 原值内容', async () => {
@@ -172,6 +207,14 @@ it('上报包携带同一次结构化诊断，补充读数另记采集时间，�
     report: {
       software: 'hermes', checkedAt: 1_800_000_000_000, validUntil: 1_800_000_600_000,
       target: { label: 'DeepSeek API', route: 'direct' },
+      pathMatrix: {
+        checkedAt: 1_800_000_000_000, valid: true,
+        entries: [
+          { path: 'direct', state: 'reachable', phase: 'http', elapsedMs: 11, message: '直连可用。', rawUrl: 'https://private.example/' },
+          { path: 'existing-proxy', state: 'failed', phase: 'tls', elapsedMs: 17, message: '代理路径 TLS 失败。', proxy: '10.0.0.8:7890' },
+          { path: 'laixin-tunnel', state: 'failed', phase: 'connection', elapsedMs: 23, message: '来信通道连接失败。', certificate: 'CERTIFICATE BODY' }
+        ]
+      },
       conclusion: {
         status: 'clear', scope: 'none', ruleId: 'DG01_NO_BLOCKER_FOUND', title: '本次未发现明确阻断',
         summary: '目标本次有响应。', nextStep: '回到 Hermes 重试原操作。',
@@ -181,7 +224,8 @@ it('上报包携带同一次结构化诊断，补充读数另记采集时间，�
       checks: [
         { id: 'internet', label: '基础网络', state: 'passed', code: 'AI_DIAG_INTERNET_OK', message: '基础网络可用。' },
         { id: 'tunnel', label: '通道出口', state: 'not-checked', code: 'AI_DIAG_DIRECT_SERVICE', message: '不需要通道。' },
-        { id: 'service', label: '目标服务', state: 'passed', code: 'AI_DIAG_SERVICE_REACHABLE', message: '目标有响应。' },
+        { id: 'service', label: '目标服务', state: 'passed', code: 'AI_DIAG_SERVICE_REACHABLE', message: '目标有响应。',
+          phase: 'http', rawFailure: 'net::ERR_PRIVATE_FIXTURE' },
         { id: 'account', label: '登录与额度', state: 'not-checked', code: 'AI_DIAG_ACCOUNT_PROVIDER', message: '未验证账号。' },
         { id: 'application', label: '应用接入', state: 'passed', code: 'AI_DIAG_APPLICATION_OBSERVED', message: '观察到调用。' }
       ]
@@ -195,8 +239,36 @@ it('上报包携带同一次结构化诊断，补充读数另记采集时间，�
   expect(body.supplemental).toEqual({ collectedAt: '2027-01-15T08:00:05.000Z' })
   const serialized = JSON.stringify(body)
   expect(serialized).toContain('重新测试')
+  expect(body.diagnosis).toMatchObject({ checks: expect.arrayContaining([expect.objectContaining({
+    id: 'service', phase: 'http'
+  })]), pathMatrix: { checkedAt: 1_800_000_000_000, valid: true, entries: [
+    expect.objectContaining({ path: 'direct', state: 'reachable', phase: 'http', elapsedMs: 11 }),
+    expect.objectContaining({ path: 'existing-proxy', state: 'failed', phase: 'tls', elapsedMs: 17 }),
+    expect.objectContaining({ path: 'laixin-tunnel', state: 'failed', phase: 'connection', elapsedMs: 23 })
+  ] } })
   expect(serialized).not.toContain('THIS-MUST-NOT-LEAVE')
   expect(serialized).not.toContain('secret-fixture-token-value')
+  expect(serialized).not.toContain('ERR_PRIVATE_FIXTURE')
+  expect(serialized).not.toContain('private.example')
+  expect(serialized).not.toContain('10.0.0.8')
+  expect(serialized).not.toContain('CERTIFICATE BODY')
+})
+
+it('手动支持包仅取冻结的本机路径枚举与时间，不接收原始网卡、SSID、MAC、内网 IP', () => {
+  const diagnosis = {
+    id: 'DG-ABC123', report: { software: 'hermes', checkedAt: 1_800_000_000_000, validUntil: 1_800_000_600_000,
+      target: { label: 'DeepSeek API', route: 'direct' }, checks: [], conclusion: { evidence: [] } },
+    attempts: [], attemptsTotal: 0, attemptsComplete: true,
+    localEgress: { platform: 'windows', sampledAt: 1_800_000_000_123, interface: 'none',
+      ipv4DefaultRoute: 'absent', ipv6DefaultRoute: 'absent', ssid: 'Office-SSID',
+      mac: '00-11-22-33-44-55', localIp: '192.168.1.2', rawOutput: 'PRIVATE-ROUTE-TABLE' }
+  } as unknown as SupportDiagnosis
+  const body = buildReportBody({ diagnosis })
+  expect(body.diagnosis).toMatchObject({ localEgress: { platform: 'windows', sampledAt: 1_800_000_000_123,
+    interface: 'none', ipv4DefaultRoute: 'absent', ipv6DefaultRoute: 'absent' } })
+  for (const secret of ['Office-SSID', '00-11-22-33-44-55', '192.168.1.2', 'PRIVATE-ROUTE-TABLE']) {
+    expect(JSON.stringify(body.diagnosis)).not.toContain(secret)
+  }
 })
 
 it('「日志读不出来」⛔ 说成「日志没生成」——后者会让客服以为这台机器一切正常', async () => {

@@ -36,6 +36,7 @@ export const api = {
   },
   // 「更新成功」弹窗内容:装完后的第一次启动返回非空 version,其余启动返回空串三件套。
   updateSuccess: (): Promise<{ version: string; previous: string; notes: string }> => call('updateSuccess'),
+  dismissUpdateSuccess: (version: string): Promise<boolean> => call('dismissUpdateSuccess', { version }),
   // 回执写好的那一刻的推送(它可能晚于渲染层启动,所以 updateSuccess 拉取也要在)。
   onUpdateSucceeded: (listener: (notice: { version: string; previous: string; notes: string }) => void): (() => void) => {
     const handler = (_event: Electron.IpcRendererEvent, notice: unknown) => {

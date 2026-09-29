@@ -13,6 +13,12 @@ import { DIAGNOSIS_QUEUE_LIMIT, DiagnosisReporter } from '../../app/main/tunnel/
 import type { DiagnosisPayload } from '../../app/main/tunnel/diagnosis-reporter'
 import { loadTrustContext } from '../../app/main/tunnel/trust'
 import { makeTempDir, removeTempDir } from './helpers'
+import type { EncryptedQueueCodec } from '../../app/main/tunnel/diagnostic-event-queue'
+
+const identityQueueCodec: EncryptedQueueCodec = {
+  encrypt: (plain) => Buffer.from(plain, 'utf8'),
+  decrypt: (encrypted) => encrypted.toString('utf8')
+}
 
 const dirs: string[] = []
 afterEach(() => { dirs.splice(0).forEach(removeTempDir) })
@@ -40,18 +46,20 @@ function seedImported(dataDir: string): string {
 
 // 守护终态由守护写进 state.json;主进程经 rawStatus 读到(守护怎么写已被 authorization-expiry 等用例守住)。
 function seedDaemonState(dataDir: string, state: Record<string, unknown>): void {
-  writeFileSync(join(dataDir, 'state.json'), JSON.stringify({ runId: 'run-fixture', ...state }))
+  const intent = JSON.parse(readFileSync(join(dataDir, 'intent.json'), 'utf8')) as { sessionToken?: string }
+  writeFileSync(join(dataDir, 'state.json'), JSON.stringify({ runId: 'run-fixture', intentToken: intent.sessionToken, ...state }))
 }
 
 interface ServiceHandle {
   tunnel: TunnelService
+  dataDir: string
   sent: DiagnosisPayload[]
   queuePath: string
   failNextSendWith: (error?: Error) => void
   setEnabled: (enabled: boolean) => void
 }
 
-function service(input: { imported?: boolean } = {}): ServiceHandle {
+function service(input: { imported?: boolean; connected?: boolean; residentAlive?: () => boolean; now?: () => number } = {}): ServiceHandle {
   const dataDir = tempDir('laixin-diagnosis-')
   if (input.imported) seedImported(dataDir)
   const queuePath = join(dataDir, 'diagnosis-pending.json')
@@ -62,22 +70,30 @@ function service(input: { imported?: boolean } = {}): ServiceHandle {
     dataDir,
     sidecarDir: input.imported ? tempDir('laixin-sidecar-empty-') : tempDir('laixin-sidecar-missing-'),
     trust: loadTrustContext({}, {}),
-    now: () => Date.now(),
+    now: input.now ?? (() => Date.now()),
     picker: async () => undefined,
     spawnDaemon: () => ({ on: () => undefined }),
     spawnRestore: () => undefined,
     routesFile: join(dataDir, 'routes.default.json'),
+    ...(input.connected ? { resident: {
+      armed: () => true, alive: input.residentAlive ?? (() => true), wake: async () => true, seatRunId: () => 'run-fixture'
+    } } : {}),
     diagnosis: {
       enabled: () => enabled,
       version: () => '9.9.9-test',
+      queueCodec: identityQueueCodec,
       send: async (payload) => {
         if (sendError) { const error = sendError; sendError = undefined; throw error }
         sent.push(payload)
       }
     }
   })
+  if (input.connected) {
+    writeFileSync(join(dataDir, 'intent.json'), JSON.stringify({ desired: 'connected', sessionToken: 'connected-fixture' }))
+    seedDaemonState(dataDir, { state: 'connected', intentToken: 'connected-fixture', exitIp: '203.0.113.10', lastVerifiedAt: Date.now() })
+  }
   return {
-    tunnel, sent, queuePath,
+    tunnel, dataDir, sent, queuePath,
     failNextSendWith: (error) => { sendError = error ?? new Error('NETWORK_SERVICE_UNAVAILABLE') },
     setEnabled: (value) => { enabled = value }
   }
@@ -87,6 +103,18 @@ const deniedAccess = {
   client: { claim: async () => { throw new NetworkAccountError('NETWORK_AUTHORIZATION_UNAVAILABLE') } },
   session: { accountId: 'customer-a', accessToken: 'token', deviceId: 'device-fixture' }
 }
+
+it('主进程报告来源读取实际 spawn 回调的 runId 与时间，不经过上报字段', () => {
+  const spawnedAt = Date.now() - 1_000
+  const f = service({ now: () => spawnedAt })
+  expect(f.tunnel.reportRuntimeProvenance()).toEqual({ residentOnlyRunning: false, restoring: false })
+  const supervisor = (f.tunnel as unknown as { supervisor: { ensureRunning: () => void } }).supervisor
+  supervisor.ensureRunning()
+  expect(f.tunnel.reportRuntimeProvenance()).toMatchObject({
+    spawnRunId: expect.any(String), lastSpawnAt: spawnedAt, residentOnlyRunning: false, restoring: false
+  })
+  expect(f.sent).toHaveLength(0)
+})
 
 describe('失败终态回传 · 客户端挂钩', () => {
   it('发起即失败(组件缺失)回传该码,阶段 connect-start', async () => {
@@ -108,6 +136,129 @@ describe('失败终态回传 · 客户端挂钩', () => {
     expect(result.code).toBe('NETWORK_AUTHORIZATION_UNAVAILABLE')
     await vi.waitFor(() => expect(f.sent).toHaveLength(1))
     expect(f.sent[0]).toMatchObject({ code: 'NETWORK_AUTHORIZATION_UNAVAILABLE', stage: 'connect-start', authorizationId: `lx-${'a'.repeat(32)}` })
+    expect(f.sent).toHaveLength(1) // 显式点连接失败不能再记一笔运行中自主暂停
+  })
+
+  it('原本已连、后台明确拒绝后自主暂停：客户能看到原因，六字段 connect-run 恰好一笔', async () => {
+    const f = service({ imported: true, connected: true })
+    expect(f.tunnel.status().state).toBe('已连')
+
+    const denied = await f.tunnel.setAccountAccess(deniedAccess as never)
+    expect(denied.code).toBe('NETWORK_AUTHORIZATION_UNAVAILABLE')
+    const intent = JSON.parse(readFileSync(join(f.dataDir, 'intent.json'), 'utf8')) as { desired: string; reason: string; sessionToken: string }
+    expect(intent).toMatchObject({ desired: 'user-disconnected', reason: 'entitlement-denied' })
+    expect(f.tunnel.explicitlyStoppedNetwork()).toBe(false)
+    expect(f.tunnel.status()).toMatchObject({
+      state: '断开中', pauseReason: 'entitlement-denied', exitIp: '', pathSource: '',
+      message: expect.stringContaining('恢复尚未确认')
+    }) // 守护尚未回写时，旧 connected 不能继续冒充本次网络可用
+    expect((await f.tunnel.syncAccountConfig())).toMatchObject({ outcome: 'rejected', code: 'TUNNEL_BUSY' })
+    expect((await f.tunnel.start())).toMatchObject({ outcome: 'rejected', code: 'TUNNEL_BUSY' })
+    expect(JSON.parse(readFileSync(join(f.dataDir, 'intent.json'), 'utf8')).sessionToken).toBe(intent.sessionToken)
+    seedDaemonState(f.dataDir, { state: 'stopped-restored', intentToken: 'connected-fixture' })
+    expect(f.tunnel.status()).toMatchObject({
+      state: '断开中', pauseReason: 'entitlement-denied',
+      message: expect.stringContaining('恢复尚未确认')
+    }) // 上一轮的完成状态不能证明这次断开已经恢复
+    seedDaemonState(f.dataDir, { state: 'stopped-restored', intentToken: intent.sessionToken })
+    expect(f.tunnel.status()).toMatchObject({
+      state: '已停止并恢复原设置', pauseReason: 'entitlement-denied',
+      message: expect.stringContaining('权益校验未通过')
+    })
+    await vi.waitFor(() => expect(f.sent).toHaveLength(1))
+    expect(f.sent[0]).toEqual({
+      code: 'NETWORK_AUTHORIZATION_UNAVAILABLE', stage: 'connect-run', platform: 'macos',
+      clientVersion: '9.9.9-test', authorizationId: `lx-${'a'.repeat(32)}`, timestamp: expect.any(Number)
+    })
+    f.tunnel.status()
+    f.tunnel.status()
+    await f.tunnel.syncAccountConfig()
+    expect(f.sent).toHaveLength(1)
+    expect(f.tunnel.status().pauseReason).toBe('entitlement-denied')
+    expect(JSON.parse(readFileSync(join(f.dataDir, 'intent.json'), 'utf8')).sessionToken).toBe(intent.sessionToken)
+    await f.tunnel.stop()
+    expect(f.tunnel.status().pauseReason).toBe('') // 后续用户操作覆盖本次受控原因
+    expect(f.tunnel.explicitlyStoppedNetwork()).toBe(true)
+    writeFileSync(join(f.dataDir, 'intent.json'), JSON.stringify({ desired: 'connected', sessionToken: 'new-connection' }))
+    seedDaemonState(f.dataDir, { state: 'connected', intentToken: 'new-connection' })
+    expect(f.tunnel.status().pauseReason).toBe('') // 新连接不能继承上次暂停的提示
+  })
+
+  it('用户先断开、后台暂时失败、自动回传关闭，都不能误报自主暂停', async () => {
+    const stopped = service({ imported: true, connected: true })
+    await stopped.tunnel.stop()
+    await stopped.tunnel.setAccountAccess(deniedAccess as never)
+    expect(stopped.sent).toHaveLength(0)
+    expect(stopped.tunnel.status().pauseReason).toBe('')
+
+    const transient = service({ imported: true, connected: true })
+    const temporaryAccess = { ...deniedAccess, client: { claim: async () => { throw new NetworkAccountError('NETWORK_SERVICE_UNAVAILABLE') } } }
+    expect((await transient.tunnel.setAccountAccess(temporaryAccess as never)).outcome).toBe('continued')
+    expect(transient.sent).toHaveLength(0)
+    expect(transient.tunnel.status().pauseReason).toBe('')
+
+    const disabled = service({ imported: true, connected: true })
+    disabled.setEnabled(false)
+    await disabled.tunnel.setAccountAccess(deniedAccess as never)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(disabled.sent).toHaveLength(0)
+    expect(existsSync(disabled.queuePath)).toBe(false)
+  })
+
+  it('权益暂停时常驻守护退出且无待还账，不永久卡断开中', async () => {
+    let alive = true
+    const f = service({ imported: true, connected: true, residentAlive: () => alive })
+    await f.tunnel.setAccountAccess(deniedAccess as never)
+    expect(f.tunnel.status().state).toBe('断开中')
+    alive = false
+    expect(f.tunnel.status()).toMatchObject({ state: '用户主动断开', pauseReason: 'entitlement-denied',
+      message: expect.stringContaining('守护未在运行') })
+    expect((await f.tunnel.syncAccountConfig()).code).toBe('NETWORK_AUTHORIZATION_UNAVAILABLE')
+  })
+
+  it('权益拒绝后守护超时不确认，仍显示拒绝原因和未确认恢复', async () => {
+    let clock = Date.now()
+    const f = service({ imported: true, connected: true, now: () => clock })
+    await f.tunnel.setAccountAccess(deniedAccess as never)
+    expect(f.tunnel.status().pauseReason).toBe('entitlement-denied')
+    clock += 46_000
+    expect(f.tunnel.status()).toMatchObject({ state: '异常', pauseReason: 'entitlement-denied',
+      message: expect.stringContaining('权益校验未通过') })
+    expect(f.tunnel.status().message).toContain('恢复尚未确认')
+  })
+
+  it('原连接仍在但通道待确认时后台明确拒绝，也算一次运行中自主暂停', async () => {
+    const f = service({ imported: true, connected: true })
+    seedDaemonState(f.dataDir, { state: 'degraded', intentToken: 'connected-fixture' })
+    expect(f.tunnel.status().state).toBe('通道待确认')
+    await f.tunnel.setAccountAccess(deniedAccess as never)
+    const intent = JSON.parse(readFileSync(join(f.dataDir, 'intent.json'), 'utf8')) as { autoPauseCode?: string; sessionToken: string }
+    expect(intent.autoPauseCode).toBe('NETWORK_AUTHORIZATION_UNAVAILABLE')
+    seedDaemonState(f.dataDir, { state: 'stopped-restored', intentToken: intent.sessionToken })
+    expect(f.tunnel.status().pauseReason).toBe('entitlement-denied')
+    await vi.waitFor(() => expect(f.sent).toHaveLength(1))
+    expect(f.sent[0]).toMatchObject({ code: 'NETWORK_AUTHORIZATION_UNAVAILABLE', stage: 'connect-run' })
+  })
+
+  it('后台核验在途时用户点断开：迟到的拒绝不冒充自主暂停', async () => {
+    const f = service({ imported: true, connected: true })
+    let rejectClaim: ((error: Error) => void) | undefined
+    let claimSignal: AbortSignal | undefined
+    const access = { ...deniedAccess, client: { claim: async (_session: unknown, signal: AbortSignal) => {
+      claimSignal = signal
+      return new Promise<never>((_resolve, reject) => { rejectClaim = reject })
+    } } }
+    const syncing = f.tunnel.setAccountAccess(access as never)
+    await vi.waitFor(() => expect(rejectClaim).toBeTypeOf('function'))
+    const stopping = f.tunnel.stop()
+    await vi.waitFor(() => expect(claimSignal?.aborted).toBe(true))
+    rejectClaim!(new NetworkAccountError('NETWORK_AUTHORIZATION_UNAVAILABLE'))
+    await syncing
+    await stopping
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(f.sent).toHaveLength(0)
+    expect(JSON.parse(readFileSync(join(f.dataDir, 'intent.json'), 'utf8'))).toMatchObject({ reason: 'user-stop' })
+    expect(f.tunnel.status().pauseReason).toBe('')
   })
 
   it('FB-3 件一:守护 state 被写进机器文本(带路径的 Node 错误)⛔ 原样上传,出口归 UNKNOWN', async () => {
@@ -133,6 +284,25 @@ describe('失败终态回传 · 客户端挂钩', () => {
 })
 
 describe('失败终态回传 · 守护终态与 UNKNOWN', () => {
+  it.each(['TUNNEL_PROXY_INSPECTION_FAILED', 'TUNNEL_PROXY_OWNERSHIP_UNKNOWN'])(
+    'N-44 离线代理故障 %s 保留精确码进入六字段自动回传', async (code) => {
+      const dataDir = tempDir('laixin-n44-diagnosis-')
+      seedImported(dataDir)
+      const sent: DiagnosisPayload[] = []
+      const tunnel = new TunnelService({
+        dataDir, sidecarDir: tempDir('laixin-sidecar-empty-'), trust: loadTrustContext({}, {}), now: () => Date.now(),
+        picker: async () => undefined, spawnDaemon: () => ({ on: () => undefined }), spawnRestore: () => undefined,
+        routesFile: join(dataDir, 'routes.default.json'),
+        diagnosis: { enabled: () => true, version: () => '9.9.9-test', send: async (payload) => { sent.push(payload) } }
+      })
+      seedDaemonState(dataDir, { state: 'error', code, message: '原始诊断不可外传' })
+      tunnel.status()
+      await vi.waitFor(() => expect(sent).toHaveLength(1))
+      expect(sent[0]).toMatchObject({ code, stage: 'connect-run', authorizationId: `lx-${'a'.repeat(32)}` })
+      expect(Object.keys(sent[0]).sort()).toEqual(['authorizationId', 'clientVersion', 'code', 'platform', 'stage', 'timestamp'])
+    }
+  )
+
   it('守护 error 带受控码(端口占用)回传该码,阶段 connect-run;同 run 不重复', async () => {
     const dataDir = tempDir('laixin-diagnosis-')
     seedImported(dataDir)
@@ -260,7 +430,8 @@ describe('本地队列 · 后台不可达攒住,恢复后补传', () => {
       platform: 'macos',
       version: () => '9.9.9-test',
       now: input.now ?? (() => 1_000_000),
-      queuePath
+      queuePath,
+      queueCodec: identityQueueCodec
     })
     return { reporter, sent, queuePath, failures }
   }
@@ -336,7 +507,8 @@ describe('本地队列 · 补传在途与入队并发(候选甲-11)', () => {
       platform: 'macos',
       version: () => '9.9.9-test',
       now: () => 1_000_000,
-      queuePath
+      queuePath,
+      queueCodec: identityQueueCodec
     })
     return { reporter, sent, queuePath }
   }

@@ -29,11 +29,12 @@ class Element {
 
 const flush = async () => { for (let index = 0; index < 8; index++) await Promise.resolve() }
 let stop = (): void => undefined
-afterEach(() => { stop(); vi.unstubAllGlobals(); vi.resetModules() })
+afterEach(() => { stop(); vi.useRealTimers(); vi.unstubAllGlobals(); vi.resetModules() })
 
 const current: UpdateView = { state: 'current', version: '', notes: '', progress: 0, message: '当前已是最新可用版本。' }
 
-async function mountSettings(desktop: Record<string, unknown>, diagnostics: Record<string, unknown> = {}) {
+async function mountSettings(desktop: Record<string, unknown>, diagnostics: Record<string, unknown> = {},
+  appInfo: () => Promise<{ version: string }> = async () => ({ version: '0.4.9' })) {
   const body = new Element('body')
   vi.stubGlobal('document', {
     visibilityState: 'visible',
@@ -50,7 +51,7 @@ async function mountSettings(desktop: Record<string, unknown>, diagnostics: Reco
       desktop: { status: async () => ({ preferences: { zoom: 1, quotaNotifications: true, autoUpdate: true }, backgroundAvailable: true, alerts: [], update: current }),
         // FB-1 新开关的缺省读数;个别用例可传入同名方法覆盖。
         failureReportEnabled: async () => ({ enabled: true, supported: true }), ...desktop },
-      app: { info: async () => ({ version: '0.4.9' }) },
+      app: { info: appInfo },
       diagnostics
     }
   })
@@ -83,8 +84,66 @@ function diagnosticReport(software: DiagnosticSoftware): NetworkDiagnosticReport
 
 function diagnosticSnapshot(software: DiagnosticSoftware): string {
   const network = diagnosticReport(software)
-  return JSON.stringify({ id: 'DG-ABCDEF-123456', software, text: `本次客服诊断 ${software}`, collectedAt: '2027/1/15 16:00:00', errors: [], faults: [], network, attempts: [], attemptsTotal: 0, attemptsComplete: true })
+  return JSON.stringify({ id: 'DG-ABCDEF-123456', software, text: `本次客服诊断 ${software}`, collectedAt: '2027/1/15 16:00:00', errors: [], faults: [], network,
+    localEgress: { platform: 'other', sampledAt: network.checkedAt, interface: 'unknown', ipv4DefaultRoute: 'unknown', ipv6DefaultRoute: 'unknown' },
+    attempts: [], attemptsTotal: 0, attemptsComplete: true })
 }
+
+it('自动失败回传说明完整列出六类字段和账号关联，读开关失败时仍看得到', async () => {
+  vi.useFakeTimers()
+  let failing = true
+  const failureReportEnabled = vi.fn(async () => {
+    if (failing) throw new Error('bridge unavailable')
+    return { enabled: true, supported: true }
+  })
+  const x = await mountSettings({ failureReportEnabled,
+    residentEnabled: async () => ({ enabled: true, supported: true, active: true }),
+    loginItem: async () => ({ enabled: false, supported: true }) })
+  const text = () => x.text().join(' ')
+  for (const field of ['故障码', '阶段', '平台', '版本', '网络授权编号', '时间']) expect(text()).toContain(field)
+  expect(text()).toContain('登录会话')
+  expect(text()).toContain('关联账号')
+  expect(text()).not.toContain('不含任何个人信息')
+
+  failing = false
+  await vi.advanceTimersByTimeAsync(20_000)
+  await flush()
+  vi.useRealTimers()
+  expect(failureReportEnabled.mock.calls.length).toBeGreaterThan(1)
+  for (const field of ['故障码', '阶段', '平台', '版本', '网络授权编号', '时间']) expect(text()).toContain(field)
+  expect(text()).not.toContain('正在重试')
+})
+
+it('主动报障先告知可能含哪些资料，离线保存才显示真实文件路径', async () => {
+  const filePath = '/tmp/reports/LX-2D4F-8HTV.json'
+  const report = vi.fn(async () => ({ snapshot: JSON.stringify({ uploaded: false, receipt: 'LX-2D4F-8HTV', filePath,
+    message: '这次没能送出去。诊断包已存在本机。' }) }))
+  const x = await mountSettings({}, { run: async ({ software }: { software: DiagnosticSoftware }) => ({ snapshot: diagnosticSnapshot(software) }), report })
+  const text = () => x.text().join(' ')
+  for (const field of ['账号', '设备编号', '出口 IP', '代理', '设置恢复', '网络运行日志']) expect(text()).toContain(field)
+  expect(text()).toContain('点击')
+  expect(report).not.toHaveBeenCalled()
+
+  x.root.all().find((node) => node.id === 'support-diagnostic-software')!.value = 'codex'
+  x.find('一键诊断').click(); await flush()
+  x.find('把本次情况报给来信').click(); await flush()
+  expect(report).toHaveBeenCalledWith({ id: 'DG-ABCDEF-123456' })
+  expect(text()).toContain(filePath)
+  expect(text()).toContain('没能送出去')
+  expect(text()).not.toContain('已上报，回执号 LX-2D4F-8HTV')
+})
+
+it('主动报障未上传且没有本地文件路径时，不把未保存说成已保存', async () => {
+  const x = await mountSettings({}, {
+    run: async ({ software }: { software: DiagnosticSoftware }) => ({ snapshot: diagnosticSnapshot(software) }),
+    report: async () => ({ snapshot: JSON.stringify({ uploaded: false, receipt: 'LX-2D4F-8HTV', message: '诊断包已存在本机。' }) })
+  })
+  x.root.all().find((node) => node.id === 'support-diagnostic-software')!.value = 'codex'
+  x.find('一键诊断').click(); await flush()
+  x.find('把本次情况报给来信').click(); await flush()
+  expect(x.text().join(' ')).toContain('未能送达')
+  expect(x.text().join(' ')).not.toContain('已存在本机')
+})
 
 it('全局诊断先选软件，界面、复制和上报共用同一快照；换软件立即作废旧结果', async () => {
   const run = vi.fn(async ({ software }: { software: DiagnosticSoftware }) => ({ snapshot: diagnosticSnapshot(software) }))
@@ -161,6 +220,66 @@ it('下载进行中「检查更新」仍保持禁用，⛔ 被恢复逻辑放开
   await flush()
 
   expect(check.disabled).toBe(true)
+})
+
+it('下载状态缺少版本号时只显示进度，不打开无效更新窗口', async () => {
+  const downloading: UpdateView = { state: 'downloading', version: '', notes: '', progress: 12, message: '正在下载新版' }
+  const x = await mountSettings({ status: async () => ({ preferences: { zoom: 1, quotaNotifications: true, autoUpdate: true },
+    backgroundAvailable: true, alerts: [], update: downloading }) })
+
+  expect(x.text()).toContain('正在下载新版 12%')
+  expect(x.find('检查更新').disabled).toBe(true)
+  expect(x.body.all().some((node) => node.tag === 'dialog')).toBe(false)
+})
+
+it('已装当前版的更新故障显示诊断，不弹出无法执行的重新下载按钮', async () => {
+  const failed: UpdateView = { state: 'error', version: '0.4.9', notes: '', progress: 0, retryDownload: false,
+    message: '当前版本已启动，但更新后的网络恢复未能确认；请复制诊断给客服。' }
+  const x = await mountSettings({ status: async () => ({ preferences: { zoom: 1, quotaNotifications: true, autoUpdate: true },
+    backgroundAvailable: true, alerts: [], update: failed }) })
+  expect(x.text()).toContain(failed.message)
+  expect(x.body.all().some((node) => node.textContent === '更新需要处理')).toBe(true)
+  expect(x.body.all().some((node) => node.textContent === '知道了')).toBe(true)
+  expect(x.findDialog('重新下载').hidden).toBe(true)
+  expect(x.findDialog('重新下载').disabled).toBe(true)
+})
+
+it('版本信息单独读取失败仍能重试已核对的新版本更新', async () => {
+  const failed: UpdateView = { state: 'error', version: '0.5.0', notes: '', progress: 0,
+    retryDownload: true, message: '上一次更新未完成，请重新下载。' }
+  const retry = vi.fn(async () => ({ ...failed, state: 'ready' as const }))
+  const x = await mountSettings({ status: async () => ({ preferences: { zoom: 1, quotaNotifications: true, autoUpdate: true },
+    backgroundAvailable: true, alerts: [], update: failed }), downloadUpdate: retry }, {},
+  async () => { throw new Error('info unavailable') })
+  expect(x.text()).toContain(failed.message)
+  expect(x.findDialog('重新下载')).toBeDefined()
+  x.findDialog('重新下载').click()
+  await flush()
+  expect(retry).toHaveBeenCalledOnce()
+})
+
+it('已关闭同版本更新提示后，新发生的失败仍会弹出处理说明', async () => {
+  vi.useFakeTimers()
+  const available: UpdateView = { state: 'available', version: '0.5.0', notes: '', progress: 0, message: '发现新版' }
+  const failed: UpdateView = { ...available, state: 'error', retryDownload: false, message: '更新后的网络恢复未确认。' }
+  let updateView = available
+  const x = await mountSettings({ status: async () => ({ preferences: { zoom: 1, quotaNotifications: true, autoUpdate: true },
+    backgroundAvailable: true, alerts: [], update: updateView }) })
+  const initial = x.body.all().find((node) => node.tag === 'dialog' && node.open)!
+  expect(initial.querySelector('.update-dialog-title')?.textContent).toBe('发现新版本')
+  x.findDialog('稍后更新').click()
+  expect(initial.open).toBe(false)
+  updateView = { ...available, state: 'ready', message: '新版已准备好。' }
+  await vi.advanceTimersByTimeAsync(20_000)
+  await flush()
+  expect(x.body.all().some((node) => node.tag === 'dialog' && node.open)).toBe(false)
+  updateView = failed
+  await vi.advanceTimersByTimeAsync(20_000)
+  await flush()
+  vi.useRealTimers()
+  const opened = x.body.all().find((node) => node.tag === 'dialog' && node.open)
+  expect(opened?.querySelector('.update-dialog-title')?.textContent).toBe('更新需要处理')
+  expect(opened?.querySelector('.update-dialog-primary')?.hidden).toBe(true)
 })
 
 // 常驻开关（0.5.0）：它的价值全在「意外退出也不断网」，所以渲染层三条要钉住——

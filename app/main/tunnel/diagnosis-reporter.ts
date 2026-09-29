@@ -2,8 +2,14 @@
 // 授权 ID/时间戳),⛔ IP、地址、进程名、配置内容、客户机器上的任何文本——自动回传必须比
 // 客户主动点的一键上报更窄。后台不可达时本地攒队列(上限 50 条、7 天),下次启动补传;
 // 判不出原因的失败在上游记 UNKNOWN+阶段,这里只管把给到的东西原样送出去。
-import { existsSync, readFileSync } from 'node:fs'
-import { writeFileAtomic } from './paths'
+import { randomBytes } from 'node:crypto'
+import { basename, dirname, join } from 'node:path'
+import {
+  existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync
+} from 'node:fs'
+import type { EncryptedQueueCodec } from './diagnostic-event-queue'
+import { KNOWN_FAILURE_CODES } from './failure-codes'
+import { DIAGNOSTIC_CLIENT_VERSION_PATTERN } from '../../diagnostic-event-types'
 
 export type DiagnosisStage = 'connect-start' | 'connect-run' | 'repair'
 
@@ -37,10 +43,13 @@ export interface DiagnosisReporterDeps {
   readonly version: () => string
   readonly now: () => number
   readonly queuePath: string
+  /** 不给即不落盘，绝不退回明文。生产由 Electron safeStorage 注入。 */
+  readonly queueCodec?: EncryptedQueueCodec
 }
 
 export const DIAGNOSIS_QUEUE_LIMIT = 50
 export const DIAGNOSIS_MAX_AGE_MS = 7 * 24 * 60 * 60_000
+const DIAGNOSIS_MAX_QUEUE_BYTES = 256 * 1024
 
 export class DiagnosisReporter {
   private flushing = false
@@ -49,7 +58,9 @@ export class DiagnosisReporter {
    * 从未发送就从盘上消失。链自身永不拒绝:一步失败不堵下一步。 */
   private queueTail: Promise<void> = Promise.resolve()
 
-  constructor(private readonly deps: DiagnosisReporterDeps) {}
+  constructor(private readonly deps: DiagnosisReporterDeps) {
+    this.cleanupLegacyPlaintextTemporaries()
+  }
 
   /** 失败终态入口。同步返回,发送与入队的异常一律就地吞掉——回传 ⛔ 影响连接动作本身。 */
   report(report: DiagnosisReport): void {
@@ -70,11 +81,14 @@ export class DiagnosisReporter {
   /** 启动/拿到会话后的补传。按序发,一条失败即停(通道不通时条条不通,⛔ 雪崩式重试);
    * 过期条目先丢。进行中重复调用直接让位。整个读-发-写回在串行链内,中途入队排在 flush 之后。 */
   async flushPending(): Promise<void> {
-    if (this.flushing || !this.deps.enabled()) return
+    if (this.flushing) return
     this.flushing = true
     try {
       await this.serialized(async () => {
-        const queue = this.readQueue().filter((entry) => this.deps.now() - entry.timestamp <= DIAGNOSIS_MAX_AGE_MS)
+        const stored = this.readQueue()
+        // 即使客户关了回传，也必须先把旧版明文授权 ID 迁移/清理。
+        if (!this.deps.enabled()) return
+        const queue = stored.filter((entry) => this.deps.now() - entry.timestamp <= DIAGNOSIS_MAX_AGE_MS)
         while (queue.length > 0) {
           const payload = queue[0]
           try {
@@ -110,21 +124,117 @@ export class DiagnosisReporter {
     this.writeQueue(queue.slice(-DIAGNOSIS_QUEUE_LIMIT))
   }
 
+  private cleanupLegacyPlaintextTemporaries(): void {
+    if (basename(this.deps.queuePath) !== 'diagnosis-pending.json') return
+    const directory = dirname(this.deps.queuePath)
+    let entries: string[]
+    try { entries = readdirSync(directory) }
+    catch { return }
+    for (const entry of entries) {
+      if (!/^diagnosis-pending\.json\.tmp-[a-f0-9]{8}$/.test(entry)) continue
+      const path = join(directory, entry)
+      try {
+        const info = lstatSync(path)
+        if (info.isFile() || info.isSymbolicLink()) unlinkSync(path)
+      } catch { /* 单个遗留项消失或无权处理时，不扩大清理范围。 */ }
+    }
+  }
+
   private readQueue(): DiagnosisPayload[] {
     if (!existsSync(this.deps.queuePath)) return []
     try {
-      const parsed: unknown = JSON.parse(readFileSync(this.deps.queuePath, 'utf8'))
-      if (!Array.isArray(parsed)) return []
-      return parsed.filter((entry): entry is DiagnosisPayload => {
+      const info = lstatSync(this.deps.queuePath)
+      if (info.isSymbolicLink()) { unlinkSync(this.deps.queuePath); return [] }
+      if (!info.isFile() || info.size <= 0) return []
+      // 专用队列超限时不可读入内存，也不能让旧明文授权 ID 永久留盘。
+      if (info.size > DIAGNOSIS_MAX_QUEUE_BYTES) { unlinkSync(this.deps.queuePath); return [] }
+      const bytes = readFileSync(this.deps.queuePath)
+      const plaintextCandidate = /^\s*\[/.test(bytes.toString('utf8'))
+      if (!this.deps.queueCodec) {
+        // 没有系统加密能力时绝不保留可识别的旧明文队列。
+        if (plaintextCandidate) unlinkSync(this.deps.queuePath)
+        return []
+      }
+      let raw: string
+      let legacyPlaintext = false
+      try {
+        raw = this.deps.queueCodec.decrypt(bytes)
+      } catch {
+        // 从旧版明文队列单向迁移：只接纳严格六字段，原始授权 ID 在重新加密前清空。
+        raw = bytes.toString('utf8')
+        legacyPlaintext = plaintextCandidate
+      }
+      let parsed: unknown
+      try { parsed = JSON.parse(raw) }
+      catch {
+        if (legacyPlaintext) unlinkSync(this.deps.queuePath)
+        return []
+      }
+      if (!Array.isArray(parsed) || parsed.length > DIAGNOSIS_QUEUE_LIMIT) {
+        if (legacyPlaintext) unlinkSync(this.deps.queuePath)
+        return []
+      }
+      const queue = parsed.filter((entry): entry is DiagnosisPayload => {
         const item = entry as Partial<DiagnosisPayload> | null
-        return item !== null && typeof item.code === 'string' && typeof item.stage === 'string' &&
-          typeof item.platform === 'string' && typeof item.clientVersion === 'string' &&
-          typeof item.authorizationId === 'string' && Number.isSafeInteger(item.timestamp)
+        return item !== null && Object.keys(item).sort().join(',') === 'authorizationId,clientVersion,code,platform,stage,timestamp' &&
+          typeof item.code === 'string' && item.code.length > 0 && item.code.length <= 80 &&
+          ['connect-start', 'connect-run', 'repair'].includes(item.stage as string) &&
+          ['macos', 'windows'].includes(item.platform as string) && typeof item.clientVersion === 'string' &&
+          DIAGNOSTIC_CLIENT_VERSION_PATTERN.test(item.clientVersion) &&
+          typeof item.authorizationId === 'string' && Number.isSafeInteger(item.timestamp) && Number(item.timestamp) >= 0
       })
+      if (queue.length !== parsed.length) {
+        if (legacyPlaintext) unlinkSync(this.deps.queuePath)
+        return []
+      }
+      const sanitized = queue.map((entry): DiagnosisPayload => ({
+        code: legacyPlaintext && !KNOWN_FAILURE_CODES.has(entry.code) ? 'UNKNOWN' : entry.code,
+        stage: entry.stage,
+        platform: entry.platform,
+        clientVersion: entry.clientVersion,
+        authorizationId: '',
+        timestamp: entry.timestamp
+      }))
+      if (legacyPlaintext || queue.some((entry) => entry.authorizationId !== '') ||
+          process.platform !== 'win32' && (info.mode & 0o077) !== 0) {
+        try { this.writeQueue(sanitized) }
+        catch {
+          // safeStorage 不可用时无法安全迁移；删掉旧明文，不让授权 ID 继续留盘。
+          if (legacyPlaintext) unlinkSync(this.deps.queuePath)
+          return []
+        }
+      }
+      return sanitized
     } catch { return [] }
   }
 
   private writeQueue(queue: readonly DiagnosisPayload[]): void {
-    writeFileAtomic(this.deps.queuePath, `${JSON.stringify(queue, null, '')}\n`)
+    if (!this.deps.queueCodec) return
+    const sanitized = queue.map((entry): DiagnosisPayload => ({
+      code: entry.code,
+      stage: entry.stage,
+      platform: entry.platform,
+      clientVersion: entry.clientVersion,
+      authorizationId: '',
+      timestamp: entry.timestamp
+    }))
+    const encrypted = this.deps.queueCodec.encrypt(`${JSON.stringify(sanitized)}\n`)
+    if (!Buffer.isBuffer(encrypted) || encrypted.length <= 0 || encrypted.length > DIAGNOSIS_MAX_QUEUE_BYTES) {
+      throw new Error('DIAGNOSIS_STORAGE_UNAVAILABLE')
+    }
+    mkdirSync(dirname(this.deps.queuePath), { recursive: true, mode: 0o700 })
+    const temporary = `${this.deps.queuePath}.tmp-${randomBytes(4).toString('hex')}`
+    let created = false
+    let renamed = false
+    try {
+      writeFileSync(temporary, encrypted, { flag: 'wx', mode: 0o600 })
+      created = true
+      renameSync(temporary, this.deps.queuePath)
+      renamed = true
+    } finally {
+      if (created && !renamed) {
+        try { unlinkSync(temporary) } catch { /* 写入前失败或已被清理。 */ }
+      }
+    }
   }
 }

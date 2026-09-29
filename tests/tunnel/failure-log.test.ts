@@ -77,7 +77,7 @@ describe('监管器的失败留痕(UNKNOWN 归因的第一现场)', () => {
   })
 
   it('叫醒被拒/三轮耗尽:每次拒有 wake-miss,耗尽有 wake-exhausted,放弃位有代理恢复随行', async () => {
-    const resident: ResidentBridge = { armed: () => true, alive: () => false, wake: async () => false }
+    const resident: ResidentBridge = { armed: () => true, alive: () => false, seatRunId: () => undefined, wake: async () => false }
     const h = harness(resident)
     h.supervisor.ensureRunning()
     await settle()
@@ -89,7 +89,7 @@ describe('监管器的失败留痕(UNKNOWN 归因的第一现场)', () => {
 
   it('恢复子进程超时被杀:留痕 restore-failed 带码(处置有据,⛔ 只剩界面一句话)', async () => {
     // 走生产同一链条触发恢复:叫醒三轮耗尽 → 放弃位 → surrenderAndRestore 派恢复子进程 → deadline 杀。
-    const resident: ResidentBridge = { armed: () => true, alive: () => false, wake: async () => false }
+    const resident: ResidentBridge = { armed: () => true, alive: () => false, seatRunId: () => undefined, wake: async () => false }
     const h = harness(resident)
     h.supervisor.ensureRunning()
     await settle()

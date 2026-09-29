@@ -87,9 +87,21 @@ export function withWriteRight(adapter, fn, log = () => undefined, options = {})
     log(`系统代理写入权不在本进程(${outcome?.reason ?? 'unavailable'},等待 ${String(requested)} ms):本次不改动系统设置`)
     return { ok: false, reason: outcome?.reason ?? 'unavailable' }
   }
-  try { return { ok: true, value: fn() } } finally {
-    try { outcome.release() } catch { /* 内核已回收 */ }
+  const release = () => {
+    let released = false
+    try { released = outcome.release() !== false } catch { /* 保守视为未确认 */ }
+    if (!released) {
+      try { outcome.deferRelease?.() } catch { /* adapter 仍保留 fail-closed 状态 */ }
+      log('系统代理写入权暂未确认交还；已保留待处理状态，下次写入前先重试')
+    }
+    return released
   }
+  let value
+  try { value = fn() } catch (error) {
+    release()
+    throw error
+  }
+  return release() ? { ok: true, value } : { ok: false, reason: 'release-incomplete' }
 }
 
 /**

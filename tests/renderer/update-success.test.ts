@@ -73,4 +73,14 @@ describe('更新成功弹窗', () => {
     show({ version: '', previous: '', notes: '' })
     expect(body.children).toHaveLength(1)
   })
+
+  it('只有用户关闭最终成功窗口才确认已读，崩溃前未关闭可在下次启动补显', async () => {
+    const body = boot()
+    const show = await load()
+    const dismissed = vi.fn()
+    show(notice, dismissed)
+    expect(dismissed).not.toHaveBeenCalled()
+    body.children[0].all().find((node) => node.textContent === '我知道了')!.click()
+    expect(dismissed).toHaveBeenCalledTimes(1)
+  })
 })

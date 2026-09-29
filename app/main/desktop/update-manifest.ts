@@ -5,8 +5,9 @@ export interface UpdateRelease { version: string; notes: string; assets: Record<
 
 export function newerVersion(candidate: string, installed: string): boolean {
   const parse = (value: string): number[] | undefined => {
-    const match = /^(\d+)\.(\d+)\.(\d+)(?:-unified\.(\d+))?$/.exec(value)
-    return match ? match.slice(1).map((part) => part === undefined ? Number.MAX_SAFE_INTEGER : Number(part)) : undefined
+    const match = /^(\d+)\.(\d+)\.(\d+)(?:-(unified|test)\.(\d+))?$/.exec(value)
+    return match ? [Number(match[1]), Number(match[2]), Number(match[3]),
+      match[4] === undefined ? 2 : match[4] === 'unified' ? 1 : 0, Number(match[5] ?? 0)] : undefined
   }
   const next = parse(candidate), current = parse(installed)
   if (!next || !current || [...next, ...current].some((part) => !Number.isSafeInteger(part))) return false

@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createDaemon as macDaemon, RECONNECT_BACKOFF_MS } from '../../sidecar/mac/daemon-core.mjs'
 import { createDaemon as winDaemon } from '../../sidecar/win/daemon-core.mjs'
 import { CONTROL_CODES, ConnectorError } from '../../sidecar/mac/connectors.mjs'
+import { SettingsBusyError as MacSettingsBusyError } from '../../sidecar/mac/ledger.mjs'
+import { SettingsBusyError as WinSettingsBusyError } from '../../sidecar/win/ledger.mjs'
 import { verifyWithFallback, verifyThroughProxy } from '../../sidecar/mac/vless-connector.mjs'
 import { buildXrayConfig } from '../../sidecar/mac/local-bridge.mjs'
 import { validVerifyFallbackUrl } from '../../sidecar/mac/vless-settings.mjs'
@@ -11,7 +13,8 @@ const dirs: string[] = []
 afterEach(() => { dirs.splice(0).forEach(removeTempDir) })
 
 describe.each([['macOS', macDaemon], ['Windows', winDaemon]] as const)('%s bounded recovery', (_platform, createDaemon) => {
-  function harness(random = 0) {
+  const SettingsBusy = _platform === 'macOS' ? MacSettingsBusyError : WinSettingsBusyError
+  function harness(random = 0, reachability?: () => Promise<{ url: string }>) {
     const dir = makeTempDir('bounded-recovery-'); dirs.push(dir)
     const clock = new FakeClock()
     const intent = { desired: 'connected', sessionToken: 'one', bridgePort: 18080,
@@ -19,18 +22,24 @@ describe.each([['macOS', macDaemon], ['Windows', winDaemon]] as const)('%s bound
       connector: { kind: 'loopback-probe', host: '127.0.0.1', port: 1, exitIp: '203.0.113.1' } }
     writeIntentFile(dir, intent)
     let value: unknown = null
+    let pathId = 'network-path:one'
     let offline = false
     const start = vi.fn(async () => { if (offline) throw new Error('offline') })
     const stop = vi.fn(async () => {})
     const verify = vi.fn(async () => ({ exitIp: '203.0.113.1' }))
+    const write = vi.fn((_ref: unknown, next: unknown) => { value = next })
     const daemon = createDaemon({ dataDir: dir, clock, random: () => random, parentAlive: () => true, onExit: () => {},
-      adapter: { managedItems: () => [{ ref: { service: 'test', item: 'proxy' }, value: true }], read: () => value, write: (_ref, next) => { value = next } },
+      adapter: { managedItems: () => [{ ref: { service: 'test', item: 'proxy' }, value: true }], read: () => value,
+        write, reapplyOnChange: () => true, currentPathIdentity: () => ({ id: pathId, kind: 'fake-network-path' }) },
       connectorFactory: () => ({ kind: 'loopback-probe', start, stop, verify, onLost: () => {}, localProxyPort: () => 1 }),
-      bridgeFactory: () => ({ listen: () => {}, close: () => {} }) })
+      bridgeFactory: () => ({ listen: () => {}, close: () => {}, ...(reachability ? { probeReachability: reachability } : {}) }) })
     const advance = async (ms: number) => { clock.advance(ms); await flushMicrotasks() }
-    return { dir, clock, daemon, start, stop, verify, intent, advance, value: () => value,
+    return { dir, clock, daemon, start, stop, verify, write, intent, advance, value: () => value,
       offline: () => { offline = true }, online: () => { offline = false },
-      state: () => readJsonFile<{ state: string; code: string; lastVerifiedAt?: number }>(`${dir}/state.json`) }
+      setValue: (next: unknown) => { value = next },
+      setPath: (next: string) => { pathId = next },
+      state: () => readJsonFile<{ state: string; code: string; lastVerifiedAt?: number;
+        availability?: { status: string; code?: string } }>(`${dir}/state.json`) }
   }
 
   it('jitter stays bounded; five fast failures fall back to one same-node attempt per 60–75 seconds', async () => {
@@ -77,6 +86,21 @@ describe.each([['macOS', macDaemon], ['Windows', winDaemon]] as const)('%s bound
     h.daemon.requestShutdown(); await flushMicrotasks()
   })
 
+  it('echo endpoint stays unavailable but the tunnel is reachable: repeated checks do not flash unconfirmed', async () => {
+    const reachability = vi.fn(async () => ({ url: 'https://probe.example/generate_204' }))
+    const h = harness(0, reachability)
+    await h.daemon.run()
+    h.verify.mockRejectedValue(new ConnectorError(CONTROL_CODES.probeUnavailable))
+    for (let index = 0; index < 4; index += 1) {
+      await h.advance(30_000)
+      expect(h.state()).toMatchObject({ state: 'connected', code: '' })
+    }
+    expect(reachability).toHaveBeenCalledTimes(4)
+    expect(h.start).toHaveBeenCalledTimes(1)
+    expect(h.stop).not.toHaveBeenCalled()
+    h.daemon.requestShutdown(); await flushMicrotasks()
+  })
+
   it('an echo HTTP failure remains explicitly degraded; unknown transport twice starts recovery', async () => {
     const h = harness(); await h.daemon.run()
     h.verify.mockRejectedValue(new ConnectorError(CONTROL_CODES.probeUnavailable))
@@ -96,9 +120,103 @@ describe.each([['macOS', macDaemon], ['Windows', winDaemon]] as const)('%s bound
     await h.advance(30_000)
     writeIntentFile(h.dir, { desired: 'user-disconnected' }); await h.advance(500)
     await h.advance(1_000)
-    expect(h.verify).toHaveBeenCalledTimes(2); expect(h.value()).toBeNull()
+    // N-55:首次接管在写后再实测一次目标；随后断开仍必须取消短确认，不得多出第四次探测。
+    expect(h.verify).toHaveBeenCalledTimes(3); expect(h.value()).toBeNull()
     h.daemon.requestShutdown(); await flushMicrotasks()
   })
+
+  it('写后目标复验失败不能停在接管中或宣布已连接', async () => {
+    const h = harness()
+    h.verify.mockResolvedValueOnce({ exitIp: '203.0.113.1' }).mockRejectedValueOnce(new Error('target unreachable'))
+    await h.daemon.run()
+    expect(h.verify).toHaveBeenCalledTimes(2)
+    expect(h.state()).toMatchObject({ state: 'error', availability: { status: 'recovered', code: 'TUNNEL_AVAILABILITY_TARGET_UNREACHABLE' } })
+    expect(h.state().state).not.toBe('connected')
+    h.daemon.requestShutdown(); await flushMicrotasks()
+  })
+
+  it('目标复验在途被外部改写后必须重新读取，不能用旧读回宣布已连接', async () => {
+    const h = harness()
+    h.verify.mockResolvedValueOnce({ exitIp: '203.0.113.1' }).mockImplementationOnce(async () => {
+      h.setValue('external-proxy-value')
+      return { exitIp: '203.0.113.1' }
+    })
+    await h.daemon.run()
+    expect(h.verify).toHaveBeenCalledTimes(2)
+    expect(h.state().state).toBe('error')
+    expect(h.state().state).not.toBe('connected')
+    expect(h.value()).toBe('external-proxy-value')
+    h.daemon.requestShutdown(); await flushMicrotasks()
+  })
+
+  it('目标复验在途活动路径变更会使旧路径证据失效，不能宣布已连接', async () => {
+    const h = harness()
+    h.verify.mockResolvedValueOnce({ exitIp: '203.0.113.1' }).mockImplementationOnce(async () => {
+      h.setPath('network-path:two')
+      return { exitIp: '203.0.113.1' }
+    })
+    await h.daemon.run()
+    expect(h.verify).toHaveBeenCalledTimes(2)
+    expect(h.state()).toMatchObject({ state: 'error', availability: { code: 'TUNNEL_AVAILABILITY_EVIDENCE_CHANGED' } })
+    expect(h.state().state).not.toBe('connected')
+    h.daemon.requestShutdown(); await flushMicrotasks()
+  })
+
+  it('夺回已写入但目标复验不可用时也消耗本轮预算，外部反复改写不能无限抢写', async () => {
+    const h = harness()
+    await h.daemon.run()
+    const writesBeforeReclaims = h.write.mock.calls.length
+    h.verify.mockRejectedValue(new ConnectorError(CONTROL_CODES.probeUnavailable))
+    for (const external of ['external-1', 'external-2', 'external-3']) {
+      h.setValue(external)
+      await h.advance(30_000)
+      await h.advance(1_000)
+    }
+    expect(h.write).toHaveBeenCalledTimes(writesBeforeReclaims + 3)
+    h.setValue('external-4')
+    await h.advance(30_000)
+    expect(h.write).toHaveBeenCalledTimes(writesBeforeReclaims + 3)
+    expect(h.state().state).toBe('error')
+    h.daemon.requestShutdown(); await flushMicrotasks()
+  })
+
+  it('夺回写入失败标记 WRITE_FAILED，不把未发生的目标复验报成不可达', async () => {
+    const h = harness()
+    await h.daemon.run()
+    const probesBefore = h.verify.mock.calls.length
+    h.write.mockImplementationOnce(() => { throw new Error('write denied') })
+    h.setValue('external-value')
+    await h.advance(30_000)
+    expect(h.verify).toHaveBeenCalledTimes(probesBefore)
+    expect(h.value()).toBe('external-value')
+    expect(h.state()).toMatchObject({ availability: { status: 'limited', code: 'TUNNEL_AVAILABILITY_WRITE_FAILED' } })
+    h.daemon.requestShutdown(); await flushMicrotasks()
+  })
+
+  it('夺回写入后设置锁暂忙时保留当前租约并顺延，不误报目标不可达', async () => {
+    const h = harness()
+    await h.daemon.run()
+    const daemonWithSettings = h.daemon as unknown as { verifySettings(repair?: boolean, options?: Record<string, unknown>): unknown }
+    const originalVerifySettings = daemonWithSettings.verifySettings.bind(daemonWithSettings)
+    let normalReadbacks = 0
+    vi.spyOn(daemonWithSettings, 'verifySettings').mockImplementation((repair = false, options = {}) => {
+      if (!repair && normalReadbacks++ === 0) throw new SettingsBusy('test-holder')
+      return originalVerifySettings(repair, options)
+    })
+    h.setValue('external-value')
+    const writesBefore = h.write.mock.calls.length
+    await h.advance(30_000)
+    const internal = h.daemon as unknown as { availabilityReclaimOperation?: { action: string; lease?: { id: string } } }
+    expect(h.write).toHaveBeenCalledTimes(writesBefore + 1)
+    expect(normalReadbacks).toBe(1)
+    expect(internal.availabilityReclaimOperation).toMatchObject({ action: 'reclaim', lease: { id: expect.any(String) } })
+    expect(h.state()).toMatchObject({ state: 'connected', availability: { status: 'reclaiming' } })
+    await h.advance(2_000)
+    expect(internal.availabilityReclaimOperation).toBeUndefined()
+    expect(h.state()).toMatchObject({ state: 'connected', availability: { status: 'connected' } })
+    h.daemon.requestShutdown(); await flushMicrotasks()
+  })
+
   it('a late confirmation success after disconnect cannot restore connected status', async () => {
     const h = harness(); await h.daemon.run()
     let finish!: (result: { exitIp: string }) => void

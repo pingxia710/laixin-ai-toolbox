@@ -38,6 +38,12 @@ describe('菜单栏 AI网络控制', () => {
     })
   })
 
+  it('断开在途只显示状态页，不给恢复或重复断开动作', () => {
+    expect(trayNetworkPresentation({ state: '断开中', currentConfig: '版本 2', unrestored: '' }, false)).toEqual({
+      statusLabel: 'AI网络 · 断开中', action: 'show', actionLabel: '查看 AI网络状态', actionEnabled: true
+    })
+  })
+
   it('动作执行中禁用重复操作，无法读到状态时不猜测连接状态', () => {
     expect(trayNetworkPresentation({ state: '已连', currentConfig: '版本 2', unrestored: '' }, true)).toMatchObject({
       action: 'stop', actionEnabled: false

@@ -77,7 +77,9 @@ let legacyRelease
 if (legacyOrigin && legacyOrigin.href !== origin.href) {
   await mkdir(legacyOutput, { recursive: true })
   legacyRelease = { version: metadata.version, notes,
-    assets: buildReleaseAssets(assetFiles, { origin: legacyOrigin, mirrorOrigin: legacyMirrorOrigin, githubRepository, version: metadata.version }) }
+    // 旧桥仍服务 0.5.15 客户端；它会先尝试 mirrors，国内客户会在 GitHub 上白等超时。
+    // 0.5.16 发布时已人工省略，这里固化为生成器默认行为。
+    assets: buildReleaseAssets(assetFiles, { origin: legacyOrigin, mirrorOrigin: legacyMirrorOrigin, githubRepository: undefined, version: metadata.version }) }
   await writeFile(join(legacyOutput, 'latest.json'), signedManifest(legacyRelease, privateKey))
 }
 console.log(JSON.stringify({ version: release.version, output, legacyOutput: legacyRelease ? legacyOutput : undefined, published: false,

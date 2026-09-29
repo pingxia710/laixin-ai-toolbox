@@ -14,7 +14,7 @@ class Element {
   all(): Element[] { return [this, ...this.children.flatMap((child) => child.all())] }
 }
 
-const terms = { plans: [], toolbox: { id: 'toolbox', priceCents: 1990, subject: '来信 AI 工具箱' }, trial: { bytes: 5 * 1024 ** 3, hours: 48, perAccount: 1 }, deviceLimit: 3 }
+const terms = { plans: [], toolbox: { id: 'toolbox', priceCents: 1990, subject: '来信 AI 工具箱' }, trial: { bytes: 5 * 1024 ** 3, hours: 48, perAccount: 1 }, deviceLimit: 3, wechatLoginAvailable: true }
 const firstStep = buildNetworkOnboarding({ state: 'signed-out', account: null, overview: null, code: '', message: '', terms }, undefined)
 
 function setup(view = firstStep, busy = false) {
@@ -37,7 +37,7 @@ afterEach(() => vi.unstubAllGlobals())
 
 it('四个步骤都能点击查看，切换不会触发注册、领取或连接', () => {
   const ui = setup()
-  for (const [step, title] of [[2, '领取 5 GB 体验流量'], [3, '连接网络'], [4, '查看 Codex 下载与版本'], [1, '先注册账号']] as const) {
+  for (const [step, title] of [[2, '领取 5 GB 体验流量'], [3, '连接网络'], [4, '查看 Codex 下载与版本'], [1, '先注册或登录']] as const) {
     ui.select(step)
     expect(ui.root.all().find((node) => node.tag === 'h2')?.textContent).toBe(title)
     expect(ui.root.all().filter((node) => node.attributes.get('aria-pressed') === 'true').map((node) => node.dataset.onboardingStep)).toEqual([String(step)])
@@ -45,7 +45,7 @@ it('四个步骤都能点击查看，切换不会触发注册、领取或连接'
     expect(ui.run).not.toHaveBeenCalled()
   }
   ui.primary().click()
-  expect(ui.run).toHaveBeenCalledExactlyOnceWith('register')
+  expect(ui.run).toHaveBeenCalledExactlyOnceWith('account')
 })
 
 it('查看后续步骤显示对应步骤名称，并保留实际进度', () => {
@@ -55,7 +55,7 @@ it('查看后续步骤显示对应步骤名称，并保留实际进度', () => {
   expect(ui.root.all().find((node) => node.className === 'onboarding-step-label')?.textContent).toBe('第4步')
   expect(ui.primary()).toBeUndefined()
   ui.select(1)
-  expect(ui.root.all().find((node) => node.tag === 'h2')?.textContent).toBe('先注册账号')
+  expect(ui.root.all().find((node) => node.tag === 'h2')?.textContent).toBe('先注册或登录')
   expect(ui.run).not.toHaveBeenCalled()
 })
 

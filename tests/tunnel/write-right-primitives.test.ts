@@ -1,7 +1,7 @@
 // 写入权互斥体与端口认人的直接行为覆盖(审查点名:这两个新件原先只有接入处被间接覆盖)。
 import { describe, expect, it } from 'vitest'
 import { WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT, acquireWriteRight } from '../../sidecar/win/wininet-write-right.mjs'
-import { isLaixinExePath, isLaixinInstallDir, isLaixinXrayPath, parsePortOwner } from '../../sidecar/win/port-owner.mjs'
+import { identifyPortOwner, isLaixinExePath, isLaixinInstallDir, isLaixinXrayPath, parsePortOwner } from '../../sidecar/win/port-owner.mjs'
 
 function fakeApi(status: number, overrides: Record<string, unknown> = {}) {
   const calls = { released: 0, closed: 0 }
@@ -116,5 +116,34 @@ describe('端口认人', () => {
     for (const raw of ['', '   ', 'garbage', '|no-pid|path', '0|x|y', undefined]) {
       expect(parsePortOwner(raw as string)).toMatchObject({ kind: 'unknown' })
     }
+  })
+
+  it('查询成功确认无监听与查询失败必须有不同结果', () => {
+    expect(parsePortOwner('LAIXIN_NO_LISTENER')).toMatchObject({ kind: 'none' })
+    let query = ''
+    expect(identifyPortOwner(18080, { exec: (_command: string, args: string[]) => {
+      query = args.at(-1) ?? ''
+      return 'LAIXIN_NO_LISTENER'
+    } }))
+      .toMatchObject({ kind: 'none' })
+    expect(query).toContain('Get-NetTCPConnection -State Listen -ErrorAction Stop')
+    expect(query).not.toContain('SilentlyContinue')
+    expect(identifyPortOwner(18080, { exec: () => { throw new Error('查询失败') } }))
+      .toMatchObject({ kind: 'unknown' })
+  })
+
+  it('IPv6 专用监听不占 IPv4 入口，双栈或多 PID 仍不可猜归属', () => {
+    expect(parsePortOwner('LAIXIN_ADDRESS_AMBIGUOUS'))
+      .toMatchObject({ kind: 'unknown', reason: 'address-ambiguous' })
+    let query = ''
+    identifyPortOwner(18080, { exec: (_command: string, args: string[]) => {
+      query = args.at(-1) ?? ''
+      return 'LAIXIN_ADDRESS_AMBIGUOUS'
+    } })
+    expect(query).toContain('LocalAddress')
+    expect(query).toContain('127.0.0.1')
+    expect(query).toContain('0.0.0.0')
+    expect(query).toContain("if ($ipv4.Count -eq 0) { 'LAIXIN_NO_LISTENER'")
+    expect(query).toContain('LAIXIN_ADDRESS_AMBIGUOUS')
   })
 })

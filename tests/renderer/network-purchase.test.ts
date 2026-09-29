@@ -2,7 +2,7 @@ import { afterEach, expect, it, vi } from 'vitest'
 import type { AccountView, CommercialTerms } from '../../app/account-types'
 import type { NetworkUsageView } from '../../app/shared/network-usage-types'
 import { networkPlans } from '../../app/network-plans'
-import { mountAccountOverview } from '../../app/renderer/src/ui/account-overview'
+import { mountAccountOverview, mountTrafficSummary } from '../../app/renderer/src/ui/account-overview'
 import { requireAccount } from '../../app/renderer/src/account-state'
 import { openPaymentDialog } from '../../app/renderer/src/ui/payment-dialog'
 
@@ -47,10 +47,12 @@ it('套餐始终展示，购买按钮直接进入付款；没有申请步骤', (
   purchase[1].click(); expect(openPaymentDialog).toHaveBeenCalledWith(networkPlans[1], 'alipay')
 })
 
-it('存在旧待付款选择时，原套餐可继续付款，其他套餐仍可直接购买', () => {
+it('存在旧待付款记录时，所有购买按钮仍新建本次付款', () => {
   const nodes = render('signed-in', pending)
-  nodes.find((node) => node.textContent === '支付宝继续付款')!.click()
-  nodes.filter((node) => node.textContent === '支付宝购买')[0].click()
+  const purchase = nodes.filter((node) => node.textContent === '支付宝购买')
+  expect(purchase).toHaveLength(4)
+  purchase[0].click()
+  purchase[1].click()
   expect(openPaymentDialog).toHaveBeenNthCalledWith(1, networkPlans[0], 'alipay')
   expect(openPaymentDialog).toHaveBeenNthCalledWith(2, networkPlans[1], 'alipay')
   expect(nodes.some((node) => node.textContent === '等待开通')).toBe(false)
@@ -73,11 +75,12 @@ it('登录前后保留两张权益卡与相同流量字段；未登录不捏造�
   }
 })
 
-it.each(['active', 'unknown', 'provisioning'] as const)('套餐 %s 时仍展示全部套餐，但不允许重复购买', (state) => {
+it.each(['active', 'unknown', 'provisioning'] as const)('套餐 %s 时仍可购买新套餐', (state) => {
   const nodes = render('signed-in', { ...pending, state })
   const buttons = nodes.filter((node) => node.tag === 'button')
-  expect(buttons).toHaveLength(4); expect(buttons.every((button) => button.disabled)).toBe(true)
-  buttons.forEach((button) => button.click()); expect(openPaymentDialog).not.toHaveBeenCalled()
+  expect(buttons).toHaveLength(4); expect(buttons.every((button) => !button.disabled)).toBe(true)
+  buttons[1].click()
+  expect(openPaymentDialog).toHaveBeenCalledExactlyOnceWith(networkPlans[1], 'alipay')
 })
 
 it('付款渠道不可用时给出明确状态，不退回提交申请', () => {
@@ -88,10 +91,39 @@ it('付款渠道不可用时给出明确状态，不退回提交申请', () => {
 
 it('正常开通过的体验到期后不误报开通失败', () => {
   const nodes = render('signed-in', null, true, { available: false, retryable: false, usage: {
-    ...pending, kind: 'trial', planId: 'trial-5g', state: 'expired', expiresAt: 1_800_000_000_000, reasonCode: 'NETWORK_AUTHORIZATION_EXPIRED'
+    ...pending, kind: 'trial', planId: 'trial-5g', totalBytes: 5 * 1024 ** 3, state: 'expired', expiresAt: 1_800_000_000_000, reasonCode: 'NETWORK_AUTHORIZATION_EXPIRED'
   } })
   expect(nodes.some((node) => node.textContent === '体验流量 · 已到期')).toBe(true)
   expect(nodes.some((node) => node.textContent.includes('体验仍未开通成功'))).toBe(false)
+  const trial = nodes.filter((node) => node.className === 'account-usage-card')[0].all()
+  expect(trial.filter((node) => node.tag === 'dd').map((node) => node.textContent).slice(0, 3)).toEqual(['5.00 GB', '—', '已到期'])
+  expect(trial.some((node) => node.textContent.includes('暂时无法获取'))).toBe(false)
+  expect(trial.some((node) => node.textContent.includes('剩余额度已失效'))).toBe(true)
+})
+
+it('到期仍带用量记录时不把旧剩余当作可用，也不伪造已用值', () => {
+  const nodes = render('signed-in', null, true, { available: false, usage: {
+    ...pending, kind: 'trial', totalBytes: 5 * 1024 ** 3, state: 'expired', measurement: 'current', usedBytes: 1024 ** 3, remainingBytes: 4 * 1024 ** 3
+  } })
+  const trial = nodes.filter((node) => node.className === 'account-usage-card')[0].all()
+  expect(trial.filter((node) => node.tag === 'dd').map((node) => node.textContent).slice(0, 3)).toEqual(['5.00 GB', '1.00 GB', '已到期'])
+  expect(trial.some((node) => node.tag === 'meter')).toBe(false)
+})
+
+it('首页到期体验显示已到期且不画旧用量条，有效付费套餐照常显示实测用量', () => {
+  vi.stubGlobal('document', { createElement: (tag: string) => new Element(tag) })
+  const root = new Element('main')
+  const view: AccountView = { state: 'signed-in', code: '', message: '', terms,
+    account: { id: 'local-fixture', username: 'local-fixture' },
+    overview: { trial: { available: false, usage: { ...pending, kind: 'trial', state: 'expired', measurement: 'current', usedBytes: 1024 ** 3, remainingBytes: 4 * 1024 ** 3 } },
+      subscription: { ...pending, state: 'active', measurement: 'current', usedBytes: 1024 ** 3, remainingBytes: 19 * 1024 ** 3 },
+      recoveryReady: true, plans: [...networkPlans], networkAvailable: true, paymentChannels: [] } }
+  mountTrafficSummary(root as unknown as HTMLElement, view)
+  const sections = root.all().filter(node => node.className === 'traffic-summary')
+  expect(sections[0].all().filter(node => node.tag === 'strong').map(node => node.textContent)).toEqual(['已到期'])
+  expect(sections[0].all().some(node => node.tag === 'meter')).toBe(false)
+  expect(sections[1].all().some(node => node.textContent === '剩余 19.00 GB')).toBe(true)
+  expect(sections[1].all().some(node => node.tag === 'meter')).toBe(true)
 })
 
 it('确实未开通成功的过期体验仍保留客服核对提示', () => {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { parseCodexTomlDocument } from '../../app/main/ai-access/codex-toml-document'
+import { codexToolboxConnectionBlock, parseCodexTomlDocument } from '../../app/main/ai-access/codex-toml-document'
 
 const replacement = `# >>> Laixin AI Toolbox managed model connection >>>
 # Provider: deepseek
@@ -76,5 +76,10 @@ experimental_bearer_token = "external-token"
     expect(() => document.removeToolboxConnection()).toThrow('AI_ACCESS_CONFIG_UNMANAGED')
     expect(() => document.replaceToolboxConnection(replacement)).toThrow('AI_ACCESS_CONFIG_UNMANAGED')
     expect(external).toContain('cc-switch.example')
+  })
+
+  it('只为语义确属工具箱的标记块保留进程内恢复快照', () => {
+    expect(codexToolboxConnectionBlock(replacement)).toBe(replacement)
+    expect(() => codexToolboxConnectionBlock('# >>> Laixin AI Toolbox managed model connection >>>\nmodel_provider = "cc-switch"\n# <<< Laixin AI Toolbox managed model connection <<<\n')).toThrow('AI_ACCESS_CONFIG_UNMANAGED')
   })
 })

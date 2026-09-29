@@ -8,11 +8,13 @@ import { fileURLToPath } from 'node:url'
 
 const script = readFileSync(fileURLToPath(new URL('../../resources/update-helper.ps1', import.meta.url)))
 const source = script.toString('utf8').replace(/^\uFEFF/, '')
+const preflightHelper = readFileSync(fileURLToPath(new URL('../../resources/update-helper.cjs', import.meta.url)), 'utf8')
 
 describe('Windows 更新回滚与 NSIS 整目录替换对称(审计 A3)', () => {
   it('脚本仍是 UTF-8 BOM + CRLF:Windows PowerShell 5.1 据此解码中文提示', () => {
     expect(script.subarray(0, 3)).toEqual(Buffer.from([0xef, 0xbb, 0xbf]))
     expect(source.includes('\r\n')).toBe(true)
+    expect(source.replace(/\r\n/g, '')).not.toContain('\n')
   })
 
   it('覆盖前备份的是整个安装目录,⛔ 只备份 app.asar', () => {
@@ -31,7 +33,7 @@ describe('Windows 更新回滚与 NSIS 整目录替换对称(审计 A3)', () => 
 
   it('校验失败的包 ⛔ 启动:只有整目录还原成功才拉起旧版,混合态不拉起', () => {
     expect(source).toContain('if ($restored) {')
-    expect(source).toContain('if (-not $backupReady -or $restored) {')
+    expect(source).toContain('if (-not $installerStarted -or $restored) {')
     expect(source).not.toContain('if ($null -eq $backup -or $restored) {')
   })
 })
@@ -56,6 +58,17 @@ describe('第 4 条 · 回退备份必须活到新版启动回执之后', () => 
     expect(lineOf(DROP_BACKUP)).toBeGreaterThan(lineOf(ACK_MATCH))
   })
 
+  it('持久提交后先写最终结果再删备份；结果写失败不得谎称提交未确认或备份已删', () => {
+    const commit = lineOf('Invoke-WindowsPreflightCommit $preflightTransaction')
+    const committed = lineOf('$preflightCommitted = $true')
+    const complete = lineOf("Write-Result 'complete'")
+    expect(committed).toBeGreaterThan(commit)
+    expect(complete).toBeGreaterThan(committed)
+    expect(lineOf(DROP_BACKUP)).toBeGreaterThan(complete)
+    const catchAt = source.indexOf('} catch {', source.indexOf("Write-Result 'complete'"))
+    expect(source.slice(catchAt)).toMatch(/if \(\$preflightCommitted\)[\s\S]+网络恢复已提交[\s\S]+exit 1/)
+  })
+
   it('无回执/启动失败:走异常分支保住备份,⛔ 写完提示就当无事发生', () => {
     expect(source).toContain('UPDATE_STARTUP_UNCONFIRMED')
     // 超时那条提示必须出现在删备份之前的位置上被跳过——即它不再是 try 块的正常收尾
@@ -67,69 +80,62 @@ describe('第 4 条 · 回退备份必须活到新版启动回执之后', () => 
   })
 })
 
-// 2026-09-15 客户实测:连着 AI 网络点「更新并重启」,重启回来还是旧版;Mac 同流程正常。
-// 根因:mac 侧助手换 bundle 前有 handOffResident(bootout 等守护真停),Windows 的 ps1 没有——
-// 主进程退出只等守护 4 秒,守护停内核/还原代理/自禁任务常常超过 4 秒;助手在守护(主程序当 node
-// 跑)和 xray.exe 还活着时 NSIS 覆盖被占用的文件,失败后整目录还原 = 「点了更新又换回旧版」。
-// 修复:换文件前先禁常驻任务(每 1 分钟重入,⛔ 让它在换文件窗口里把守护拉回来),再给守护自然
-// 收尾的宽限,到点还在才强杀。本机无 Windows/pwsh:照审计 A3 的源码契约做法,把步骤与顺序钉在仓内。
-describe('Windows 换文件前先停常驻与隧道进程(与 mac handOffResident 对称)', () => {
+// Windows 原生命令不能靠「命令发出去了」当成功。任务变更/删除后必须回读；进程只允许按
+// 当前安装目录的精确可执行路径停止。真正行为由 windows-update-preflight.test.ts 的假原生命令覆盖，
+// 这里钉住 PowerShell 真实入口与可测试 helper 的连接，防止绕过安全闸直接写安装目录。
+describe('Windows 换文件前置闸入口合同', () => {
   const lines = source.split(/\r?\n/)
   const lineOf = (needle: string) => lines.findIndex((line) => line.includes(needle))
-  const DISABLE = '/change /tn $task /disable'
-  const ENUM = 'Get-CimInstance Win32_Process'
-  const KILL = 'Stop-Process -Id $process.ProcessId -Force'
+  const PREFLIGHT = '$preflightTransaction = Invoke-WindowsPreflight'
   const BACKUP = 'Copy-Item -LiteralPath $job.target -Destination $backup -Recurse -Force'
+  const preflightInvocation = () => lines.findIndex((line, index) => index > lineOf(BACKUP) && line.trim() === PREFLIGHT)
 
-  it('先禁常驻任务,且新旧两个任务名(\\Laixin\\<label> 与根路径)都禁', () => {
-    expect(lineOf(DISABLE)).toBeGreaterThan(0)
-    expect(source).toContain("'\\Laixin\\' + $label")
-    // 根路径旧任务名(RESIDENT_TASK_LEGACY)也要禁,否则老机器上的残账照旧重入
-    expect(lineOf('$label, $label')).toBeGreaterThan(0)
+  it('PowerShell 先校验并完整备份，再调用 helper；超时和非零退出码都失败', () => {
+    expect(preflightInvocation()).toBeGreaterThan(lineOf(BACKUP))
+    expect(source).toContain("'windows-preflight', 'update'")
+    expect(source).toContain('$preflight.WaitForExit(185000)')
+    expect(source).toContain('$preflight.WaitForExit(5000)')
+    expect(source).toContain('$preflight.ExitCode -ne 0')
   })
 
-  it('只清「从安装目录跑起来的」进程:名字限定 + 路径/命令行落在 target 下,⛔ 按名一律杀', () => {
-    expect(source).toContain("[IO.Path]::GetFileName($job.executable)")
-    expect(source).toContain("'xray.exe'")
-    expect(source).toContain('OrdinalIgnoreCase')
-    expect(source).toContain('$job.target.ToLowerInvariant()')
+  it('新旧两个任务逐一变更并 XML 回读，未知状态不得冒充不存在', () => {
+    expect(preflightHelper).toContain("[`\\\\Laixin\\\\${options.residentLabel}`, options.residentLabel]")
+    expect(preflightHelper).toContain("['/query', '/tn', task, '/xml', 'ONE']")
+    expect(preflightHelper).toContain('function taskDisabled(xml)')
+    expect(preflightHelper).toContain('const settings = /<Settings')
+    expect(preflightHelper).toContain('test(settings[1])')
+    expect(preflightHelper).toContain('UPDATE_RESIDENT_TASK_STATE_UNKNOWN')
   })
 
-  it('顺序钉死:禁任务 → 等待/强杀 → 整目录备份(NSIS 在备份之后)', () => {
-    const disable = lineOf(DISABLE)
-    const enumeration = lineOf(ENUM)
-    const kill = lineOf(KILL)
-    const backup = lineOf(BACKUP)
-    expect(disable).toBeGreaterThan(0)
-    expect(enumeration).toBeGreaterThan(disable)
-    expect(kill).toBeGreaterThan(enumeration)
-    expect(backup).toBeGreaterThan(kill)
+  it('只按当前安装路径匹配主程序与 xray，并在同一进程句柄上复核路径后停止', () => {
+    expect(preflightHelper).toContain('normalizeWindowsPath(options.executable)')
+    expect(preflightHelper).toContain("win32.join(options.target, 'resources', 'xray', 'xray.exe')")
+    expect(preflightHelper).toContain('QueryFullProcessImageName')
+    expect(preflightHelper).toContain('WaitForSingleObject')
+    expect(preflightHelper).toContain('TerminateProcess')
+    expect(preflightHelper).not.toContain("['/PID', String(pid), '/F']")
+    expect(preflightHelper).not.toMatch(/\/im\s+["']?xray\.exe/i)
   })
 
-  it('给守护自然收尾的宽限(有界等待),⛔ 一上来就强杀把系统代理留在死端口', () => {
-    expect(source).toMatch(/AddSeconds\(\d+\)/)
-    // 宽限循环:枚举不到目标进程才跳出,到点才落到强杀那一行
-    expect(lineOf('if ($left.Count -eq 0) { break }')).toBeGreaterThan(0)
+  it('schtasks、进程枚举与同句柄终止都服从一个能覆盖正常路径和补偿的总事务窗口', () => {
+    expect(preflightHelper).toContain('const WINDOWS_PREFLIGHT_TIMEOUT_MS = 5_000')
+    expect(preflightHelper).toContain('const WINDOWS_PREFLIGHT_WORK_MS = 90_000')
+    expect(preflightHelper).toContain('const WINDOWS_PREFLIGHT_TOTAL_MS = 165_000')
+    expect(preflightHelper).toContain('deadlineTimeout(deadlineAt')
+    expect(preflightHelper).toContain('boundedCommand(commands, powershell')
+    expect(preflightHelper).not.toContain("win32.join(systemRoot, 'System32', 'taskkill.exe')")
   })
 
-  it('强杀之后留出句柄释放的间隔再进备份,⛔ 紧贴着 Copy-Item 复制运行中的 exe', () => {
-    expect(source).toMatch(/if \(\$left\.Count -gt 0\) \{ Start-Sleep -Milliseconds \d+ \}/)
-  })
-
-  // 2026-09-16 验收查出:这一整段停进程的活干在大 try 之外(try 从「校验安装包」才开始),而脚本第 2 行
-  // 是 $ErrorActionPreference='Stop'。枚举进程一旦抛错(WMI 库损坏/CIM 服务停用的机器上会),脚本当场
-  // 终止、连 result.json 都不写 —— 客户端拿不到任何回执,客户看到的还是「点更新重启又是旧版」,
-  // 而且这次连句说明都没有。Windows 真机实测:裸调必抛 CimException 且不生成 result.json;
-  // 加 -ErrorAction SilentlyContinue 后不终止、$left 为空立刻 break,退回修复前那条有还原有回执的路。
-  it('枚举进程必须自己兜住错误(它在大 try 之外,抛出去就没人写回执)', () => {
-    const enumeration = lineOf(ENUM)
-    const tryStart = lines.findIndex((line) => line.trim() === 'try {')
-    expect(enumeration).toBeGreaterThan(0)
-    expect(source).toContain("$ErrorActionPreference = 'Stop'")
-    const guarded = lines[enumeration].includes('-ErrorAction SilentlyContinue')
-    const insideTry = tryStart >= 0 && enumeration > tryStart
-    // 两条路任选其一:要么自带容错,要么整段挪进 try 让 catch 去还原并写回执
-    expect(guarded || insideTry).toBe(true)
+  it('预检失败进入统一异常分支；安装器尚未启动时只删备份并拉起原版', () => {
+    const preflight = preflightInvocation()
+    const installer = lineOf('$installer = Start-Process -FilePath $job.installer')
+    const catchAt = lineOf('} catch {')
+    expect(preflight).toBeGreaterThan(lineOf(BACKUP))
+    expect(preflight).toBeLessThan(installer)
+    expect(source).toContain('$installerStarted = $false')
+    expect(source).toContain('if ($backupReady -and $installerStarted -and (Test-Path -LiteralPath $backup))')
+    expect(source).toContain('if (-not $installerStarted -or $restored)')
+    expect(catchAt).toBeGreaterThan(-1)
   })
 })
 
@@ -138,7 +144,8 @@ describe('失败回执与 ready 等待(2026-09-16 真机:Administrator 机)', ()
     const writeResult = source.indexOf('function Write-Result')
     expect(writeResult).toBeGreaterThan(-1)
     const body = source.slice(writeResult)
-    expect(body).toContain('[IO.File]::WriteAllText($job.result')
+    expect(body).toContain('MoveFileEx($temporary, $job.result, 9)')
+    expect(body).toContain('$stream.Flush($true)')
     expect(body).toContain('UTF8Encoding($false)')
     // ⛔ 退回 Set-Content -Encoding UTF8(带 BOM = 客户端永远读不到上次为什么失败)
     expect(body).not.toContain('Set-Content -LiteralPath $job.result -Encoding UTF8')

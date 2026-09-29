@@ -3,14 +3,15 @@
 // 守护日志落点由主线窗口定死：`<userData>/logs/tunnel-daemon.log`（常驻守护的 stderr）。
 // 非常驻时守护 stderr 继承主进程、不落盘，所以现在多数机器上没有这个文件——
 // 那就如实写「未生成」，⛔ 自己造一个空文件冒充。
-import { open, stat } from 'node:fs/promises'
-import { join } from 'node:path'
+import { constants } from 'node:fs'
+import { lstat, open, type FileHandle } from 'node:fs/promises'
+import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 
 export interface ReportFileSources {
   /** 读整个文件；不存在返回 undefined。 */
-  readText(path: string): Promise<string | undefined>
+  readText(path: string, root?: string): Promise<string | undefined>
   /** 读文件末尾若干字节；不存在返回 undefined。 */
-  readTail(path: string, maxBytes: number): Promise<string | undefined>
+  readTail(path: string, maxBytes: number, root?: string): Promise<string | undefined>
 }
 
 export interface CollectOptions {
@@ -23,6 +24,8 @@ export interface CollectOptions {
 export interface CollectedFiles {
   readonly daemonState?: unknown
   readonly ledger?: unknown
+  /** 只供本机归因：明确 ENOENT 才算空账本；读失败或损坏不算。 */
+  readonly ledgerMissing: boolean
   readonly connection?: unknown
   readonly daemonLog?: { readonly source: string; readonly lines: readonly string[] }
   /** 日志没进包的原因：'not-generated' = 文件确实不在；'unreadable' = 文件在但读不出来。
@@ -38,21 +41,23 @@ export function daemonLogCandidates(userDataPath: string, tunnelDataDir: string)
 
 export async function collectLocalFiles(options: CollectOptions): Promise<CollectedFiles> {
   const notes: string[] = []
-  const readJson = async (path: string, label: string): Promise<unknown> => {
+  const readJson = async (path: string, label: string, onMissing?: () => void): Promise<unknown> => {
     let text: string | undefined
-    try { text = await options.files.readText(path) } catch (error) { notes.push(`${label} 读取失败：${errorLabel(error)}`); return undefined }
-    if (text === undefined) { notes.push(`${label} 不存在`); return undefined }
+    try { text = await options.files.readText(path, options.tunnelDataDir) } catch (error) { notes.push(`${label} 读取失败：${errorLabel(error)}`); return undefined }
+    if (text === undefined) { onMissing?.(); notes.push(`${label} 不存在`); return undefined }
     try { return JSON.parse(text) } catch { notes.push(`${label} 内容不是合法 JSON`); return undefined }
   }
   const daemonState = await readJson(join(options.tunnelDataDir, 'state.json'), '守护状态 state.json')
-  const ledger = await readJson(join(options.tunnelDataDir, 'ledger.json'), '设置账本 ledger.json')
+  let ledgerMissing = false
+  const ledger = await readJson(join(options.tunnelDataDir, 'ledger.json'), '设置账本 ledger.json', () => { ledgerMissing = true })
   const connection = await readJson(join(options.tunnelDataDir, 'connection-verified.json'), '复验记录 connection-verified.json')
 
   let daemonLog: CollectedFiles['daemonLog']
   let daemonLogAbsence: CollectedFiles['daemonLogAbsence'] = 'not-generated'
-  for (const path of daemonLogCandidates(options.userDataPath, options.tunnelDataDir)) {
+  for (const [index, path] of daemonLogCandidates(options.userDataPath, options.tunnelDataDir).entries()) {
     let text: string | undefined
-    try { text = await options.files.readTail(path, options.maxLogBytes ?? 64 * 1024) }
+    try { text = await options.files.readTail(path, options.maxLogBytes ?? 64 * 1024,
+      index === 0 ? options.userDataPath : options.tunnelDataDir) }
     catch (error) {
       // 文件在、但读不出来：这跟「没生成」是两件事，⛔ 说成同一句。
       notes.push(`守护日志读取失败：${errorLabel(error)}`)
@@ -72,7 +77,7 @@ export async function collectLocalFiles(options: CollectOptions): Promise<Collec
   // 摆一句人话进注记——**不对客户说 ≠ 不留痕**：公司网络的客户报「连上之后内网打不开」时，
   // 客服得一眼看到我们动过哪几项，否则只能猜。
   for (const line of describeManagedSettings(ledger)) notes.push(line)
-  return { daemonState, ledger, connection, daemonLog, ...(daemonLog ? {} : { daemonLogAbsence }), notes }
+  return { daemonState, ledger, ledgerMissing, connection, daemonLog, ...(daemonLog ? {} : { daemonLogAbsence }), notes }
 }
 
 /** 账本里那些客服看不懂的项，给一句人话。⛔ 带原始值（那是客户机器上的设置内容）。 */
@@ -94,25 +99,72 @@ function errorLabel(error: unknown): string {
   return error instanceof Error ? error.name : '未知原因'
 }
 
+function unsafeReportFile(): Error & { code: string } {
+  return Object.assign(new Error('REPORT_FILE_UNSAFE'), { code: 'REPORT_FILE_UNSAFE' })
+}
+
+// 拒绝静态或持续存在的父目录软链；Node 的路径打开无法对同用户恶意进程的换目录竞态提供 openat 级隔离。
+async function checkedParents(path: string, root?: string): Promise<readonly { path: string; dev: number; ino: number }[]> {
+  if (root === undefined) return []
+  const base = resolve(root)
+  const parts = relative(base, resolve(path))
+  if (parts === '' || parts === '..' || parts.startsWith(`..${sep}`) || isAbsolute(parts)) throw unsafeReportFile()
+  const parents: { path: string; dev: number; ino: number }[] = []
+  let parent = base
+  for (const part of parts.split(sep).slice(0, -1)) {
+    const info = await lstat(parent)
+    if (!info.isDirectory() || info.isSymbolicLink()) throw unsafeReportFile()
+    parents.push({ path: parent, dev: info.dev, ino: info.ino })
+    parent = join(parent, part)
+  }
+  const info = await lstat(parent)
+  if (!info.isDirectory() || info.isSymbolicLink()) throw unsafeReportFile()
+  parents.push({ path: parent, dev: info.dev, ino: info.ino })
+  return parents
+}
+
+async function openReportFile(path: string, root?: string): Promise<{ readonly handle: FileHandle; readonly size: number }> {
+  const parents = await checkedParents(path, root)
+  const before = await lstat(path)
+  if (!before.isFile() || before.isSymbolicLink()) throw unsafeReportFile()
+  const noFollow = typeof constants.O_NOFOLLOW === 'number' ? constants.O_NOFOLLOW : 0
+  let handle: FileHandle
+  try { handle = await open(path, constants.O_RDONLY | noFollow) }
+  catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'ELOOP') throw unsafeReportFile()
+    throw error
+  }
+  try {
+    const current = await handle.stat()
+    if (!current.isFile() || current.dev !== before.dev || current.ino !== before.ino) throw unsafeReportFile()
+    for (const parent of parents) {
+      const latest = await lstat(parent.path).catch(() => { throw unsafeReportFile() })
+      if (!latest.isDirectory() || latest.isSymbolicLink() || latest.dev !== parent.dev || latest.ino !== parent.ino) throw unsafeReportFile()
+    }
+    return { handle, size: current.size }
+  } catch (error) {
+    await handle.close().catch(() => undefined)
+    throw error
+  }
+}
+
 /** 生产实现：只读、不跟随异常文件类型、只取末尾。 */
 export const nodeReportFiles: ReportFileSources = {
-  async readText(path) {
+  async readText(path, root) {
     try {
-      const handle = await open(path, 'r')
+      const { handle } = await openReportFile(path, root)
       try { return await handle.readFile('utf8') } finally { await handle.close() }
     } catch (error) {
       if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') return undefined
       throw error
     }
   },
-  async readTail(path, maxBytes) {
+  async readTail(path, maxBytes, root) {
     try {
-      const info = await stat(path)
-      if (!info.isFile()) return undefined
-      const start = Math.max(0, info.size - maxBytes)
-      const handle = await open(path, 'r')
+      const { handle, size } = await openReportFile(path, root)
+      const start = Math.max(0, size - maxBytes)
       try {
-        const buffer = Buffer.alloc(Math.min(maxBytes, info.size))
+        const buffer = Buffer.alloc(Math.min(maxBytes, size))
         await handle.read(buffer, 0, buffer.length, start)
         return buffer.toString('utf8')
       } finally { await handle.close() }

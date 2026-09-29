@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events'
 import { request as httpRequest } from 'node:http'
 import { afterEach, describe, expect, it } from 'vitest'
-import { AiGateway, type GatewayRoute } from '../../app/main/ai-access/gateway'
+import { AiGateway, type GatewayFetch, type GatewayRoute } from '../../app/main/ai-access/gateway'
 
 const token = 'laixin-fixture-client-token-0123456789'
 const key = 'sk-fixture-upstream-key-0123456789'
@@ -9,7 +9,7 @@ type Json = Record<string, unknown>
 const routes: GatewayRoute[] = ['codex', 'claude', 'hermes'].map(shell => ({ shell: shell as GatewayRoute['shell'], provider: 'deepseek', model: 'fixture-model', endpoint: 'https://api.deepseek.com/fixture', key }))
 const gateways: AiGateway[] = []
 afterEach(async () => { await Promise.all(gateways.splice(0).map(g => g.stop())) })
-async function start(fetcher: typeof fetch, timeoutMs = 500) {
+async function start(fetcher: GatewayFetch, timeoutMs = 500) {
   const gateway = new AiGateway({ fetch: fetcher, timeoutMs })
   gateways.push(gateway)
   await gateway.start(0, token)
@@ -17,6 +17,42 @@ async function start(fetcher: typeof fetch, timeoutMs = 500) {
   return gateway
 }
 describe('本机 API 服务', () => {
+  it('N-56/N-57/N-58 只把有租约标记的三个模型路由交给各自私有传输', async () => {
+    const observed: { shell: string | undefined; isolated: boolean | undefined }[] = []
+    const g = await start(async (_url, _init, route) => {
+      observed.push({ shell: route?.shell, isolated: route?.isolated })
+      if (route?.shell === 'claude') return Response.json({ type: 'message', stop_reason: 'end_turn', content: [{ type: 'text', text: 'OK' }] })
+      if (route?.shell === 'hermes') return Response.json({ choices: [{ finish_reason: 'stop', message: { content: 'OK' } }] })
+      return Response.json({ status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: 'OK' }] }] })
+    })
+    const isolatedRoutes = routes.map(route => ({ ...route, isolated: true }))
+    g.setRoutes(isolatedRoutes)
+
+    for (const route of isolatedRoutes) await expect(g.probe(route)).resolves.toMatchObject({ ok: true })
+
+    for (const [shell, path] of [['codex', 'responses'], ['claude', 'messages'], ['hermes', 'chat/completions']] as const) {
+      const response = await fetch(`${g.baseUrl}/${shell}/deepseek/v1/${path}`, {
+        method: 'POST', headers: { authorization: `Bearer ${token}` }, body: '{}'
+      })
+      expect(response.status).toBe(200)
+    }
+    // Replacing the route map removes the lease marker; it is not sticky across ordinary routes.
+    g.setRoutes(routes)
+    expect((await fetch(`${g.baseUrl}/codex/deepseek/v1/responses`, {
+      method: 'POST', headers: { authorization: `Bearer ${token}` }, body: '{}'
+    })).status).toBe(200)
+
+    expect(observed).toEqual([
+      { shell: 'codex', isolated: true },
+      { shell: 'claude', isolated: true },
+      { shell: 'hermes', isolated: true },
+      { shell: 'codex', isolated: true },
+      { shell: 'claude', isolated: true },
+      { shell: 'hermes', isolated: true },
+      { shell: 'codex', isolated: undefined }
+    ])
+  })
+
   it('拒绝未授权请求、网页跨站请求和未知路径，不接触上游', async () => {
     let calls = 0
     const g = await start(async () => { calls++; return new Response('{}') })
@@ -106,6 +142,74 @@ describe('本机 API 服务', () => {
     expect(await response.text()).toBe(sse)
     expect(g.snapshot().requests[0]).toMatchObject({ shell, source: 'client', ok: true })
     expect(g.clientAcceptances()).toEqual({})
+  })
+  it.each([
+    ['非流式', JSON.stringify({
+        status: 'completed',
+        output: [{ type: 'custom_tool_call', call_id: 'call-apply-1', name: 'apply_patch', input: '*** Begin Patch\n*** End Patch' }]
+      }), { 'content-type': 'application/json' }],
+    ['流式', 'event: response.output_item.done\ndata: {"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"call-apply-1","name":"apply_patch","input":"*** Begin Patch\\n*** End Patch"}}\n\nevent: response.completed\ndata: {"type":"response.completed","response":{"status":"completed"}}\n\n', { 'content-type': 'text/event-stream' }]
+  ])('Codex 的合法 custom_tool_call %s会透传，且不被当成最终回答', async (_transport, body, headers) => {
+    const g = await start(async () => new Response(body, { headers }))
+    const response = await fetch(`${g.baseUrl}/codex/deepseek/v1/responses`, {
+      method: 'POST', headers: { authorization: `Bearer ${token}` }, body: '{}'
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe(body)
+    expect(g.snapshot().requests[0]).toMatchObject({ shell: 'codex', source: 'client', ok: true })
+    expect(g.clientAcceptances()).toEqual({})
+  })
+  it('custom_tool_call 前的规划文字不点亮证明；工具结果后的完整文字才点亮', async () => {
+    let calls = 0
+    const sentBodies: Json[] = []
+    const g = await start(async (_url, init) => {
+      calls += 1
+      sentBodies.push(JSON.parse(String(init?.body)))
+      return calls === 1
+        ? Response.json({
+          status: 'completed',
+          output: [
+            { type: 'message', content: [{ type: 'output_text', text: '正在修改文件' }] },
+            { type: 'custom_tool_call', call_id: 'call-apply-1', name: 'apply_patch', input: '*** Begin Patch\n*** End Patch' }
+          ]
+        })
+        : Response.json({ status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: '修改完成' }] }] })
+    })
+    const url = `${g.baseUrl}/codex/deepseek/v1/responses`
+
+    const toolTurn = await fetch(url, { method: 'POST', headers: { authorization: `Bearer ${token}` }, body: '{}' })
+    expect(toolTurn.status).toBe(200)
+    expect(g.clientAcceptances()).toEqual({})
+
+    const finalTurn = await fetch(url, {
+      method: 'POST', headers: { authorization: `Bearer ${token}` },
+      body: JSON.stringify({ input: [{ type: 'custom_tool_call_output', call_id: 'call-apply-1', output: 'applied' }] })
+    })
+    expect(finalTurn.status).toBe(200)
+    expect(sentBodies[1].input).toEqual([{ type: 'custom_tool_call_output', call_id: 'call-apply-1', output: 'applied' }])
+    expect(g.clientAcceptances().codex).toMatchObject({ provider: 'deepseek', model: 'fixture-model' })
+  })
+  it.each([
+    ['缺少字符串 input 的伪 custom_tool_call', JSON.stringify({ status: 'completed', output: [{ type: 'custom_tool_call', call_id: 'call-apply-1', name: 'apply_patch' }] }), { 'content-type': 'application/json' }, 'invalid_reply', 502],
+    ['未知 output 类型', JSON.stringify({ status: 'completed', output: [{ type: 'unrecognized_tool', call_id: 'call-apply-1', name: 'apply_patch', input: 'x' }] }), { 'content-type': 'application/json' }, 'invalid_reply', 502],
+    ['空 output', JSON.stringify({ status: 'completed', output: [] }), { 'content-type': 'application/json' }, 'invalid_reply', 502],
+    ['只有工具增量、没有完成终态', 'event: response.output_item.done\ndata: {"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"call-apply-1","name":"apply_patch","input":"x"}}\n\n', { 'content-type': 'text/event-stream' }, 'invalid_reply', 200],
+    ['工具后截断', JSON.stringify({
+        status: 'incomplete', incomplete_details: { reason: 'max_tokens' },
+        output: [{ type: 'custom_tool_call', call_id: 'call-apply-1', name: 'apply_patch', input: 'x' }]
+      }), { 'content-type': 'application/json' }, 'response_truncated', 400],
+    ['工具后上游错误', 'event: response.output_item.done\ndata: {"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"call-apply-1","name":"apply_patch","input":"x"}}\n\nevent: response.failed\ndata: {"type":"response.failed","response":{"status":"failed","error":{"message":"private upstream detail"}}}\n\n', { 'content-type': 'text/event-stream' }, 'upstream_error', 200]
+  ])('%s仍会被拒绝，不能借 custom_tool_call 放行', async (_scenario, body, headers, code, expectedStatus) => {
+    const g = await start(async () => new Response(body, { headers }))
+    const response = await fetch(`${g.baseUrl}/codex/deepseek/v1/responses`, {
+      method: 'POST', headers: { authorization: `Bearer ${token}` }, body: '{}'
+    })
+
+    expect(g.snapshot().requests[0]).toMatchObject({ shell: 'codex', source: 'client', ok: false, code })
+    expect(g.clientAcceptances()).toEqual({})
+    if (headers['content-type'] === 'text/event-stream') expect(await response.text()).toContain(code)
+    else expect(response.status).toBe(expectedStatus)
   })
   it.each([
     {
@@ -683,6 +787,7 @@ describe('本机 API 服务', () => {
     expect(g.snapshot().requests[0]).toMatchObject({ shell: 'hermes', source: 'client', ok: true })
     expect(g.snapshot().requests[0].code).toBeUndefined()
     expect(g.clientAcceptances().hermes).toMatchObject({ provider: 'deepseek' })
+    expect(g.clientAttempts().hermes).toMatchObject({ provider: 'deepseek', ok: true })
   })
 
   it('Hermes 只有文本未收到终态就断开时仍记为中止，不能点亮已使用', async () => {
@@ -723,6 +828,7 @@ describe('本机 API 服务', () => {
     for (let attempt = 0; attempt < 20 && g.snapshot().requests.length === 0; attempt += 1) await new Promise(resolve => setTimeout(resolve, 5))
     expect(g.snapshot().requests[0]).toMatchObject({ shell: 'hermes', source: 'client', ok: false, code: 'client_aborted' })
     expect(g.clientAcceptances().hermes).toBeUndefined()
+    expect(g.clientAttempts().hermes).toBeUndefined()
   })
 
   it('本机并发达到上限时从读入请求体前就拒绝，使用 local_service_busy 而不是上游限流', async () => {
@@ -816,6 +922,7 @@ describe('本机 API 服务', () => {
 
     expect(g.clientAcceptances()).toEqual({})
     expect(g.clientCalls()).toEqual({})
+    expect(g.clientAttempts()).toEqual({})
   })
 
   it('回答被 max_tokens 截断单独判类，⛔ 报成服务商故障；正常回答仍判通过（第 4 轮）', async () => {

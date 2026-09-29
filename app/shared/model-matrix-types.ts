@@ -21,6 +21,9 @@ export interface ModelMatrixEntry {
 export interface ModelMatrixReport {
   readonly at: string
   readonly entries: readonly ModelMatrixEntry[]
+  /** 采集时刻的状态快照指纹（16 位十六进制，绑定选择与 Key 存在性，⛔ 含 Key 材料）。
+   * 矩阵要跑几分钟，运维对照当前选择时靠它分辨「报告与现状不同期」。 */
+  readonly stateFingerprint?: string
 }
 
 export interface ModelMatrixProgress {

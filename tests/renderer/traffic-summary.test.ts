@@ -9,6 +9,9 @@ const usage: NetworkUsageView = {
 }
 
 describe('首页流量摘要保留实测与未知的区别', () => {
+  it.each(['current', 'unavailable', 'not-requested'] as const)('已到期的 %s 记录不再显示可用剩余或读取故障', (measurement) => {
+    expect(trafficSummary({ ...usage, state: 'expired', measurement }).remaining).toBe('已到期')
+  })
   it('显示真实剩余流量，已用完时可显示零', () => {
     expect(trafficSummary(usage).remaining).toBe('4.00 GB')
     expect(trafficSummary({ ...usage, state: 'exhausted', remainingBytes: 0 }).remaining).toBe('0.00 GB')

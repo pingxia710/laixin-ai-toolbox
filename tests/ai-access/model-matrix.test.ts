@@ -239,3 +239,20 @@ describe('配方换了标准默认模型', () => {
     expect(JSON.parse(String(f.fetcher.mock.lastCall?.[1]?.body)).model).toBe('deepseek-v4-pro')
   })
 })
+
+it('报告自带采集时刻的状态指纹：随状态变化、读写消毒都认、⛔ 含 Key 材料', async () => {
+  const f = fixture(everywhere)
+  const first = await f.service.probeMatrix()
+  expect(first.stateFingerprint).toMatch(/^[a-f0-9]{16}$/)
+  expect(JSON.stringify(first)).not.toContain(key)
+  const sanitized = sanitizeMatrixReport(JSON.parse(JSON.stringify(first)))
+  expect(sanitized?.stateFingerprint).toBe(first.stateFingerprint)
+  // 换一份保存的 Key（Key 存在性矩阵变化）→ 指纹必须跟着变，证明它绑定的是采集时刻的状态快照。
+  await f.service.saveProviderKey('codex', 'zhipu', 'sk-fixture-matrix-zhipu-0123456789')
+  const second = await f.service.probeMatrix()
+  expect(second.stateFingerprint).toMatch(/^[a-f0-9]{16}$/)
+  expect(second.stateFingerprint).not.toBe(first.stateFingerprint)
+  // 指纹形状不对的整份作废（消毒口径与其余字段一致）。
+  expect(sanitizeMatrixReport({ ...first, stateFingerprint: 'zz-not-hex' })).toBeUndefined()
+  expect(sanitizeMatrixReport({ ...first, stateFingerprint: undefined, at: first.at, entries: [...first.entries] })).toBeDefined()
+})

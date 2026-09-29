@@ -1,9 +1,8 @@
 // GPT-6 补核 fe8f91f R6:另一款代理软件先后把系统代理改成两个不同地址;
 // 退出时必须把对方**最后**写的值还回去。fe8f91f 只记第一次的值 → 还回 7891(可能已停用),客户断网。
 //
-// 2026-09-15 更新(创始人定「两次连续被改即止损」):原用例里「每次都改回」是旧硬标准,已撤销——
-// 第一次被改允许改回,同一连接周期内第二次又被改就停止自动写回、保留对方现值。
-// R6 的原始意图(退出还给对方**最后**写的值)不受影响,仍然逐字保住:止损时账本同步更新到现值。
+// N-55:原来“第二次即停”的规则已撤销；本意图仍有可验证租约和路径证据时可以有界夺回。
+// R6 的原始意图(退出还给对方**最后**写的值)不受影响：每次夺回前账本同步更新到现值。
 import { expect, it } from 'vitest'
 import { join } from 'node:path'
 import { createDaemon } from '../../sidecar/win/daemon-core.mjs'
@@ -33,10 +32,10 @@ it('外部代理连续两次改成不同地址，退出应保留最后一次外�
     adapter.write(ref, external(7891))
     clock.advance(30_000); await flushMicrotasks(); await flushMicrotasks()
     expect(adapter.read(ref)).toEqual(external(18080))
-    // 第二次又被改:止损,保留对方此刻的实际设置,⛔ 再改回去
+    // 第二次又被改:仍在本意图的有界夺回内，先按当前证据接回。
     adapter.write(ref, external(7892))
     clock.advance(30_000); await flushMicrotasks(); await flushMicrotasks()
-    expect(adapter.read(ref)).toEqual(external(7892))
+    expect(adapter.read(ref)).toEqual(external(18080))
     daemon.requestShutdown(); await flushMicrotasks()
     // 退出还原要还给对方最后写的 7892,⛔ 第一次被改回时记下的 7891(那个地址可能早已停用)
     expect(adapter.read(ref)).toEqual(external(7892))

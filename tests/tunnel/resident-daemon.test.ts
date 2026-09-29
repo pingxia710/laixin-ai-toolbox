@@ -6,6 +6,12 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { instanceLockPath, readInstanceLock } from '../../sidecar/win/instance-lock.mjs'
+import { currentProcessStartedAt, settingsLockPath } from '../../sidecar/win/ledger.mjs'
+import { makeResidentRuntime } from '../../app/main/tunnel/resident-bridge'
+import { DaemonSupervisor } from '../../app/main/tunnel/supervisor'
+import { computeStatus, DISPLAY_STATES } from '../../app/main/tunnel/status-service'
+import type { CurrentInfo } from '../../app/main/tunnel/import-meta'
+import { pendingRecoveryNotice } from '../../app/main/desktop/recovery-notice'
 import { fakeAdapterEnv, makeTempDir, readFakeStore, removeTempDir, startFakeUpstream } from './helpers'
 
 const daemonPath = fileURLToPath(new URL('../../sidecar/mac/tunnel-daemon.mjs', import.meta.url))
@@ -31,9 +37,10 @@ async function stage() {
     routes: { directSuffixes: [], protectedDirectSuffixes: [] }
   }))
   const children: ChildProcess[] = []
-  const launch = (args: string[], runId: string) => {
+  const launch = (args: string[], runId?: string) => {
     const child = spawn(process.execPath, [daemonPath, 'start', '--data-dir', root, '--adapter', adapterPath,
-      '--intent-poll-ms', '100', '--parent-poll-ms', '100', '--verify-interval-ms', '60000', '--run-id', runId, ...args],
+      '--intent-poll-ms', '100', '--parent-poll-ms', '100', '--verify-interval-ms', '60000',
+      ...(runId === undefined ? [] : ['--run-id', runId]), ...args],
     { env: { ...process.env, ...fakeAdapterEnv(storePath) }, stdio: ['ignore', 'ignore', 'pipe'] })
     let stderr = ''
     child.stderr?.on('data', (chunk) => { stderr += String(chunk) })
@@ -47,11 +54,54 @@ async function stage() {
       await waitFor(() => child.exitCode !== null || child.signalCode !== null, 3000, '收尾').catch(() => undefined)
     }
   })
-  const state = () => { try { return JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')) as { state: string } } catch { return undefined } }
+  const state = () => { try { return JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')) as { state: string; runId?: string } } catch { return undefined } }
   return { root, storePath, launch, state, upstream }
 }
 
 describe('守护常驻模式', () => {
+  it('新常驻已占席却被恢复锁挡住时，旧 connected/recovery 不能成为界面已连与恢复通知', async () => {
+    const s = await stage()
+    const oldState = { state: 'connected', runId: 'old-resident', recovery: { id: 71, attempts: 1, outageMs: 3_000 } }
+    writeFileSync(join(s.root, 'state.json'), JSON.stringify(oldState))
+    writeFileSync(join(s.root, 'ledger.json'), JSON.stringify([
+      { id: 'old-setting', kind: 'setting', service: 'Wi-Fi', item: 'socks-proxy', originalValue: null,
+        writtenValue: { enabled: true, host: '127.0.0.1', port: 18080 }, sessionToken: 'old', time: 1, status: 'applied', note: '' }
+    ]))
+    writeFileSync(settingsLockPath(s.root), JSON.stringify({ token: 'other-recovery', pid: process.pid,
+      at: Date.now(), startedAt: currentProcessStartedAt() }))
+    const child = s.launch(['--resident', '1'])
+    await waitFor(() => readInstanceLock(s.root)?.holder?.pid === child.child.pid, 10_000, `新守护占席；stderr=${child.stderr()}`)
+    const seatRunId = readInstanceLock(s.root)?.holder?.runId
+    expect(seatRunId).toBeTruthy()
+    expect(seatRunId).not.toBe(oldState.runId)
+    expect(s.state()).toMatchObject(oldState) // 设置锁忙，新守护尚未落自己的 state
+
+    const resident = makeResidentRuntime({ dataDir: s.root, platform: 'macos', supported: true,
+      probeInstalled: () => true, spec: () => { throw new Error('本用例不校准常驻任务') } })
+    const supervisor = new DaemonSupervisor({ dataDir: s.root, resident: resident.bridge,
+      spawnDaemon: () => { throw new Error('不应自起第二份守护') }, spawnRestore: () => undefined })
+    expect(supervisor.isRunning()).toBe(true)
+    const info: CurrentInfo = { protocol: 'ssh-socks', batchId: 'test', configVersion: 1, authorizationId: 'test',
+      node: { host: 'example.invalid', port: 22, sshUser: 'test' },
+      nodes: [{ host: 'example.invalid', port: 22, credentialName: 'test' }], credentialName: 'test',
+      expiresAt: '2027-01-01T00:00:00Z', sourceLine: '测试配置' }
+    const status = computeStatus({ dataDir: s.root, daemonState: supervisor.currentState(oldState),
+      daemonUnexpectedExitAt: supervisor.lastUnexpectedExitAt(oldState), componentMissing: [], sshBinary: '',
+      preReadInfo: { current: info, pending: undefined } })
+    expect(status.state).not.toBe(DISPLAY_STATES.connected)
+    expect(pendingRecoveryNotice(oldState, () => false, status)).toBeUndefined()
+  }, 20_000)
+
+  it('真实常驻入口不传 --run-id 时仍生成非空本轮身份，并同席位与恢复 owner 一致', async () => {
+    const s = await stage()
+    const first = s.launch(['--resident', '1'])
+    await waitFor(() => s.state()?.state === 'connected', 15_000, `无 run-id 连上；stderr=${first.stderr()}`)
+    const runId = s.state()?.runId
+    expect(runId).toBeTruthy()
+    expect(readInstanceLock(s.root)?.holder?.runId).toBe(runId)
+    expect(JSON.parse(readFileSync(join(s.root, 'recovery-owner.json'), 'utf8'))).toMatchObject({ runId })
+  }, 30_000)
+
   it('脱开父进程照样连上并留下来（界面关了/崩了不断网），席位记着自己', async () => {
     const s = await stage()
     const first = s.launch(['--resident', '1'], 'resident-a')

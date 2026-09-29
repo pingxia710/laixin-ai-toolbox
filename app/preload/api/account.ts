@@ -4,6 +4,8 @@ import { IPC_CHANNEL } from '../../bridge-protocol'
 export interface AccountApi {
   status(): Promise<{ snapshot: string }>
   login(input: { username: string; password: string; inviteCode: string }): Promise<{ snapshot: string; recoveryCode: string }>
+  wechatLogin(input: { mode: 'login' | 'bind' }): Promise<{ snapshot: string; recoveryCode: string }>
+  cancelWechatLogin(): Promise<{ cancelled: boolean }>
   register(input: { username: string; password: string; inviteCode: string }): Promise<{ snapshot: string; recoveryCode: string }>
   recover(input: { username: string; password: string; recoveryCode: string }): Promise<{ snapshot: string; recoveryCode: string }>
   rotateRecovery(input: { password: string }): Promise<{ snapshot: string; recoveryCode: string }>
@@ -22,13 +24,15 @@ export interface AccountApi {
   sendDeviceReport(): Promise<{ state: string; message: string }>
   logout(): Promise<{ snapshot: string }>
   apply(input: { planId: string }): Promise<{ snapshot: string }>
-  pay(input: { planId: string; channel: 'alipay' | 'wechat' }): Promise<{ snapshot: string; order: string; openedBrowser: boolean }>
+  pay(input: { planId: string; channel: 'alipay' | 'wechat'; amountFen: string }): Promise<{ snapshot: string; order: string; openedBrowser: boolean }>
   pollPayment(input: { orderId: string }): Promise<{ order: string }>
 }
 export const namespace = 'account'
 export const api: AccountApi = {
   status: () => ipcRenderer.invoke(IPC_CHANNEL, 'account.status', undefined),
   login: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'account.login', input),
+  wechatLogin: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'account.wechatLogin', input),
+  cancelWechatLogin: () => ipcRenderer.invoke(IPC_CHANNEL, 'account.cancelWechatLogin', undefined),
   register: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'account.register', input),
   recover: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'account.recover', input),
   rotateRecovery: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'account.rotateRecovery', input),

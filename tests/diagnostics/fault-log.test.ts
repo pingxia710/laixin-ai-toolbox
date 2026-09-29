@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -128,5 +128,16 @@ describe('故障经过按天留存', () => {
   it('记录失败从不把调用方拖下水', async () => {
     const log = new FaultLog({ files: { ...memoryFiles().files, append: async () => { throw new Error('fixture disk full') } } })
     await expect(log.record({ code: 'timeout' })).resolves.toBeUndefined()
+  })
+
+  it('按天追加不会跟随符号链接改写目录外文件', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'laixin-fault-symlink-')); roots.push(root)
+    const logs = join(root, 'logs'); mkdirSync(logs)
+    const outside = join(root, 'outside.txt'); writeFileSync(outside, 'ORIGINAL')
+    symlinkSync(outside, join(logs, '2026-09-12.jsonl'))
+    const files = createFaultLogFiles(logs)
+
+    await expect(files.append('2026-09-12.jsonl', 'SHOULD-NOT-APPEND\n')).rejects.toThrow('FAULT_LOG_FILE_INVALID')
+    expect(readFileSync(outside, 'utf8')).toBe('ORIGINAL')
   })
 })

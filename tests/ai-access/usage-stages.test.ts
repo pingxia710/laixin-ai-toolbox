@@ -17,7 +17,10 @@ function reply(second: boolean): Response {
 
 function fixture(initial: AiAccessState = { version: 1, selected: {} }, desktopAttestor?: DesktopRouteAttestor) {
   let state = initial
-  const fetcher = vi.fn<typeof fetch>(async (_url, init) => reply(JSON.parse(String(init?.body)).stream === true))
+  let clientFailure = false
+  const fetcher = vi.fn<typeof fetch>(async (_url, init) => clientFailure
+    ? new Response('{"error":{"message":"fixture failure"}}', { status: 502, headers: { 'content-type': 'application/json' } })
+    : reply(JSON.parse(String(init?.body)).stream === true))
   const adapters = aiAccessShells.map(shell => ({ shell, applyDeepSeek: vi.fn(async () => undefined),
     applyConnection: vi.fn<NonNullable<AiAccessAdapter['applyConnection']>>(async () => undefined),
     captureConnection: vi.fn(async () => vi.fn(async () => undefined)),
@@ -26,7 +29,7 @@ function fixture(initial: AiAccessState = { version: 1, selected: {} }, desktopA
   const store = { read: async () => state, write: async (next: AiAccessState) => { state = next } }
   const service = new AiAccessService(store, adapters, gateway)
   services.push(service)
-  return { service, adapters, fetcher, gateway, store, state: () => state }
+  return { service, adapters, fetcher, gateway, store, state: () => state, setClientFailure: (value: boolean) => { clientFailure = value } }
 }
 const stage = async (service: AiAccessService) => (await service.serviceStatus()).usage.find(item => item.shell === 'codex')!
 
@@ -95,6 +98,30 @@ describe('确认软件真的用上了', () => {
     const switched = await stage(f.service)
     expect(switched).toMatchObject({ provider: 'kimi', observedClientCall: null })
     expect(switched.configured).not.toBeNull()
+  })
+
+  it('保留当前路由最近一次失败，换渠道后立即清空', async () => {
+    const f = fixture()
+    await f.service.saveProviderKey('codex', 'deepseek', 'sk-fixture-attempt-0123456789')
+    await f.service.useProvider('codex', 'deepseek')
+    const route = (await f.service.serviceStatus()).routes.find(item => item.shell === 'codex')!
+    await (await fetch(`${route.baseUrl}/responses`, { method: 'POST',
+      headers: { authorization: `Bearer ${f.state().relay!.token}` }, body: JSON.stringify({ stream: true }) })).text()
+    expect(await stage(f.service)).toMatchObject({
+      observedClientCall: expect.any(String), lastClientAttempt: { ok: true, at: expect.any(String) }
+    })
+
+    f.setClientFailure(true)
+    await (await fetch(`${route.baseUrl}/responses`, { method: 'POST',
+      headers: { authorization: `Bearer ${f.state().relay!.token}` }, body: JSON.stringify({ stream: true }) })).text()
+    expect(await stage(f.service)).toMatchObject({
+      observedClientCall: expect.any(String), lastClientAttempt: { ok: false, code: expect.any(String), at: expect.any(String) }
+    })
+
+    f.setClientFailure(false)
+    await f.service.saveProviderKey('codex', 'kimi', 'sk-fixture-attempt-kimi-0123456789')
+    await f.service.useProvider('codex', 'kimi')
+    expect(await stage(f.service)).toMatchObject({ provider: 'kimi', observedClientCall: null, lastClientAttempt: null })
   })
 
   it('重开工具箱后三态从头来过，只有配置留在盘上', async () => {

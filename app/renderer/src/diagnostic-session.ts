@@ -1,5 +1,6 @@
 import { supportDiagnosticAttemptLimit, type DiagnosticSoftware, type NetworkDiagnosticReport } from '../../network-diagnostics-types'
 import type { FaultRecord } from '../../shared/fault-log-types'
+import { normalizeLocalEgressEvidence, type LocalEgressEvidence } from '../../shared/local-egress-evidence'
 
 export interface DiagnosticSessionReference {
   readonly id: string
@@ -17,6 +18,7 @@ export interface DiagnosticRunSnapshot {
   readonly errors: readonly string[]
   readonly faults: readonly FaultRecord[]
   readonly network: NetworkDiagnosticReport
+  readonly localEgress: LocalEgressEvidence
   readonly attempts: readonly DiagnosticAttempt[]
   readonly attemptsTotal: number
   readonly attemptsComplete: boolean
@@ -32,6 +34,7 @@ export interface DiagnosticAttempt {
 
 export function parseDiagnosticRunSnapshot(snapshot: string): DiagnosticRunSnapshot {
   const value = JSON.parse(snapshot) as DiagnosticRunSnapshot
+  const localEgress = normalizeLocalEgressEvidence(value?.localEgress)
   if (!value || !/^DG-[A-F0-9]{6}-[A-F0-9]{6}$/.test(value.id) ||
       !['codex', 'claude', 'hermes'].includes(value.software) || typeof value.text !== 'string' || value.text.length > 200_000 ||
       typeof value.collectedAt !== 'string' || !Array.isArray(value.errors) || value.errors.some((item) => typeof item !== 'string') ||
@@ -41,10 +44,10 @@ export function parseDiagnosticRunSnapshot(snapshot: string): DiagnosticRunSnaps
         (item.detail !== undefined && (typeof item.detail !== 'string' || item.detail.length > 160))) ||
       !Number.isSafeInteger(value.attemptsTotal) || value.attemptsTotal < value.attempts.length || value.attemptsTotal > 1_000 ||
       typeof value.attemptsComplete !== 'boolean' ||
-      !value.network || value.network.software !== value.software || !Number.isSafeInteger(value.network.checkedAt)) {
+      !value.network || value.network.software !== value.software || !Number.isSafeInteger(value.network.checkedAt) || !localEgress) {
     throw new Error('DIAGNOSTIC_SESSION_INVALID')
   }
-  return value
+  return { ...value, localEgress }
 }
 
 export function rememberDiagnosticSession(session: DiagnosticSessionReference): void {

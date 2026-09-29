@@ -8,7 +8,7 @@ import { randomBytes } from 'node:crypto'
 import { ConnectorError, CONTROL_CODES } from '../../../sidecar/win/connectors.mjs'
 import { parseProxyServer, wininetValuesEqual } from '../../../sidecar/win/wininet-values.mjs'
 import { isOurProxy } from '../../../sidecar/win/proxy-identity.mjs'
-import { autoDetectManagedItem } from '../../../sidecar/win/connection-settings.mjs'
+import { autoDetectEnabled, autoDetectManagedItem, hexToBlob } from '../../../sidecar/win/connection-settings.mjs'
 
 const CONNECTION_ITEM = 'DefaultConnectionSettings'
 const ITEMS = ['ProxyEnable', 'ProxyServer', 'ProxyOverride', 'AutoConfigURL', CONNECTION_ITEM]
@@ -20,6 +20,10 @@ export function createAdapter(env = process.env) {
     throw new Error('FAKE_WININET_STORE 未设置')
   }
   const failures = JSON.parse(env.FAKE_WININET_FAILURES ?? '{"write":[]}')
+  const ownerSequence = String(env.FAKE_WININET_PORT_OWNER_SEQUENCE ?? '').split(',').filter(Boolean)
+  let ownerProbeCount = 0
+  let readFailuresRemaining = env.FAKE_WININET_READ_FAILURE_COUNT === undefined
+    ? Number.POSITIVE_INFINITY : Number(env.FAKE_WININET_READ_FAILURE_COUNT)
   const opsPath = `${storePath}.ops.jsonl`
 
   const load = () => (existsSync(storePath) ? JSON.parse(readFileSync(storePath, 'utf8')) : {})
@@ -38,6 +42,11 @@ export function createAdapter(env = process.env) {
   const read = (ref) => {
     if (ref.service !== 'WinINET' || !ITEMS.includes(ref.item)) {
       throw new Error(`WININET_ITEM_INVALID:${ref.service}/${ref.item}`)
+    }
+    if (env.FAKE_WININET_READ_FAILURE === ref.item && readFailuresRemaining > 0) {
+      readFailuresRemaining -= 1
+      log('read-failed', ref.item, null)
+      throw new Error('注入读取失败')
     }
     const store = load()
     log('read', ref.item, store[ref.item] ?? null)
@@ -69,6 +78,18 @@ export function createAdapter(env = process.env) {
   }
 
   return {
+    currentPathIdentity: () => ({ id: 'fake-wininet-default-route', kind: 'fake-wininet' }),
+    identifyPortOwner: () => {
+      const kind = ownerSequence.length > 0
+        ? ownerSequence[Math.min(ownerProbeCount++, ownerSequence.length - 1)]
+        : env.FAKE_WININET_PORT_OWNER ?? 'none'
+      log('owner', String(kind), null)
+      if (kind === 'throw') throw new Error('注入端口归属查询失败')
+      if (kind === 'self') return { kind: 'laixin', pid: process.pid }
+      if (kind === 'self-other') return { kind: 'other', pid: process.pid }
+      if (kind === 'ambiguous') return { kind: 'unknown', reason: 'address-ambiguous' }
+      return { kind }
+    },
     valuesEqual: wininetValuesEqual,
     // 与真实 adapter-wininet.mjs 同形:电脑上别的代理正开着吗(⛔ 把我们自己写的算成别人的)。
     // 守护据此决定「能出外网就复用」还是接管,以及争抢时该不该让位。
@@ -76,6 +97,10 @@ export function createAdapter(env = process.env) {
       const store = load()
       const pac = store.AutoConfigURL
       if (pac != null && pac.data !== '') return { kind: 'pac', url: pac.data, source: 'WinINET/AutoConfigURL' }
+      const connection = read({ service: 'WinINET', item: CONNECTION_ITEM })
+      if (autoDetectEnabled(hexToBlob(connection?.type === 'REG_BINARY' ? connection.data : undefined)) !== false) {
+        return { kind: 'pac', source: 'WinINET/DefaultConnectionSettings' }
+      }
       if (store.ProxyEnable?.data !== '1') return undefined
       const parsed = parseProxyServer(store.ProxyServer?.data ?? '')
       if (parsed === undefined) return undefined

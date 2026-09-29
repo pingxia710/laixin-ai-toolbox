@@ -22,6 +22,8 @@ export interface AppendOnlyTextFile {
 /** Test-only hook: runs after the descriptor comparison and before the append write. */
 export interface ManagedTextFileOptions {
   readonly beforeAppend?: (path: string) => Promise<void> | void
+  /** A caller may opt into a bounded larger file only for a known generated configuration. */
+  readonly maxBytes?: number
 }
 
 const maxTextFileBytes = 128 * 1024
@@ -35,6 +37,7 @@ async function symlinkFailure(path: string): Promise<Error> {
 
 /** A small file adapter that never follows a final-path symlink and never shells out. */
 export function createManagedTextFile(options: ManagedTextFileOptions = {}): ManagedTextFile & AppendOnlyTextFile {
+  const maximumBytes = options.maxBytes ?? maxTextFileBytes
   const read = async (path: string): Promise<string | undefined> => {
     let info: Stats
     try {
@@ -45,7 +48,7 @@ export function createManagedTextFile(options: ManagedTextFileOptions = {}): Man
     }
     // 软链单独标记：调用方要说清真身在哪，⛔ 只回一句「无效」。
     if (info.isSymbolicLink()) return Promise.reject(await symlinkFailure(path))
-    if (!info.isFile() || info.size > maxTextFileBytes) throw new Error('AI_ACCESS_CONFIG_FILE_INVALID')
+    if (!info.isFile() || info.size > maximumBytes) throw new Error('AI_ACCESS_CONFIG_FILE_INVALID')
     try {
       return await readFile(path, 'utf8')
     } catch (error) {
@@ -75,7 +78,7 @@ export function createManagedTextFile(options: ManagedTextFileOptions = {}): Man
   const write = async (path: string, contents: string): Promise<void> => {
     let temporary: string | undefined
     try {
-      const existing = await existingFile(path)
+      const existing = await existingFile(path, maximumBytes)
       if (existing === 'invalid') throw new Error('AI_ACCESS_CONFIG_FILE_INVALID')
       temporary = await createTemporary(path, contents)
       await rename(temporary, path)
@@ -91,7 +94,7 @@ export function createManagedTextFile(options: ManagedTextFileOptions = {}): Man
     write,
 
     async appendIfCurrent(path, expected, contents) {
-      const initial = await stableSnapshot(path)
+      const initial = await stableSnapshot(path, maximumBytes)
       if (initial === undefined || initial.contents !== expected || initial.identity === undefined) return 'changed'
 
       let handle: FileHandle | undefined
@@ -100,10 +103,10 @@ export function createManagedTextFile(options: ManagedTextFileOptions = {}): Man
         // but the pre-open and descriptor snapshots still fail closed when the source changes.
         const flags = constants.O_RDWR | constants.O_APPEND | (process.platform === 'win32' ? 0 : constants.O_NOFOLLOW)
         handle = await open(path, flags)
-        if (!sameSnapshot(initial, await stableHandleSnapshot(handle))) return 'changed'
+        if (!sameSnapshot(initial, await stableHandleSnapshot(handle, maximumBytes))) return 'changed'
 
         await options.beforeAppend?.(path)
-        if (!sameSnapshot(initial, await stableHandleSnapshot(handle))) return 'changed'
+        if (!sameSnapshot(initial, await stableHandleSnapshot(handle, maximumBytes))) return 'changed'
 
         // O_APPEND makes this one kernel append; it never seeks back and replaces customer bytes.
         await handle.writeFile(contents, 'utf8')
@@ -115,7 +118,7 @@ export function createManagedTextFile(options: ManagedTextFileOptions = {}): Man
         await handle?.close().catch(() => undefined)
       }
 
-      const latest = await stableSnapshot(path)
+      const latest = await stableSnapshot(path, maximumBytes)
       return latest !== undefined && latest.contents === `${expected}${contents}` ? 'appended' : 'changed'
     },
 
@@ -131,7 +134,7 @@ export function createManagedTextFile(options: ManagedTextFileOptions = {}): Man
     },
 
     async remove(path) {
-      const existing = await existingFile(path)
+      const existing = await existingFile(path, maximumBytes)
       if (existing === 'missing') return
       if (existing === 'invalid') throw new Error('AI_ACCESS_CONFIG_FILE_INVALID')
       try { await rm(path) } catch (error) { throw new Error('AI_ACCESS_CONFIG_FILE_INVALID', { cause: error }) }
@@ -163,7 +166,7 @@ interface FileIdentity {
 }
 
 /** Two metadata checks bracket each read so a detected race fails before any append occurs. */
-async function stableSnapshot(path: string): Promise<StableFileSnapshot | undefined> {
+async function stableSnapshot(path: string, maximumBytes: number): Promise<StableFileSnapshot | undefined> {
   let before: Stats
   try {
     before = await lstat(path)
@@ -171,7 +174,7 @@ async function stableSnapshot(path: string): Promise<StableFileSnapshot | undefi
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { contents: undefined, identity: undefined }
     throw new Error('AI_ACCESS_CONFIG_FILE_INVALID', { cause: error })
   }
-  if (!validFile(before)) throw new Error('AI_ACCESS_CONFIG_FILE_INVALID')
+  if (!validFile(before, maximumBytes)) throw new Error('AI_ACCESS_CONFIG_FILE_INVALID')
   const contents = await readFile(path, 'utf8')
   let after: Stats
   try {
@@ -180,23 +183,23 @@ async function stableSnapshot(path: string): Promise<StableFileSnapshot | undefi
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
     throw new Error('AI_ACCESS_CONFIG_FILE_INVALID', { cause: error })
   }
-  if (!validFile(after) || !sameIdentity(identity(before), identity(after))) return undefined
+  if (!validFile(after, maximumBytes) || !sameIdentity(identity(before), identity(after))) return undefined
   return { contents, identity: identity(after) }
 }
 
 /** The descriptor stays pinned to the inode we compared; a replacement at the path cannot pass. */
-async function stableHandleSnapshot(handle: FileHandle): Promise<StableFileSnapshot | undefined> {
+async function stableHandleSnapshot(handle: FileHandle, maximumBytes: number): Promise<StableFileSnapshot | undefined> {
   const before = await handle.stat()
-  if (!validFile(before)) return undefined
+  if (!validFile(before, maximumBytes)) return undefined
   const buffer = Buffer.alloc(before.size)
   const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0)
   const after = await handle.stat()
-  if (bytesRead !== buffer.length || !validFile(after) || !sameIdentity(identity(before), identity(after))) return undefined
+  if (bytesRead !== buffer.length || !validFile(after, maximumBytes) || !sameIdentity(identity(before), identity(after))) return undefined
   return { contents: buffer.toString('utf8'), identity: identity(after) }
 }
 
-function validFile(value: Stats): boolean {
-  return value.isFile() && !value.isSymbolicLink() && value.size <= maxTextFileBytes
+function validFile(value: Stats, maximumBytes: number): boolean {
+  return value.isFile() && !value.isSymbolicLink() && value.size <= maximumBytes
 }
 
 function identity(value: Stats): FileIdentity {
@@ -213,10 +216,10 @@ function sameIdentity(left: FileIdentity | undefined, right: FileIdentity | unde
       left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs
 }
 
-async function existingFile(path: string): Promise<'present' | 'missing' | 'invalid'> {
+async function existingFile(path: string, maximumBytes: number): Promise<'present' | 'missing' | 'invalid'> {
   try {
     const info = await lstat(path)
-    return info.isFile() && !info.isSymbolicLink() ? 'present' : 'invalid'
+    return info.isFile() && !info.isSymbolicLink() && info.size <= maximumBytes ? 'present' : 'invalid'
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing' : 'invalid'
   }

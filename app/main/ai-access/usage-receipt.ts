@@ -174,7 +174,7 @@ export function createUsageReceiptRecorder(options: UsageReceiptRecorderOptions)
         const entry = entryFromEvent(event, options.version, options.osVersion, clientVersion, now)
         if (entry === undefined) return
         const entries = [...await readEntries(options.store), entry]
-        await options.store.write(trimEntries(entries, Date.now() - retentionMs, maxEntries))
+        await options.store.write(trimEntries(entries, now() - retentionMs, maxEntries))
       }).catch(() => undefined)
     },
     async generate() {

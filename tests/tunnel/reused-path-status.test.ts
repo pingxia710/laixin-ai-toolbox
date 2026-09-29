@@ -39,6 +39,15 @@ function statusOf(daemon: DaemonStateView): TunnelStatus {
 }
 
 describe('复用本机已有外网时的状态', () => {
+  it('本机路径身份缺失说明连接重试和问题反馈，不让客户重复购买', () => {
+    const status = statusOf({ state: 'error', code: 'TUNNEL_AVAILABILITY_OBJECT_IDENTITY_MISSING', message: '',
+      availability: { active: true, status: 'limited', action: 'reuse', code: 'TUNNEL_AVAILABILITY_OBJECT_IDENTITY_MISSING', intentGeneration: 1 } })
+    expect(status.message).toContain('本机网卡或网络路径')
+    expect(status.message).toContain('重新连接')
+    expect(status.message).toContain('复制诊断给客服')
+    expect(status.message).toContain('无需重复购买套餐')
+  })
+
   it('复用态被如实标成 reused，来信自己的通道标成 laixin，没连接时为空', () => {
     expect(isReusedPath(reusedDaemon)).toBe(true)
     expect(isReusedPath(laixinDaemon)).toBe(false)
@@ -65,6 +74,7 @@ describe('复用本机已有外网时的状态', () => {
 
   it('网络页在复用态说的是「用你原有的外网、没改设置」，⛔ 说通道出口已校验', () => {
     const view = (partial: Partial<TunnelStatusView>): TunnelStatusView => ({
+      pauseReason: '',
       currentConfig: '', pendingConfig: '', canApplyPending: false, state: DISPLAY_STATES.connected, message: '', source: '',
       authorization: '', backend: '', nodeLabel: '', exitIp: '', pathSource: '', lastVerifiedAt: '2026-09-13T10:00:00.000Z',
       configVersion: '', expiresAt: '', pendingAvailable: false, unrestored: '', componentMissing: '', ...partial
@@ -75,5 +85,26 @@ describe('复用本机已有外网时的状态', () => {
     expect(reused.primaryLabel).not.toBe('断开通道') // ⛔ 让客户以为点一下会关掉别人的软件
     const laixin = buildTunnelPresentation(view({ pathSource: 'laixin', exitIp: '203.0.113.42' }))
     expect(laixin.description).toContain('通道出口已完成校验')
+  })
+
+  it('N-55 只有执行中的当前动作才优先展示阶段：被动 examining 不覆盖断开或真实错误', () => {
+    const afterReuseDisconnect = statusOf({
+      state: 'stopped-restored', code: '', message: '',
+      availability: { status: 'examining', action: 'inspect', intentGeneration: 9 }
+    })
+    expect(afterReuseDisconnect).toMatchObject({ state: '已停止并恢复原设置', availabilityStatus: '' })
+
+    const portError = statusOf({
+      state: 'error', code: '端口占用', message: '端口占用',
+      availability: { status: 'examining', action: 'inspect', intentGeneration: 9 }
+    })
+    expect(portError).toMatchObject({ state: '异常', availabilityStatus: '' })
+    expect(portError.message).toContain('端口')
+
+    const activeReuse = statusOf({
+      state: 'error', code: '端口占用', message: '端口占用',
+      availability: { active: true, status: 'reusing', action: 'reuse', intentGeneration: 10 }
+    })
+    expect(activeReuse).toMatchObject({ state: '连接中', availabilityStatus: 'reusing', message: '正在复用' })
   })
 })

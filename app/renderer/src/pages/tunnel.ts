@@ -6,10 +6,11 @@ import { revealSupport } from '../support-widget'
 import { requestTabNavigation } from '../navigation'
 import { accountSnapshot, onAccountChange } from '../account-state'
 import { idleNetworkRepair, type NetworkRepairStatus } from '../../../shared/network-repair'
-import { currentDiagnosticSession, forgetDiagnosticSession } from '../diagnostic-session'
+import type { DiagnosticSoftware } from '../../../network-diagnostics-types'
+import { currentDiagnosticSession, forgetDiagnosticSession, parseDiagnosticRunSnapshot, rememberDiagnosticSession } from '../diagnostic-session'
 
 type Tone = 'neutral' | 'positive' | 'warning' | 'danger'
-type PrimaryAction = 'guide' | 'sync' | 'import' | 'start' | 'stop' | 'support' | 'none'
+type PrimaryAction = 'guide' | 'sync' | 'import' | 'start' | 'stop' | 'repair' | 'support' | 'none'
 
 interface TunnelPageState {
   status: TunnelStatusView | undefined
@@ -26,6 +27,7 @@ interface TunnelPageState {
   reportReceipt: string
   /** 没送出去时诊断包落在本机哪儿；送出去了为空串。 */
   reportFile: string
+  reportSoftware: DiagnosticSoftware
 }
 
 export interface TunnelPresentation {
@@ -37,11 +39,22 @@ export interface TunnelPresentation {
   readonly primaryLabel: string
 }
 
+function isHealthyLocalBackendContinuation(status: TunnelStatusView, now: number): boolean {
+  const verifiedAt = Date.parse(status.lastVerifiedAt)
+  return status.state === '已连' && status.unrestored === '' && status.componentMissing === '' &&
+    Number.isFinite(verifiedAt) && verifiedAt <= now && now - verifiedAt <= 90_000 &&
+    (status.pathSource === 'reused' || status.exitIp !== '') &&
+    status.authorization === '本地配置有效期内，等待重新核验' &&
+    status.backend === '后台暂不可达，按本地有效期继续' &&
+    status.message === '账号后台暂时问不到，按本地套餐有效期继续提供网络；恢复后自动核验' &&
+    Date.parse(status.expiresAt) > now
+}
+
 const state: TunnelPageState = {
   status: undefined, statusReadError: '', lastActionMessage: '', lastActionTone: 'neutral',
   routeHost: '', routeResult: undefined, routeError: '', routeBusy: false,
   repair: { ...idleNetworkRepair }, repairReadError: false,
-  reportReceipt: '', reportFile: ''
+  reportReceipt: '', reportFile: '', reportSoftware: 'codex'
 }
 /** 分流说明与出口 IP 所在的折叠区：首次挂载就展开，⛔ 让客户多点一下才看得到（验收 P3-4）。 */
 const networkExtraClass = 'technical-details network-extra'
@@ -53,6 +66,7 @@ let refreshRequest = 0
 let lastRefreshedRequest = 0
 let lastRender = ''
 let busy = false
+let reportInProgress = false
 let stopAccount = (): void => undefined
 const listeners: Array<() => void> = []
 
@@ -65,16 +79,19 @@ export const page: PageModule = {
     activeElement = element
     state.status = undefined
     state.statusReadError = ''
-    state.lastActionMessage = ''
-    state.lastActionTone = 'neutral'
+    if (!reportInProgress && !state.reportReceipt) {
+      state.lastActionMessage = ''
+      state.lastActionTone = 'neutral'
+    }
     state.routeHost = ''
     state.routeResult = undefined
     state.routeError = ''
     state.routeBusy = false
     state.repair = { ...idleNetworkRepair }
     state.repairReadError = false
+    if (!reportInProgress && !state.reportReceipt) state.reportSoftware = 'codex'
     lastRender = ''
-    busy = false
+    busy = reportInProgress
     stopAccount = onAccountChange(() => render(element))
     render(element)
     void refresh(version)
@@ -108,6 +125,12 @@ export function buildTunnelPresentation(status: TunnelStatusView | undefined): T
     return { tone: 'danger', headline: '原设置尚未恢复', description: '通道已停止。可以重试恢复；其他软件修改的设置会保留。',
       hint: status.message || '恢复完成前无法重新连接或应用新配置。', primaryAction: 'stop', primaryLabel: '重试恢复原设置' }
   }
+  if (status.state === '断开中') {
+    return { tone: 'warning', headline: status.pauseReason === 'entitlement-denied' ? '权益校验未通过，正在暂停网络' : '正在断开网络',
+      description: '正在恢复你的原网络设置。完成前请不要重复连接或断开。',
+      hint: status.pauseReason === 'entitlement-denied' ? '恢复完成后可重新确认账号权益。' : '恢复完成后可再次连接。',
+      primaryAction: 'none', primaryLabel: '恢复中' }
+  }
   if (status.authorization === '等待重新确认账号权益') {
     return { tone: 'warning', headline: '通道已暂时暂停', description: '账号服务暂时无法确认权益。确认有效后将接续先前连接。',
       hint: '点击断开可取消自动恢复；也可手动同步账号状态。', primaryAction: 'stop', primaryLabel: '断开并取消自动恢复' }
@@ -115,6 +138,22 @@ export function buildTunnelPresentation(status: TunnelStatusView | undefined): T
   if (status.authorization === '保留先前连接，等待重新核验') {
     return { tone: 'warning', headline: '原连接暂时保留', description: status.message,
       hint: '正在自动重试账号校验；你也可以随时断开。', primaryAction: 'stop', primaryLabel: '断开通道' }
+  }
+  const availability = status.availabilityStatus ?? ''
+  // 接管失败后恢复原设置时，守护仍须保留“异常”的连接结果；不能用“已恢复设置”盖掉它。
+  if (availability && !(availability === 'recovered' && status.state === '异常')) {
+    const labels: Record<string, { readonly tone: TunnelPresentation['tone']; readonly headline: string; readonly description: string; readonly primaryLabel: string }> = {
+      examining: { tone: 'warning', headline: '正在取证', description: '正在确认当前网络路径、设置归属和恢复条件。', primaryLabel: '取消连接' },
+      reusing: { tone: 'warning', headline: '正在复用', description: '正在实测电脑现有网络是否可以到达目标服务；不会改动系统设置。', primaryLabel: '取消连接' },
+      'taking-over': { tone: 'warning', headline: '正在接管', description: '正在保存原设置、建立写入租约，并在写后读回和实测目标服务。', primaryLabel: '取消连接' },
+      reclaiming: { tone: 'warning', headline: '正在夺回', description: '检测到设置被改写，正在按当前证据进行有界夺回和复验。', primaryLabel: '取消连接' },
+      recovering: { tone: 'warning', headline: '正在恢复', description: '正在只恢复仍由本次租约拥有且未被外部再次修改的设置。', primaryLabel: '恢复中' },
+      recovered: { tone: 'positive', headline: '已恢复', description: '原网络设置已读回确认；外部后来修改的值已保留。', primaryLabel: '连接通道' },
+      limited: { tone: 'danger', headline: '无法安全自动处理', description: status.availabilityReason || '当前网络设置缺少可验证的处理条件。', primaryLabel: '联系来信客服' }
+    }
+    const presentation = labels[availability]
+    if (presentation !== undefined) return { ...presentation, hint: status.availabilityReason || '状态会随新的连接意图或路径证据自动更新。',
+      primaryAction: availability === 'limited' ? 'support' : availability === 'recovered' ? 'start' : 'stop' }
   }
   switch (status.state) {
     case '通道待确认':
@@ -155,17 +194,28 @@ export function buildTunnelPresentation(status: TunnelStatusView | undefined): T
     case '异常':
       return {
         tone: 'danger', headline: '通道需要处理', description: '请查看下方状态说明；原设置未恢复前，不能应用新的配置。',
-        hint: status.message === '' ? '连接状态异常。' : status.message,
-        primaryAction: status.currentConfig === '' ? 'import' : 'start', primaryLabel: status.currentConfig === '' ? '导入配置包' : '重新连接'
+        hint: status.availabilityStatus === 'recovered' && status.availabilityReason
+          ? status.availabilityReason : status.message === '' ? '连接状态异常。' : status.message,
+        primaryAction: status.currentConfig === '' ? 'import' : 'repair', primaryLabel: status.currentConfig === '' ? '导入配置包' : '检测并修复连接'
       }
     case '用户主动断开':
       // N-26 轻暂停:用户断开就是暂停(共用同一意图),状态卡明说「已暂停」与开机不接续,
       // ⛔ 让客户靠理解状态机猜按钮行为。动作不变:恢复仍走连接链路。
+      if (status.pauseReason === 'entitlement-denied') return {
+        tone: 'warning', headline: '权益校验未通过，网络已暂停', description: status.message,
+        hint: '本次恢复完成状态尚未确认；可点「恢复使用」重新校验。如账号显示权益仍有效，请联系来信客服。',
+        primaryAction: status.currentConfig === '' ? 'import' : 'start', primaryLabel: status.currentConfig === '' ? '导入配置包' : '恢复使用'
+      }
       return {
         tone: 'neutral', headline: '已暂停使用', description: '通道已暂停，正在恢复你的原网络设置；开机不会自动连接。',
         hint: '需要时点「恢复使用」即可继续。', primaryAction: status.currentConfig === '' ? 'import' : 'start', primaryLabel: status.currentConfig === '' ? '导入配置包' : '恢复使用'
       }
     case '已停止并恢复原设置':
+      if (status.pauseReason === 'entitlement-denied') return {
+        tone: 'warning', headline: '权益校验未通过，网络已暂停', description: status.message,
+        hint: '可点「恢复使用」重新校验；如账号显示权益仍有效，请联系来信客服。开机不会自动连接。',
+        primaryAction: status.currentConfig === '' ? 'import' : 'start', primaryLabel: status.currentConfig === '' ? '导入配置包' : '恢复使用'
+      }
       return {
         tone: 'neutral', headline: '已暂停使用', description: '网络已暂停，原网络设置已恢复；开机不会自动连接。',
         hint: '点「恢复使用」可随时继续；退出工具箱时也会按此规则恢复原设置。',
@@ -217,8 +267,25 @@ async function runAction(action: () => Promise<TunnelActionResult>): Promise<voi
   await refresh(version)
 }
 
+async function runReportDiagnosis(software: DiagnosticSoftware): Promise<ReturnType<typeof parseDiagnosticRunSnapshot>> {
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  try {
+    const response = await Promise.race([
+      window.toolbox.diagnostics.runForReport({ software }),
+      new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error('DIAGNOSTIC_TIMEOUT')), 30_000) })
+    ])
+    const session = parseDiagnosticRunSnapshot(response.snapshot)
+    if (session.software !== software) throw new Error('DIAGNOSTIC_SOFTWARE_MISMATCH')
+    return session
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout)
+  }
+}
+
 function render(element: HTMLElement): void {
-  const key = JSON.stringify([state, busy, accountSnapshot().state])
+  const now = Date.now()
+  const key = JSON.stringify([state, busy, accountSnapshot().state,
+    state.status !== undefined && isHealthyLocalBackendContinuation(state.status, now)])
   if (key === lastRender) return
   const firstRender = lastRender === ''
   lastRender = key
@@ -236,7 +303,7 @@ function render(element: HTMLElement): void {
     ? { ...buildTunnelPresentation(status), headline: '暂时无法确认连接状态', description: '状态读取失败，正在等待重新读取。', hint: '请稍后重试，或联系来信客服。' }
     : buildTunnelPresentation(status)
   element.append(connectionCard(presentation))
-  appendFeedback(element, status)
+  appendFeedback(element, status, now)
   element.append(repairCard(), detailsCard(status), networkShortcuts(status))
   const extra = document.createElement('details'); extra.className = networkExtraClass
   extra.open = opened.has(networkExtraClass)
@@ -283,7 +350,7 @@ function renderAdvanced(): void {
 }
 
 function connectionCard(presentation: TunnelPresentation): HTMLElement {
-  if (state.repair.running) presentation = { tone: 'warning', headline: '正在检测并修复连接',
+  if (state.repair.running && state.status?.state !== '断开中') presentation = { tone: 'warning', headline: '正在检测并修复连接',
     description: state.repair.message, hint: '修复期间会短暂断开来信通道；可以随时取消。',
     primaryAction: 'stop', primaryLabel: '取消修复并断开' }
   const card = document.createElement('section')
@@ -313,7 +380,8 @@ function connectionCard(presentation: TunnelPresentation): HTMLElement {
   const guide = presentation.primaryAction === 'guide'
   const support = presentation.primaryAction === 'support'
   const trigger = button('', {
-    className: 'power-button', iconName: 'power', disabled: busy || (!guide && !support && action === undefined),
+    className: 'power-button', iconName: presentation.primaryAction === 'repair' ? 'refresh' : 'power',
+    disabled: busy || (presentation.primaryAction === 'repair' && state.repairReadError) || (!guide && !support && action === undefined),
     onClick: support ? () => revealSupport() : guide ? () => requestTabNavigation('dashboard') : action === undefined ? undefined : () => void runAction(action)
   })
   trigger.dataset.networkAction = 'primary'
@@ -336,7 +404,7 @@ function repairCard(): HTMLElement {
   card.append(Object.assign(document.createElement('p'), { textContent: '恢复来信管理的设置、同步配置，再重新连接验证。不会接管其他代理，也不会更改 AI 的模型或 API Key。' }))
   const actions = document.createElement('div'); actions.className = 'network-repair-actions'
   const trigger = button(repair.running ? '正在修复' : '检测并修复连接', {
-    iconName: 'refresh', disabled: busy || repair.running || !state.status || state.repairReadError,
+    iconName: 'refresh', disabled: busy || repair.running || !state.status || state.status.state === '断开中' || state.repairReadError,
     onClick: () => void runAction(() => { forgetDiagnosticSession(); return window.toolbox.tunnel.repair() })
   })
   trigger.dataset.networkAction = 'repair'
@@ -351,22 +419,78 @@ function repairCard(): HTMLElement {
   copy.dataset.networkAction = 'repair-copy'
   // 一键上报：客户不会复制诊断、也不一定发得出来（创始人 09-13：「复制诊断我不发哈」）。
   // 点一下，剩下的不用他管；发不出去也给同一个回执号和一份本机文件。
+  const softwareLabel = document.createElement('label'); softwareLabel.className = 'setting-row network-report-software'
+  softwareLabel.append(document.createTextNode('本次报障检查的软件'))
+  const softwareSelect = document.createElement('select'); softwareSelect.className = 'theme-select'
+  softwareSelect.dataset.networkAction = 'repair-report-software'
+  for (const [value, title] of [['codex', 'Codex'], ['claude', 'Claude Code'], ['hermes', 'Hermes（DeepSeek）']] as const) {
+    softwareSelect.append(Object.assign(document.createElement('option'), { value, textContent: title }))
+  }
+  softwareSelect.value = state.reportSoftware
+  softwareSelect.disabled = busy || repair.running
+  softwareSelect.addEventListener('change', () => {
+    if (softwareSelect.value === 'codex' || softwareSelect.value === 'claude' || softwareSelect.value === 'hermes') {
+      state.reportSoftware = softwareSelect.value
+    }
+  })
+  softwareLabel.append(softwareSelect)
   const send = button('把情况报给来信', { disabled: busy || repair.running,
-    onClick: () => void runAction(async () => {
-      const session = currentDiagnosticSession()
-      const result = JSON.parse((await window.toolbox.diagnostics.report({ id: session?.id ?? '' })).snapshot) as
+    onClick: () => {
+      if (reportInProgress || busy) return
+      const submitReport = async (id: string) => JSON.parse((await window.toolbox.diagnostics.report({ id })).snapshot) as
         { receipt?: string; uploaded: boolean; stale?: boolean; filePath?: string; message: string }
-      if (result.stale && session) forgetDiagnosticSession(session.id)
-      if (result.stale) return { outcome: 'rejected', code: '', message: result.message }
-      state.reportReceipt = result.receipt ?? ''
-      state.reportFile = result.uploaded ? '' : result.filePath ?? ''
-      return { outcome: result.uploaded ? 'applied' : 'rejected', code: '', message: result.message }
-    }) })
+      const submitIncomplete = async (software: DiagnosticSoftware) => JSON.parse((await window.toolbox.diagnostics.reportIncomplete({ software })).snapshot) as
+        { receipt?: string; uploaded: boolean; stale?: boolean; filePath?: string; message: string }
+      const software = state.reportSoftware
+      reportInProgress = true
+      busy = true
+      state.reportReceipt = ''
+      state.reportFile = ''
+      state.lastActionMessage = '正在检查本次网络情况并准备报告，请稍候。'
+      state.lastActionTone = 'neutral'
+      if (activeElement) render(activeElement)
+      void (async () => {
+        try {
+          forgetDiagnosticSession()
+          let id = ''
+          let incomplete = false
+          try {
+            const diagnosis = await runReportDiagnosis(software)
+            id = diagnosis.id
+            rememberDiagnosticSession({ id, software, checkedAt: diagnosis.network.checkedAt })
+          } catch {
+            incomplete = true
+          }
+          let result = id ? await submitReport(id) : await submitIncomplete(software)
+          if (result.stale && id) {
+            forgetDiagnosticSession(id)
+            incomplete = true
+            result = await submitIncomplete(software)
+          }
+          if (result.stale) {
+            state.lastActionMessage = result.message
+            state.lastActionTone = 'danger'
+            return
+          }
+          state.reportReceipt = result.receipt ?? ''
+          state.reportFile = result.uploaded ? '' : result.filePath ?? ''
+          state.lastActionMessage = incomplete ? `本次诊断未完成；${result.message}` : result.message
+          state.lastActionTone = result.uploaded ? 'neutral' : 'danger'
+        } catch {
+          state.lastActionMessage = '上报未完成，请重试；若本次检查失败，诊断结果也未生成。'
+          state.lastActionTone = 'danger'
+        } finally {
+          reportInProgress = false
+          busy = false
+          if (activeElement) render(activeElement)
+        }
+      })()
+    } })
   send.dataset.networkAction = 'repair-report'
-  actions.append(trigger, send, copy); card.append(actions)
+  actions.append(trigger, send, copy); card.append(softwareLabel, actions)
   // 客户按之前就该知道发的是什么。这句是事实陈述，⛔ 写成免责声明。
   card.append(Object.assign(document.createElement('small'), { className: 'network-report-scope',
-    textContent: '上报会把这台电脑的连接状态、错误码和网络日志发给来信客服；不含账号密码、Key、通道凭据，也不含你访问过的网址。' }))
+    textContent: '只有点击上报才会发送脱敏诊断包，可能包含账号/设备编号、出口 IP、代理与设置恢复状态、近期故障和网络运行日志。日志中的地址文本会做脱敏处理，但仍可能保留部分地址；不主动采集对话内容。' }))
   if (state.reportReceipt) {
     const receipt = document.createElement('p'); receipt.className = 'network-report-receipt'
     receipt.dataset.receipt = state.reportReceipt
@@ -428,7 +552,7 @@ function networkShortcuts(status: TunnelStatusView | undefined): HTMLElement {
   }
   for (const [title, description, iconName, action, disabled] of [
     ['刷新状态', '读取当前连接状态与最近一次复验结果。', 'refresh', () => { void refresh(mountVersion) }, busy],
-    ['同步配置', '登录后读取账号下的网络配置，沿用现有应用流程。', 'download', () => { void runAction(() => window.toolbox.tunnel.syncAccountConfig()) }, busy || state.repair.running || status === undefined || accountSnapshot().state !== 'signed-in'],
+    ['同步配置', '登录后读取账号下的网络配置，沿用现有应用流程。', 'download', () => { void runAction(() => window.toolbox.tunnel.syncAccountConfig()) }, busy || state.repair.running || status === undefined || status.state === '断开中' || accountSnapshot().state !== 'signed-in'],
     ['网络诊断', '检查基础网络、当前通道和目标 AI 服务。', 'network', () => open('.network-diagnostics'), false],
     ['手动配置', '导入已有的来信配置包，或应用待用配置。', 'settings', () => open('.network-manual'), false]
   ] as const) {
@@ -548,18 +672,19 @@ function actionSection(status: TunnelStatusView | undefined): HTMLElement {
   actions.className = 'action-grid'
   // N-26:启动与暂停拆两颗卡,两卡并存、各自禁用态正确——⛔ 一张卡按状态换脸让客户不敢点。
   // 暂停 = 通道活动或待确认时可用,语义走既有 tunnel.stop() 链路(复用 user-disconnected 意图)。
-  const channelActive = status !== undefined && (['已连', '连接中', '通道待确认'].includes(status.state) ||
+  const disconnecting = status?.state === '断开中'
+  const channelActive = status !== undefined && !disconnecting && (['已连', '连接中', '通道待确认'].includes(status.state) ||
     ['等待重新确认账号权益', '保留先前连接，等待重新核验'].includes(status.authorization))
-  // 恢复进行中(用户主动断开)/落定(已停止并恢复原设置)都是暂停态:启动卡换「恢复使用」文案。
+  // 旧用户主动断开与已停止状态沿用暂停文案；断开中仍在恢复原设置，不开放连接。
   const paused = status !== undefined && ['用户主动断开', '已停止并恢复原设置'].includes(status.state)
   actions.append(
-    actionCard('同步账号配置', '登录来信账号后，领取已开通的网络配置。', 'refresh', '同步配置', () => window.toolbox.tunnel.syncAccountConfig(), status === undefined),
+    actionCard('同步账号配置', '登录来信账号后，领取已开通的网络配置。', 'refresh', '同步配置', () => window.toolbox.tunnel.syncAccountConfig(), status === undefined || disconnecting),
     actionCard('导入配置包', '从本机选择来信签发的配置包；不会读取第三方订阅。', 'upload', '导入配置包', () => window.toolbox.tunnel.importConfig(), status === undefined),
     actionCard('应用待用配置', '仅在通道断开且原设置已恢复时可应用。', 'check', '应用新配置', () => window.toolbox.tunnel.applyPending(), status?.canApplyPending !== true),
     // 启动/恢复一颗:暂停态换文案;通道活动中原设置未恢复时都不可发起(恢复入口在上方「重试恢复原设置」)。
     actionCard(paused ? '恢复使用' : '连接通道', paused ? '回到暂停前的用法：重新连接并核验，随时可再暂停。' : '使用当前配置重新连接并核验。',
       paused ? 'play' : 'power', paused ? '恢复' : '连接', () => window.toolbox.tunnel.start(),
-      status === undefined || channelActive || Boolean(status.unrestored) || status.currentConfig === ''),
+      status === undefined || disconnecting || channelActive || Boolean(status.unrestored) || status.currentConfig === ''),
     actionCard('暂停使用', '断开通道并恢复你的原网络设置；开机不会自动连接。', 'pause', '暂停',
       () => window.toolbox.tunnel.stop(), status === undefined || !channelActive)
   )
@@ -583,17 +708,20 @@ function primaryAction(action: PrimaryAction): (() => Promise<TunnelActionResult
     case 'import': return () => window.toolbox.tunnel.importConfig()
     case 'start': return () => window.toolbox.tunnel.start()
     case 'stop': return () => window.toolbox.tunnel.stop()
+    case 'repair': return () => { forgetDiagnosticSession(); return window.toolbox.tunnel.repair() }
     case 'guide':
     case 'support':
     case 'none': return undefined
   }
 }
 
-function appendFeedback(element: HTMLElement, status: TunnelStatusView | undefined): void {
+function appendFeedback(element: HTMLElement, status: TunnelStatusView | undefined, now: number): void {
   const messages: Array<{ text: string; tone: Tone; iconName: IconName }> = []
   if (state.statusReadError !== '') messages.push({ text: state.statusReadError, tone: 'danger', iconName: 'warning' })
   if (state.lastActionMessage !== '') messages.push({ text: state.lastActionMessage, tone: state.lastActionTone, iconName: state.lastActionTone === 'danger' ? 'warning' : 'check' })
-  if (status?.message !== undefined && status.message !== '') messages.push({ text: status.message, tone: status.state === '异常' ? 'danger' : 'warning', iconName: 'warning' })
+  if (status?.message !== undefined && status.message !== '' && !isHealthyLocalBackendContinuation(status, now)) {
+    messages.push({ text: status.message, tone: status.state === '异常' ? 'danger' : 'warning', iconName: 'warning' })
+  }
   if (status?.unrestored !== undefined && status.unrestored !== '') messages.push({ text: `未恢复项：${status.unrestored}`, tone: 'danger', iconName: 'warning' })
   if (status?.componentMissing !== undefined && status.componentMissing !== '') messages.push({ text: status.componentMissing, tone: 'danger', iconName: 'warning' })
   for (const message of messages) {

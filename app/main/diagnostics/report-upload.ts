@@ -8,7 +8,7 @@
 //
 // 两条都不成：把整包写成本机文件，回执号照给，客户可以手工发给客服（回执号对得上同一次上报）。
 import { randomInt } from 'node:crypto'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, open, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { REPORT_RECEIPT_ALPHABET, REPORT_RECEIPT_PATTERN } from '../../report-types'
 
@@ -108,7 +108,24 @@ function errorCode(body: string): string | undefined {
 export async function saveReportLocally(directory: string, receipt: string, payload: string): Promise<string> {
   if (!REPORT_RECEIPT_PATTERN.test(receipt)) throw new Error('REPORT_RECEIPT_INVALID')
   await mkdir(directory, { recursive: true, mode: 0o700 })
+  const directoryInfo = await lstat(directory)
+  if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink()) throw new Error('REPORT_DIRECTORY_INVALID')
   const path = join(directory, `${receipt}.json`)
-  await writeFile(path, payload, { mode: 0o600 })
+  const handle = await open(path, 'wx', 0o600)
+  let created: Awaited<ReturnType<typeof handle.stat>> | undefined
+  let closed = false
+  try {
+    created = await handle.stat()
+    await handle.writeFile(payload)
+    await handle.sync()
+  } catch (error) {
+    await handle.close().catch(() => undefined)
+    closed = true
+    try {
+      const current = await lstat(path)
+      if (created && current.isFile() && !current.isSymbolicLink() && current.dev === created.dev && current.ino === created.ino) await rm(path)
+    } catch { /* Preserve the write failure. */ }
+    throw error
+  } finally { if (!closed) await handle.close() }
   return path
 }

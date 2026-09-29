@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { randomUUID, timingSafeEqual } from 'node:crypto'
 import { apiFailureMessage, classifyProviderFailure, providerRecoveryNotice, type ApiFailure, type ApiLatency, type ApiRequestRecord, type ApiServiceSnapshot, type ApiShell, type CodexDesktopRouteReason, type CodexDesktopRouteVerification, type ModelProviderId } from '../../shared/api-service-types'
 import { isProviderModelAllowed, modelProviderIds, normalizeProviderModel } from '../../shared/model-providers'
-import { ClientAcceptanceTracker, type ClientAcceptanceRoute, type ClientRouteAcceptance } from './client-acceptance'
+import { ClientAcceptanceTracker, type ClientAcceptanceRoute, type ClientRouteAcceptance, type ClientRouteAttempt } from './client-acceptance'
 import { unavailableDesktopRouteAttestor, unverified, type DesktopRouteAttestor } from './desktop-route-attestation'
 import { rewriteUpstreamRequest } from './provider-rewrite'
 
@@ -12,12 +12,24 @@ export interface GatewayRoute {
   readonly model: string
   readonly endpoint: string
   readonly key: string
+  /** An active application-isolation lease may select its private Electron HTTP/CONNECT transport. */
+  readonly isolated?: boolean
   /** Internal only: a successful client call counts only while this revision is still active. */
   readonly revision?: string
+  /** Multi-model routes use their immutable local picker ID as an evidence namespace. */
+  readonly routeId?: string
 }
+
+/** The optional third argument carries route ownership to the production egress selector. */
+export type GatewayFetch = (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1], route?: GatewayRoute) => ReturnType<typeof fetch>
 type ActiveGatewayRoute = GatewayRoute & ClientAcceptanceRoute
 type Json = Record<string, unknown>
 type ProviderFailureDetail = { readonly code: ApiFailure; readonly recoveryNotice?: string }
+type RetryBlock = { readonly code: ApiFailure; readonly expiresAt: number; readonly recoveryNotice?: string; readonly recoveryId?: string }
+type RetryBlockDecision =
+  | { readonly kind: 'open' }
+  | { readonly kind: 'blocked'; readonly block: RetryBlock }
+  | { readonly kind: 'recovery'; readonly recoveryId: string }
 const paths: Record<ApiShell, string> = { codex: 'responses', claude: 'messages', hermes: 'chat/completions' }
 const maximumBody = 32 * 1024 * 1024
 const maximumConcurrentClients = 16
@@ -45,9 +57,14 @@ const retryBlockedClientFailures = new Set<ApiFailure>([
   'membership_quota_exhausted', 'membership_concurrency_limited', 'membership_rate_limited',
   'coding_plan_expired', 'coding_plan_quota_exhausted', 'coding_plan_model_unavailable', 'coding_plan_key_product_mismatch'
 ])
+/** 只有 Codex 增强模式的三类临时限流，在 30 秒短路到期后需要一发客户请求受控确认恢复。 */
+const controlledRecoveryFailures = new Set<ApiFailure>([
+  'rate_limited', 'membership_rate_limited', 'membership_concurrency_limited'
+])
 /** 只允许这些上游时间字段穿过错误判类的短暂内存对象；不会写入诊断记录。 */
 const providerRecoveryFields = ['reset_at', 'resetAt', 'next_reset_at', 'nextResetAt', 'quota_reset_at', 'quotaResetAt', 'retry_at', 'retryAt', 'available_at', 'availableAt', 'next_flush_time', 'nextFlushTime', 'retry_after', 'retryAfter', 'retry_after_seconds', 'retryAfterSeconds', 'retry_after_ms', 'retryAfterMs'] as const
 const routePattern = new RegExp(`^/(codex|claude|hermes)/(${modelProviderIds.map(escapeRegex).join('|')})/v1/(responses|messages|chat/completions|models)$`)
+const multiModelRoutePattern = /^\/codex\/multi\/v1\/(responses|models)$/
 const desktopRouteStatusPath = '/_laixin/codex-desktop-route-status'
 const desktopRouteReasons = new Set<CodexDesktopRouteVerification['reason']>([
   'verified_socket_bound_desktop', 'awaiting_desktop_request', 'incomplete_answer', 'platform_unsupported',
@@ -56,7 +73,7 @@ const desktopRouteReasons = new Set<CodexDesktopRouteVerification['reason']>([
 ])
 
 export interface AiGatewayOptions {
-  readonly fetch?: typeof fetch
+  readonly fetch?: GatewayFetch
   readonly timeoutMs?: number
   /** Production installs the macOS process/socket observer; test and legacy callers stay fail-closed. */
   readonly desktopAttestor?: DesktopRouteAttestor
@@ -65,7 +82,35 @@ export interface AiGatewayOptions {
    * 只含壳名、时间与固定枚举；监听方负责白名单落盘。缺省时不产生任何行为变化。
    */
   readonly onUsageEvent?: (event: AiGatewayUsageEvent) => void
+  /** Present only in the independent headless router. The GUI gateway has no control plane. */
+  readonly routerControl?: (req: IncomingMessage, res: ServerResponse) => Promise<void>
 }
+
+/** A Codex picker entry is a stable local ID, never an upstream model name guessed from display text. */
+export interface MultiModelGatewayEntry {
+  readonly internalModelId: string
+  readonly provider: ModelProviderId
+  readonly model: string
+  readonly endpoint: string
+  /** Main-process only. The entry is materialized from encrypted state immediately before install. */
+  readonly key: string
+}
+
+/** The only logical provider used by a multi-Key Codex thread. */
+export interface MultiModelGatewayRoute {
+  readonly provider: 'laixin-multi'
+  readonly models: readonly MultiModelGatewayEntry[]
+}
+
+export interface MultiModelDesktopUse {
+  readonly provider: ModelProviderId
+  readonly model: string
+  readonly internalModelId: string
+  readonly at: string
+}
+
+type ActiveMultiModelGatewayEntry = MultiModelGatewayEntry & { readonly revision: string }
+type ActiveMultiModelGatewayRoute = { readonly provider: 'laixin-multi'; readonly models: readonly ActiveMultiModelGatewayEntry[] }
 
 /** 回执只认这两类固定事件；字段集合固定，⛔ 扩成请求记录或任何请求内容。 */
 export type AiGatewayUsageEvent =
@@ -77,6 +122,8 @@ export class AiGateway {
   private server?: Server
   private token = ''
   private routes: readonly ActiveGatewayRoute[] = []
+  /** Kept separately so the existing single-source shell routing remains type-safe and unchanged. */
+  private multiModelRoute?: ActiveMultiModelGatewayRoute
   private records: ApiRequestRecord[] = []
   private startedAt: string | null = null
   private controllers = new Set<AbortController>()
@@ -95,7 +142,7 @@ export class AiGateway {
   /** 连续超时计数：厂商侧连续没回复才算 provider_outage，单次超时仍报 timeout。 */
   private timeoutRuns = new Map<string, { count: number; first: number }>()
   /** 只针对实际客户端的当前路由版本；手动探测永远不从这里短路。 */
-  private retryBlocks = new Map<string, { code: ApiFailure; expiresAt: number; recoveryNotice?: string }>()
+  private retryBlocks = new Map<string, RetryBlock>()
   /** 已出口过「客户端调用观察」事件的路由版本：每版本只报一次开始真的在用。 */
   private usageAcceptedRevisions = new Set<string>()
   /** 客户端流量失败时通知一次；只报事实，⛔ 让通知失败影响这次请求。 */
@@ -130,14 +177,45 @@ export class AiGateway {
   setRoutes(routes: readonly GatewayRoute[]): void {
     const previous = new Map(this.routes.map(route => [route.shell, route]))
     this.routes = routes.map(route => {
-      const before = previous.get(route.shell)
-      const revision = route.revision ?? (before && sameRouteBinding(before, route) ? before.revision : randomUUID())
-      return { ...route, revision }
+      const { isolated: requestedIsolation, ...base } = route
+      // Only an explicit model API application lease may select a private egress. Every ordinary
+      // route keeps the default transport even if a caller provides an accidental marker.
+      const normalized = (route.shell === 'codex' || route.shell === 'claude' || route.shell === 'hermes') && requestedIsolation === true
+        ? { ...base, isolated: true } : base
+      const before = previous.get(normalized.shell)
+      const revision = normalized.revision ?? (before && sameRouteBinding(before, normalized) ? before.revision : randomUUID())
+      return { ...normalized, revision }
     })
-    const activeRevisions = new Set(this.routes.map(route => route.revision))
-    for (const revision of this.retryBlocks.keys()) if (!activeRevisions.has(revision)) this.retryBlocks.delete(revision)
-    this.acceptance.replaceRoutes(this.routes)
-    this.desktopAcceptance.replaceRoutes(this.routes)
+    this.refreshActiveEvidence()
+  }
+  /**
+   * Install one immutable picker directory for the logical `laixin-multi` provider. Entries are
+   * copied at the gateway boundary so a subsequent pool update cannot mutate an in-flight request.
+   */
+  setMultiModelRoute(route: MultiModelGatewayRoute | undefined): void {
+    if (route === undefined) {
+      this.multiModelRoute = undefined
+      this.refreshActiveEvidence()
+      return
+    }
+    const ids = new Set<string>()
+    if (route.models.length === 0) throw new Error('AI_ACCESS_MULTI_MODEL_ROUTE_INVALID')
+    for (const entry of route.models) {
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(entry.internalModelId) || ids.has(entry.internalModelId) ||
+        !modelProviderIds.includes(entry.provider) || !isProviderModelAllowed(entry.provider, 'codex', entry.model) ||
+        entry.endpoint === '' || entry.key === '') throw new Error('AI_ACCESS_MULTI_MODEL_ROUTE_INVALID')
+      ids.add(entry.internalModelId)
+    }
+    const previous = new Map(this.multiModelRoute?.models.map(entry => [entry.internalModelId, entry]))
+    this.multiModelRoute = {
+      provider: 'laixin-multi',
+      models: route.models.map(entry => {
+        const before = previous.get(entry.internalModelId)
+        const revision = before !== undefined && sameMultiModelBinding(before, entry) ? before.revision : randomUUID()
+        return { ...entry, revision }
+      })
+    }
+    this.refreshActiveEvidence()
   }
   /** 观察到的真实客户端调用时间，按壳；没观察到就没有这一项。 */
   clientCalls(): Readonly<Partial<Record<ApiShell, string>>> {
@@ -145,8 +223,34 @@ export class AiGateway {
   }
   /** 当前路由版本上，已真正观察到的成功客户端调用。 */
   clientAcceptances(): Readonly<Partial<Record<ApiShell, ClientRouteAcceptance>>> { return this.acceptance.acceptances() }
+  /** 当前路由版本上最近一次已落定的成功或失败；客户主动取消不算故障证据。 */
+  clientAttempts(): Readonly<Partial<Record<ApiShell, ClientRouteAttempt>>> { return this.acceptance.latestAttempts() }
+  /** Per internal picker ID: no Key, endpoint, prompt, or provider secret is exposed. */
+  multiModelClientAcceptances(): Readonly<Record<string, ClientRouteAcceptance>> { return this.acceptance.multiModelAcceptances() }
+  /** Per internal picker ID: current revision's latest successful/failed client evidence. */
+  multiModelClientAttempts(): Readonly<Record<string, ClientRouteAttempt>> { return this.acceptance.multiModelAttempts() }
   /** 仅在同一 socket 已绑定经签名 Codex Desktop 进程且该请求完整回答后才会是 verified。 */
   codexDesktopRouteAcceptance(): CodexDesktopRouteVerification { return this.desktopAcceptance.value() }
+  /** Per internal picker ID strict Desktop proof, isolated from official Codex and other pool entries. */
+  multiModelDesktopRouteAcceptances(): Readonly<Record<string, CodexDesktopRouteVerification>> { return this.desktopAcceptance.multiModelValues() }
+  /** Only a complete current-revision answer with a verified Desktop socket can become visible. */
+  async latestMultiModelDesktopUse(): Promise<MultiModelDesktopUse | undefined> {
+    await this.awaitDesktopAttestations()
+    return this.latestSettledMultiModelDesktopUse()
+  }
+  /** Control/status reads are snapshots: pending socket attestation never delays a router ACK. */
+  latestSettledMultiModelDesktopUse(): MultiModelDesktopUse | undefined {
+    const accepted = this.acceptance.multiModelAcceptances()
+    const desktop = this.desktopAcceptance.multiModelValues()
+    const candidates = this.multiModelRoute?.models.flatMap(entry => {
+      const completion = accepted[entry.internalModelId]
+      const attestation = desktop[entry.internalModelId]
+      return completion !== undefined && attestation?.status === 'verified' && attestation.at !== null
+        ? [{ provider: entry.provider, model: entry.model, internalModelId: entry.internalModelId, at: attestation.at }]
+        : []
+    }) ?? []
+    return candidates.sort((left, right) => Date.parse(right.at) - Date.parse(left.at))[0]
+  }
   /** A shell file changed outside the Toolbox, so prior route evidence no longer proves its current connection. */
   invalidateClientAcceptance(shell: ApiShell): void {
     const retired = this.routes.find(route => route.shell === shell)
@@ -156,23 +260,81 @@ export class AiGateway {
     // the old “in use” or Desktop proof against the still-equal upstream binding.
     this.routes = this.routes.map(route => route.shell === shell ? { ...route, revision: randomUUID() } : route)
     if (retired.revision !== undefined) this.retryBlocks.delete(retired.revision)
-    this.acceptance.replaceRoutes(this.routes)
-    this.desktopAcceptance.replaceRoutes(this.routes)
+    this.refreshActiveEvidence()
   }
   snapshot(): Omit<ApiServiceSnapshot, 'checks' | 'usage'> {
     return {
       running: this.server?.listening === true && this.baseUrl !== null,
       baseUrl: this.baseUrl, startedAt: this.startedAt, requests: [...this.records],
-      routes: this.routes.map(r => ({ shell: r.shell, provider: r.provider, model: r.model, baseUrl: `${this.baseUrl}/${r.shell}/${r.provider}${r.shell === 'claude' ? '' : '/v1'}`, upstream: r.endpoint }))
+      routes: this.routes.map(r => ({ shell: r.shell, provider: r.provider, model: r.model, baseUrl: `${this.baseUrl}/${r.shell}/${r.provider}${r.shell === 'claude' ? '' : '/v1'}`, upstream: r.endpoint,
+        ...(r.isolated === true ? { isolated: true, revision: r.revision } : {}) }))
     }
   }
-  async stop(): Promise<void> {
+  /** No model call or credentials: attest the current isolated route with a bounded origin HEAD. */
+  async probeDiagnosticPath(shell: ApiShell, revision: string): Promise<
+    { status: number; durationMs: number } | { failure: 'path-unavailable' | 'timeout' | 'unavailable'; durationMs: number }
+  > {
+    const started = Date.now()
+    const route = this.routes.find(item => item.shell === shell)
+    if (route?.isolated !== true || route.revision !== revision || this.options.fetch === undefined) {
+      return { failure: 'path-unavailable', durationMs: 0 }
+    }
+    const controller = new AbortController()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      const endpoint = new URL(route.endpoint)
+      if (endpoint.protocol !== 'https:' || endpoint.username || endpoint.password) return { failure: 'path-unavailable', durationMs: 0 }
+      const response = await Promise.race([
+        this.options.fetch(`${endpoint.origin}/`, { method: 'HEAD', credentials: 'omit', redirect: 'manual', signal: controller.signal }, route),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => { controller.abort(); reject(new Error('DIAGNOSTIC_TIMEOUT')) }, 5_000)
+        })
+      ])
+      void response.body?.cancel().catch(() => undefined)
+      const current = this.routes.find(item => item.shell === shell)
+      if (current?.isolated !== true || current.revision !== revision) return { failure: 'path-unavailable', durationMs: Date.now() - started }
+      return { status: response.status, durationMs: Date.now() - started }
+    } catch {
+      return { failure: controller.signal.aborted ? 'timeout' : 'unavailable', durationMs: Date.now() - started }
+    } finally { if (timer !== undefined) clearTimeout(timer) }
+  }
+  /** 立即中止在飞请求。同端口同令牌的重启（restartGateway 处理动作）传短宽限让回答收尾；
+   * 令牌轮换/换端口路径必须保持 0——旧令牌已作废，在飞请求不能继续用。 */
+  async stop(timeoutMs = 0): Promise<void> {
+    await this.drain(timeoutMs)
+  }
+
+  /** Stop accepting work, let current client requests settle, then abort only after the bound. */
+  async drain(timeoutMs = 5_000): Promise<void> {
     this.stopping = true
-    for (const controller of this.controllers) controller.abort()
     const server = this.server
-    this.server = undefined; this.baseUrl = null; this.token = ''; this.routes = []
+    let closed: Promise<void> | undefined
+    if (server) closed = new Promise<void>(resolve => server.close(() => resolve()))
+    const until = Date.now() + Math.max(0, timeoutMs)
+    while (this.controllers.size > 0 && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 20))
+    if (this.controllers.size > 0) for (const controller of this.controllers) controller.abort()
+    if (server) {
+      server.closeAllConnections()
+      await Promise.race([closed!, new Promise<void>(resolve => setTimeout(resolve, 250))])
+    }
+    this.server = undefined; this.baseUrl = null; this.token = ''; this.routes = []; this.multiModelRoute = undefined
     this.acceptance.clear(); this.desktopAcceptance.clear(); this.timeoutRuns.clear(); this.retryBlocks.clear(); this.usageAcceptedRevisions.clear()
-    if (server) await new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections() })
+  }
+
+  private multiModelEvidenceRoutes(): readonly ActiveGatewayRoute[] {
+    return this.multiModelRoute?.models.map(entry => ({
+      shell: 'codex', provider: entry.provider, model: entry.model, endpoint: entry.endpoint, key: entry.key,
+      revision: entry.revision, routeId: entry.internalModelId
+    })) ?? []
+  }
+
+  /** One current snapshot drives picker routing, retry gates, generic evidence, and Desktop proof. */
+  private refreshActiveEvidence(): void {
+    const active = [...this.routes, ...this.multiModelEvidenceRoutes()]
+    const activeRevisions = new Set(active.map(route => route.revision))
+    for (const revision of this.retryBlocks.keys()) if (!activeRevisions.has(revision)) this.retryBlocks.delete(revision)
+    this.acceptance.replaceRoutes(active)
+    this.desktopAcceptance.replaceRoutes(this.routes, this.multiModelEvidenceRoutes())
   }
 
   /**
@@ -225,7 +387,9 @@ export class AiGateway {
    * 短路已过时，立即失效——「测试已通过/重新启用成功」后客户端不再继续吃到缓存错误。
    * 绑定不一致（测的是另一家或另一把 Key）不清，⛔ 替别的路由放行。 */
   clearRetryBlock(route: GatewayRoute): void {
-    const active = this.routes.find(item => item.shell === route.shell)
+    const active = route.routeId === undefined
+      ? this.routes.find(item => item.shell === route.shell)
+      : this.multiModelEvidenceRoutes().find(item => item.routeId === route.routeId)
     if (active === undefined || !sameRouteBinding(active, route)) return
     if (active.revision !== undefined) this.retryBlocks.delete(active.revision)
   }
@@ -234,6 +398,12 @@ export class AiGateway {
     res.setHeader('cache-control', 'no-store')
     const [pathname, query] = (req.url ?? '').split('?')
     if (req.headers.origin || req.headers['sec-fetch-site'] || req.headers.host !== this.baseUrl?.slice(7)) { sendError(res, 403, 'key_rejected'); return }
+    if (pathname.startsWith('/_laixin/router/')) {
+      if (!this.options.routerControl) { sendError(res, 404, 'not_configured'); return }
+      await this.options.routerControl(req, res)
+      return
+    }
+    if (this.stopping) { discardRequestBody(req); sendError(res, 503, 'local_service_down'); return }
     // This loopback-only endpoint is intentionally read-only and returns just the fixed Desktop
     // proof state. It is a diagnostic surface, not an acceptance capability: a separate process
     // cannot authenticate an arbitrary caller-provided loopback port without a private channel.
@@ -250,6 +420,11 @@ export class AiGateway {
       ? req.headers.authorization.slice(7) : typeof req.headers['x-api-key'] === 'string' ? req.headers['x-api-key'] : ''
     if (!sameToken(supplied, this.token)) { sendError(res, 401, 'key_rejected'); return }
     if (query && query !== 'beta=true') { sendError(res, 404, 'not_configured'); return }
+    const multiMatch = multiModelRoutePattern.exec(pathname)
+    if (multiMatch) {
+      await this.handleMultiModelRequest(req, res, multiMatch[1])
+      return
+    }
     const match = routePattern.exec(pathname)
     const shell = match?.[1] as ApiShell | undefined
     if (shell && match?.[3] !== paths[shell] && match?.[3] !== 'models') { sendError(res, 404, 'not_configured'); return }
@@ -260,20 +435,22 @@ export class AiGateway {
       res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ object: 'list', data: [{ id: route.model, object: 'model', owned_by: route.provider }] })); return
     }
     if (req.method !== 'POST' || pathname.endsWith('/models')) { sendError(res, 405, 'not_configured'); return }
-    const blocked = this.retryBlockFor(route)
-    if (blocked !== undefined) {
+    const retryDecision = this.retryBlockFor(route)
+    if (retryDecision.kind === 'blocked') {
       // 仍把 body 交给 Node 流式丢弃，避免 keep-alive 连接遗留未读数据；⛔ 缓冲或接触上游。
       discardRequestBody(req)
-      const status = retryBlockStatus(blocked.code)
-      sendError(res, status, blocked.code, route.provider, blocked.recoveryNotice)
-      this.recordShortCircuitedClientFailure(route, blocked.code, status)
+      const status = retryBlockStatus(retryDecision.block.code)
+      sendError(res, status, retryDecision.block.code, route.provider, retryDecision.block.recoveryNotice)
+      this.recordShortCircuitedClientFailure(route, retryDecision.block.code, status)
       return
     }
+    const recoveryId = retryDecision.kind === 'recovery' ? retryDecision.recoveryId : undefined
     // 从开始收 body 就占一个槽。否则大量慢上传能在尚未进入 request() 前各自缓存 32MB，
     // 既绕过并发上限又把本机内存打满。
     if (this.controllers.size >= maximumConcurrentClients) {
       discardRequestBody(req)
       sendError(res, 503, 'local_service_busy')
+      if (recoveryId !== undefined) this.releaseRecovery(route, recoveryId)
       return
     }
     // Start before reading the body, while the accepted TCP connection is necessarily live.
@@ -300,6 +477,70 @@ export class AiGateway {
         if (typeof value === 'string' && value.length <= 1024 && /^[\x20-\x7e]+$/.test(value)) headers[name] = value
       }
       await this.request(route, body, 'client', res, controller, headers, true, false, desktopAttestation)
+    } finally {
+      if (recoveryId !== undefined) this.releaseRecovery(route, recoveryId)
+      res.off('close', disconnected)
+      this.controllers.delete(controller)
+    }
+  }
+
+  /** Multi-model requests are selected only by an exact internal ID and never fall back to a default route. */
+  private async handleMultiModelRequest(req: IncomingMessage, res: ServerResponse, operation: string): Promise<void> {
+    const pool = this.multiModelRoute
+    if (!pool) { sendError(res, 409, 'not_configured'); return }
+    if (operation === 'models') {
+      if (req.method !== 'GET') { sendError(res, 405, 'not_configured'); return }
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ object: 'list', data: pool.models.map(entry => ({ id: entry.internalModelId, object: 'model', owned_by: 'laixin-multi' })) }))
+      return
+    }
+    if (req.method !== 'POST') { sendError(res, 405, 'not_configured'); return }
+    if (this.controllers.size >= maximumConcurrentClients) { discardRequestBody(req); sendError(res, 503, 'local_service_busy'); return }
+    // The body is untrusted request content. Capture socket-only Desktop attestation first, while
+    // the accepted connection is live and before any request bytes are inspected.
+    const desktopAttestation = this.beginDesktopAttestation(req)
+    const controller = new AbortController()
+    this.controllers.add(controller)
+    const disconnected = (): void => { if (!res.writableEnded && !res.writableFinished) controller.abort() }
+    res.once('close', disconnected)
+    try {
+      let size = 0
+      const chunks: Buffer[] = []
+      for await (const chunk of req) {
+        size += chunk.length
+        if (size > maximumBody) { sendError(res, 413, 'payload_too_large'); return }
+        chunks.push(chunk)
+      }
+      let body: Json
+      try { const value: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8')); if (!isJson(value)) throw new Error(); body = value } catch { sendError(res, 400, 'invalid_reply'); return }
+      const internalModelId = body.model
+      if (typeof internalModelId !== 'string') { sendError(res, 409, 'not_configured'); return }
+      const entry = pool.models.find(candidate => candidate.internalModelId === internalModelId)
+      if (!entry) { sendError(res, 409, 'not_configured'); return }
+      // This concrete copy is the request's immutable route snapshot. `setMultiModelRoute()` can
+      // replace the pool while streaming, but can never alter this upstream endpoint or Key.
+      const route: GatewayRoute = {
+        shell: 'codex', provider: entry.provider, model: entry.model, endpoint: entry.endpoint, key: entry.key,
+        revision: entry.revision, routeId: entry.internalModelId
+      }
+      const retryDecision = this.retryBlockFor(route)
+      if (retryDecision.kind === 'blocked') {
+        const status = retryBlockStatus(retryDecision.block.code)
+        sendError(res, status, retryDecision.block.code, route.provider, retryDecision.block.recoveryNotice)
+        this.recordShortCircuitedClientFailure(route, retryDecision.block.code, status)
+        return
+      }
+      const recoveryId = retryDecision.kind === 'recovery' ? retryDecision.recoveryId : undefined
+      try {
+        const headers: Record<string, string> = {}
+        for (const name of ['user-agent']) {
+          const value = req.headers[name]
+          if (typeof value === 'string' && value.length <= 1024 && /^[\x20-\x7e]+$/.test(value)) headers[name] = value
+        }
+        await this.request(route, { ...body, model: entry.model }, 'client', res, controller, headers, true, false, desktopAttestation)
+      } finally {
+        if (recoveryId !== undefined) this.releaseRecovery(route, recoveryId)
+      }
     } finally {
       res.off('close', disconnected)
       this.controllers.delete(controller)
@@ -342,7 +583,8 @@ export class AiGateway {
       if (route.shell === 'claude') { headers['x-api-key'] = route.key; headers['anthropic-version'] = '2023-06-01' }
       const model = routedModel(route, body)
       const rewritten = rewriteUpstreamRequest({ shell: route.shell, provider: route.provider, model, body: { ...body, model }, headers })
-      const response = await (this.options.fetch ?? fetch)(route.endpoint, { method: 'POST', headers: rewritten.headers, body: JSON.stringify(rewritten.body), signal: controller.signal, redirect: 'error' })
+      const fetcher: GatewayFetch = this.options.fetch ?? ((input, init) => fetch(input, init))
+      const response = await fetcher(route.endpoint, { method: 'POST', headers: rewritten.headers, body: JSON.stringify(rewritten.body), signal: controller.signal, redirect: 'error' }, route)
       noteUpstreamActivity()
       status = response.status
       if (!response.ok) {
@@ -530,12 +772,31 @@ export class AiGateway {
     if (pending.length > 0) await Promise.all(pending)
   }
 
-  private retryBlockFor(route: GatewayRoute): { readonly code: ApiFailure; readonly recoveryNotice?: string } | undefined {
-    if (route.revision === undefined) return undefined
+  private retryBlockFor(route: GatewayRoute): RetryBlockDecision {
+    if (route.revision === undefined) return { kind: 'open' }
     const block = this.retryBlocks.get(route.revision)
-    if (block === undefined) return undefined
-    if (block.expiresAt <= Date.now()) { this.retryBlocks.delete(route.revision); return undefined }
-    return block
+    if (block === undefined) return { kind: 'open' }
+    if (block.expiresAt > Date.now() || block.recoveryId !== undefined) return { kind: 'blocked', block }
+    if (route.shell !== 'codex' || !controlledRecoveryFailures.has(block.code)) {
+      this.retryBlocks.delete(route.revision)
+      return { kind: 'open' }
+    }
+    const recoveryId = randomUUID()
+    this.retryBlocks.set(route.revision, { ...block, recoveryId })
+    return { kind: 'recovery', recoveryId }
+  }
+
+  /** A failed recovery gives up only its slot; the expired block still gates the next real request. */
+  private releaseRecovery(route: GatewayRoute, recoveryId: string): void {
+    if (route.revision === undefined) return
+    const block = this.retryBlocks.get(route.revision)
+    if (block?.recoveryId === recoveryId) {
+      this.retryBlocks.set(route.revision, {
+        code: block.code,
+        expiresAt: block.expiresAt,
+        ...(block.recoveryNotice ? { recoveryNotice: block.recoveryNotice } : {})
+      })
+    }
   }
 
   private recordShortCircuitedClientFailure(route: GatewayRoute, code: ApiFailure, status: number): void {
@@ -549,6 +810,9 @@ export class AiGateway {
     this.records = [record, ...this.records].slice(0, 200)
     if (record.source !== 'client') return
     if (updateRetryBlock) this.updateRetryBlock(route, record, recoveryNotice)
+    if (record.code !== 'client_aborted' && route.revision !== undefined && (!record.ok || completedAnswer)) {
+      this.acceptance.recordAttempt({ ...route, model: record.model } as ActiveGatewayRoute, record.at, record.ok, record.code)
+    }
     // 迟到的响应属于切换前那条路由：只有它还是当前绑定的同一 revision，才算「这一家真的被用过」，
     // ⛔ 拿旧请求给刚换上的服务商打勾。
     if (record.ok && completedAnswer && route.revision !== undefined &&
@@ -570,6 +834,9 @@ export class AiGateway {
       this.retryBlocks.set(route.revision, { code: record.code, expiresAt: Date.now() + clientRetryBlockWindowMs, ...(recoveryNotice ? { recoveryNotice } : {}) })
       return
     }
+    // This request has not proved recovery. Leave the expired block in place so releaseRecovery()
+    // can only relinquish its unique slot and the next real request must claim a new one.
+    if (!record.ok && this.retryBlocks.get(route.revision)?.recoveryId !== undefined) return
     this.retryBlocks.delete(route.revision)
   }
 
@@ -578,7 +845,9 @@ export class AiGateway {
    * 有过数据流动的超时（慢而在动、下游倒灌停读被掐）不算厂商账，否则健康厂商会被连坐误报（API-08）。
    */
   private escalateTimeouts(route: GatewayRoute, code: ApiFailure | undefined, sawUpstreamData = false): ApiFailure | undefined {
-    const key = `${route.shell}/${route.provider}`
+    // A multi-model entry's Key/endpoint revision is its failure domain; a timeout on A must not
+    // escalate B just because both happen to use one provider family.
+    const key = route.revision ?? `${route.shell}/${route.provider}`
     if (code === 'client_aborted') return code
     if (code !== 'timeout' || sawUpstreamData) { this.timeoutRuns.delete(key); return code }
     const now = Date.now()
@@ -596,17 +865,35 @@ export class AiGateway {
 class DesktopRouteAcceptanceTracker {
   private active?: ActiveGatewayRoute
   private latest: CodexDesktopRouteVerification = unverified('awaiting_desktop_request')
+  private multiActive = new Map<string, ActiveGatewayRoute>()
+  private multiLatest = new Map<string, CodexDesktopRouteVerification>()
 
-  replaceRoutes(routes: readonly ActiveGatewayRoute[]): void {
+  replaceRoutes(routes: readonly ActiveGatewayRoute[], multiRoutes: readonly ActiveGatewayRoute[] = []): void {
     const next = routes.find(route => route.shell === 'codex')
     if (next?.revision !== this.active?.revision) this.latest = unverified('awaiting_desktop_request')
     this.active = next
+    const nextMulti = new Map(multiRoutes.map(route => [route.routeId!, route]))
+    for (const [routeId, latest] of this.multiLatest) {
+      if (nextMulti.get(routeId)?.revision !== this.multiActive.get(routeId)?.revision) this.multiLatest.delete(routeId)
+      else if (latest === undefined) this.multiLatest.delete(routeId)
+    }
+    this.multiActive = nextMulti
   }
 
   /** @returns 该结果是否改变了当前路由版本上的证明状态；调用方据此决定是否出口回执事件。 */
   record(route: GatewayRoute, result: CodexDesktopRouteVerification): boolean {
-    if (route.shell !== 'codex' || route.revision === undefined || this.active?.revision !== route.revision) return false
+    if (route.shell !== 'codex' || route.revision === undefined) return false
     const safe = publicDesktopRouteResult(result)
+    if (route.routeId !== undefined) {
+      const active = this.multiActive.get(route.routeId)
+      if (active?.revision !== route.revision) return false
+      const latest = this.multiLatest.get(route.routeId) ?? unverified('awaiting_desktop_request')
+      if (safe.status !== 'verified' && latest.status === 'verified') return false
+      if (safe.status === latest.status && safe.reason === latest.reason) return false
+      this.multiLatest.set(route.routeId, safe)
+      return true
+    }
+    if (this.active?.revision !== route.revision) return false
     // Once the current route has a strict Desktop proof, a later CLI/unverified call cannot erase
     // that historical fact. A route replacement above clears it immediately.
     if (safe.status === 'verified' || this.latest.status !== 'verified') {
@@ -619,9 +906,15 @@ class DesktopRouteAcceptanceTracker {
 
   value(): CodexDesktopRouteVerification { return { ...this.latest } }
 
+  multiModelValues(): Readonly<Record<string, CodexDesktopRouteVerification>> {
+    return Object.fromEntries([...this.multiLatest].map(([routeId, value]) => [routeId, { ...value }]))
+  }
+
   clear(): void {
     this.active = undefined
     this.latest = unverified('awaiting_desktop_request')
+    this.multiActive.clear()
+    this.multiLatest.clear()
   }
 }
 
@@ -882,6 +1175,7 @@ function toolCallSummary(item: Json, data: Json): { readonly total: number; read
 function toolCallName(candidate: unknown): string | undefined {
   if (!isJson(candidate)) return undefined
   if (candidate.type === 'function_call' && typeof candidate.call_id === 'string' && typeof candidate.name === 'string') return candidate.name
+  if (candidate.type === 'custom_tool_call' && typeof candidate.call_id === 'string' && typeof candidate.name === 'string' && typeof candidate.input === 'string') return candidate.name
   if (candidate.type === 'tool_use' && typeof candidate.id === 'string' && typeof candidate.name === 'string') return candidate.name
   if (typeof candidate.id === 'string' && isJson(candidate.function) && typeof candidate.function.name === 'string') return candidate.function.name
   return undefined
@@ -903,6 +1197,10 @@ function tokens(value: unknown): number | null { return typeof value === 'number
 function contentText(value: unknown): boolean { return Array.isArray(value) && value.some(part => isJson(part) && typeof part.text === 'string' && part.text.trim().length > 0) }
 function isJson(value: unknown): value is Json { return !!value && typeof value === 'object' && !Array.isArray(value) }
 function sameRouteBinding(left: ActiveGatewayRoute, right: GatewayRoute): boolean {
+  return left.provider === right.provider && left.model === right.model && left.endpoint === right.endpoint && left.key === right.key &&
+    left.routeId === right.routeId && left.isolated === right.isolated
+}
+function sameMultiModelBinding(left: ActiveMultiModelGatewayEntry, right: MultiModelGatewayEntry): boolean {
   return left.provider === right.provider && left.model === right.model && left.endpoint === right.endpoint && left.key === right.key
 }
 function escapeRegex(value: string): string { return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') }

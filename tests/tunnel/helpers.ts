@@ -10,7 +10,7 @@ export function makeTempDir(prefix: string): string {
 }
 
 export function removeTempDir(path: string): void {
-  rmSync(path, { recursive: true, force: true })
+  rmSync(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
 }
 
 export function readJsonFile<T>(path: string): T {
@@ -95,6 +95,33 @@ export function writeIntentFile(dataDir: string, intent: unknown): void {
   const temporary = `${path}.tmp`
   writeFileSync(temporary, `${JSON.stringify(intent)}\n`, { mode: 0o600 })
   renameSync(temporary, path)
+}
+
+/** 假守护确认本轮断开；这些夹具没有真实系统设置账本。 */
+export function acknowledgeStoppedRestored(dataDir: string, runId?: string): void {
+  const intent = readJsonFile<{ desired: string; sessionToken: string }>(join(dataDir, 'intent.json'))
+  if (intent.desired !== 'user-disconnected' || !intent.sessionToken) throw new Error('没有可确认的断开意图')
+  writeFileSync(join(dataDir, 'state.json'), JSON.stringify({ state: 'stopped-restored', intentToken: intent.sessionToken, ...(runId ? { runId } : {}) }))
+}
+
+/** 真守护回写的停止结论必须与当前断开意图同 token。 */
+export function hasStoppedRestoredAck(dataDir: string): boolean {
+  try {
+    const intent = readJsonFile<{ desired: string; sessionToken: string }>(join(dataDir, 'intent.json'))
+    const state = readJsonFile<{ state: string; intentToken: string }>(join(dataDir, 'state.json'))
+    return intent.desired === 'user-disconnected' && state.state === 'stopped-restored' &&
+      state.intentToken === intent.sessionToken
+  } catch { return false }
+}
+
+export async function acknowledgeNextStop(dataDir: string, previousToken: string, runId?: string): Promise<void> {
+  await waitFor(() => {
+    try {
+      const intent = readJsonFile<{ desired: string; sessionToken: string }>(join(dataDir, 'intent.json'))
+      return intent.desired === 'user-disconnected' && intent.sessionToken !== previousToken
+    } catch { return false }
+  }, 6_000)
+  acknowledgeStoppedRestored(dataDir, runId)
 }
 
 // 需要验证「来信接管」的进程级用例不能受运行机器所在地区影响：美国 CI 能直连 AI 服务，

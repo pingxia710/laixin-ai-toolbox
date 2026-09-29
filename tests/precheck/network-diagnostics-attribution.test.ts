@@ -64,6 +64,27 @@ describe('DG-01 同次证据归因', () => {
     expect(report.conclusion.summary).not.toContain('服务器故障')
   })
 
+  it.each([
+    ['dns', 'AI_DIAG_SERVICE_DNS_FAILED', 'DG03_TARGET_DNS_FAILURE', '域名解析'],
+    ['proxy', 'AI_DIAG_SERVICE_PROXY_FAILED', 'DG03_PROXY_FAILURE', '代理或通道'],
+    ['connection', 'AI_DIAG_SERVICE_CONNECTION_FAILED', 'DG03_TARGET_CONNECTION_FAILURE', '网络连接'],
+    ['tls', 'AI_DIAG_SERVICE_TLS_FAILED', 'DG03_TARGET_TLS_FAILURE', '安全连接'],
+    ['http', 'AI_DIAG_SERVICE_HTTP_FAILED', 'DG03_TARGET_HTTP_FAILURE', 'HTTP 响应']
+  ] as const)('目标失败阶段为 %s：给出分层结论，不再压成上游不可达', async (phase, code, ruleId, title) => {
+    const report = await runNetworkDiagnostics('codex', diagnostic({
+      selection: async () => ({ mode: 'official' }),
+      probe: vi.fn(async (url: string) => {
+        if (url.includes('generate_204')) return { status: 204, durationMs: 18, phase: 'http' as const }
+        throw new DiagnosticProbeError('unavailable', 35, phase)
+      })
+    }))
+
+    expect(report.checks.find(check => check.id === 'service')).toMatchObject({ state: 'unknown', code, phase, elapsedMs: 35 })
+    expect(report.conclusion).toMatchObject({ status: 'blocked', ruleId, scope: 'target-path' })
+    expect(report.conclusion.title).toContain(title)
+    expect(`${report.conclusion.summary}${report.conclusion.nextStep}`).not.toContain('上游不可达')
+  })
+
   it('诊断期间切换配置：旧目标证据失效并要求重新检查', async () => {
     const selections: DiagnosticSelection[] = [
       { mode: 'deepseek', routed: true, serviceRunning: true, observedClientCall: null },
@@ -139,6 +160,37 @@ describe('DG-01 同次证据归因', () => {
     expect(report.conclusion).toMatchObject({ status: 'clear', ruleId: 'DG01_NO_BLOCKER_FOUND' })
   })
 
+  it.each([
+    ['missing', 'AI_DIAG_APPLICATION_CONFIGURATION_MISSING'],
+    ['modified-externally', 'AI_DIAG_APPLICATION_CONFIGURATION_MODIFIED']
+  ] as const)('当前配置为 %s：旧成功记录不能掩盖接入已经失效', async (configuration, code) => {
+    const report = await runNetworkDiagnostics('codex', diagnostic({
+      selection: async () => ({
+        mode: 'deepseek', routed: true, serviceRunning: true,
+        observedClientCall: new Date(now - 1_000).toISOString(), configuration
+      })
+    }))
+
+    expect(report.checks.find(check => check.id === 'application')).toMatchObject({ state: 'attention', code })
+    expect(report.conclusion).toMatchObject({ status: 'blocked', ruleId: 'DG01_APPLICATION_CONFIGURATION', scope: 'application' })
+    expect(`${report.conclusion.summary}${report.conclusion.nextStep}`).toContain('重新写入配置')
+  })
+
+  it('当前配置读不出来：旧成功记录不能被当成本次可用证据', async () => {
+    const report = await runNetworkDiagnostics('codex', diagnostic({
+      selection: async () => ({
+        mode: 'deepseek', routed: true, serviceRunning: true,
+        observedClientCall: new Date(now - 1_000).toISOString(), configuration: 'unknown'
+      })
+    }))
+
+    expect(report.checks.find(check => check.id === 'application')).toMatchObject({
+      state: 'unknown', code: 'AI_DIAG_APPLICATION_CONFIGURATION_UNKNOWN'
+    })
+    expect(report.conclusion).toMatchObject({ status: 'unknown', ruleId: 'DG01_APPLICATION_CONFIGURATION_UNKNOWN', scope: 'application' })
+    expect(`${report.conclusion.summary}${report.conclusion.nextStep}`).not.toContain('未发现明确阻断')
+  })
+
   it('读不到通道或无法归因：如实显示未知，并给重新检查这一个下一步', async () => {
     const report = await runNetworkDiagnostics('codex', diagnostic({
       status: () => { throw new Error('fixture unreadable') },
@@ -167,5 +219,35 @@ describe('DG-01 同次证据归因', () => {
     expect(report.checks.find(check => check.id === 'application')).toMatchObject({ state: 'not-checked', code: 'AI_DIAG_APPLICATION_STALE' })
     expect(report.conclusion.status).toBe('unknown')
     expect(report.validUntil).toBe(report.checkedAt + 10 * 60_000)
+  })
+
+  it('当前路由更新的失败不得被较早成功记录盖住', async () => {
+    const report = await runNetworkDiagnostics('codex', diagnostic({
+      selection: async () => ({
+        mode: 'deepseek', routed: true, serviceRunning: true,
+        observedClientCall: new Date(now - 2_000).toISOString(),
+        lastClientAttempt: { at: new Date(now - 1_000).toISOString(), ok: false, code: 'network_error' }
+      })
+    }))
+
+    expect(report.checks.find(check => check.id === 'application')).toMatchObject({
+      state: 'attention', code: 'AI_DIAG_APPLICATION_FAILED'
+    })
+    expect(report.conclusion).toMatchObject({ status: 'unknown', ruleId: 'DG01_APPLICATION_UNCONFIRMED', scope: 'application' })
+    expect(`${report.conclusion.title}${report.conclusion.summary}`).toContain('最近一次')
+  })
+
+  it('已知应用最新请求失败时，无认证根地址的 401 不得把结论退回目标边界', async () => {
+    const report = await runNetworkDiagnostics('codex', diagnostic({
+      selection: async () => ({
+        mode: 'deepseek', routed: true, serviceRunning: true,
+        observedClientCall: new Date(now - 2_000).toISOString(),
+        lastClientAttempt: { at: new Date(now - 1_000).toISOString(), ok: false, code: 'key_rejected' }
+      }),
+      probe: vi.fn(async (url: string) => ({ status: url.includes('generate_204') ? 204 : 401, durationMs: 18 }))
+    }))
+
+    expect(report.conclusion).toMatchObject({ status: 'unknown', ruleId: 'DG01_APPLICATION_UNCONFIRMED', scope: 'application' })
+    expect(report.conclusion.evidence.map(item => item.code)).toContain('AI_DIAG_APPLICATION_FAILED')
   })
 })

@@ -9,7 +9,8 @@ function node<K extends keyof HTMLElementTagNameMap>(tag: K, text = '', classNam
 }
 
 export function openProviderEditor(api: AiAccessApi, shell: ApiShell, provider: ModelProviderId, keySaved: boolean,
-  save: (key: string | undefined, model: string) => Promise<{ ok: boolean; message: string; keySaved: boolean }>, restoreFocus: () => void): () => void {
+  save: (key: string | undefined, model: string) => Promise<{ ok: boolean; message: string; keySaved: boolean }>, restoreFocus: () => void,
+  readConfiguration: () => Promise<{ snapshot: string }> = () => api.providerConfiguration({ shell, provider }), initialModel?: string): () => void {
   const dialog = node('dialog', '', 'api-service-dialog provider-editor')
   dialog.setAttribute('aria-label', `编辑 ${modelProviders[provider].title}`)
   const header = node('header', '', 'api-service-header')
@@ -68,11 +69,12 @@ export function openProviderEditor(api: AiAccessApi, shell: ApiShell, provider: 
   const load = async (): Promise<void> => {
     submit.disabled = true; retry.hidden = true; notice.textContent = ''
     try {
-      const config: unknown = JSON.parse((await api.providerConfiguration({ shell, provider })).snapshot)
+      const config: unknown = JSON.parse((await readConfiguration()).snapshot)
       if (disposed) return
       if (!config || typeof config !== 'object' || !('keyUrl' in config) || typeof config.keyUrl !== 'string' || !('endpoint' in config) || typeof config.endpoint !== 'string' || !('model' in config) || typeof config.model !== 'string' || !('models' in config) || !Array.isArray(config.models) || !config.models.length || config.models.some(item => typeof item !== 'string') || !config.models.includes(config.model)) throw new Error('PROVIDER_CONFIGURATION_INVALID')
       website.value = config.keyUrl; endpoint.value = config.endpoint
-      model.replaceChildren(...config.models.map(id => Object.assign(node('option', id), { value: id }))); model.value = config.model
+      model.replaceChildren(...config.models.map(id => Object.assign(node('option', id), { value: id })))
+      model.value = initialModel && config.models.includes(initialModel) ? initialModel : config.model
       loaded = true; submit.disabled = false; speed.disabled = false; model.disabled = false
     } catch { if (!disposed) { notice.textContent = '配置信息暂时无法读取，请重试。'; retry.hidden = false } }
   }
@@ -100,7 +102,7 @@ export function openProviderEditor(api: AiAccessApi, shell: ApiShell, provider: 
     } catch { if (!disposed) notice.textContent = '保存或验证未完成，请检查后重试。' }
     finally {
       busy = false
-      if (!disposed) { submit.disabled = false; speed.disabled = false; close.disabled = false; key.disabled = false; model.disabled = false; reveal.disabled = false; getKey.disabled = false; submit.textContent = '保存并验证' }
+      if (!disposed) { submit.disabled = false; speed.disabled = false; close.disabled = false; key.disabled = false; model.disabled = false; reveal.disabled = false; getKey.disabled = false; submit.textContent = '保存并验证'; key.focus() }
     }
   }
   document.body.append(dialog); dialog.showModal(); key.focus(); void load()

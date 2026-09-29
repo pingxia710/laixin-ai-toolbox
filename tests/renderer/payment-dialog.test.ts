@@ -7,6 +7,7 @@ class Element {
   append(...children: Element[]) { this.children.push(...children) }
   replaceChildren(...children: Element[]) { this.children = children }
   setAttribute(name: string, value: string) { this.attributes.set(name, value) }
+  getAttribute(name: string) { return this.attributes.get(name) ?? null }
   addEventListener(name: string, handler: () => void) { this.handlers.set(name, handler) }
   showModal() { this.open = true }
   close() { this.open = false; this.handlers.get('close')?.() }
@@ -20,7 +21,9 @@ const snapshot = JSON.stringify(view)
 const plan = { id: '20g', label: '20 GB 月套餐', priceCents: 1990, bytes: 20 * 1024 ** 3 }
 
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals() })
-async function setup(pay = vi.fn(async () => ({ snapshot, order: JSON.stringify(order), openedBrowser: false })), product = plan, channel: PaymentChannelName = 'wechat') {
+async function setup(pay = vi.fn(async () => ({ snapshot, order: JSON.stringify({ ...order, redirect: {
+  kind: 'qrcode', data: 'weixin://wxpay/bizpayurl?pr=fixture', expiresAt: Date.now() + 60_000
+} }), openedBrowser: false })), product = plan, channel: PaymentChannelName = 'wechat') {
   vi.resetModules(); vi.useFakeTimers()
   const body = new Element()
   const navigate = vi.fn()
@@ -42,6 +45,41 @@ it('建单失败也始终保留关闭按钮，不把客户困在付款窗口', a
   expect(x.pollPayment).not.toHaveBeenCalled()
 })
 
+it('快速连点只保留一个付款窗口和一笔建单操作，关闭后才能再次购买', async () => {
+  const pay = vi.fn(async () => ({ snapshot, order: JSON.stringify({ ...order, redirect: {
+    kind: 'qrcode', data: 'weixin://wxpay/bizpayurl?pr=fixture', expiresAt: Date.now() + 60_000
+  } }), openedBrowser: false }))
+  const x = await setup(pay)
+  const { openPaymentDialog } = await import('../../app/renderer/src/ui/payment-dialog')
+  const duplicate = openPaymentDialog(plan, 'wechat')
+  await vi.advanceTimersByTimeAsync(0)
+  expect(duplicate).toBe(x.controls)
+  expect((document.body as unknown as Element).children).toHaveLength(1)
+  expect(pay).toHaveBeenCalledTimes(1)
+  x.controls.close()
+  const next = openPaymentDialog(plan, 'wechat')
+  await vi.advanceTimersByTimeAsync(0)
+  expect(next).not.toBe(x.controls)
+  expect(pay).toHaveBeenCalledTimes(2)
+  next.close()
+})
+
+it.each([
+  ['金额', { amountFen: 2990 }],
+  ['套餐', { planId: '50g' }],
+  ['渠道', { channel: 'alipay' }]
+])('建单回包%s与点击时所见不符，不显示微信付款码并说明持续不符时如何处理', async (_field, changes) => {
+  const mismatched = { ...order, ...changes, redirect: {
+    kind: 'qrcode', data: 'weixin://wxpay/bizpayurl?pr=fixture', expiresAt: Date.now() + 60_000
+  } }
+  const x = await setup(vi.fn(async () => ({ snapshot, order: JSON.stringify(mismatched), openedBrowser: false })))
+  expect(x.dialog.all().some((node) => node.attributes.get('aria-label') === '微信支付二维码')).toBe(false)
+  expect(x.dialog.all().some((node) => node.textContent.includes('核对已有订单') && node.textContent.includes('再次出现') && node.textContent.includes('联系客服'))).toBe(true)
+  await vi.advanceTimersByTimeAsync(10_000)
+  expect(x.pollPayment).not.toHaveBeenCalled()
+  x.controls.close()
+})
+
 it('慢查询不重叠；关闭后迟到的成功响应不会刷新另一页面的账号', async () => {
   const x = await setup()
   let resolve!: (value: { order: string }) => void
@@ -55,13 +93,68 @@ it('慢查询不重叠；关闭后迟到的成功响应不会刷新另一页面�
   expect(x.status).not.toHaveBeenCalled()
 })
 
-it('服务端确认后显示开通成功并停止继续查单', async () => {
+it('服务端确认后暂时读不到权益时保守提示，并停止继续查单', async () => {
   const x = await setup()
   x.pollPayment.mockResolvedValue({ order: JSON.stringify({ ...order, status: 'confirmed' }) })
   await vi.advanceTimersByTimeAsync(10_000)
-  expect(x.dialog.all().some((node) => node.textContent === '支付成功，套餐已开通。可到「AI网络」页连接。')).toBe(true)
+  expect(x.dialog.all().some((node) => node.textContent === '支付成功，账号权益读取失败；请联系来信客服核对，勿重复付款。')).toBe(true)
   expect(x.pollPayment).toHaveBeenCalledTimes(1)
   expect(x.status).toHaveBeenCalledTimes(1)
+})
+
+it('再次购买的套餐付款后立即作为本订单的可用套餐显示', async () => {
+  const x = await setup()
+  x.status.mockResolvedValue({ snapshot: JSON.stringify({ ...view, overview: { subscriptions: [{ authorizationId: order.applicationId, state: 'active' }] } }) })
+  x.pollPayment.mockResolvedValue({ order: JSON.stringify({ ...order, status: 'confirmed' }) })
+  await vi.advanceTimersByTimeAsync(10_000)
+  expect(x.dialog.all().some((node) => node.textContent === '支付成功，套餐已开通。可到「AI网络」页连接。')).toBe(true)
+  expect(x.dialog.all().some((node) => node.textContent.includes('待接续'))).toBe(false)
+})
+
+it('只有回读到本订单的可用权益时才显示已开通', async () => {
+  const x = await setup()
+  x.status.mockResolvedValue({ snapshot: JSON.stringify({ ...view, overview: {
+    queuedSubscriptions: [], subscription: { authorizationId: order.applicationId, state: 'active' }
+  } }) })
+  x.pollPayment.mockResolvedValue({ order: JSON.stringify({ ...order, status: 'confirmed' }) })
+  await vi.advanceTimersByTimeAsync(10_000)
+  expect(x.dialog.all().some((node) => node.textContent === '支付成功，套餐已开通。可到「AI网络」页连接。')).toBe(true)
+})
+
+it('旧套餐已停用且本订单未出现在权益中时不能提示套餐已开通', async () => {
+  const x = await setup()
+  x.status.mockResolvedValue({ snapshot: JSON.stringify({ ...view, overview: {
+    queuedSubscriptions: [], subscription: { authorizationId: 'lx-' + 'c'.repeat(32), state: 'disabled' }
+  } }) })
+  x.pollPayment.mockResolvedValue({ order: JSON.stringify({ ...order, status: 'confirmed' }) })
+  await vi.advanceTimersByTimeAsync(10_000)
+  expect(x.dialog.all().some((node) => node.textContent.includes('套餐已开通'))).toBe(false)
+  expect(x.dialog.all().some((node) => node.textContent.includes('系统未读到本订单对应的可用套餐'))).toBe(true)
+})
+
+it('点击购买即返回已付款旧订单时不能误报刚完成本次支付', async () => {
+  const old = { ...order, status: 'confirmed', paidAt: Date.now() - 86400_000 }
+  const x = await setup(vi.fn(async () => ({ snapshot, order: JSON.stringify(old), openedBrowser: false })))
+  expect(x.dialog.all().some((node) => node.textContent.includes('本次购买没有展示付款入口'))).toBe(true)
+  expect(x.dialog.all().some((node) => node.textContent.includes('订单返回已确认付款'))).toBe(true)
+  expect(x.dialog.all().some((node) => node.textContent.includes('支付成功'))).toBe(false)
+  expect(x.pollPayment).not.toHaveBeenCalled()
+})
+
+it('没有展示付款入口却返回已付款状态时不说本次支付成功', async () => {
+  const x = await setup(vi.fn(async () => ({ snapshot, order: JSON.stringify(order), openedBrowser: false })))
+  x.pollPayment.mockResolvedValue({ order: JSON.stringify({ ...order, status: 'confirmed', paidAt: Date.now() }) })
+  await vi.advanceTimersByTimeAsync(3000)
+  expect(x.dialog.all().some((node) => node.textContent.includes('本次购买没有展示付款入口'))).toBe(true)
+  expect(x.dialog.all().some((node) => node.textContent.includes('支付成功'))).toBe(false)
+})
+
+it('查单返回其他订单的付款结果时不能冒充当前订单成功', async () => {
+  const x = await setup()
+  x.pollPayment.mockResolvedValue({ order: JSON.stringify({ ...order, orderId: 'd'.repeat(32), status: 'confirmed' }) })
+  await vi.advanceTimersByTimeAsync(3000)
+  expect(x.dialog.all().some((node) => node.textContent.includes('支付成功'))).toBe(false)
+  expect(x.status).not.toHaveBeenCalled()
 })
 
 it('客服记录退款后撤下付款载体、说明结果并停止查单，不误报开通', async () => {
@@ -97,7 +190,7 @@ it.each([true, false])('支付宝查单不返回链接时保留浏览器打开�
   expect(x.pollPayment).toHaveBeenCalledTimes(1)
   x.pollPayment.mockResolvedValue({ order: JSON.stringify({ ...pending, status: 'confirmed' }) })
   await vi.advanceTimersByTimeAsync(10_000)
-  expect(x.dialog.all().some((node) => node.textContent.includes('套餐已开通'))).toBe(true)
+  expect(x.dialog.all().some((node) => node.textContent.includes('账号权益读取失败'))).toBe(true)
   expect(x.pollPayment).toHaveBeenCalledTimes(2)
   x.controls.close()
 })
@@ -124,7 +217,7 @@ it('订单已创建但权益刷新失败时仍显示有效二维码、查单并�
   expect(accountSnapshot().code).toBe('ACCOUNT_SERVICE_UNAVAILABLE')
   x.pollPayment.mockResolvedValue({ order: JSON.stringify({ ...order, status: 'confirmed' }) })
   await vi.advanceTimersByTimeAsync(10_000)
-  expect(x.dialog.all().some((node) => node.textContent === '支付成功，套餐已开通。可到「AI网络」页连接。')).toBe(true)
+  expect(x.dialog.all().some((node) => node.textContent === '支付成功，账号权益读取失败；请联系来信客服核对，勿重复付款。')).toBe(true)
   expect(x.pollPayment).toHaveBeenCalledTimes(1)
   expect(x.status).toHaveBeenCalledTimes(1)
   x.controls.close()

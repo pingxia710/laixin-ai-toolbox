@@ -33,7 +33,9 @@ export function composeManagedAdapters(networkAdapter, terminalAdapter, acquireW
     try {
       return operation()
     } catch (error) {
-      optionalNote = '终端自动接入这次没启用（配置文件无法访问），浏览器与系统代理不受影响'
+      const reason = error?.code === 'TERMINAL_ENVIRONMENT_REGISTRY_WRITE_FAILED' ? '注册表写入失败'
+        : error?.code === 'TERMINAL_ENVIRONMENT_REGISTRY_READ_FAILED' ? '注册表读取失败' : '终端配置不可用'
+      optionalNote = `终端自动接入这次没启用（${reason}），浏览器与系统代理不受影响`
       throw Object.assign(new Error(`终端接入配置不可用:${error instanceof Error ? error.message : String(error)}`), {
         code: 'TUNNEL_OPTIONAL_SETTING_UNAVAILABLE'
       })
@@ -48,6 +50,10 @@ export function composeManagedAdapters(networkAdapter, terminalAdapter, acquireW
     ...(typeof acquireWriteRight === 'function' ? { acquireWriteRight } : {}),
     // 端口被占时认人用;没注入(mac/纯测试)时守护沿用「换下一个候选」的原行为。
     ...(typeof identifyPortOwner === 'function' ? { identifyPortOwner } : {}),
+    // 不能把适配器“没有路径读取能力”伪装成一个会返回 undefined 的读取函数。
+    // 前者可走带快照/租约的接管；真实读取失败才是需要限制并重新取证的证据。
+    ...(typeof networkAdapter.currentPathIdentity === 'function'
+      ? { currentPathIdentity: () => networkAdapter.currentPathIdentity() } : {}),
     preserveExternalChanges: (ref) => !isTerminalRef(ref) && networkAdapter.preserveExternalChanges?.(ref) === true,
     reapplyOnChange: (ref) => !isTerminalRef(ref) && networkAdapter.reapplyOnChange?.(ref) === true,
     existingProxy: (ours) => networkAdapter.existingProxy?.(ours),

@@ -151,3 +151,46 @@ it('切换后选套餐仍进入确认下单视图', async () => {
   expect(root.button('确认下单')).toBeDefined()
   dispose()
 })
+
+// PAY-11:主进程打开浏览器失败时回包带 browserOpened:false,界面必须如实说「未能自动打开」且保留「继续付款」重试入口。
+const payFlowOrder = (product: SubscriptionProduct) => ({
+  id: 'sub-pay-1', product, status: 'pending_payment' as const, channel: 'alipay' as const, createdAt: 1790000000000, paidAt: null,
+  dueAt: null, updatedAt: 1790000000000, issue: null, deliveredAt: null, startsAt: null, expiresAt: null, revealedAt: null,
+  refundAt: null, paymentId: 'pay-1', events: []
+})
+function stubAlipayPay(api: ReturnType<typeof stubApi>, browserOpened: boolean | undefined) {
+  api.catalog.mockImplementation(async () => ({ data: JSON.stringify({ ...catalog, channels: ['alipay'] }), error: '' }))
+  api.create.mockImplementation(async () => ({ data: JSON.stringify(payFlowOrder(catalog.products[0]!)), error: '' }))
+  api.pay.mockImplementation(async () => ({ data: JSON.stringify({ order: payFlowOrder(catalog.products[0]!),
+    payment: { orderId: 'pay-1', applicationId: 'sub-pay-1', planId: catalog.products[0]!.id, channel: 'alipay', amountFen: 6800,
+      status: 'open', paidAt: null, confirmError: null, redirect: { kind: 'url', data: 'https://openapi.alipay.com/gateway.do', expiresAt: 1790000060000 },
+      expiresAt: 1790000600000, cancelPending: false, refundedFen: 0 }, ...(browserOpened === undefined ? {} : { browserOpened }) }), error: '' }))
+}
+async function submitAlipayCheckout(root: Element) {
+  root.button('查看套餐与办理说明')!.click()
+  await flush()
+  const form = root.all().find((node): node is Element => node instanceof Element && node.tag === 'form')!
+  const select = form.all().find((node): node is Element => node instanceof Element && node.tag === 'select')!
+  select.value = 'alipay'
+  form.submit()
+  await flush(); await flush()
+}
+it('支付宝下单后浏览器未能自动打开:如实提示并保留「继续付款」', async () => {
+  const api = stubApi()
+  stubAlipayPay(api, false)
+  const { root, dispose } = await mountView(api)
+  await submitAlipayCheckout(root as unknown as Element)
+  const text = root.text()
+  expect(text).toContain('未能自动打开支付宝付款页')
+  expect(text).toContain('订单已保留')
+  expect(root.button('继续付款')).toBeDefined()
+  dispose()
+})
+it('支付宝下单后浏览器正常打开:保持既有提示', async () => {
+  const api = stubApi()
+  stubAlipayPay(api, undefined)
+  const { root, dispose } = await mountView(api)
+  await submitAlipayCheckout(root as unknown as Element)
+  expect(root.text()).toContain('已在系统浏览器打开支付宝')
+  dispose()
+})

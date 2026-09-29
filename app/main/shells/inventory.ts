@@ -4,6 +4,7 @@ import { access, lstat, open, readFile, readdir, realpath as realpathFs } from '
 import { delimiter, join, posix, win32 } from 'node:path'
 import { promisify } from 'node:util'
 import { compareVersions, npmRegistries, shellIds, type Recipes, type ShellId } from '../recipes/recipes'
+import { readWindowsCodexPackage } from '../desktop/codex-package'
 
 const execFile = promisify(execFileCallback)
 
@@ -204,7 +205,8 @@ async function trustedCodexCommandCandidates(platform: string, home: string, env
   const candidates: string[] = []
   if (platform === 'darwin') {
     candidates.push(...['/Applications', path.join(home, 'Applications')].flatMap(root =>
-      ['Codex.app', 'ChatGPT.app'].map(app => path.join(root, app, 'Contents', 'Resources', 'codex'))))
+      ['Codex.app', 'ChatGPT.app'].flatMap(app => ['codex', 'codex-cli/bin/codex', 'codex-cli/CodexCLI.app/Contents/MacOS/codex']
+        .map(relative => path.join(root, app, 'Contents', 'Resources', relative)))))
   }
   if (platform === 'win32') {
     const local = env.LOCALAPPDATA !== undefined && path.isAbsolute(env.LOCALAPPDATA)
@@ -214,6 +216,8 @@ async function trustedCodexCommandCandidates(platform: string, home: string, env
       path.join(local, 'Programs', 'ChatGPT', 'resources', 'codex.exe'),
       path.join(local, 'ChatGPT', 'resources', 'codex.exe')
     )
+    const packaged = await readWindowsCodexPackage(undefined, env).catch(() => undefined)
+    if (packaged !== undefined) candidates.push(...packaged.cliCandidates)
   }
   // `npm install -g @openai/codex` installs a JS shim in PATH and a native vendor binary below
   // the global package root. Never execute the shim; enumerate only fixed standard global roots.

@@ -253,3 +253,46 @@ it('卸载时移除监听器并清空页面', async () => {
   expect(documentListeners.get('visibilitychange')?.size).toBe(1); expect(windowListeners.get('blur')?.size).toBe(1); dispose()
   expect(documentListeners.get('visibilitychange')?.size ?? 0).toBe(0); expect(windowListeners.get('blur')?.size ?? 0).toBe(0); expect(root.children).toHaveLength(0)
 })
+
+// PAY-11:租单付款浏览器打开失败时,界面如实提示且保留「继续付款」;正常打开保持既有提示。
+const sharePayOrder = {
+  id: 'share-pay-1', listing, status: 'pending_payment' as const, channel: 'alipay' as const, createdAt: 1790000000000, paidAt: null,
+  dueAt: null, updatedAt: 1790000000000, issue: null, deliveredAt: null, startsAt: null, expiresAt: null, revealedAt: null,
+  refundAt: null, paymentId: 'pay-2', events: []
+}
+function stubAlipaySharePay(api: ReturnType<typeof stubApi>, browserOpened: boolean | undefined) {
+  api.catalog.mockImplementation(() => Promise.resolve({ data: JSON.stringify({ listings: [listing], channels: ['alipay'] }), error: '' }))
+  api.create.mockImplementation(() => Promise.resolve({ data: JSON.stringify(sharePayOrder), error: '' }))
+  api.pay.mockImplementation(() => Promise.resolve({ data: JSON.stringify({ order: sharePayOrder,
+    payment: { orderId: 'pay-2', applicationId: 'share-pay-1', planId: listing.id, channel: 'alipay', amountFen: 1999,
+      status: 'open', paidAt: null, confirmError: null, redirect: { kind: 'url', data: 'https://openapi.alipay.com/gateway.do', expiresAt: 1790000060000 },
+      expiresAt: 1790000600000, cancelPending: false, refundedFen: 0 }, ...(browserOpened === undefined ? {} : { browserOpened }) }), error: '' }))
+}
+async function submitAlipayShareCheckout(root: Element) {
+  root.button('查看并下单')!.click()
+  await flush()
+  const checkoutForm = form(root)
+  const select = checkoutForm.all().find((node): node is Element => node instanceof Element && node.tag === 'select')!
+  select.value = 'alipay'
+  checkoutForm.submit()
+  await flush(); await flush()
+}
+it('租单支付宝付款浏览器未能自动打开:如实提示并保留「继续付款」', async () => {
+  const api = stubApi()
+  stubAlipaySharePay(api, false)
+  const { root, dispose } = await mountView(api)
+  await submitAlipayShareCheckout(root)
+  const text = root.text()
+  expect(text).toContain('未能自动打开支付宝付款页')
+  expect(text).toContain('租单已保留')
+  expect(root.button('继续付款')).toBeDefined()
+  dispose()
+})
+it('租单支付宝付款正常打开:保持既有提示', async () => {
+  const api = stubApi()
+  stubAlipaySharePay(api, undefined)
+  const { root, dispose } = await mountView(api)
+  await submitAlipayShareCheckout(root)
+  expect(root.text()).toContain('已在系统浏览器打开支付宝')
+  dispose()
+})

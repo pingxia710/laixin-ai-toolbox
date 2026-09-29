@@ -98,21 +98,22 @@ export const page: PageModule = {
         } catch { if (active) { residentToggle.disabled = false; residentNote.textContent = '暂时无法保存这项设置，请重试。' } }
       })()
     })
-    // FB-1 自动回传开关。与客户主动点的「一键上报」不同,自动回传必须让客户看得见、关得掉;
-    // 说明只讲我们回传什么:故障类型,⛔ 写「诊断数据」这类可以装下任何东西的词。
+    // FB-1 自动回传与客户主动上报分开；开关旁说明实际发送的固定字段。
     const failureLabel = document.createElement('label'); failureLabel.className = 'setting-row'
     const failureToggle = document.createElement('input'); failureToggle.type = 'checkbox'; failureToggle.disabled = true
-    failureLabel.append(Object.assign(document.createElement('span'), { textContent: '连接失败时自动告知来信故障类型' }), failureToggle)
+    failureLabel.append(Object.assign(document.createElement('span'), { textContent: '连接故障自动回传' }), failureToggle)
     const failureNote = document.createElement('p'); failureNote.className = 'account-note'
-    failureNote.textContent = '连不上网络时，工具箱自动告诉我们是哪一类故障（如组件缺失、端口占用、权益到期），方便下一版修对方向。只回传故障类型，不含任何个人信息或使用记录。'
-    background.append(failureLabel, failureNote)
+    failureNote.textContent = '开启后，连接失败、运行中故障或修复失败时，会通过当前登录会话发送故障码、发生阶段、系统平台、工具箱版本、网络授权编号和时间；这些信息可关联账号。自动回传不包含完整诊断包或网络运行日志。'
+    const failureStatus = document.createElement('p'); failureStatus.className = 'account-note'; failureStatus.setAttribute('role', 'status')
+    background.append(failureLabel, failureNote, failureStatus)
     const readFailureReport = async (): Promise<boolean> => {
       try {
         const status = await window.toolbox.desktop.failureReportEnabled()
         if (!active) return true
         failureToggle.checked = status.enabled; failureToggle.disabled = !status.supported
+        failureStatus.textContent = ''
         return true
-      } catch { if (active) failureNote.textContent = '暂时无法读取这项设置的状态，正在重试。'; return false }
+      } catch { if (active) failureStatus.textContent = '暂时无法读取这项设置的状态，正在重试。'; return false }
     }
     failureToggle.addEventListener('change', () => {
       failureToggle.disabled = true
@@ -121,9 +122,9 @@ export const page: PageModule = {
           const status = await window.toolbox.desktop.setFailureReportEnabled({ enabled: failureToggle.checked })
           if (!active) return
           failureToggle.checked = status.enabled; failureToggle.disabled = false
-          if (!status.supported) failureNote.textContent = '这项设置没有保存成功，请重试或联系来信客服。'
-          else feedback.textContent = '已保存'
-        } catch { if (active) { failureToggle.disabled = false; failureNote.textContent = '暂时无法保存这项设置，请重试。' } }
+          if (!status.supported) failureStatus.textContent = '这项设置没有保存成功，请重试或联系来信客服。'
+          else { failureStatus.textContent = ''; feedback.textContent = '已保存' }
+        } catch { if (active) { failureToggle.disabled = false; failureStatus.textContent = '暂时无法保存这项设置，请重试。' } }
       })()
     })
     const loginLabel = document.createElement('label'); loginLabel.className = 'setting-row'
@@ -197,7 +198,8 @@ export const page: PageModule = {
     const diagRun = button('一键诊断', { onClick: () => { void runDiagnostics() } })
     const diagCopy = button('复制诊断信息', { onClick: () => { void copyDiagnostics() } }); diagCopy.disabled = true
     const diagSend = button('把本次情况报给来信', { onClick: () => { void reportDiagnostics() } }); diagSend.disabled = true
-    diagRow.append(Object.assign(document.createElement('p'), { textContent: '先选出问题的软件再诊断；界面、复制和上报使用同一次结果。' }), diagLabel, diagSoftware, diagRun, diagCopy, diagSend)
+    diagRow.append(Object.assign(document.createElement('p'), { textContent: '先选出问题的软件再诊断；界面、复制和上报使用同一次结果。' }), diagLabel, diagSoftware, diagRun, diagCopy, diagSend,
+      Object.assign(document.createElement('p'), { className: 'account-note', textContent: '只有点击上报才会发送脱敏诊断包，可能包含账号/设备编号、出口 IP、代理与设置恢复状态、近期故障和网络运行日志。日志中的地址文本会做脱敏处理，但仍可能保留部分地址。' }))
     // 最近故障单独列出来：客服问「你试过什么」时，客户自己就能看到，不用在整页诊断文本里找。
     const faultTitle = Object.assign(document.createElement('p'), { className: 'account-note', textContent: '最近故障与已试过的处理' })
     // 分列的字全部来自主进程给的结构化记录，⛔ 回头解析诊断全文。
@@ -251,7 +253,11 @@ export const page: PageModule = {
         const value = JSON.parse((await window.toolbox.diagnostics.report({ id })).snapshot) as
           { uploaded?: boolean; stale?: boolean; receipt?: string; filePath?: string; message?: string }
         if (!active || request !== diagnosticGeneration || diagnosticId !== id) return
-        diagStatus.textContent = value.message ?? (value.uploaded ? `已上报，回执号 ${value.receipt ?? '—'}。` : `没能送达，材料已保存在 ${value.filePath ?? '本机'}。`)
+        diagStatus.textContent = value.stale ? value.message ?? '结果已失效，请重新诊断。'
+          : value.uploaded ? value.message ?? `已上报，回执号 ${value.receipt ?? '—'}。`
+            : typeof value.filePath === 'string' && value.filePath.trim()
+              ? `${value.message ?? '这次没能送出去。'} 诊断包位置：${value.filePath}`
+              : '未能送达，也未取得本机保存文件的位置。请重试或联系来信客服。'
         if (value.stale) clearDiagnostics()
       } catch { if (active && request === diagnosticGeneration && diagnosticId === id) diagStatus.textContent = '上报未完成，请重试；本次诊断不会被替换。' }
       finally { if (active && request === diagnosticGeneration && diagnosticId === id) diagSend.disabled = false }
@@ -266,42 +272,51 @@ export const page: PageModule = {
     let clientVersion = ''
     let latestUpdate: UpdateView | undefined
     let updateDialog: HTMLDialogElement | undefined
-    let dismissedUpdateVersion = ''
+    let dismissedUpdateKey = ''
+    const updateDialogKey = (value: UpdateView): string =>
+      `${value.version}:${value.state === 'error' ? `error:${value.retryDownload === true}` : 'update'}`
 
     const closeUpdateDialog = (): void => { updateDialog?.close() }
     const renderUpdateDialogContent = (dialog: HTMLDialogElement, value: UpdateView): void => {
+      const title = dialog.querySelector<HTMLElement>('.update-dialog-title')
       const release = dialog.querySelector<HTMLElement>('.update-dialog-release')
       const summary = dialog.querySelector<HTMLElement>('.update-dialog-summary')
       const notes = dialog.querySelector<HTMLElement>('.update-dialog-notes')
       const progress = dialog.querySelector<HTMLProgressElement>('.update-dialog-progress')
       const progressStatus = dialog.querySelector<HTMLElement>('.update-dialog-progress-status')
       const primary = dialog.querySelector<HTMLButtonElement>('.update-dialog-primary')
-      if (!release || !summary || !notes || !progress || !progressStatus || !primary) return
+      const later = dialog.querySelector<HTMLButtonElement>('.update-dialog-later')
+      if (!title || !release || !summary || !notes || !progress || !progressStatus || !primary || !later) return
+      title.textContent = value.state === 'error' ? '更新需要处理' : '发现新版本'
       release.textContent = value.version ? `v${value.version}` : '正在检查版本…'
-      summary.textContent = clientVersion === '' ? '正在读取当前版本…' : `当前版本 v${clientVersion}，新版本已可用。`
+      summary.textContent = value.state === 'error' ? '上次更新没有完成，请按下面的提示处理。' :
+        clientVersion === '' ? '正在读取当前版本…' : `当前版本 v${clientVersion}，新版本已可用。`
       notes.textContent = value.notes || '此版本未提供更新说明。'
       progress.hidden = value.state !== 'downloading'; progress.value = value.progress
       // error 的原因也在这里说:客户和客服都靠这一行定位「为什么换回旧版」,⛔ 只写进设置页一行小字。
       progressStatus.textContent = value.state === 'downloading' ? `${value.message} ${value.progress}%` : value.state === 'ready'
         ? '新版已下载并完成校验，确认后将重启工具箱。' : value.state === 'installing' || value.state === 'error' ? value.message : ''
       progressStatus.hidden = progressStatus.textContent === ''
-      const action = value.state === 'available' || value.state === 'error' ? 'downloadUpdate' : value.state === 'ready' ? 'installUpdate' : ''
+      const action = value.state === 'available' || value.state === 'error' && value.retryDownload === true
+        ? 'downloadUpdate' : value.state === 'ready' ? 'installUpdate' : ''
       primary.dataset.updateAction = action
       primary.disabled = action === ''
+      primary.hidden = value.state === 'error' && value.retryDownload !== true
+      later.textContent = primary.hidden ? '知道了' : '稍后更新'
       primary.replaceChildren()
       if (value.state === 'downloading') primary.append(icon('download'), document.createTextNode(`正在下载 ${value.progress}%`))
       else if (value.state === 'installing') primary.append(document.createTextNode('正在重启…'))
       else primary.append(icon('download'), document.createTextNode(value.state === 'ready' ? '更新并重启' : value.state === 'error' ? '重新下载' : '立即更新'))
     }
     const renderUpdateDialog = (value: UpdateView): void => {
-      const relevant = ['available', 'downloading', 'ready', 'installing'].includes(value.state) || (value.state === 'error' && value.version !== '')
+      const relevant = value.version !== '' && ['available', 'downloading', 'ready', 'installing', 'error'].includes(value.state)
       if (!relevant) { closeUpdateDialog(); return }
-      if (updateDialog === undefined && dismissedUpdateVersion === value.version) return
+      if (updateDialog === undefined && dismissedUpdateKey === updateDialogKey(value)) return
       if (updateDialog === undefined) {
         const dialog = document.createElement('dialog'); dialog.className = 'recovery-dialog update-dialog'
         const header = document.createElement('header'); header.className = 'update-dialog-header'
         const mark = document.createElement('span'); mark.className = 'update-dialog-mark'; mark.append(icon('sparkle'))
-        const title = document.createElement('h2'); title.textContent = '发现新版本'; title.id = 'update-dialog-title'
+        const title = document.createElement('h2'); title.textContent = '发现新版本'; title.id = 'update-dialog-title'; title.className = 'update-dialog-title'
         dialog.setAttribute('aria-labelledby', title.id)
         const close = document.createElement('button'); close.type = 'button'; close.className = 'update-dialog-close'; close.textContent = '×'; close.setAttribute('aria-label', '关闭更新窗口')
         close.addEventListener('click', () => dialog.close())
@@ -327,7 +342,7 @@ export const page: PageModule = {
         footer.append(later, primary); dialog.append(header, content, footer)
         dialog.addEventListener('close', () => {
           if (updateDialog === dialog) {
-            dismissedUpdateVersion = latestUpdate?.version ?? ''
+            dismissedUpdateKey = latestUpdate === undefined ? '' : updateDialogKey(latestUpdate)
             updateDialog = undefined
           }
           dialog.remove()
@@ -344,7 +359,7 @@ export const page: PageModule = {
       renderUpdateDialog(value)
     }
     const update = async (method: 'checkUpdate' | 'downloadUpdate' | 'installUpdate') => {
-      if (method === 'checkUpdate') dismissedUpdateVersion = ''
+      if (method === 'checkUpdate') dismissedUpdateKey = ''
       check.disabled = true
       try { const value = await window.toolbox.desktop[method](); if (active) renderUpdate(value) }
       // 桥本身失败时没有新状态可渲染，得自己把「检查更新」放开；成功路径由 renderUpdate 按状态决定，

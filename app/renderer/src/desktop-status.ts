@@ -6,8 +6,7 @@ import type { UpdateView } from '../../desktop-types'
  *  而「点了没反应」正是这条线花过一整版去修的症状。 */
 function updateEntryLabel(update: UpdateView): string {
   switch (update.state) {
-    // ⛔ 把版本号塞进这个位置:现有约定 displayReleaseVersion('0.5.11') = 'V0.511',
-    // 在窄徽章里读起来像「零点五一一」。具体版本号在设置页的更新窗口里有完整呈现。
+    // 更新入口只提示动作；完整版本号由旁边的版本角标与设置页展示。
     case 'ready': return '新版已备好，点击更新'
     case 'available': return '有新版本'
     case 'downloading': return `正在下载新版 ${Math.min(100, Math.max(0, Math.round(update.progress)))}%`

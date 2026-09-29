@@ -162,4 +162,96 @@ describe('系统代理写入权', () => {
     expect(second.acquired).toBe(true)
     a.daemon.requestShutdown(); await flushMicrotasks()
   })
+
+  it('交还原语暂时失败时保留本地持权引用，下一次交还重试成功而不是自锁成 held', async () => {
+    const store = `${dirA}/registry.json`
+    let held = false
+    let acquireCalls = 0
+    let releaseCalls = 0
+    let failNextRelease = false
+    const issue = () => {
+      acquireCalls += 1
+      if (held) return { acquired: false as const, reason: 'held' as const }
+      held = true
+      return {
+        acquired: true as const,
+        abandoned: false,
+        release: () => {
+          releaseCalls += 1
+          if (failNextRelease) { failNextRelease = false; return false }
+          held = false
+          return true
+        }
+      }
+    }
+    const a = build(dirA, issue, store)
+    await a.daemon.run()
+    await flushMicrotasks()
+    const internal = a.daemon as unknown as {
+      releaseWriteRight(): boolean
+      ensureWriteRight(): { ok: boolean }
+    }
+
+    const callsBeforeRelease = acquireCalls
+    failNextRelease = true
+    expect(internal.releaseWriteRight()).toBe(false)
+    expect(internal.ensureWriteRight()).toEqual({ ok: true })
+    expect(acquireCalls).toBe(callsBeforeRelease)
+    const callsAfterRetain = releaseCalls
+    clock.advance(10_000); await flushMicrotasks()
+    expect(releaseCalls).toBe(callsAfterRetain)
+    expect(held).toBe(true)
+    expect(internal.releaseWriteRight()).toBe(true)
+    expect(held).toBe(false)
+
+    a.daemon.requestShutdown(); await flushMicrotasks(); await flushMicrotasks()
+  })
+
+  it('断开恢复已成功但交权暂失败：无新意图也会用同一 handle 后台重试，不永久占位', async () => {
+    const store = `${dirA}/registry.json`
+    let held = false
+    let releaseAvailable = true
+    let acquireCalls = 0
+    let releaseCalls = 0
+    const issue = () => {
+      acquireCalls += 1
+      if (held) return { acquired: false as const, reason: 'held' as const }
+      held = true
+      return {
+        acquired: true as const,
+        abandoned: false,
+        release: () => {
+          releaseCalls += 1
+          if (!releaseAvailable) return false
+          held = false
+          return true
+        }
+      }
+    }
+    const a = build(dirA, issue, store)
+    await a.daemon.run()
+    await flushMicrotasks()
+    expect(a.view().state).toBe('connected')
+    expect(held).toBe(true)
+
+    releaseAvailable = false
+    writeIntentFile(dirA, { desired: 'user-disconnected' })
+    clock.advance(5_000); await flushMicrotasks(); await flushMicrotasks()
+    expect(a.view().state).toBe('stopped-restored')
+    expect(held).toBe(true)
+    const callsAfterFailedRelease = releaseCalls
+    const acquiresAfterFailedRelease = acquireCalls
+
+    releaseAvailable = true
+    clock.advance(30_000); await flushMicrotasks(); await flushMicrotasks()
+    expect(releaseCalls).toBeGreaterThan(callsAfterFailedRelease)
+    expect(acquireCalls).toBe(acquiresAfterFailedRelease)
+    expect(held).toBe(false)
+    const second = issue()
+    expect(second.acquired).toBe(true)
+    expect(acquireCalls).toBe(acquiresAfterFailedRelease + 1)
+    if (second.acquired) expect(second.release()).toBe(true)
+
+    a.daemon.requestShutdown(); await flushMicrotasks(); await flushMicrotasks()
+  })
 })

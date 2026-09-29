@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url'
 import { ConnectorError, CONTROL_CODES } from './connectors.mjs'
 import { parseProxyServer, wininetValuesEqual } from './wininet-values.mjs'
 import { isOurProxy } from './proxy-identity.mjs'
-import { autoDetectManagedItem } from './connection-settings.mjs'
+import { autoDetectEnabled, autoDetectManagedItem, hexToBlob } from './connection-settings.mjs'
 
 if (process.env.TOOLBOX_REAL_NETWORK_ADAPTER !== '1') {
   throw new Error('REAL_ADAPTER_GUARD:真实 WinINET 适配器未获放行(TOOLBOX_REAL_NETWORK_ADAPTER!=1)')
@@ -99,10 +99,19 @@ export function createAdapter(options = {}) {
       }
       // 客户主动连接即使用来信网络。旧代理/PAC 由写前账本保存,退出时恢复。
     },
+    // WinINET 是当前用户全局设置，但复用结果还必须属于本轮实际默认路径。读取最低度量的 IPv4
+    // 默认路由及其 InterfaceGuid；虚拟适配器也进入身份。查不到就抛，由守护拒绝把旧探测绿灯
+    // 归给“current-user-wininet”这种常量假身份。
+    currentPathIdentity() { return registryCommand({ operation: 'path' }) },
     // 电脑上别的代理(不是我们的)当前开着吗:守护据此决定「能出外网就复用」还是接管。PAC 也报,守护按不可判定处理。
     existingProxy(ours) {
       const pac = read({ service: SERVICE, item: 'AutoConfigURL' })
       if (pac !== null && pac.data !== '') return { kind: 'pac', url: pac.data, source: 'WinINET/AutoConfigURL' }
+      const connection = read({ service: SERVICE, item: CONNECTION_ITEM })
+      // A successful direct/manual probe cannot attest a path selected by WPAD. Unknown is not off.
+      if (autoDetectEnabled(hexToBlob(connection?.type === 'REG_BINARY' ? connection.data : undefined)) !== false) {
+        return { kind: 'pac', source: 'WinINET/DefaultConnectionSettings' }
+      }
       const enabled = read({ service: SERVICE, item: 'ProxyEnable' })
       if (enabled?.data !== '1') return undefined
       const server = read({ service: SERVICE, item: 'ProxyServer' })
@@ -258,6 +267,7 @@ export function createAdapter(options = {}) {
       const result = JSON.parse(output.replace(/^\uFEFF/, '').trim())
       if (request.operation === 'notify' && result !== true) throw new Error('invalid notification response')
       if (request.operation === 'policy' && typeof result !== 'boolean') throw new Error('invalid policy response')
+      if (request.operation === 'path') return routeIdentity(result)
       if (request.operation === 'read' && result !== null) {
         if (!isRegistryValue(result)) throw new Error('invalid registry response')
         return registryValue(result.type, result.data)
@@ -265,6 +275,24 @@ export function createAdapter(options = {}) {
       return result
     } catch { throw new ConnectorError(CONTROL_CODES.settingsTransient, '系统代理设置读取或通知暂时失败,将自动重试') }
   }
+}
+
+function routeIdentity(value) {
+  const candidates = Array.isArray(value) ? value : [value]
+  if (candidates.length === 0 || candidates.some((candidate) => typeof candidate !== 'object' || candidate === null || Array.isArray(candidate) ||
+      !Number.isSafeInteger(candidate.metric) || candidate.metric < 0 ||
+      !Number.isSafeInteger(candidate.interfaceIndex) || candidate.interfaceIndex < 0 ||
+      typeof candidate.interfaceGuid !== 'string' || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(candidate.interfaceGuid) ||
+      !['network-interface', 'virtual-tun'].includes(candidate.kind))) {
+    throw new ConnectorError(CONTROL_CODES.settingsTransient, 'Windows 当前默认路径无法确认')
+  }
+  const metric = Math.min(...candidates.map((candidate) => candidate.metric))
+  const selected = candidates.filter((candidate) => candidate.metric === metric)
+  // Equal-metric default routes are ECMP/multi-active evidence, not a license
+  // to sort an arbitrary interface and call it the customer path.
+  if (selected.length !== 1) throw new ConnectorError(CONTROL_CODES.settingsTransient, 'Windows 当前默认路径无法确认')
+  const route = selected[0]
+  return { id: `if:${String(route.interfaceIndex)}:guid:${route.interfaceGuid.toLowerCase()}`, kind: route.kind }
 }
 
 function localProxyValue(proxy) {
@@ -308,4 +336,3 @@ function isRegistryValue(value) {
 function textOf(value) {
   return value === undefined || value === null ? '' : String(value)
 }
-

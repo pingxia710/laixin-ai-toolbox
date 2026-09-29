@@ -42,7 +42,7 @@ function fastClock(outcomes: UpdateOutcome[]) {
 }
 
 describe('更新后连不上自动退回', () => {
-  it('更新前客户没连着：回执照旧立刻写，⛔ 多等一秒', async () => {
+  it('更新前客户没连着：新版即使是未配置也照旧立刻写回执', async () => {
     const f = await pending({ requireConnected: false })
     const { deps, giveUp } = fastClock([])
 
@@ -52,9 +52,10 @@ describe('更新后连不上自动退回', () => {
     expect(giveUp).not.toHaveBeenCalled()
   })
 
-  it('更新前连着：连上了才写回执', async () => {
+  it('更新前连着：新版短暂未配置后恢复连接，恢复后才写回执', async () => {
     const f = await pending({ requireConnected: true })
-    const { deps, giveUp } = fastClock(['waiting', 'waiting', 'connected'])
+    // waiting 在下方判据用例中由“未配置”映射；这里钉住不可过早回执。
+    const { deps, giveUp } = fastClock(['waiting', 'connected'])
 
     await acknowledgeUpdate(f.directory, f.version, deps)
 
@@ -63,7 +64,7 @@ describe('更新后连不上自动退回', () => {
     expect(await readRejectedVersion(f.directory)).toBeUndefined()
   })
 
-  it('到点没连上：⛔ 写回执，记下这一版别再自动装，然后自己退出让台', async () => {
+  it('更新前连着：新版一直未配置到超时，⛔ 写回执且保留回退通道', async () => {
     const f = await pending({ requireConnected: true })
     const { deps, giveUp } = fastClock([]) // 一直 waiting
 
@@ -184,14 +185,25 @@ describe('被退回来的版本不再自动装', () => {
 // 「这一轮算不算成」的判据本身：⛔ 用 supervisor 的 surrendered（它只管守护起没起来，
 // 而「起来了连不上」压根不经过它——那正是更新后最可能的失败）。
 describe('算不算成的判据', () => {
-  it('已连=成；用户主动断开/未配置=不是更新的锅；其余一律继续等', async () => {
+  it('已连=成；只有用户主动断开=放弃；未配置与其他未成功状态都继续等', async () => {
     const { initializeTunnelRuntime, updateConnectOutcome } = await import('../../app/main/tunnel/runtime-owner')
     let state = '已连'
-    initializeTunnelRuntime(() => ({ status: () => ({ state }) }) as never)
+    let userStopped = false
+    initializeTunnelRuntime(() => ({ status: () => ({ state }), explicitlyStoppedNetwork: () => userStopped }) as never)
 
     expect(updateConnectOutcome()).toBe('connected')
-    for (const abandoned of ['用户主动断开', '未配置']) { state = abandoned; expect(updateConnectOutcome()).toBe('abandoned') }
+    state = '用户主动断开'; expect(updateConnectOutcome()).toBe('waiting')
+    userStopped = true; expect(updateConnectOutcome()).toBe('abandoned')
+    userStopped = false
+    state = '断开中'; expect(updateConnectOutcome()).toBe('waiting')
+    userStopped = true; expect(updateConnectOutcome()).toBe('abandoned')
+    userStopped = false
+    state = '已停止并恢复原设置'; expect(updateConnectOutcome()).toBe('waiting')
+    userStopped = true; expect(updateConnectOutcome()).toBe('abandoned')
+    userStopped = false
     // 坏版本会停在这几个地方，⛔ 当成「客户不要连了」放过去
-    for (const waiting of ['连接中', '通道待确认', '异常', '已停止并恢复原设置']) { state = waiting; expect(updateConnectOutcome()).toBe('waiting') }
+    for (const waiting of ['未配置', '连接中', '通道待确认', '异常', '已停止并恢复原设置']) {
+      state = waiting; expect(updateConnectOutcome()).toBe('waiting')
+    }
   })
 })

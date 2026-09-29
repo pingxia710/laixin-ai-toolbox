@@ -40,10 +40,17 @@ const context = (overrides: Partial<SupportSessionContext> = {}): SupportSession
   tunnelVerified: true,
   repairFingerprint: '{"outcome":"idle"}',
   attemptsFingerprint: '[]',
+  pathFingerprint: 'not-required',
   ...overrides
 })
 
 describe('DG-02 同一次客服诊断快照', () => {
+  it('应用隔离报告的客服摘要保留实际出口，不冒充系统 AI 网络', () => {
+    const isolated = { ...report, target: { label: 'DeepSeek API', route: 'isolated' as const } }
+    const text = buildSupportSummary(createSupportDiagnosis('DG-ISOLATED', isolated, []))
+    expect(text).toContain('DeepSeek API（经应用隔离出口）')
+    expect(text).not.toContain('DeepSeek API（经 AI 网络）')
+  })
   it('统一有效期、相关配置、通道、修复或已试动作变化都会使旧材料失效', () => {
     const original = context()
     expect(supportSessionInvalidReason(report, original, original, checkedAt + 1_000)).toBeUndefined()
@@ -94,6 +101,63 @@ describe('DG-02 同一次客服诊断快照', () => {
       expect(text).toContain(expected)
     }
     expect(text).not.toContain('DG01_APPLICATION_UNCONFIRMED')
+  })
+
+  it('复制摘要携带同次失败路径对照，不携带 URL、IP 或代理地址', () => {
+    const matrixReport: NetworkDiagnosticReport = {
+      ...report,
+      pathMatrix: {
+        checkedAt, valid: true,
+        entries: [
+          { path: 'direct', state: 'reachable', phase: 'http', elapsedMs: 11, message: '已到达目标的 HTTP 响应（耗时 11 ms）。' },
+          { path: 'existing-proxy', state: 'failed', phase: 'tls', elapsedMs: 17, message: '在 TLS 安全连接阶段失败（耗时 17 ms）。' },
+          { path: 'laixin-tunnel', state: 'failed', phase: 'connection', elapsedMs: 23, message: '在网络连接阶段失败（耗时 23 ms）。' }
+        ]
+      }
+    }
+
+    const text = buildSupportSummary(createSupportDiagnosis('DG-MATRIX1', matrixReport, []))
+
+    for (const expected of ['失败后路径对照', '直连', '系统现有代理', '来信通道', 'TLS 安全连接']) expect(text).toContain(expected)
+    expect(text).not.toMatch(/https?:\/\/|10\.0\.0\.8|proxy\.local:7890|CERTIFICATE BODY/)
+  })
+
+  it('直连主目标的矩阵也会因来信通道变化失效', () => {
+    const matrixReport: NetworkDiagnosticReport = {
+      ...report,
+      target: { label: 'DeepSeek API', route: 'direct' },
+      pathMatrix: {
+        checkedAt, valid: true,
+        entries: [
+          { path: 'direct', state: 'failed', phase: 'connection', message: '在网络连接阶段失败。' },
+          { path: 'existing-proxy', state: 'unavailable', phase: 'proxy', message: '没有读到可用的系统现有代理，本路径未执行。' },
+          { path: 'laixin-tunnel', state: 'failed', phase: 'connection', message: '在网络连接阶段失败。' }
+        ]
+      }
+    }
+    const original = context({ tunnelRequired: true, pathFingerprint: 'path-a' })
+    expect(supportSessionInvalidReason(matrixReport, original, original, checkedAt + 1_000)).toBeUndefined()
+    expect(supportSessionInvalidReason(matrixReport, original,
+      context({ tunnelRequired: true, pathFingerprint: 'path-a', tunnelFingerprint: '{"configVersion":"changed"}' }),
+    checkedAt + 1_000)).toBe('changed')
+  })
+
+  it('矩阵路径指纹任何一次读不到都失效，不把两次 unreadable 当成稳定', () => {
+    const matrixReport: NetworkDiagnosticReport = {
+      ...report,
+      pathMatrix: {
+        checkedAt, valid: true,
+        entries: [
+          { path: 'direct', state: 'failed', phase: 'connection', message: '在网络连接阶段失败。' },
+          { path: 'existing-proxy', state: 'unavailable', phase: 'proxy', message: '本路径未执行。' },
+          { path: 'laixin-tunnel', state: 'failed', phase: 'connection', message: '在网络连接阶段失败。' }
+        ]
+      }
+    }
+    expect(supportSessionInvalidReason(matrixReport, context({ pathFingerprint: 'unreadable' }),
+      context({ pathFingerprint: 'unreadable' }), checkedAt + 1_000)).toBe('changed')
+    expect(supportSessionInvalidReason(matrixReport, context({ pathFingerprint: 'path-a' }),
+      context({ pathFingerprint: 'unreadable' }), checkedAt + 1_000)).toBe('changed')
   })
 
   it('没有执行动作时明确写未记录，不能把建议动作冒充成已尝试', () => {

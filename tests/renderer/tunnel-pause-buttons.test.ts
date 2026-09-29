@@ -52,10 +52,11 @@ class Element {
 }
 
 const connected: TunnelStatusView = {
+  pauseReason: '',
   currentConfig: '版本 1', pendingConfig: '', canApplyPending: false, state: '已连', message: '', source: '', authorization: '', backend: '',
   nodeLabel: '', exitIp: '', pathSource: '' as const, lastVerifiedAt: '', configVersion: '', expiresAt: '', pendingAvailable: false, unrestored: '', componentMissing: ''
 }
-// 暂停落定(账本结清)= 已停止并恢复原设置;恢复进行中 = 用户主动断开。两个都是「已暂停使用」的呈现。
+// 旧用户主动断开与已停止状态沿用暂停文案；新的恢复在途状态由 N-48 单独验证。
 const pausedSettled = { ...connected, state: '已停止并恢复原设置' }
 const pausedRestoring = { ...connected, state: '用户主动断开' }
 
@@ -63,21 +64,28 @@ const flush = async () => { for (let i = 0; i < 8; i++) await Promise.resolve() 
 let cleanup = () => undefined as void
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals(); vi.resetModules() })
 
-async function setup(statusResponse: TunnelStatusView) {
+async function setup(statusResponse: TunnelStatusView, repairResponse: NetworkRepairStatus = idleNetworkRepair, signedIn = false) {
   vi.useFakeTimers()
   const start = vi.fn().mockResolvedValue({ outcome: 'started', message: '连接中', code: '' })
   const stop = vi.fn().mockResolvedValue({ outcome: 'stopped', message: '已断开,原设置恢复中', code: '' })
+  const repair = vi.fn().mockResolvedValue({ outcome: 'started', message: '正在修复', code: '' })
+  const syncAccountConfig = vi.fn().mockResolvedValue({ outcome: 'unchanged', message: '配置已更新', code: '' })
   const status = vi.fn<() => Promise<TunnelStatusView>>().mockResolvedValue(statusResponse)
-  const repairStatus = vi.fn<() => Promise<NetworkRepairStatus>>().mockResolvedValue({ ...idleNetworkRepair })
+  const repairStatus = vi.fn<() => Promise<NetworkRepairStatus>>().mockResolvedValue(repairResponse)
   vi.stubGlobal('document', { activeElement: null, createElement: (tag: string) => Object.assign(new Element(), { tag }), createTextNode: (textContent: string) => Object.assign(new Element(), { textContent }) })
-  vi.stubGlobal('window', { toolbox: { tunnel: { status, start, stop, explainRoute: vi.fn(), repairStatus, repair: vi.fn(), syncAccountConfig: vi.fn(), importConfig: vi.fn(), applyPending: vi.fn() }, diagnostics: { report: vi.fn() } } })
+  vi.stubGlobal('window', { toolbox: { tunnel: { status, start, stop, explainRoute: vi.fn(), repairStatus, repair, syncAccountConfig, importConfig: vi.fn(), applyPending: vi.fn() }, diagnostics: { report: vi.fn() } } })
+  if (signedIn) {
+    const { accountAction } = await import('../../app/renderer/src/account-state')
+    await accountAction(async () => ({ snapshot: JSON.stringify({ state: 'signed-in', account: { id: 'local-customer', username: '测试账号' },
+      overview: null, code: '', message: '' }) }))
+  }
   const tunnelPage = await import('../../app/renderer/src/pages/tunnel')
   // 启动/暂停两颗卡在「手动配置」动作区,由 mountTunnelDetails 挂到独立宿主——两处都要挂。
   const advanced = new Element(); const unmountAdvanced = tunnelPage.mountTunnelDetails(advanced as unknown as HTMLElement)
   const root = new Element(); tunnelPage.page.mount(root as unknown as HTMLElement, { tab: 'tunnel' })
   cleanup = () => { tunnelPage.page.unmount(); unmountAdvanced() }
   await flush()
-  return { root, advanced, start, stop, text: () => [...root.all(), ...advanced.all()].map((node) => node.textContent) }
+  return { root, advanced, start, stop, repair, syncAccountConfig, text: () => [...root.all(), ...advanced.all()].map((node) => node.textContent) }
 }
 
 describe('N-26 启动与暂停拆两颗卡', () => {
@@ -115,5 +123,48 @@ describe('N-26 启动与暂停拆两颗卡', () => {
     await flush()
     expect(x.start).toHaveBeenCalledTimes(1)
     expect(x.stop).not.toHaveBeenCalled()
+  })
+})
+
+describe('N-48 断开在途', () => {
+  it('主入口和手动连接、重复暂停都不可点，即使旧授权显示等待重查', async () => {
+    const x = await setup({ ...connected, state: '断开中', authorization: '等待重新确认账号权益',
+      pauseReason: 'entitlement-denied', message: '后台权益校验未通过，网络正在暂停并恢复原网络设置。' })
+    const primary = x.root.querySelector('[data-network-action="primary"]')
+    const connect = x.advanced.querySelector('[data-network-action="连接通道"]')
+    const pause = x.advanced.querySelector('[data-network-action="暂停使用"]')
+    const repair = x.root.querySelector('[data-network-action="repair"]')
+    expect(primary?.disabled).toBe(true)
+    expect(connect?.disabled).toBe(true)
+    expect(pause?.disabled).toBe(true)
+    expect(repair?.disabled).toBe(true)
+    expect(x.text().some((text) => text.includes('权益校验未通过，正在暂停网络'))).toBe(true)
+    primary!.click(); connect!.click(); pause!.click(); repair!.click()
+    await flush()
+    expect(x.start).not.toHaveBeenCalled()
+    expect(x.stop).not.toHaveBeenCalled()
+    expect(x.repair).not.toHaveBeenCalled()
+  })
+
+  it('修复任务仍报告 running 时也以断开在途为准，主入口不能重复取消', async () => {
+    const x = await setup({ ...connected, state: '断开中' }, { ...idleNetworkRepair, running: true,
+      phase: 'restoring', outcome: 'running', message: '正在恢复原设置' })
+    const primary = x.root.querySelector('[data-network-action="primary"]')
+    expect(primary?.disabled).toBe(true)
+    expect(x.text().some((text) => text.includes('正在断开网络'))).toBe(true)
+    primary!.click()
+    await flush()
+    expect(x.stop).not.toHaveBeenCalled()
+  })
+
+  it('已登录账号在断开中也不能通过快捷或手动同步配置改写停止意图', async () => {
+    const x = await setup({ ...connected, state: '断开中' }, idleNetworkRepair, true)
+    const shortcut = x.root.querySelector('[data-network-action="同步配置"]')
+    const manual = x.advanced.querySelector('[data-network-action="同步账号配置"]')
+    expect(shortcut?.disabled).toBe(true)
+    expect(manual?.disabled).toBe(true)
+    shortcut!.click(); manual!.click()
+    await flush()
+    expect(x.syncAccountConfig).not.toHaveBeenCalled()
   })
 })

@@ -39,6 +39,9 @@ function fixture(initial: AiAccessState = { version: 1, selected: {} }, status =
   services.push(service)
   return { service, adapters, fetcher, gateway, store, faults, state: () => state }
 }
+function api15rDUpgraded(before: AiAccessState): AiAccessState {
+  return { ...before, codexMode: before.codexMode ?? 'single', codexMultiModelPool: before.codexMultiModelPool ?? [], migrations: { api15rD: 1 } }
+}
 function supportedProviders(shell: AiAccessShell) {
   return aiAccessProviders.filter(provider => isProviderShellSupported(provider, shell))
 }
@@ -457,7 +460,7 @@ describe('保存 Key 到真实路由的闭环（隔离上游）', () => {
     expect((await f.service.serviceStatus()).startupError).toBeUndefined()
     expect(await f.service.status()).toMatchObject({ shells: { codex: { selected: 'zhipu' } } })
     expect(f.adapters[0].applyConnection).not.toHaveBeenCalled()
-    expect(f.state()).toEqual(before)
+    expect(f.state()).toEqual(api15rDUpgraded(before))
 
     await f.service.useOfficial('codex')
     expect((await f.service.status()).shells.codex.selected).toBe('official')
@@ -489,12 +492,12 @@ describe('保存 Key 到真实路由的闭环（隔离上游）', () => {
     expect((await f.service.serviceStatus()).usage.find(stage => stage.shell === 'codex')).toMatchObject({ configuration: 'not-managed' })
     expect(f.gateway.snapshot().running).toBe(false)
     expect(f.adapters[0].applyConnection).not.toHaveBeenCalled()
-    expect(f.state()).toEqual(before)
+    expect(f.state()).toEqual(api15rDUpgraded(before))
 
     const recovery = await f.service.recoverAccess('manual')
     expect(recovery).toMatchObject({ outcome: 'not-managed' })
     expect(f.gateway.snapshot().running).toBe(false)
-    expect(f.state()).toEqual(before)
+    expect(f.state()).toEqual(api15rDUpgraded(before))
 
     await f.service.useOfficial('codex')
     expect((await f.service.status()).shells.codex.selected).toBe('official')
@@ -514,7 +517,7 @@ describe('保存 Key 到真实路由的闭环（隔离上游）', () => {
       legacyDirect: { provider: 'deepseek', reason: 'not-managed-by-current-gateway' },
       providerKeys: { deepseek: true }
     } } })
-    expect(f.state()).toEqual(before)
+    expect(f.state()).toEqual(api15rDUpgraded(before))
     expect(f.adapters[0].applyConnection).not.toHaveBeenCalled()
 
     const enabled = await f.service.useProvider('codex', 'deepseek')
@@ -545,7 +548,7 @@ describe('保存 Key 到真实路由的闭环（隔离上游）', () => {
     expect((await f.service.serviceStatus())).toMatchObject({ routes: [], startupError: 'configuration_interrupted' })
     await expect(f.service.recoverAccess('manual')).resolves.toMatchObject({ outcome: 'still_failing', code: 'configuration_interrupted' })
     expect(f.adapters[0].applyConnection).not.toHaveBeenCalled()
-    expect(f.state()).toEqual(before)
+    expect(f.state()).toEqual(api15rDUpgraded(before))
 
     const enabled = await f.service.useProvider('codex', 'deepseek')
     expect(enabled.shells.codex).toMatchObject({ selected: 'deepseek' })
@@ -573,7 +576,7 @@ describe('保存 Key 到真实路由的闭环（隔离上游）', () => {
     })
     await expect(f.service.recoverAccess('manual')).resolves.toMatchObject({ outcome: 'still_failing', code: 'configuration_interrupted' })
     expect(f.adapters[0].applyConnection).not.toHaveBeenCalled()
-    expect(f.state()).toEqual(before)
+    expect(f.state()).toEqual(api15rDUpgraded(before))
   })
 
   it.each(['glm-5.3', 'glm-5.3-flash'] as const)('历史 Codex Coding Plan %s 不隔离整包状态；未接管的记录不生成本机路由', async model => {

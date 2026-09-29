@@ -27,6 +27,9 @@ export function trayNetworkPresentation(status: TrayNetworkStatus | undefined, a
   }
   const paused = TRAY_PAUSED_STATES.includes(status.state)
   const statusLabel = paused ? 'AI网络 · 已暂停使用' : `AI网络 · ${status.state || '状态未知'}`
+  if (status.state === '断开中') {
+    return { statusLabel, action: 'show', actionLabel: '查看 AI网络状态', actionEnabled: true }
+  }
   if (status.unrestored) {
     return { statusLabel, action: 'show', actionLabel: '查看 AI网络状态', actionEnabled: true }
   }

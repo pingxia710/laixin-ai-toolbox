@@ -34,7 +34,7 @@ export interface StartClaudeLoginOptions {
 const ANSI = /\u001b\[[0-9;?]*[A-Za-z]|\u001b\][^\u0007]*\u0007/g
 const URL_PATTERN = /https:\/\/[^\s'"<>)\]]+/g
 const CODE_PROMPT = /(paste|enter|input|provide)[^\n]{0,60}code|code[^\n]{0,40}(paste|enter|here)|登录码|授权码|verification code|authorization code/i
-const SUCCESS = /login successful|logged in|successfully (logged|authenticated)|登录成功|已登录/i
+const SUCCESS = /(?:^|[\r\n])\s*(?:login successful\b|(?:you are(?: now)? |you're(?: now)? )?logged in\b|successfully (?:logged in|authenticated)\b|登录成功|已登录)/i
 
 const authHosts = ['claude.ai', 'anthropic.com', 'console.anthropic.com', 'platform.claude.com', 'claude.com']
 
@@ -72,6 +72,7 @@ export function startClaudeLogin(command: ClaudeLoginCommand, options: StartClau
   let buffer = ''
   let bytes = 0
   let finished = false
+  let successCheckStarted = false
   let resolveCompletion!: (value: boolean) => void
   const completed = new Promise<boolean>((done) => { resolveCompletion = done })
   const timer = setTimeout(() => finish(false), options.timeoutMs ?? 10 * 60_000)
@@ -103,6 +104,7 @@ export function startClaudeLogin(command: ClaudeLoginCommand, options: StartClau
     resolveCompletion(value)
   }
   const consume = (chunk: Buffer): void => {
+    if (finished) return
     bytes += chunk.length
     if (bytes > 1_048_576) { finish(false); return }
     buffer = (buffer + chunk.toString('utf8').replace(ANSI, '')).slice(-8_000)
@@ -127,7 +129,15 @@ export function startClaudeLogin(command: ClaudeLoginCommand, options: StartClau
         fallbackTimer = setTimeout(() => openFallback(), options.fallbackAfterMs ?? 5_000)
       }
     }
-    if (SUCCESS.test(buffer)) { finish(true); return }
+    if (SUCCESS.test(buffer)) {
+      if (!successCheckStarted) {
+        successCheckStarted = true
+        // A success banner is only a hint. The CLI may not have persisted OAuth yet; a negative
+        // or temporarily unavailable status here leaves the exit-time check below in charge.
+        void Promise.resolve().then(options.statusCheck).then(ok => { if (ok) finish(true) }, () => undefined)
+      }
+      return
+    }
     // CLI 开始问登录码＝地址已经打印完了：这时若还没有任何授权形态的链接被打开，立刻兜底。
     if (state === 'pending' && CODE_PROMPT.test(buffer)) { state = 'code-required'; openFallback() }
   }
@@ -182,7 +192,7 @@ function parseLeadingJsonObject(text: string, start: number): Record<string, unk
   return undefined
 }
 
-/** `claude auth status --json`：只认明确的已登录字段；任何异常都当未登录。 */
+/** 官方订阅状态不接受明确的 API Key 认证；旧版缺少 authMethod 时保留明确登录字段兼容。 */
 export async function readClaudeAuthStatus(command: ClaudeLoginCommand, env: NodeJS.ProcessEnv = process.env, exec = execFile): Promise<boolean> {
   try {
     const { stdout } = await exec(command.executable, ['auth', 'status', '--json'], { encoding: 'utf8', timeout: 15_000, maxBuffer: 256 * 1024, env, windowsHide: true })
@@ -191,11 +201,12 @@ export async function readClaudeAuthStatus(command: ClaudeLoginCommand, env: Nod
     if (start >= 0) {
       const data = parseLeadingJsonObject(text, start)
       if (!data) return false
+      if (data.authMethod === 'api_key') return false
       for (const key of ['loggedIn', 'authenticated', 'isAuthenticated', 'isLoggedIn']) if (data[key] === true) return true
       if (data.status === 'authenticated' || data.status === 'logged_in') return true
       return false
     }
-    return /logged in/i.test(text) && !/not logged in/i.test(text)
+    return /logged in/i.test(text) && !/\b(?:not|never|no longer)\b[^\r\n]*\blogged in\b/i.test(text) && !/\bapi[_ -]?key\b/i.test(text)
   } catch { return false }
 }
 
@@ -228,6 +239,9 @@ export class ClaudeOfficialLoginController {
     this.current = 'pending'
     let command: ClaudeLoginCommand | null
     try { command = await this.deps.findCommand() } catch { command = null }
+    // N-59:取消可能落在 findCommand 的 await 窗口里,恢复后先认代次——
+    // 客户已取消,⛔ 拽回 pending 再建登录会话。
+    if (generation !== this.generation) { this.current = 'idle'; return this.status() }
     if (command === null) { if (generation === this.generation) this.current = 'not-installed'; return this.status() }
     let session: ClaudeLoginSession
     try { session = this.deps.startLogin(command) } catch { if (generation === this.generation) this.current = 'failed'; return this.status() }

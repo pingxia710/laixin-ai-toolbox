@@ -43,7 +43,7 @@ export interface SubscriptionDelivery {
   expiresAt: number
 }
 export interface SubscriptionCatalog { products: SubscriptionProduct[]; channels: (PaymentChannelName | 'manual')[] }
-export interface SubscriptionPayment { order: SubscriptionOrderView; payment: PaymentOrderView | null }
+export interface SubscriptionPayment { order: SubscriptionOrderView; payment: PaymentOrderView | null; /** 仅在主进程打开浏览器失败时为 false:订单已建,界面如实提示重试(PAY-11)。 */ browserOpened?: boolean }
 export type SubscriptionOperation = 'catalog' | 'list' | 'create' | 'detail' | 'pay' | 'reveal' | 'complete' | 'cancel' | 'report'
 export const subscriptionMessages: Record<string, string> = {
   SUBSCRIPTION_UNAVAILABLE: '代订阅暂未开放购买。',

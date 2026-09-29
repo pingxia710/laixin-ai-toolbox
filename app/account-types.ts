@@ -34,6 +34,8 @@ export interface CommercialTerms {
   deviceLimit: number
   /** 邀请有礼条款；旧版后台缺省时界面退化为不含数字的通用文案。 */
   invite?: { bytes: number; hours: number; perMonth: number }
+  /** 只有后台已加载微信开放平台配置时才显示登录与绑定入口。 */
+  wechatLoginAvailable?: boolean
 }
 export type PaymentChannelName = 'alipay' | 'wechat'
 export interface PaymentRedirect { kind: 'url' | 'qrcode'; data: string; expiresAt: number }
@@ -71,9 +73,16 @@ export interface InviteOverview {
 }
 export interface AccountOverview {
   profile?: CustomerProfile
+  wechatBound?: boolean
   trial: { available: boolean; usage: NetworkUsageView | null; retryable?: boolean; compensated?: boolean }
   recoveryReady: boolean
   subscription: NetworkUsageView | null
+  /** 本账号每一份已付款网络套餐；各自从付款时间计期，可同时有效。 */
+  subscriptions?: NetworkUsageView[]
+  /** 兼容旧后台的历史字段；新购买逻辑不依赖未付款申请阻断或取消其他购买。 */
+  pendingSubscription?: { id: string; planId: string } | null
+  /** 兼容旧后台遗留记录；新付款套餐不进入等待队列。 */
+  queuedSubscriptions?: { id: string; planId: string }[]
   plans: NetworkPlan[]
   networkAvailable: boolean
   paymentChannels: readonly PaymentChannelName[]

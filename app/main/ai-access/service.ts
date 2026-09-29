@@ -1,8 +1,11 @@
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
+import { chooseAiRouterPort, type AiRouterController, type AiRouterPublicStatus } from './router-controller'
+import type { CodexWorkspaceCatalogStatus } from './codex-workspace-config'
 import {
   isProviderModelAllowed,
   isProviderShellSupported,
   isStoredProviderModelAllowed,
+  modelIdPattern,
   modelProviderIds,
   modelProviders,
   normalizeProviderModel,
@@ -13,12 +16,16 @@ import { apiFailureMessage, apiFailureRemedy, apiRemedyLabels, type AccessRecove
 import type { FaultInput } from '../diagnostics/fault-log'
 import type { FaultNoteId } from '../../shared/fault-log-types'
 import type { ModelMatrixEntry, ModelMatrixProgress, ModelMatrixReport } from '../../shared/model-matrix-types'
-import type { AiGateway, GatewayRoute } from './gateway'
+import type { AiGateway, GatewayRoute, MultiModelGatewayRoute } from './gateway'
 import type { ConfigurationTargetEvidence } from './configuration-target'
 import type { CodexOfficialAuthStatus } from './codex-auth-document'
 import { configWriteFaultNotice } from './config-write-fault'
+import type { ApplicationIsolationApplyResult } from './deepseek-config'
 import { isPortListening, residualAddressNote, residualLoopbackAddress } from './residual-address'
 import type { UsageReceiptEvent } from './usage-receipt'
+import { legacyKeyFieldNames, savedProviderKey } from './saved-provider-key'
+import type { ApplicationIsolationAdapter, ApplicationIsolationEntry, ApplicationIsolationRestoreResult } from './application-isolation-lease'
+import type { CodexIsolationAdapter } from './codex-app-isolation'
 
 /** 核对结果：按壳的一致性判定，可能带上客户可读的说明（比如别的工具留下的死地址）。 */
 export type ConfigurationVerification = Readonly<Record<AiAccessShell, ConfigurationState>> & {
@@ -37,8 +44,19 @@ export const aiAccessModes = [...aiAccessProviders, 'official', 'zai'] as const
 export type AiAccessMode = typeof aiAccessModes[number]
 export type ExplicitConfigurationTargetScope = 'user' | 'project'
 
+/** One verified upstream model exposed through the single logical `laixin-multi` Codex provider. */
+export interface CodexMultiModelPoolEntry {
+  readonly provider: AiAccessProvider
+  readonly model: string
+  readonly internalModelId: string
+}
+
+export type CodexRoutingMode = 'single' | 'multi'
+
 export interface AiAccessState {
   readonly version: 1
+  /** Kept under state version 1 so 0.5.20 can ignore it without discarding saved Keys on rollback. */
+  readonly migrations?: Readonly<Record<string, unknown>> & { readonly api15rD?: 1 }
   readonly shellKeys?: Readonly<Partial<Record<AiAccessShell, Readonly<Partial<Record<AiAccessProvider, string>>>>>>
   readonly shellModels?: Readonly<Partial<Record<AiAccessShell, Readonly<Partial<Record<AiAccessProvider, string>>>>>>
   readonly deepseekKey?: string
@@ -54,6 +72,12 @@ export interface AiAccessState {
   readonly shellFingerprints?: Readonly<Partial<Record<AiAccessShell, string>>>
   /** Claude 客户明确确认过的配置作用域；Codex 永远使用用户级配置。 */
   readonly configurationTargetScopes?: Readonly<Partial<Record<AiAccessShell, ExplicitConfigurationTargetScope>>>
+  /** Absent is historical single-model behavior; A never migrates existing Keys into the pool. */
+  readonly codexMode?: CodexRoutingMode
+  /** Keys remain only in encrypted shellKeys.codex[provider], never duplicated in this mapping. */
+  readonly codexMultiModelPool?: readonly CodexMultiModelPoolEntry[]
+  /** GUI-owned binding; the headless process rotates its client token separately on every boot. */
+  readonly codexMultiRelay?: { readonly port: number; readonly identitySecret: string }
   readonly selected: Readonly<Partial<Record<AiAccessShell, AiAccessMode>>>
 }
 
@@ -71,7 +95,30 @@ export interface AiAccessAdapter {
   applyDeepSeek(key: string): Promise<void>
   applyProvider?(provider: Exclude<AiAccessProvider, 'deepseek'>, key: string): Promise<void>
   applyConnection?(provider: AiAccessProvider, connection: ApiServiceConnection): Promise<void>
+  /** Application isolation writes only if the exact captured Toolbox-owned block still owns the shared config lock. */
+  applyIsolationConnection?(provider: AiAccessProvider, connection: ApiServiceConnection, expectedIsolationFingerprint: string, leaseId: string, expectedConfigurationTargetIdentity?: string): Promise<ApplicationIsolationApplyResult>
   captureConnection?(): Promise<() => Promise<void>>
+  /** Application isolation captures only a marker-proven block and restores it iff its expected fingerprint still owns the file. */
+  captureIsolation?(expectedConfigurationTargetIdentity?: string): Promise<{
+    readonly beforeFingerprint: string
+    readonly beforeIsolationFingerprint: string
+    /** Opaque effective target captured under the same config lock as the lease snapshot. */
+    readonly configurationTargetIdentity?: string
+    readonly leaseId: string
+    /** Hermes uses an opaque HERMES_HOME identity; Claude/Codex use configurationTargetIdentity. */
+    readonly targetIdentity?: string
+    restoreIfOwned(expectedFingerprint?: string): Promise<ApplicationIsolationRestoreResult>
+    /** Captured-target cleanup; never re-resolve a changed effective target. */
+    clearIsolationLease?(): Promise<void>
+  }>
+  /** Application-isolation managed-block digest, including ownership information. */
+  readIsolationFingerprint?(targetIdentity?: string): Promise<string | undefined>
+  recoverIsolationLease?(): Promise<'none' | ApplicationIsolationRestoreResult>
+  clearIsolationLease?(leaseId: string, targetIdentity?: string): Promise<void>
+  /** Main-process-only opaque identity of the effective configuration target; never reaches status or IPC. */
+  configurationTargetIdentity?(): Promise<string | undefined>
+  /** Opaque identity of the currently effective configuration target. */
+  isolationTargetIdentity?(): Promise<string | undefined>
   /** 当前这个壳里工具箱托管段的指纹；没有托管段返回 undefined。读不出就让上层报「不能判断」。 */
   readManagedFingerprint?(): Promise<string | undefined>
   /** No raw local path, command arguments, or environment content may leave this method. */
@@ -104,6 +151,8 @@ export interface AiAccessStatus {
   readonly configurationTargets?: Readonly<Partial<Record<AiAccessShell, ConfigurationTargetEvidence>>>
   /** Only a safe Codex credential classification; absence means no conclusion was available. */
   readonly officialAuthentication?: Readonly<Partial<Record<AiAccessShell, CodexOfficialAuthStatus>>>
+  /** Picker state only; no Key, local client token or upstream URL is exposed. */
+  readonly codexMultiModel?: { readonly mode: CodexRoutingMode; readonly models: readonly CodexMultiModelPoolEntry[] }
   readonly shells: Readonly<Record<AiAccessShell, {
     readonly selected: AiAccessMode | null
     readonly officialAvailable: boolean
@@ -120,16 +169,11 @@ export interface AiAccessStatus {
 }
 
 const keyPattern = /^[A-Za-z0-9._-]{16,512}$/
-type LegacyKeyField = 'deepseekKey' | 'zhipuKey' | 'kimiKey' | 'moonshotKey'
-/** `zhipu-api` has no historical field: never reinterpret a Coding Plan Key as a metered API Key. */
-const legacyKeyFields: Readonly<Record<AiAccessProvider, LegacyKeyField | undefined>> = {
-  deepseek: 'deepseekKey',
-  'zhipu-api': undefined,
-  zhipu: 'zhipuKey',
-  kimi: 'kimiKey',
-  moonshot: 'moonshotKey'
+function gatewayFailureCode(error: unknown): ApiFailure {
+  if (error instanceof Error && error.message === 'AI_ACCESS_STATE_WRITE_FAILED') return 'configuration_failed'
+  return error instanceof Error && (error as NodeJS.ErrnoException).code === 'EADDRINUSE'
+    ? 'port_unavailable' : 'local_service_start_failed'
 }
-const legacyKeyFieldNames: readonly LegacyKeyField[] = ['deepseekKey', 'zhipuKey', 'kimiKey', 'moonshotKey']
 
 function isProvider(value: unknown): value is AiAccessProvider {
   return aiAccessProviders.includes(value as AiAccessProvider)
@@ -190,7 +234,22 @@ export interface AiAccessExtras {
   readonly saveMatrix?: (report: ModelMatrixReport) => Promise<void> | void
   /** 本机端口探测：残留死地址核对用，测试注入。默认真连 127.0.0.1。 */
   readonly isPortListening?: (port: number) => Promise<boolean>
+  /** Main-process-only readback. Its implementation receives no Key and returns no path or config. */
+  readonly readCodexMultiModelCatalog?: (connection: { readonly baseUrl: string; readonly model: string; readonly models: readonly string[] }) => Promise<CodexWorkspaceCatalogStatus>
+  /** Removes only D's multi-model config/catalog and commits state in the same rollback boundary. */
+  readonly deactivateCodexMultiModel?: (commitState: () => Promise<void>) => Promise<void>
+  /** A port rebound writes shell configuration; revoke an active per-app lease just beforehand. */
+  readonly beforeRecoveryRewrite?: (shells: readonly AiAccessShell[]) => Promise<void>
+  /** Main-process lifecycle gate for a Hermes route/configuration change. It never exposes a target path. */
+  readonly beforeHermesRouteMutation?: () => Promise<void>
 }
+
+export interface ApplicationIsolationEgress {
+  activate(proxyUrl: string, targetUrl: string): Promise<void>
+  deactivate(): Promise<void>
+}
+export type CodexIsolationEgress = ApplicationIsolationEgress
+export type ClaudeIsolationEgress = ApplicationIsolationEgress
 
 export class AiAccessService {
   private readonly adapters: ReadonlyMap<AiAccessShell, AiAccessAdapter>
@@ -208,11 +267,15 @@ export class AiAccessService {
   private matrixProgress: ModelMatrixProgress = { done: 0, total: 0 }
   /** 上一条已经记过的持续故障原因；同一个原因一直不好，就 ⛔ 每次核对都再落一条。 */
   private lastFailure?: string
+  /** A failed D migration keeps subsequent writes closed until one durable migration succeeds. */
+  private api15rDMigrationFailed = false
   /** The clients retry a failed request themselves; keep all request facts, but write one support fault per burst. */
   private recentClientFaults = new Map<string, number>()
+  /** A private transport is eligible only for the exact target identity that owns its live lease. */
+  private readonly isolatedShellTargets = new Map<AiAccessShell, string>()
 
   constructor(private readonly store: AiAccessStateStore, adapters: readonly AiAccessAdapter[], private readonly gateway?: AiGateway,
-    private readonly extras: AiAccessExtras = {}) {
+    private readonly extras: AiAccessExtras = {}, private readonly multiRouter?: AiRouterController) {
     this.adapters = new Map(adapters.map((adapter) => [adapter.shell, adapter]))
     if (this.adapters.size !== aiAccessShells.length || aiAccessShells.some((shell) => !this.adapters.has(shell))) {
       throw new Error('AI_ACCESS_ADAPTERS_INVALID')
@@ -235,8 +298,8 @@ export class AiAccessService {
   async status(): Promise<AiAccessStatus> {
     await this.pending
     const state = await this.read()
-    // `read()` may quarantine a corrupt encrypted state and create this one-shot note. Consume it
-    // afterwards so the first status response carries the customer-facing recovery instruction.
+    // Older stores exposed a one-shot corruption note. Current storage fails closed and preserves
+    // the original bytes; keep consuming the optional hook for injected/backward-compatible stores.
     // 写失败分译(Phase 2 ⑤)同用这个出口:磁盘满/权限那句话跟上一次状态读数,⛔ 只留在异常码里。
     const note = this.store.consumeCorruptionNote?.() ?? this.store.consumeWriteFaultNote?.()
     await this.refreshConfigurationTargets(state)
@@ -244,6 +307,52 @@ export class AiAccessService {
     await this.refreshRecoveryPoints()
     const view = this.publicStatus(state)
     return note ? { ...view, storageNote: note } : view
+  }
+
+  /**
+   * Starts the GUI-owned local gateway when necessary and returns only the provider-table
+   * information required for `laixin-multi`. Command auth obtains its local token separately.
+   */
+  async codexMultiModelConnection(): Promise<{ readonly baseUrl: string; readonly model: string; readonly models: readonly string[] } | undefined> {
+    return this.serialize(async () => {
+      let state = await this.read()
+      if (!state.codexMultiModelPool?.length || !this.gateway || state.codexMode !== 'multi') return undefined
+      if (this.multiRouter) {
+        const ready = await this.multiRouter.ensureReady(state, true)
+        if (!ready || !(await this.refreshMultiRouter(state))) return undefined
+        const route = this.multiModelGatewayRoute(state)
+        return route ? { baseUrl: `${ready.baseUrl}/codex/multi/v1`, model: route.models[0].internalModelId,
+          models: route.models.map(entry => entry.internalModelId) } : undefined
+      }
+      state = await this.ensureGateway(state)
+      const route = this.multiModelGatewayRoute(state)
+      if (!route || !this.gateway.baseUrl) return undefined
+      return {
+        baseUrl: `${this.gateway.baseUrl}/codex/multi/v1`, model: route.models[0].internalModelId,
+        models: route.models.map(entry => entry.internalModelId)
+      }
+    })
+  }
+
+  /** GUI control surface exposes only verified process/catalog evidence, never client token or provider Keys. */
+  async aiRouterStatus(): Promise<AiRouterPublicStatus & { readonly catalog: CodexWorkspaceCatalogStatus }> {
+    await this.pending
+    const state = await this.read()
+    const routerStatus: AiRouterPublicStatus = this.multiRouter
+      ? await this.multiRouter.status(state)
+      : { running: false, modelCount: state.codexMultiModelPool?.length ?? 0, error: 'not_configured' }
+    const status: AiRouterPublicStatus = {
+      running: routerStatus.running,
+      modelCount: state.codexMultiModelPool?.length ?? 0,
+      ...(routerStatus.error ? { error: routerStatus.error } : {}),
+      ...(routerStatus.lastDesktopUse ? { lastDesktopUse: routerStatus.lastDesktopUse } : {})
+    }
+    const connection = this.storedMultiModelConnection(state)
+    let catalog: CodexWorkspaceCatalogStatus = { state: 'missing' }
+    if (connection && this.extras.readCodexMultiModelCatalog) {
+      try { catalog = await this.extras.readCodexMultiModelCatalog(connection) } catch { catalog = { state: 'unreadable' } }
+    }
+    return { ...status, catalog }
   }
 
   /** Safe target evidence for the page: it explains a blocked repair without leaking a local path or launch arguments. */
@@ -265,6 +374,161 @@ export class AiAccessService {
     return root
   }
 
+  /**
+   * The N-56 controller receives no raw config path, key or document. This adapter keeps those
+   * values in the main process and lets a supported shell change only its owned model API route.
+   */
+  private createApplicationIsolationAdapter(shell: AiAccessShell, egress: ApplicationIsolationEgress): ApplicationIsolationAdapter {
+    let expectedFingerprint: string | undefined
+    let expectedIsolationFingerprint: string | undefined
+    let expectedTargetIdentity: string | undefined
+    let capturedIsolationFingerprint: string | undefined
+    let capturedTargetIdentity: string | undefined
+    let capturedConfigurationTargetIdentity: string | undefined
+    let capturedLeaseId: string | undefined
+    const configurationTargetIdentity = () => {
+      const adapter = this.adapter(shell)
+      return shell === 'hermes' ? adapter.isolationTargetIdentity?.() : adapter.configurationTargetIdentity?.()
+    }
+    const current = async () => {
+      await this.pending
+      const state = await this.read()
+      const provider = state.selected[shell]
+      const key = activeRelayKey(state, shell)
+      const adapter = this.adapter(shell)
+      const [target, targetIdentityValue] = await Promise.all([
+        adapter.configurationTargetStatus?.(),
+        configurationTargetIdentity()
+      ])
+      if (!this.gateway || !isProvider(provider) || key === undefined || !state.relay ||
+          target?.writable !== true || targetIdentityValue === undefined) return undefined
+      return { state, provider, key, target, configurationTargetIdentity: targetIdentityValue, route: this.route(shell, provider, key, state) }
+    }
+    const targetIdentity = (active: NonNullable<Awaited<ReturnType<typeof current>>>) => this.routeTargetIdentity(active.route)
+    const combinedTargetIdentity = (active: NonNullable<Awaited<ReturnType<typeof current>>>, configurationTarget: string | undefined) =>
+      configurationTarget === undefined ? targetIdentity(active)
+        : createHash('sha256').update(`${targetIdentity(active)}:${configurationTarget}`).digest('hex')
+    const currentTargetMatchesCapture = async () => capturedConfigurationTargetIdentity === undefined ||
+      capturedConfigurationTargetIdentity === (await current())?.configurationTargetIdentity
+    return {
+      inspect: async () => {
+        const active = await current()
+        const adapter = this.adapter(shell)
+        const fingerprint = await adapter.readManagedFingerprint?.()
+        const isolationFingerprint = await adapter.readIsolationFingerprint?.()
+        if (active === undefined || fingerprint === undefined || isolationFingerprint === undefined) return undefined
+        return {
+          id: `${shell}:${active.target.scope}`,
+          targetIdentity: combinedTargetIdentity(active, active.configurationTargetIdentity),
+          fingerprint,
+          isolationFingerprint
+        }
+      },
+      capture: async () => {
+        // A previous lease cannot authorize a new operation. This is reset before entry binding,
+        // so an entry/configuration failure has no managed value to restore.
+        expectedFingerprint = undefined
+        expectedIsolationFingerprint = undefined
+        expectedTargetIdentity = undefined
+        capturedIsolationFingerprint = undefined
+        capturedTargetIdentity = undefined
+        capturedConfigurationTargetIdentity = undefined
+        capturedLeaseId = undefined
+        const capture = this.adapter(shell).captureIsolation
+        if (capture === undefined) throw new Error('AI_ACCESS_CONFIGURATION_TARGET_BLOCKED')
+        const active = await current()
+        if (active === undefined) throw new Error('AI_ACCESS_CONFIGURATION_TARGET_BLOCKED')
+        const snapshot = await capture(active.configurationTargetIdentity)
+        // Scope alone is not a target identity: two projects can both have scope=project.
+        const snapshotTargetIdentity = snapshot.configurationTargetIdentity ?? snapshot.targetIdentity
+        if (snapshotTargetIdentity !== active.configurationTargetIdentity) throw new Error('AI_ACCESS_CONFIGURATION_TARGET_BLOCKED')
+        capturedIsolationFingerprint = snapshot.beforeIsolationFingerprint
+        capturedConfigurationTargetIdentity = snapshotTargetIdentity
+        capturedTargetIdentity = combinedTargetIdentity(active, capturedConfigurationTargetIdentity)
+        capturedLeaseId = snapshot.leaseId
+        return {
+          beforeFingerprint: snapshot.beforeFingerprint,
+          beforeIsolationFingerprint: snapshot.beforeIsolationFingerprint,
+          targetIdentity: capturedTargetIdentity,
+          leaseId: snapshot.leaseId,
+          restoreIfOwned: async () => snapshot.restoreIfOwned(expectedIsolationFingerprint),
+          ...(snapshot.clearIsolationLease === undefined ? {} : { clearLease: snapshot.clearIsolationLease })
+        }
+      },
+      activateEntry: async (entry: ApplicationIsolationEntry) => {
+        const active = await current()
+        if (active === undefined || capturedTargetIdentity === undefined || !await currentTargetMatchesCapture() ||
+            combinedTargetIdentity(active, capturedConfigurationTargetIdentity) !== capturedTargetIdentity) throw new Error('AI_ACCESS_CONFIGURATION_TARGET_BLOCKED')
+        await egress.activate(entry.proxyUrl, active.route.endpoint)
+      },
+      deactivateEntry: async () => {
+        this.isolatedShellTargets.delete(shell)
+        this.updateRoutes(await this.read())
+        await egress.deactivate()
+      },
+      apply: async () => {
+        const active = await current()
+        const adapter = this.adapter(shell)
+        if (active === undefined || capturedTargetIdentity === undefined || capturedLeaseId === undefined || adapter.applyIsolationConnection === undefined) throw new Error('AI_ACCESS_CONFIGURATION_TARGET_BLOCKED')
+        if (!await currentTargetMatchesCapture() || combinedTargetIdentity(active, capturedConfigurationTargetIdentity) !== capturedTargetIdentity) return 'stale'
+        try {
+          const applied = await adapter.applyIsolationConnection(active.provider, {
+            baseUrl: this.connectionUrl(shell, active.provider), apiKey: active.state.relay!.token, model: active.route.model
+          }, capturedIsolationFingerprintForApply(), capturedLeaseId, capturedConfigurationTargetIdentity)
+          if (applied === 'stale') return 'stale'
+          const after = await current()
+          if (after === undefined || !await currentTargetMatchesCapture() ||
+              combinedTargetIdentity(after, capturedConfigurationTargetIdentity) !== capturedTargetIdentity) return 'stale'
+          expectedFingerprint = applied.managedFingerprint
+          expectedIsolationFingerprint = applied.isolationFingerprint
+          expectedTargetIdentity = targetIdentity(after)
+          this.isolatedShellTargets.set(shell, expectedTargetIdentity)
+          this.updateRoutes(active.state)
+          return 'applied'
+        } catch (error) {
+          this.isolatedShellTargets.delete(shell)
+          this.updateRoutes(active.state)
+          throw error
+        }
+      },
+      readback: async () => {
+        const active = await current()
+        return expectedFingerprint !== undefined && expectedIsolationFingerprint !== undefined && expectedTargetIdentity !== undefined &&
+          active !== undefined && await currentTargetMatchesCapture() && expectedTargetIdentity === targetIdentity(active) &&
+          capturedTargetIdentity === combinedTargetIdentity(active, capturedConfigurationTargetIdentity) &&
+          expectedFingerprint === await this.adapter(shell).readManagedFingerprint?.() &&
+          expectedIsolationFingerprint === await this.adapter(shell).readIsolationFingerprint?.(capturedConfigurationTargetIdentity)
+      },
+      recoverLease: async () => this.adapter(shell).recoverIsolationLease?.() ?? 'none',
+      clearLease: async (leaseId) => { await this.adapter(shell).clearIsolationLease?.(leaseId, capturedConfigurationTargetIdentity) },
+      verifyTarget: async () => {
+        const active = await current()
+        return active === undefined || expectedTargetIdentity === undefined || expectedTargetIdentity !== targetIdentity(active) ||
+          capturedTargetIdentity !== combinedTargetIdentity(active, capturedConfigurationTargetIdentity) || !await currentTargetMatchesCapture()
+          ? false : (await this.gateway!.probe(this.route(shell, active.provider, active.key, active.state))).ok
+      }
+    }
+
+    function capturedIsolationFingerprintForApply(): string {
+      if (capturedIsolationFingerprint !== undefined) return capturedIsolationFingerprint
+      throw new Error('AI_ACCESS_CONFIG_UNMANAGED')
+    }
+  }
+
+  /** The N-56 adapter retains its compatibility surface while sharing the capability lease implementation. */
+  createCodexIsolationAdapter(egress: CodexIsolationEgress): CodexIsolationAdapter {
+    return this.createApplicationIsolationAdapter('codex', egress)
+  }
+
+  /** Claude uses the same model-gateway lease; no path, key or settings document crosses the controller boundary. */
+  createClaudeIsolationAdapter(egress: ClaudeIsolationEgress): ApplicationIsolationAdapter {
+    return this.createApplicationIsolationAdapter('claude', egress)
+  }
+
+  createHermesIsolationAdapter(egress: ApplicationIsolationEgress): ApplicationIsolationAdapter {
+    return this.createApplicationIsolationAdapter('hermes', egress)
+  }
+
   /** The UI uses this after the customer chooses the single understandable repair action for a detected project config. */
   async selectConfigurationTarget(shell: AiAccessShell, scope: ExplicitConfigurationTargetScope): Promise<AiAccessStatus> {
     return this.serialize(async () => {
@@ -273,6 +537,7 @@ export class AiAccessService {
       if (shell === 'codex') throw new Error('AI_ACCESS_CONFIGURATION_TARGET_UNSUPPORTED')
       const previous = await this.read()
       this.assertConfigurationTargetChangeIsSafe(previous, shell)
+      await this.beforeHermesRouteMutation(shell)
       const adapter = this.adapter(shell)
       if (adapter.selectConfigurationTarget === undefined) throw new Error('AI_ACCESS_CONFIGURATION_TARGET_UNSUPPORTED')
       const evidence = await adapter.selectConfigurationTarget(scope)
@@ -280,7 +545,7 @@ export class AiAccessService {
         ...previous,
         configurationTargetScopes: { ...previous.configurationTargetScopes, [shell]: scope }
       }
-      await this.store.write(next)
+      await this.writeState(next)
       this.configurationTargets.set(shell, evidence)
       return this.publicStatus(next)
     })
@@ -292,6 +557,7 @@ export class AiAccessService {
       if (shell === 'codex') throw new Error('AI_ACCESS_CONFIGURATION_TARGET_UNSUPPORTED')
       const previous = await this.read()
       this.assertConfigurationTargetChangeIsSafe(previous, shell)
+      await this.beforeHermesRouteMutation(shell)
       const adapter = this.adapter(shell)
       if (adapter.selectConfigurationProject === undefined) throw new Error('AI_ACCESS_CONFIGURATION_TARGET_UNSUPPORTED')
       const evidence = await adapter.selectConfigurationProject(projectDir)
@@ -300,7 +566,7 @@ export class AiAccessService {
         ...previous,
         configurationTargetScopes: { ...previous.configurationTargetScopes, [shell]: 'project' }
       }
-      await this.store.write(next)
+      await this.writeState(next)
       this.configurationTargets.set(shell, evidence)
       return this.publicStatus(next)
     })
@@ -347,9 +613,17 @@ export class AiAccessService {
         const model = previous.shellModels?.[shell]?.[provider] ?? this.route(shell, provider, '', previous).model
         return this.activateProviderNow(shell, provider, { key, model })
       }
+      if (this.multiRouter && shell === 'codex' && previous.codexMode === 'multi' &&
+        previous.codexMultiModelPool?.some(entry => entry.provider === provider)) {
+        if (!this.gateway) throw new Error('AI_ACCESS_PROVIDER_UNSUPPORTED')
+        const result = await this.gateway.probe(this.route(shell, provider, key, previous))
+        this.markCheck(shell, provider, result.ok, result.code)
+        if (!result.ok) return this.publicStatus(previous)
+      }
+      await this.beforeHermesRouteMutation(shell)
       const next: AiAccessState = { ...previous,
         shellKeys: { ...previous.shellKeys, [shell]: { ...previous.shellKeys?.[shell], [provider]: key } } }
-      await this.store.write(next)
+      await this.writeAndRefreshMulti(previous, next, shell, provider)
       this.attempt = undefined
       this.checks = this.checks.filter(check => check.shell !== shell || check.provider !== provider)
       this.updateRoutes(next)
@@ -369,6 +643,7 @@ export class AiAccessService {
       this.assertProviderShellSupported(shell, provider)
       const key = value.trim()
       if (!keyPattern.test(key)) throw new Error(`AI_ACCESS_${provider.toUpperCase()}_KEY_INVALID`)
+      await this.beforeHermesRouteMutation(shell)
       if (!this.gateway) throw new Error('AI_ACCESS_PROVIDER_UNSUPPORTED')
       const previous = await this.read()
       const result = await this.gateway.probe(this.route(shell, provider, key, previous))
@@ -382,7 +657,144 @@ export class AiAccessService {
         ...previous,
         shellKeys: { ...previous.shellKeys, [shell]: { ...previous.shellKeys?.[shell], [provider]: key } }
       }
-      await this.store.write(next)
+      await this.writeAndRefreshMulti(previous, next, shell, provider)
+      this.updateRoutes(next)
+      return this.publicStatus(next)
+    })
+  }
+
+  /**
+   * Multi-model saving is deliberately separate from the single-model action: it probes the
+   * candidate, then updates the explicit pool without changing selected.codex or shell files.
+   */
+  async verifyAndAddCodexMultiModel(provider: AiAccessProvider, value: string): Promise<AiAccessStatus> {
+    return this.configureCodexMultiModel(provider, value, '')
+  }
+
+  /** Candidate Key/model is proved first; a failed candidate never replaces the pool binding. */
+  async configureCodexMultiModel(provider: AiAccessProvider, value: string, requestedModel: string): Promise<AiAccessStatus> {
+    return this.serialize(async () => {
+      this.assertProviderShellSupported('codex', provider)
+      if (requestedModel) this.validateModel('codex', provider, requestedModel)
+      let previous = await this.read()
+      const key = value.trim() || previous.shellKeys?.codex?.[provider]
+      if (!key) throw new Error(`AI_ACCESS_${provider.toUpperCase()}_KEY_MISSING`)
+      if (!keyPattern.test(key)) throw new Error(`AI_ACCESS_${provider.toUpperCase()}_KEY_INVALID`)
+      if (!this.gateway) throw new Error('AI_ACCESS_PROVIDER_UNSUPPORTED')
+      if (!this.multiRouter) {
+        try { previous = await this.ensureGateway(previous) } catch (error) {
+          const code = gatewayFailureCode(error)
+          this.markCheck('codex', provider, false, code)
+          return this.publicStatus(previous)
+        }
+      }
+      const previousEntry = previous.codexMultiModelPool?.find(entry => entry.provider === provider)
+      const route = this.route('codex', provider, key, previous, requestedModel || previousEntry?.model)
+      const result = await this.gateway.probe(route)
+      this.recordUsage('codex', 'probe', result.ok ? 'success' : 'failure', result.ok ? undefined : result.code ?? 'unknown')
+      const suggestedProvider = result.ok ? undefined : await this.suggestedProviderForKey('codex', provider, key, previous, result.code)
+      const code = suggestedProvider === undefined ? result.code : 'key_product_mismatch'
+      this.markCheck('codex', provider, result.ok, code,
+        suggestedProvider === undefined ? undefined : this.suggestedProviderNotice(provider, suggestedProvider), suggestedProvider)
+      if (!result.ok) return this.publicStatus(previous)
+      const entry: CodexMultiModelPoolEntry = { provider, model: route.model, internalModelId: multiModelInternalId(provider, route.model) }
+      const next: AiAccessState = {
+        ...previous,
+        codexMode: 'multi',
+        shellKeys: { ...previous.shellKeys, codex: { ...previous.shellKeys?.codex, [provider]: key } },
+        codexMultiModelPool: [...(previous.codexMultiModelPool ?? []).filter(candidate => candidate.provider !== provider), entry],
+        ...(this.multiRouter ? { codexMultiRelay: previous.codexMultiRelay ?? {
+          port: await chooseAiRouterPort(), identitySecret: randomBytes(32).toString('hex')
+        } } : {})
+      }
+      await this.writeState(next)
+      if (this.multiRouter && !(await this.refreshMultiRouter(next))) {
+        await this.writeState(previous)
+        if (previous.codexMultiRelay) {
+          if (!(await this.refreshMultiRouter(previous))) await this.stopMultiRouter(previous)
+        } else await this.stopMultiRouter(next)
+        this.markCheck('codex', provider, false, 'port_unavailable')
+        this.updateRoutes(previous)
+        return this.publicStatus(previous)
+      }
+      this.updateRoutes(next)
+      return this.publicStatus(next)
+    })
+  }
+
+  /** The persisted mode changes only as one serialized start/stop transaction. */
+  async setCodexMode(mode: CodexRoutingMode): Promise<AiAccessStatus> {
+    return this.serialize(async () => {
+      const previous = await this.read()
+      if ((previous.codexMode ?? 'single') === mode) return this.publicStatus(previous)
+      if (!this.multiRouter) throw new Error('AI_ROUTER_UNAVAILABLE')
+      if (mode === 'multi') {
+        if (!previous.codexMultiModelPool?.length || !this.multiModelGatewayRoute(previous)) throw new Error('AI_ACCESS_MULTI_MODEL_POOL_EMPTY')
+        const next: AiAccessState = { ...previous, codexMode: 'multi', codexMultiRelay: previous.codexMultiRelay ?? {
+          port: await chooseAiRouterPort(), identitySecret: randomBytes(32).toString('hex')
+        } }
+        await this.writeState(next)
+        if (!(await this.refreshMultiRouter(next))) {
+          await this.writeState(previous)
+          if (previous.codexMode === 'multi') await this.refreshMultiRouter(previous)
+          else await this.stopMultiRouter(next)
+          this.updateRoutes(previous)
+          throw new Error('AI_ROUTER_REFRESH_FAILED')
+        }
+        this.updateRoutes(next)
+        return this.publicStatus(next)
+      }
+      if (!(await this.stopMultiRouter(previous))) {
+        await this.refreshMultiRouter(previous)
+        throw new Error('AI_ROUTER_STOP_FAILED')
+      }
+      const next: AiAccessState = { ...previous, codexMode: 'single' }
+      try { await this.commitCodexMultiDeactivation(next) } catch (error) {
+        await this.refreshMultiRouter(previous)
+        throw error
+      }
+      this.updateRoutes(next)
+      return this.publicStatus(next)
+    })
+  }
+
+  /** Repairs only recoverable current-multi runtime faults; mode, pool and bindings are never rewritten here. */
+  async repairCodexMultiModelRouter(): Promise<{ readonly repaired: boolean; readonly reason?: 'already_running' | 'manual_intervention_required' }> {
+    return this.serialize(async () => {
+      const previous = await this.read()
+      if (!this.multiRouter || previous.codexMode !== 'multi' || !this.multiModelGatewayRoute(previous)) {
+        return { repaired: false, reason: 'manual_intervention_required' }
+      }
+      const status = await this.multiRouter.status(previous)
+      if (status.running) return { repaired: false, reason: 'already_running' }
+      if (status.error !== 'not_running' && status.error !== 'stale_route') {
+        return { repaired: false, reason: 'manual_intervention_required' }
+      }
+      if (!(await this.refreshMultiRouter(previous))) throw new Error('AI_ROUTER_REFRESH_FAILED')
+      return { repaired: true }
+    })
+  }
+
+  async removeCodexMultiModel(provider: AiAccessProvider): Promise<AiAccessStatus> {
+    return this.serialize(async () => {
+      const previous = await this.read()
+      if (!previous.codexMultiModelPool?.some(entry => entry.provider === provider)) return this.publicStatus(previous)
+      const remaining = previous.codexMultiModelPool?.filter(entry => entry.provider !== provider) ?? []
+      const next: AiAccessState = { ...previous, codexMultiModelPool: remaining,
+        codexMode: remaining.length ? 'multi' : 'single' }
+      if (remaining.length === 0 && this.multiRouter && !(await this.stopMultiRouter(previous))) {
+        await this.refreshMultiRouter(previous)
+        throw new Error('AI_ROUTER_STOP_FAILED')
+      }
+      try { await (remaining.length === 0 ? this.commitCodexMultiDeactivation(next) : this.writeState(next)) } catch (error) {
+        if (remaining.length === 0) await this.refreshMultiRouter(previous)
+        throw error
+      }
+      if (remaining.length && this.multiRouter && !(await this.refreshMultiRouter(next))) {
+        await this.writeState(previous)
+        if (!(await this.refreshMultiRouter(previous))) await this.stopMultiRouter(previous)
+        throw new Error('AI_ROUTER_REFRESH_FAILED')
+      }
       this.updateRoutes(next)
       return this.publicStatus(next)
     })
@@ -416,6 +828,7 @@ export class AiAccessService {
       if (!isProvider(provider)) throw new Error('AI_ACCESS_PROVIDER_INVALID')
       this.assertProviderShellSupported(shell, provider)
       const adapter = this.adapter(shell)
+      await this.beforeHermesRouteMutation(shell)
       let previous = await this.read()
       if (input && !this.gateway) throw new Error('AI_ACCESS_PROVIDER_UNSUPPORTED')
       this.validateModel(shell, provider, input?.model ?? '')
@@ -430,9 +843,11 @@ export class AiAccessService {
       const blocked = await this.extras.gate?.(shell, provider)
       if (blocked) { this.recordUsage(shell, 'probe', 'unverified', 'shell_version_incompatible'); this.markCheck(shell, provider, false, 'shell_version_incompatible', blocked); return this.publicStatus(previous) }
       if (this.gateway) {
-        try { previous = await this.ensureGateway(previous) } catch {
-          this.recordUsage(shell, 'probe', 'unverified', 'port_unavailable')
-          this.markCheck(shell, provider, false, 'port_unavailable')
+        try { previous = await this.ensureGateway(previous) } catch (error) {
+          const code = gatewayFailureCode(error)
+          if (previous.relay) this.startupError = code
+          this.recordUsage(shell, 'probe', 'unverified', code)
+          this.markCheck(shell, provider, false, code)
           return this.publicStatus(previous)
         }
         const result = await this.gateway.probe(route)
@@ -479,7 +894,7 @@ export class AiAccessService {
         } : {}),
         ...(this.gateway ? { relayShells: [...new Set([...(previous.relayShells ?? []), shell])], pendingShells: previous.pendingShells?.filter(item => item !== shell) } : {}),
         shellFingerprints: await this.captureFingerprints(previous.shellFingerprints, [shell]) }
-      try { await this.store.write(next) } catch (error) {
+      try { await this.writeAndRefreshMulti(previous, next, shell, provider) } catch (error) {
         if (!this.gateway) throw error
         const restored = await this.rollbackChange(previous, rollback!)
         this.recordUsage(shell, 'config-write', 'failure', restored ? 'configuration_failed' : 'configuration_rollback_failed')
@@ -497,6 +912,7 @@ export class AiAccessService {
     return this.serialize(async () => {
       const adapter = this.adapter(shell)
       const previous = await this.read()
+      await this.beforeHermesRouteMutation(shell)
       try { await this.ensureConfigurationTarget(shell, previous) } catch { throw new Error('AI_ACCESS_CONFIGURATION_TARGET_BLOCKED') }
       if (adapter.deactivateToolboxConnection === undefined && adapter.activateOfficial === undefined) throw new Error('AI_ACCESS_OFFICIAL_UNSUPPORTED')
       const rollback = await adapter.captureConnection?.()
@@ -512,10 +928,20 @@ export class AiAccessService {
         throw new Error('AI_ACCESS_APPLY_FAILED')
       }
       const next: AiAccessState = { ...previous, selected: { ...previous.selected, [shell]: 'official' }, relayShells: previous.relayShells?.filter(item => item !== shell), pendingShells: previous.pendingShells?.filter(item => item !== shell),
+        ...(shell === 'codex' && this.multiRouter ? { codexMode: 'single' as const } : {}),
         shellFingerprints: withoutShell(previous.shellFingerprints, shell) }
-      try { await this.store.write(next) } catch {
+      const stopMultiRouter = shell === 'codex' && this.multiRouter && previous.codexMode === 'multi'
+      if (stopMultiRouter) {
+        try { if (!(await this.multiRouter!.stop(previous))) throw new Error('AI_ROUTER_STOP_FAILED') } catch {
+          if (this.gateway) await this.rollbackChange(previous, rollback!)
+          else if (rollback) await rollback()
+          throw new Error('AI_ROUTER_STOP_FAILED')
+        }
+      }
+      try { await (shell === 'codex' ? this.commitCodexMultiDeactivation(next) : this.writeState(next)) } catch {
         if (this.gateway) await this.rollbackChange(previous, rollback!)
         else if (rollback) await rollback()
+        if (stopMultiRouter) await this.multiRouter!.refresh(previous).catch(() => undefined)
         throw new Error('AI_ACCESS_APPLY_FAILED')
       }
       this.attempt = undefined
@@ -541,6 +967,7 @@ export class AiAccessService {
       if (previous.selected[shell] !== 'official') throw new Error('AI_ACCESS_RESTORE_PREVIOUS_REQUIRES_OFFICIAL')
       const adapter = this.adapter(shell)
       if (adapter.restorePreviousConnection === undefined) throw new Error('AI_ACCESS_RESTORE_PREVIOUS_UNSUPPORTED')
+      await this.beforeHermesRouteMutation(shell)
       await this.ensureConfigurationTarget(shell, previous)
       const rollback = await adapter.captureConnection?.()
       if (this.gateway) {
@@ -559,7 +986,7 @@ export class AiAccessService {
         pendingShells: previous.pendingShells?.filter(item => item !== shell),
         shellFingerprints: withoutShell(previous.shellFingerprints, shell)
       }
-      try { await this.store.write(next) } catch {
+      try { await this.writeState(next) } catch {
         if (this.gateway) await this.rollbackChange(previous, rollback!)
         else if (rollback) await rollback()
         throw new Error('AI_ACCESS_APPLY_FAILED')
@@ -577,13 +1004,36 @@ export class AiAccessService {
   /** Only restarts previously configured toolbox routes; never rewrites a shell on startup. */
   async initialize(): Promise<void> {
     await this.serialize(async () => {
+      let state: AiAccessState
       try {
-        const state = await this.read()
-        if (state.relay) {
-          try { await this.ensureGateway(state) } catch { this.startupError = 'port_unavailable' }
+        state = await this.migrateApi15rDState()
+        this.api15rDMigrationFailed = false
+      } catch {
+        this.api15rDMigrationFailed = true
+        this.startupError = 'configuration_failed'
+        return
+      }
+      try {
+        if (state.relay || (!this.multiRouter && state.codexMultiModelPool?.length)) {
+          try { await this.ensureGateway(state) } catch (error) { this.startupError = gatewayFailureCode(error) }
         } else this.updateRoutes(state)
+        if (this.multiRouter && state.codexMode === 'multi' && state.codexMultiModelPool?.length) {
+          if (!(await this.multiRouter.ensureReady(state, true))) this.startupError = 'local_service_down'
+        }
       } catch { this.startupError = 'configuration_failed' }
     })
+  }
+
+  /** The Desktop update gate has just re-proved the exact HMAC/runtime/seat owner. */
+  async acceptVerifiedAiRouterRecovery(): Promise<void> {
+    await this.pending
+    if (this.startupError === 'local_service_down') this.startupError = undefined
+  }
+
+  async probeDiagnosticPath(shell: AiAccessShell, revision: string) {
+    await this.pending
+    if (this.gateway === undefined) return { failure: 'path-unavailable' as const, durationMs: 0 }
+    return this.gateway.probeDiagnosticPath(shell, revision)
   }
 
   async serviceStatus(): Promise<ApiServiceSnapshot> {
@@ -601,15 +1051,15 @@ export class AiAccessService {
         (state !== undefined && aiAccessShells.some(shell => isInterruptedSelection(state, shell)))
       )
     const retainedStartupError = this.startupError
-    const startupError = down
-      ? 'local_service_down'
-      : retainedStartupError ?? (pendingBlocksAllRoutes ? 'configuration_interrupted' : undefined)
+    const startupError = retainedStartupError ?? (down ? 'local_service_down'
+      : pendingBlocksAllRoutes ? 'configuration_interrupted' : undefined)
     return { ...base, ...(startupError ? { startupError } : {}), checks: [...this.checks], usage: this.usageStages(state) }
   }
 
   /** 「测过 / 写了 / 真的在用」三件分开报；判不出就是 null，⛔ 用「配置写了」冒充「在用」。 */
   private usageStages(state?: AiAccessState): readonly ApiUsageStage[] {
     const observed = this.gateway?.clientAcceptances() ?? {}
+    const attempts = this.gateway?.clientAttempts() ?? {}
     return aiAccessShells.map(shell => {
       const selected = state?.selected[shell]
       // 还没切换过的壳，按客户刚测过的那一家报进度；已切到官方就没有第三方进度可报。
@@ -633,6 +1083,9 @@ export class AiAccessService {
         // old provider therefore cannot turn the newly selected provider into "in use".
         observedClientCall: provider && currentConfiguration && observed[shell]?.provider === provider ? observed[shell]!.at : null,
         lastObservedClientCall: provider && currentConfiguration && observed[shell]?.provider === provider ? observed[shell]!.lastAt : null,
+        lastClientAttempt: provider && currentConfiguration && attempts[shell]?.provider === provider
+          ? { at: attempts[shell]!.at, ok: attempts[shell]!.ok, ...(attempts[shell]!.code === undefined ? {} : { code: attempts[shell]!.code }) }
+          : null,
         ...(codexDesktopRoute === undefined ? {} : { codexDesktopRoute }),
         configuration
       }
@@ -650,9 +1103,11 @@ export class AiAccessService {
       const blocked = await this.extras.gate?.(shell, provider)
       if (blocked) { this.recordUsage(shell, 'probe', 'unverified', 'shell_version_incompatible'); this.markCheck(shell, provider, false, 'shell_version_incompatible', blocked); return }
       if (!this.gateway) { this.recordUsage(shell, 'probe', 'unverified', 'not_configured'); this.markCheck(shell, provider, false, 'not_configured'); return }
-      try { await this.ensureGateway(state) } catch {
-        this.recordUsage(shell, 'probe', 'unverified', 'port_unavailable')
-        this.markCheck(shell, provider, false, 'port_unavailable'); return
+      try { await this.ensureGateway(state) } catch (error) {
+        const code = gatewayFailureCode(error)
+        if (state.relay) this.startupError = code
+        this.recordUsage(shell, 'probe', 'unverified', code)
+        this.markCheck(shell, provider, false, code); return
       }
       const result = await this.gateway.probe(this.route(shell, provider, key, state))
       this.recordUsage(shell, 'probe', result.ok ? 'success' : 'failure', result.ok ? undefined : result.code ?? 'unknown')
@@ -772,7 +1227,17 @@ export class AiAccessService {
           ...(result.firstTextMs === undefined ? {} : { firstTextMs: result.firstTextMs }), at: at() })
       }
     }
-    const result: ModelMatrixReport = { at: new Date().toISOString(), entries }
+    const result: ModelMatrixReport = {
+      at: new Date().toISOString(), entries,
+      // 矩阵按开跑时读到的这份状态快照采集，全程可能持续数分钟；把快照指纹随报告带走
+      //（选择 × Key 存在性 × 各壳已选模型，⛔ 任何 Key 材料），运维对照现状时能分辨不同期。
+      stateFingerprint: createHash('sha256').update(JSON.stringify({
+        selected: state.selected,
+        shellKeys: Object.fromEntries(Object.entries(state.shellKeys ?? {}).map(([shell, keys]) =>
+          [shell, Object.fromEntries(Object.entries(keys ?? {}).map(([provider, key]) => [provider, typeof key === 'string' && key !== '']))])),
+        shellModels: state.shellModels ?? {}
+      })).digest('hex').slice(0, 16)
+    }
     this.matrixProgress = { done: entries.length, total }
     await this.extras.saveMatrix?.(result)
     return result
@@ -855,24 +1320,41 @@ export class AiAccessService {
       let relay = initial.relay
       let rebound = false
       const port = this.gateway.baseUrl === null ? null : Number(new URL(this.gateway.baseUrl).port)
-      if (port !== relay.port || !this.gatewayRunning()) {
+      const restartingGateway = port !== relay.port || !this.gatewayRunning()
+      // Rebinding or restarting the local gateway can make Hermes use the ordinary upstream
+      // transport before its six-field route is rewritten. Settle the isolated lease first;
+      // a failed settlement leaves both the gateway and Hermes configuration untouched.
+      if (restartingGateway && routed.includes('hermes')) {
+        try { await this.beforeHermesRouteMutation('hermes') } catch {
+          return this.recovery(reason, at, 'still_failing', 'configuration_failed',
+            'Hermes 模型 API 隔离未能安全停止，未重启或回写本机网关配置。', await this.inspectConfigurations(state), [], 'recovery_config_broken')
+        }
+      }
+      if (restartingGateway) {
         await this.gateway.stop()
         try {
           await this.gateway.start(relay.port, relay.token)
-        } catch {
+        } catch (error) {
+          const code = gatewayFailureCode(error)
+          if (code !== 'port_unavailable') {
+            this.startupError = code
+            return this.recovery(reason, at, 'still_failing', code, apiFailureMessage(code), await this.inspectConfigurations(state), [], 'recovery_service_down')
+          }
           // 记的端口被别的程序占了：换一个可用端口，⛔ 让三壳继续把请求发给占用者。
           // 旧端口现在归那个陌生程序，而壳里的配置还带着本机中继令牌；换端口时一并轮换令牌，
           // 拿到旧令牌的程序就打不开新端口。⛔ 沿用旧令牌。
           const rotated = randomBytes(32).toString('hex')
           let replacement: number
-          try { replacement = await this.gateway.start(0, rotated) } catch {
-            this.updateRoutes(state)
-            return this.recovery(reason, at, 'still_failing', 'local_service_down', apiFailureMessage('local_service_down'), await this.inspectConfigurations(state), [], 'recovery_service_down')
+          try { replacement = await this.gateway.start(0, rotated) } catch (replacementError) {
+            const replacementCode = gatewayFailureCode(replacementError)
+            this.startupError = replacementCode
+            return this.recovery(reason, at, 'still_failing', replacementCode, apiFailureMessage(replacementCode), await this.inspectConfigurations(state), [], 'recovery_service_down')
           }
           relay = { port: replacement, token: rotated }
           state = { ...state, relay }
           rebound = true
         }
+        this.startupError = undefined
         this.updateRoutes(state)
       }
       const rewrote: AiAccessShell[] = []
@@ -880,10 +1362,23 @@ export class AiAccessService {
         // 回写是拿新端口把托管段整段重渲染，客户在块内改过的行会被覆盖。所以先核对这一段还是不是
         // 工具箱写的那份：被别的程序改过、不见了、读不出来的壳一律跳过，留在暂停态交「重新写入配置」，
         // ⛔ 顺手把客户的改动盖掉。
-        const before = await this.inspectConfigurations(state)
-        const writable = routed.filter(shell => before[shell] === 'ok')
+        let before = await this.inspectConfigurations(state)
+        let writable = routed.filter(shell => before[shell] === 'ok')
+        try {
+          await this.extras.beforeRecoveryRewrite?.(writable)
+        } catch {
+          // The replacement listener/token were not made durable; do not follow a failed lease
+          // revocation with a configuration rewrite.
+          this.updateRoutes({ ...state, pendingShells: [...new Set([...(state.pendingShells ?? []), ...routed])] })
+          await this.gateway.stop().catch(() => undefined)
+          return this.recovery(reason, at, 'still_failing', 'configuration_failed', '换用新端口前没能安全解除应用隔离，未改写任何 AI 配置。', await this.inspectConfigurations(state), [], 'recovery_state_unavailable')
+        }
+        // Revocation can restore the owned application block; its former fingerprint is not a
+        // write authorization, so obtain a fresh decision before the recovery transaction.
+        before = await this.inspectConfigurations(state)
+        writable = routed.filter(shell => before[shell] === 'ok')
         const pending: AiAccessState = { ...state, pendingShells: [...new Set([...(state.pendingShells ?? []), ...routed])] }
-        try { await this.store.write(pending) } catch {
+        try { await this.writeState(pending) } catch {
           // The new listener/token are not durable until this write succeeds.  Pause routes before
           // returning and stop that listener so a stale UI/state cannot leave a usable route alive.
           this.updateRoutes(pending)
@@ -904,7 +1399,7 @@ export class AiAccessService {
         }
         state = { ...state, pendingShells: (pending.pendingShells ?? []).filter(shell => !rewrote.includes(shell)),
           shellFingerprints: await this.captureFingerprints(state.shellFingerprints, rewrote) }
-        try { await this.store.write(state) } catch {
+        try { await this.writeState(state) } catch {
           return this.recovery(reason, at, 'still_failing', 'configuration_failed', '新端口的配置写进去了，但没能保存状态，请重新启用这个 AI。', await this.inspectConfigurations(state), [], 'recovery_state_unavailable')
         }
         this.updateRoutes(state)
@@ -1031,7 +1526,10 @@ export class AiAccessService {
   private async refreshOfficialAuthentication(state: AiAccessState): Promise<void> {
     await Promise.all(aiAccessShells.map(async shell => {
       const reader = this.adapter(shell).officialAuthenticationStatus
-      if (state.selected[shell] !== 'official' || reader === undefined) {
+      // 多模型共用下 OpenAI 官方是池内一条线（创始人 2026-09-29 定案）：官方登录状态
+      //（工具箱发起或桌面端直登写的同一份凭据）要随 status 下发供界面显示已启用。
+      const visible = state.selected[shell] === 'official' || (shell === 'codex' && (state.codexMode ?? 'single') === 'multi')
+      if (!visible || reader === undefined) {
         this.officialAuthentications.delete(shell)
         return
       }
@@ -1058,6 +1556,11 @@ export class AiAccessService {
       throw new Error('AI_ACCESS_CONFIGURATION_TARGET_BLOCKED')
     }
     if (evidence !== undefined) this.recordUsage(shell, 'config-target', 'success')
+  }
+
+  /** A production-provided gate settles Hermes' private transport before its route target can change. */
+  private async beforeHermesRouteMutation(shell: AiAccessShell): Promise<void> {
+    if (shell === 'hermes') await this.extras.beforeHermesRouteMutation?.()
   }
 
   /** 回执出口统一走这里：recordUsageEvent 的实现保证不抛，这里再兜一层，⛔ 因记录影响主流程。 */
@@ -1122,8 +1625,14 @@ export class AiAccessService {
       const state = await this.read().catch(() => undefined)
       if (!state) return 'configuration_failed'
       if (!state.relay) return 'not_configured'
-      await this.gateway!.stop()
-      try { await this.ensureGateway(state) } catch { return 'port_unavailable' }
+      // 同端口同令牌重启：给在飞的客户流式回答一个短沉降窗（复审收尾），界内收尾的不掐断；
+      // 换端口/令牌轮换路径仍走 stop() 的立即中止。
+      await this.gateway!.stop(5_000)
+      try { await this.ensureGateway(state) } catch (error) {
+        const code = gatewayFailureCode(error)
+        this.startupError = code
+        return code
+      }
       return undefined
     })
   }
@@ -1162,7 +1671,13 @@ export class AiAccessService {
     const recipeModel = resolved === undefined ? undefined : normalizeProviderModel(provider, shell, resolved.model)
     const selected = model || storedModel || recipeModel || contract.defaultModel
     if (!isProviderModelAllowed(provider, shell, selected)) throw new Error('AI_ACCESS_MODEL_INVALID')
-    return { shell, provider, key, endpoint: resolved?.endpoint ?? contract.endpoint, model: selected }
+    const route = { shell, provider, key, endpoint: resolved?.endpoint ?? contract.endpoint, model: selected }
+    const isolated = this.isolatedShellTargets.get(shell) === this.routeTargetIdentity(route)
+    return { ...route, ...(isolated ? { isolated: true } : {}) }
+  }
+
+  private routeTargetIdentity(route: Pick<GatewayRoute, 'provider' | 'key' | 'model' | 'endpoint'>): string {
+    return createHash('sha256').update(JSON.stringify([route.provider, route.key, route.model, route.endpoint])).digest('hex')
   }
 
   private async suggestedProviderForKey(shell: AiAccessShell, provider: AiAccessProvider, key: string, state: AiAccessState, code?: ApiFailure): Promise<AiAccessProvider | undefined> {
@@ -1203,7 +1718,10 @@ export class AiAccessService {
     const activeRelay = aiAccessShells.some(shell => activeRelayKey(state, shell) !== undefined)
     if (!activeRelay && ((state.pendingShells?.length ?? 0) > 0 || suspended || interrupted)) this.startupError = 'configuration_interrupted'
     else if (this.startupError === 'configuration_interrupted') this.startupError = undefined
-    if (!this.gateway || !state.relay) return
+    if (!this.gateway || !state.relay) {
+      this.gateway?.setMultiModelRoute?.(undefined)
+      return
+    }
     this.gateway.setRoutes(aiAccessShells.flatMap(shell => {
       const key = activeRelayKey(state, shell)
       if (key === undefined) return []
@@ -1211,18 +1729,67 @@ export class AiAccessService {
       if (!isProvider(provider)) return []
       try { return [this.route(shell, provider, key, state)] } catch { return [] }
     }))
+    this.gateway.setMultiModelRoute?.(this.multiRouter ? undefined : this.multiModelGatewayRoute(state))
+  }
+
+  private async writeAndRefreshMulti(previous: AiAccessState, next: AiAccessState,
+    shell: AiAccessShell, provider: AiAccessProvider): Promise<void> {
+    await this.writeState(next)
+    if (!this.multiRouter || shell !== 'codex' || previous.codexMode !== 'multi' ||
+      !previous.codexMultiModelPool?.some(entry => entry.provider === provider) ||
+      previous.shellKeys?.codex?.[provider] === next.shellKeys?.codex?.[provider]) return
+    if (await this.refreshMultiRouter(next)) return
+    await this.writeState(previous)
+    if (!(await this.refreshMultiRouter(previous))) await this.stopMultiRouter(previous)
+    throw new Error('AI_ROUTER_REFRESH_FAILED')
+  }
+
+  private async refreshMultiRouter(state: AiAccessState): Promise<boolean> {
+    try { return await this.multiRouter?.refresh(state) === true } catch { return false }
+  }
+
+  private async stopMultiRouter(state: AiAccessState): Promise<boolean> {
+    try { return await this.multiRouter?.stop(state) === true } catch { return false }
+  }
+
+  private async commitCodexMultiDeactivation(next: AiAccessState): Promise<void> {
+    const commit = () => this.writeState(next)
+    if (this.extras.deactivateCodexMultiModel) await this.extras.deactivateCodexMultiModel(commit)
+    else await commit()
+  }
+
+  private multiModelGatewayRoute(state: AiAccessState): MultiModelGatewayRoute | undefined {
+    const pool = state.codexMultiModelPool
+    if (!pool?.length) return undefined
+    const models = pool.map(entry => {
+      const key = state.shellKeys?.codex?.[entry.provider]
+      const contract = providerShellContract(entry.provider, 'codex')
+      if (!key || !keyPattern.test(key) || contract.status !== 'supported' ||
+        !isProviderModelAllowed(entry.provider, 'codex', entry.model) ||
+        entry.internalModelId !== multiModelInternalId(entry.provider, entry.model)) return undefined
+      return { ...entry, endpoint: contract.endpoint, key }
+    })
+    const validModels = models.filter((entry): entry is NonNullable<typeof entry> => entry !== undefined)
+    return validModels.length === models.length ? { provider: 'laixin-multi', models: validModels } : undefined
+  }
+
+  private storedMultiModelConnection(state: AiAccessState): { readonly baseUrl: string; readonly model: string; readonly models: readonly string[] } | undefined {
+    const route = this.multiModelGatewayRoute(state)
+    const relay = state.codexMultiRelay
+    return route && relay ? { baseUrl: `http://127.0.0.1:${String(relay.port)}/codex/multi/v1`,
+      model: route.models[0].internalModelId, models: route.models.map(entry => entry.internalModelId) } : undefined
   }
 
   private async beginChange(previous: AiAccessState, shell: AiAccessShell): Promise<void> {
     const pending: AiAccessState = { ...previous, pendingShells: [...new Set([...(previous.pendingShells ?? []), shell])] }
-    await this.store.write(pending)
+    await this.writeState(pending)
     this.updateRoutes(pending)
   }
 
   private async rollbackChange(previous: AiAccessState, rollback: () => Promise<void>): Promise<boolean> {
     try {
       await rollback()
-      await this.store.write(previous)
+      await this.writeState(previous)
       this.updateRoutes(previous)
       return true
     } catch { return false } // Keep the persisted write-ahead block and paused route.
@@ -1233,7 +1800,10 @@ export class AiAccessService {
     const token = state.relay?.token ?? randomBytes(32).toString('hex')
     const port = await this.gateway.start(state.relay?.port ?? 0, token)
     const next = state.relay ? state : { ...state, relay: { token, port } }
-    try { if (!state.relay) await this.store.write(next) } catch (error) { await this.gateway.stop(); throw error }
+    try { if (!state.relay) await this.writeState(next) } catch (error) {
+      await this.gateway.stop()
+      throw new Error('AI_ACCESS_STATE_WRITE_FAILED', { cause: error })
+    }
     this.startupError = undefined
     this.updateRoutes(next)
     return next
@@ -1245,28 +1815,67 @@ export class AiAccessService {
     return result
   }
 
+  private async writeState(next: AiAccessState): Promise<void> {
+    if (!this.api15rDMigrationFailed) {
+      await this.store.write(next)
+      return
+    }
+    const migrated = await this.migrateApi15rDState()
+    this.api15rDMigrationFailed = false
+    if (this.startupError === 'configuration_failed') this.startupError = undefined
+    const durable: AiAccessState = {
+      ...migrated,
+      ...next,
+      shellKeys: next.shellKeys ?? migrated.shellKeys,
+      codexMode: next.codexMode ?? migrated.codexMode,
+      codexMultiModelPool: next.codexMultiModelPool ?? migrated.codexMultiModelPool,
+      migrations: migrated.migrations
+    }
+    await this.store.write(durable)
+  }
+
   private async read(): Promise<AiAccessState> {
     const stored = await this.store.read()
     if (!validAiAccessState(stored)) throw new Error('AI_ACCESS_STORAGE_INVALID')
     let state = withoutLegacyCodexTargetScope(stored)
     const migratedCodexTarget = state !== stored
-    if (state.shellKeys !== undefined) {
-      if (migratedCodexTarget) await this.store.write(state).catch(() => undefined)
-      return state
+    if (state.shellKeys === undefined) {
+      // Preserve only existing legacy bindings. Never assign a shared Key to another shell.
+      const shellKeys: Partial<Record<AiAccessShell, Partial<Record<AiAccessProvider, string>>>> = {}
+      for (const shell of aiAccessShells) {
+        const provider = state.selected[shell]
+        if (!isProvider(provider)) continue
+        const key = savedProviderKey(state, shell, provider)
+        if (key) shellKeys[shell] = { [provider]: key }
+      }
+      state = { ...state, shellKeys }
     }
-    // Preserve only existing legacy bindings. Never assign a shared Key to another shell.
-    const shellKeys: Partial<Record<AiAccessShell, Partial<Record<AiAccessProvider, string>>>> = {}
-    for (const shell of aiAccessShells) {
-      const provider = state.selected[shell]
-      if (!isProvider(provider)) continue
-      const key = legacyKeyForProvider(state, provider)
-      if (key) shellKeys[shell] = { [provider]: key }
+    if (migratedCodexTarget) await this.writeState(state).catch(() => undefined)
+    return state
+  }
+
+  private async migrateApi15rDState(): Promise<AiAccessState> {
+    const stored = await this.store.read()
+    if (!validAiAccessState(stored)) throw new Error('AI_ACCESS_STORAGE_INVALID')
+    let state = withoutLegacyCodexTargetScope(stored)
+    if (state.shellKeys === undefined) {
+      const shellKeys: Partial<Record<AiAccessShell, Partial<Record<AiAccessProvider, string>>>> = {}
+      for (const shell of aiAccessShells) {
+        const provider = state.selected[shell]
+        if (!isProvider(provider)) continue
+        const key = savedProviderKey(state, shell, provider)
+        if (key) shellKeys[shell] = { [provider]: key }
+      }
+      state = { ...state, shellKeys }
     }
-    state = { ...state, shellKeys }
-    // A failed preference migration must not block a customer from returning to the valid user
-    // target. The normalized in-memory state is still used, and any later normal state write
-    // persists it atomically.
-    if (migratedCodexTarget) await this.store.write(state).catch(() => undefined)
+    if (state.migrations?.api15rD !== 1) {
+      state = { ...state, codexMode: state.codexMode ?? 'single', codexMultiModelPool: state.codexMultiModelPool ?? [],
+        migrations: { ...state.migrations, api15rD: 1 } }
+    }
+    if (state !== stored) {
+      try { await this.store.write(state) }
+      catch (error) { throw new Error('AI_ACCESS_STATE_MIGRATION_FAILED', { cause: error }) }
+    }
     return state
   }
 
@@ -1282,6 +1891,7 @@ export class AiAccessService {
       ...(this.attempt ? { attempt: this.attempt } : {}),
       ...(this.configurationTargets.size ? { configurationTargets: Object.fromEntries(this.configurationTargets) as AiAccessStatus['configurationTargets'] } : {}),
       ...(this.officialAuthentications.size ? { officialAuthentication: Object.fromEntries(this.officialAuthentications) as AiAccessStatus['officialAuthentication'] } : {}),
+      codexMultiModel: { mode: state.codexMode ?? 'single', models: state.codexMultiModelPool ?? [] },
       shells: Object.fromEntries(aiAccessShells.map((shell) => [shell, {
         selected: isLegacyDirectSelection(state, shell) || isSuspendedSelection(state, shell) || isInterruptedSelection(state, shell)
           ? null : state.selected[shell] ?? null,
@@ -1310,6 +1920,10 @@ export class AiAccessService {
 
 export function validAiAccessState(value: unknown): value is AiAccessState {
   if (!record(value) || value.version !== 1 || !record(value.selected)) return false
+  // Future versions may append migration markers. D only owns and validates its own marker so an
+  // older binary does not reject, overwrite, or clear otherwise-valid forward-compatible state.
+  if (value.migrations !== undefined && (!record(value.migrations) ||
+    (value.migrations.api15rD !== undefined && value.migrations.api15rD !== 1))) return false
   if (value.shellKeys !== undefined && (!record(value.shellKeys) || Object.entries(value.shellKeys).some(([shell, keys]) =>
     !aiAccessShells.includes(shell as AiAccessShell) || !record(keys) || Object.entries(keys).some(([provider, key]) =>
       !isProvider(provider) || typeof key !== 'string' || !keyPattern.test(key))))) return false
@@ -1325,12 +1939,25 @@ export function validAiAccessState(value: unknown): value is AiAccessState {
   if (value.pendingShells !== undefined && (!Array.isArray(value.pendingShells) || value.pendingShells.some(shell => !aiAccessShells.includes(shell)))) return false
   if (value.configurationTargetScopes !== undefined && (!record(value.configurationTargetScopes) || Object.entries(value.configurationTargetScopes).some(([shell, scope]) =>
     !aiAccessShells.includes(shell as AiAccessShell) || (scope !== 'user' && scope !== 'project')))) return false
+  if (value.codexMode !== undefined && value.codexMode !== 'single' && value.codexMode !== 'multi') return false
+  if (value.codexMultiModelPool !== undefined && (!Array.isArray(value.codexMultiModelPool) || value.codexMultiModelPool.some(entry =>
+    !record(entry) || !isProvider(entry.provider) || typeof entry.model !== 'string' || !isProviderModelAllowed(entry.provider, 'codex', entry.model) ||
+    typeof entry.internalModelId !== 'string' || !modelIdPattern.test(entry.internalModelId) ||
+    entry.internalModelId !== multiModelInternalId(entry.provider, entry.model)) ||
+    new Set(value.codexMultiModelPool.map(entry => entry.provider)).size !== value.codexMultiModelPool.length)) return false
+  if (value.codexMultiRelay !== undefined && (!record(value.codexMultiRelay) || !Number.isInteger(value.codexMultiRelay.port) ||
+    Number(value.codexMultiRelay.port) < 1024 || Number(value.codexMultiRelay.port) > 65535 ||
+    typeof value.codexMultiRelay.identitySecret !== 'string' || !/^[a-f0-9]{64}$/.test(value.codexMultiRelay.identitySecret))) return false
   if (value.shellFingerprints !== undefined && (!record(value.shellFingerprints) || Object.entries(value.shellFingerprints).some(([shell, print]) =>
     !aiAccessShells.includes(shell as AiAccessShell) || typeof print !== 'string' || !/^[a-f0-9]{64}$/.test(print)))) return false
   if (value.relay !== undefined && (!record(value.relay) || !Number.isInteger(value.relay.port) || Number(value.relay.port) < 1024 || Number(value.relay.port) > 65535 || typeof value.relay.token !== 'string' || !/^[a-f0-9]{64}$/.test(value.relay.token))) return false
   return Object.entries(value.selected).every(([shell, mode]) =>
     aiAccessShells.includes(shell as AiAccessShell) && aiAccessModes.includes(mode as AiAccessMode)
   )
+}
+
+export function multiModelInternalId(provider: AiAccessProvider, model: string): string {
+  return `laixin.${provider}.${model}`
 }
 
 function withoutShell(prints: AiAccessState['shellFingerprints'], shell: AiAccessShell): AiAccessState['shellFingerprints'] {
@@ -1350,11 +1977,6 @@ function withoutLegacyCodexTargetScope(state: AiAccessState): AiAccessState {
 
 function shellLabel(shell: AiAccessShell): string {
   return shell === 'codex' ? 'Codex' : shell === 'claude' ? 'Claude Code' : 'Hermes'
-}
-
-function legacyKeyForProvider(state: AiAccessState, provider: AiAccessProvider): string | undefined {
-  const field = legacyKeyFields[provider]
-  return field === undefined ? undefined : state[field]
 }
 
 /** Current routes are strict; a pending route may preserve a known historical model without becoming routable. */

@@ -5,7 +5,7 @@ import { spawn } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { acknowledgeUpdate } from '../../app/main/desktop/updater'
+import { acknowledgeUpdate, dismissCommittedUpdate, waitForCommittedUpdate } from '../../app/main/desktop/updater'
 
 const cleanups: Array<() => Promise<unknown>> = []
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); vi.restoreAllMocks() })
@@ -94,5 +94,69 @@ describe('更新磁盘卫生', () => {
     expect(entries).toContain('previous-1000.app')
     expect(entries).toContain('download-AAA')
     expect(entries).not.toContain('acknowledgement.json')
+  })
+
+  it('Windows 启动回执不等于最终成功；提交失败绝不弹成功', async () => {
+    const directory = await tempRoot('toolbox-win-commit-error-')
+    await writeFile(join(directory, 'pending.json'), JSON.stringify({ version: '0.5.18', previous: '0.5.17', notes: '修复' }))
+    const wait = async () => {
+      await writeFile(join(directory, 'result.json'), JSON.stringify({ version: '0.5.18', state: 'error' }))
+    }
+    expect(await acknowledgeUpdate(directory, '0.5.18', { outcome: () => 'connected', giveUp: () => {}, deferSuccessUntilCommit: true })).toBeUndefined()
+    expect(JSON.parse(await readFile(join(directory, 'acknowledgement.json'), 'utf8'))).toMatchObject({ version: '0.5.18' })
+    await wait()
+    expect(await waitForCommittedUpdate(directory, '0.5.18')).toBeUndefined()
+  })
+
+  it('最终 complete 后才报成功；新版在回执后崩溃重启可补显一次，用户关闭后不再弹', async () => {
+    const directory = await tempRoot('toolbox-win-commit-restart-')
+    await writeFile(join(directory, 'pending.json'), JSON.stringify({ version: '0.5.18', previous: '0.5.17', notes: '修复' }))
+    await acknowledgeUpdate(directory, '0.5.18', { outcome: () => 'connected', giveUp: () => {}, deferSuccessUntilCommit: true })
+    await writeFile(join(directory, 'result.json'), JSON.stringify({ version: '0.5.18', state: 'complete', previous: '0.5.17', notes: '修复' }))
+    await rm(join(directory, 'pending.json'))
+    expect(await acknowledgeUpdate(directory, '0.5.18', { outcome: () => 'connected', giveUp: () => {}, deferSuccessUntilCommit: true })).toBeUndefined()
+    expect(await waitForCommittedUpdate(directory, '0.5.18')).toEqual({ previous: '0.5.17', notes: '修复' })
+    await dismissCommittedUpdate(directory, '0.5.18')
+    expect(await waitForCommittedUpdate(directory, '0.5.18')).toBeUndefined()
+  })
+
+  it('最终提交仍在进行时一直不通知，助手完成才通知', async () => {
+    const directory = await tempRoot('toolbox-win-commit-wait-')
+    await writeFile(join(directory, 'pending.json'), JSON.stringify({ version: '0.5.18' }))
+    let waits = 0
+    const notice = await waitForCommittedUpdate(directory, '0.5.18', {
+      wait: async () => {
+        waits += 1
+        await writeFile(join(directory, 'result.json'), JSON.stringify({ version: '0.5.18', state: 'complete', previous: '0.5.17', notes: '修复' }))
+      }
+    })
+    expect(waits).toBe(1)
+    expect(notice).toEqual({ previous: '0.5.17', notes: '修复' })
+  })
+
+  it('Windows 助手的 complete 持久结果只能写在预检提交之后', async () => {
+    const script = await readFile(join(__dirname, '..', '..', 'resources', 'update-helper.ps1'), 'utf8')
+    const commit = script.indexOf('Invoke-WindowsPreflightCommit $preflightTransaction')
+    const complete = script.indexOf("Write-Result 'complete'", commit)
+    expect(commit).toBeGreaterThan(-1)
+    expect(complete).toBeGreaterThan(commit)
+    expect(script.slice(complete, script.indexOf('} catch {', complete))).not.toContain("Write-Result 'error'")
+    expect(script).toContain('MoveFileEx($temporary, $job.result, 9)')
+    expect(script).toContain('$stream.Flush($true)')
+    expect(script).not.toContain('WriteAllText($job.result')
+  })
+
+  it('pending 刚删除而结果暂时半写时重读最终结果，不永久漏弹成功', async () => {
+    const directory = await tempRoot('toolbox-win-half-result-')
+    await writeFile(join(directory, 'result.json'), '{"version":"0.5.18"')
+    let waits = 0
+    const notice = await waitForCommittedUpdate(directory, '0.5.18', {
+      wait: async () => {
+        waits += 1
+        await writeFile(join(directory, 'result.json'), JSON.stringify({ version: '0.5.18', state: 'complete', previous: '0.5.17', notes: '修复' }))
+      }
+    })
+    expect(waits).toBe(1)
+    expect(notice).toEqual({ previous: '0.5.17', notes: '修复' })
   })
 })

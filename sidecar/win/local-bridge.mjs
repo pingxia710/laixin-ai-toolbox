@@ -1,13 +1,16 @@
 // 复用 01 朋友包的 Xray -> SSH SOCKS 转发结构；协议处理交给官方内核。
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { connect, createServer, isIP } from 'node:net'
 import { uptime } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { TUNNEL_PROBE_URLS, probeTunnelReachability, verifyWithFallback } from './vless-connector.mjs'
 import { CONTROL_CODES, ConnectorError } from './connectors.mjs'
 import { validVerifyFallbackUrl } from './vless-settings.mjs'
+import { lockHolderAlive } from './ledger.mjs'
+import { createDeliveryOptimizationAdmission, createProxyDestinationAdmissionTransform } from './download-concurrency.mjs'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 
@@ -118,6 +121,8 @@ export function createLocalBridge(options) {
   let failure
   let lost
   let degraded
+  let runId
+  let closeInFlight
   let port = options.listenPort
   const spawnImpl = options.spawnImpl ?? spawn
   const platform = options.platform ?? process.platform
@@ -141,7 +146,7 @@ export function createLocalBridge(options) {
     // 被动检测(照 mihomo 的 onDialFailed):客户真实请求在通道里连续失败,就立刻通知守护复验,⛔ 干等 30 秒定时。
     onDegraded: (callback) => { degraded = callback },
     async listen() {
-      if (!stopped) throw new Error('BRIDGE_ALREADY_STARTED')
+      if (!stopped || child !== undefined) throw new Error('BRIDGE_ALREADY_STARTED')
       if (!options.outbound && !(options.outbounds?.length > 0) && options.upstream?.host !== '127.0.0.1') throw fail()
       const executable = options.executablePath ?? xrayExecutable()
       // 内核文件不在(装包不全,或被安全软件隔离)是缺组件 ⛔ 「上游不可达」:按上游不可达报会无限重连,
@@ -155,16 +160,16 @@ export function createLocalBridge(options) {
       while (requestedPort > 0 && xrayPort === requestedPort) xrayPort = await availablePort(0)
       mkdirSync(options.dataDir, { recursive: true })
       const config = join(options.dataDir, 'xray-bridge.json')
-      const pidPath = `${config}.pid`
+      runId = randomUUID()
       // 上次 runner 被硬杀(Windows TerminateProcess)时 close 钩子不跑,pid 记档留在磁盘、
-      // 内核还活着。启动前按记档清扫,⛔ 直接覆盖记档把旧 xray 留成没人管的孤儿。
-      sweepOrphanXray(pidPath, platform, imageNameOf(executable), spawnImpl)
+      // 内核还活着。启动前清扫失去 runner 的旧记录；活 runner 的记录保留。
+      sweepOrphanXrays(config, platform, imageNameOf(executable), spawnImpl)
       writeFileSync(config, JSON.stringify(buildXrayConfig({ ...options, listenPort: xrayPort })), { mode: 0o600 })
       stopped = false
       failure = undefined
       // runner 的 stdin 是停止管道:close() 关闭它,runner 见 EOF 即停 xray(跨平台可靠)。
       // stderr 接进守护的 stderr(甲-6:runner 把内核 stderr 转发到那里 → 守护日志 → 诊断包)。
-      child = spawnImpl(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), 'xray-runner.mjs'), executable, config, String(process.pid)], {
+      child = spawnImpl(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), 'xray-runner.mjs'), executable, config, String(process.pid), runId], {
         env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
         stdio: ['pipe', 'ignore', 'inherit'], windowsHide: true
       })
@@ -185,7 +190,8 @@ export function createLocalBridge(options) {
           if (failure !== undefined) break
           if (await probeSocks(xrayPort)) {
             const detector = createFailureDetector({ onDegraded: () => degraded?.() })
-            const listener = await startTrafficRelay(requestedPort, xrayPort, traffic, relaySockets, options.idleStreamMs, detector)
+            const listener = await startTrafficRelay(requestedPort, xrayPort, traffic, relaySockets, options.idleStreamMs, detector,
+              createDeliveryOptimizationAdmission())
             relay = listener.server
             port = listener.port
             if (await probeSocks(port)) return
@@ -199,35 +205,49 @@ export function createLocalBridge(options) {
       }
     },
     async close() {
+      if (closeInFlight !== undefined) return closeInFlight
       stopped = true
-      await closeTrafficRelay(relay, relaySockets)
-      relay = undefined
-      if (child === undefined) return
-      if (child.exitCode === null && child.signalCode === null) {
-        // 主停止通道:关 stdin 管道;runner 收到 EOF 即停 xray。
-        // Windows 上 child.kill('SIGTERM') 等于 TerminateProcess,runner 的清理钩子不会跑,
-        // 会把占着端口和含 UUID 配置的 xray.exe 留成孤儿,⛔ 作停止信号依赖。
-        child.stdin?.end()
-      }
-      const timer = setTimeout(() => {
-        if (child === undefined || (child.exitCode !== null || child.signalCode !== null)) return
-        // 兜底:管道未停成 → 按记档 pid 连 xray 一起强杀(Windows),再杀 runner。
-        if (platform === 'win32') {
-          const pid = readXrayRecord(join(options.dataDir, 'xray-bridge.json.pid'))?.pid
-          if (pid !== undefined) {
-            try { spawnImpl('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true }) } catch { /* 强杀失败时下方仍杀 runner。 */ }
-          }
+      const closing = Promise.resolve().then(async () => {
+        const closingChild = child
+        const closingRunId = runId
+        const closingExited = exited
+        const relayTeardown = closeTrafficRelay(relay, relaySockets)
+        relay = undefined
+        if (closingChild === undefined) { await relayTeardown; return }
+        if (closingChild.exitCode === null && closingChild.signalCode === null) {
+          // 主停止通道:关 stdin 管道;runner 收到 EOF 即停 xray。
+          // Windows 上 child.kill('SIGTERM') 等于 TerminateProcess,runner 的清理钩子不会跑,
+          // 会把占着端口和含 UUID 配置的 xray.exe 留成孤儿,⛔ 作停止信号依赖。
+          closingChild.stdin?.end()
         }
-        child.kill('SIGKILL')
-      }, 1_000)
-      try { await exited } finally { clearTimeout(timer); child = undefined }
+        const timer = setTimeout(() => {
+          if (closingChild.exitCode !== null || closingChild.signalCode !== null) return
+          // 兜底只处理本次 runner 与本次 runId 记档。
+          if (platform === 'win32') {
+            const record = readXrayRecord(join(options.dataDir, `xray-bridge.json.${closingRunId}.pid`))
+            const pid = record?.runId === closingRunId ? record.pid : undefined
+            if (pid !== undefined) {
+              try { spawnImpl('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true }) } catch { /* 强杀失败时下方仍杀 runner。 */ }
+            }
+          }
+          closingChild.kill('SIGKILL')
+        }, 1_000)
+        try { await Promise.all([closingExited, relayTeardown]) } finally {
+          clearTimeout(timer)
+          if (child === closingChild) child = undefined
+        }
+      })
+      const complete = closing.finally(() => { if (closeInFlight === complete) closeInFlight = undefined })
+      closeInFlight = complete
+      return complete
     }
   }
 }
 
-function startTrafficRelay(port, targetPort, traffic, sockets, idleStreamMs = IDLE_STREAM_MS, detector = createFailureDetector()) {  return new Promise((resolve, reject) => {
+function startTrafficRelay(port, targetPort, traffic, sockets, idleStreamMs = IDLE_STREAM_MS, detector = createFailureDetector(), downloadAdmission = createDeliveryOptimizationAdmission()) {  return new Promise((resolve, reject) => {
     const server = createServer((client) => {
       const upstream = connect({ host: '127.0.0.1', port: targetPort })
+      const destinationAdmission = createProxyDestinationAdmissionTransform(downloadAdmission)
       sockets.add(client); sockets.add(upstream)
       // 「在途流」= 这条连接**此刻正在往回吐回答**。⛔ 记它连的是谁。
       // 起算点是正文第一个字节,⛔ 上游回的第一个字节——relay 与 xray 之间走 SOCKS5,
@@ -258,16 +278,17 @@ function startTrafficRelay(port, targetPort, traffic, sockets, idleStreamMs = ID
       client.on('data', (chunk) => { traffic.uploadBytes += chunk.length; payload.noteRequest(chunk) })
       upstream.on('data', (chunk) => {
         traffic.downloadBytes += chunk.length
+        destinationAdmission.noteBytes(chunk.length)
         if (!payload.consume(chunk)) return // 还在握手应答里,⛔ 当成回答
         if (!life.streaming) { life.streaming = true; traffic.activeStreams += 1 }
         keepAlive()
       })
-      client.once('error', close); upstream.once('error', close)
+      client.once('error', close); upstream.once('error', close); destinationAdmission.stream.once('error', close)
       // 上游把回答发完并收尾(FIN):这条回答结束了,⛔ 等空闲窗口才销账。
       upstream.once('end', settle)
-      client.once('close', () => { settle(); forget(); report() })
-      upstream.once('close', () => { settle(); forget(); report() })
-      client.pipe(upstream); upstream.pipe(client)
+      client.once('close', () => { destinationAdmission.stream.destroy(); settle(); forget(); report() })
+      upstream.once('close', () => { destinationAdmission.stream.destroy(); settle(); forget(); report() })
+      client.pipe(destinationAdmission.stream).pipe(upstream); upstream.pipe(client)
     })
     server.once('error', () => reject(new ConnectorError(CONTROL_CODES.portBusy)))
     server.listen(port, '127.0.0.1', () => {
@@ -436,7 +457,20 @@ function readXrayRecord(pidPath) {
   return {
     pid,
     startedAt: Number.isFinite(parsed.startedAt) ? Number(parsed.startedAt) : undefined,
-    image: typeof parsed.image === 'string' && parsed.image !== '' ? parsed.image : undefined
+    image: typeof parsed.image === 'string' && parsed.image !== '' ? parsed.image : undefined,
+    runId: typeof parsed.runId === 'string' && parsed.runId !== '' ? parsed.runId : undefined,
+    owner: parsed.owner !== null && typeof parsed.owner === 'object' ? parsed.owner : undefined
+  }
+}
+
+function sweepOrphanXrays(config, platform, imageName, spawnImpl) {
+  const name = basename(config)
+  let files
+  try { files = readdirSync(dirname(config)) } catch { return }
+  for (const file of files) {
+    if (file !== `${name}.pid` && !file.startsWith(`${name}.`)) continue
+    if (file !== `${name}.pid` && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.pid$/.test(file.slice(name.length + 1))) continue
+    sweepOrphanXray(join(dirname(config), file), platform, imageName, spawnImpl)
   }
 }
 
@@ -446,6 +480,7 @@ function readXrayRecord(pidPath) {
 function sweepOrphanXray(pidPath, platform, imageName, spawnImpl) {
   const record = readXrayRecord(pidPath)
   if (record === undefined) return
+  if (record.owner !== undefined && lockHolderAlive(record.owner)) return
   const bootedAt = Date.now() - uptime() * 1_000
   const beforeThisBoot = record.startedAt !== undefined && record.startedAt < bootedAt - 60_000
   if (platform === 'win32' && !beforeThisBoot) {
@@ -455,7 +490,7 @@ function sweepOrphanXray(pidPath, platform, imageName, spawnImpl) {
         { stdio: 'ignore', windowsHide: true })
     } catch { /* 清扫失败不挡启动:新内核用新端口,旧孤儿下次启动再扫。 */ }
   }
-  // 记档已作废:留着会让本次 close 的兜底按旧 pid 强杀(新 runner 若没来得及写记档)。
+  // 旧记录已作废；新 runner 使用自己的 runId 文件。
   try { rmSync(pidPath, { force: true }) } catch { /* 删不掉也不挡启动。 */ }
 }
 

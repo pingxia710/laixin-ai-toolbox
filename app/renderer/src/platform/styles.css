@@ -107,8 +107,7 @@ html:has(.platform-account-overview) { scrollbar-gutter: stable; }
 .platform-usage-card .usage-header button { padding: 7px 11px; min-height: 40px; font-size: 13px; }
 .model-api { display: grid; gap: 18px; }
 .codex-workspaces { display: grid; gap: 12px; padding: 20px; border: 1px solid var(--accent); border-radius: 16px; background: var(--accent-soft); }
-.codex-workspaces-header { display: grid; gap: 4px; }
-.codex-workspaces-header h2, .codex-workspaces-header p, .codex-workspaces-notice { margin: 0; }
+.codex-workspaces-notice { margin: 0; }
 .codex-workspaces .model-provider { padding: 16px; background: var(--surface); }
 .codex-workspaces .provider-details h3 { margin: 0; font-size: 15px; }
 .codex-workspaces .provider-details p { margin: 4px 0 0; }

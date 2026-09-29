@@ -3,14 +3,16 @@
 // ② bridge(win32 注入模拟:管道停不住时按记档 pid taskkill /T /F 兜底);
 // ③ 真实进程(darwin):真实 runner + 官方 xray,断开后 pid 记档清除、xray 进程确死。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { spawn as realSpawn } from 'node:child_process'
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
-import { createServer, type Server } from 'node:net'
+import fs from 'node:fs'
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
+import { createServer, Server } from 'node:net'
 import { EventEmitter } from 'node:events'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { startXrayRunner } from '../../sidecar/win/xray-runner.mjs'
 import { createLocalBridge } from '../../sidecar/win/local-bridge.mjs'
+import { currentProcessStartedAt } from '../../sidecar/win/ledger.mjs'
 import { makeTempDir, removeTempDir, startFakeSocks5Server, type FakeSocks5 } from './helpers'
 
 interface FakeTimers {
@@ -63,6 +65,8 @@ function fakeXrayChild() {
 }
 
 describe('xray-runner(win32 注入模拟)', () => {
+  const RUN_ID = '11111111-1111-4111-8111-111111111111'
+  const NEXT_RUN_ID = '22222222-2222-4222-8222-222222222222'
   let dataDir: string
   let config: string
   beforeEach(() => { dataDir = makeTempDir('laixin-runner-stop-'); config = join(dataDir, 'xray-bridge.json'); writeFileSync(config, '{}') })
@@ -70,7 +74,7 @@ describe('xray-runner(win32 注入模拟)', () => {
 
   function runnerOptions(overrides: Record<string, unknown> = {}) {
     return {
-      executable: 'C:\\toolbox\\xray.exe', config, parent: 999,
+      executable: 'C:\\toolbox\\xray.exe', config, parent: 999, runId: RUN_ID,
       stdin: fakeStdin(), ppid: 999, platform: 'win32',
       spawnImpl: () => fakeXrayChild(),
       getPpid: () => 999,
@@ -95,15 +99,58 @@ describe('xray-runner(win32 注入模拟)', () => {
     void runner
     expect(spawned[0]?.args).toEqual(['run', '-config', config])
     // 记档带启动时刻与映像名:下一次启动据此清扫孤儿,且能防 PID 复用误杀(审计 A2)
-    expect(JSON.parse(readFileSync(`${config}.pid`, 'utf8')) as Record<string, unknown>)
-      .toEqual({ pid: 4242, startedAt: expect.any(Number), image: 'xray.exe' })
+    const pidPath = `${config}.${RUN_ID}.pid`
+    expect(JSON.parse(readFileSync(pidPath, 'utf8')) as Record<string, unknown>)
+      .toEqual({ pid: 4242, startedAt: expect.any(Number), image: 'xray.exe', runId: RUN_ID,
+        owner: { pid: process.pid, startedAt: expect.any(Number), at: expect.any(Number) } })
     expect(exit).not.toHaveBeenCalled()
     // bridge close() 关管道:stdin EOF 即停,不依赖 SIGTERM 送达(Windows 上等于强杀)
     stdin.emit('end')
     expect(child.signals).toContain('SIGTERM')
     child.emit('close', 0)
     expect(exit).toHaveBeenCalledWith(0)
-    expect(existsSync(`${config}.pid`)).toBe(false)
+    expect(existsSync(pidPath)).toBe(false)
+  })
+
+  it('旧 runner 的 close 迟到时保留新 runner 的 pid 记档', () => {
+    const oldChild = fakeXrayChild()
+    startXrayRunner(runnerOptions({ spawnImpl: () => oldChild }))
+    const newChild = fakeXrayChild()
+    newChild.pid = 4343
+    startXrayRunner(runnerOptions({ runId: NEXT_RUN_ID, spawnImpl: () => newChild }))
+    const newerPath = `${config}.${NEXT_RUN_ID}.pid`
+    const newerRecord = readFileSync(newerPath, 'utf8')
+
+    oldChild.emit('close', 0)
+
+    expect(readFileSync(newerPath, 'utf8')).toBe(newerRecord)
+    newChild.emit('close', 0)
+  })
+
+  it('旧 runner 读完自己的记录、删除前新 runner 落盘，仍保留新记录', () => {
+    const oldChild = fakeXrayChild()
+    startXrayRunner(runnerOptions({ spawnImpl: () => oldChild }))
+    const newChild = fakeXrayChild()
+    newChild.pid = 4343
+    const originalRm = fs.rmSync
+    let interleaved = false
+    fs.rmSync = ((path, options) => {
+      if (!interleaved && String(path).startsWith(config) && String(path).endsWith('.pid')) {
+        interleaved = true
+        startXrayRunner(runnerOptions({ runId: NEXT_RUN_ID, spawnImpl: () => newChild }))
+      }
+      return originalRm(path, options)
+    }) as typeof fs.rmSync
+    syncBuiltinESMExports()
+    try {
+      oldChild.emit('close', 0)
+      expect(interleaved).toBe(true)
+      expect(JSON.parse(readFileSync(`${config}.${NEXT_RUN_ID}.pid`, 'utf8')) as { pid: number }).toMatchObject({ pid: 4343 })
+    } finally {
+      fs.rmSync = originalRm
+      syncBuiltinESMExports()
+      newChild.emit('close', 0)
+    }
   })
 
   it('stdin 已提前结束(readableEnded)→ 直接近停', () => {
@@ -139,12 +186,13 @@ describe('xray-runner(win32 注入模拟)', () => {
     expect(timers.intervals.size).toBe(0)
   })
 
-  it('启动护栏:parent 不合法或与真实 ppid 不符 → exit(64),⛔ 起 xray', () => {
+  it('启动护栏:parent 或 runId 不合法 → exit(64),⛔ 起 xray', () => {
     const exit = vi.fn()
     const spawnImpl = vi.fn(() => fakeXrayChild())
     startXrayRunner(runnerOptions({ parent: Number.NaN, spawnImpl, exit }))
     startXrayRunner(runnerOptions({ ppid: 1, spawnImpl, exit }))
-    expect(exit).toHaveBeenCalledTimes(2)
+    startXrayRunner(runnerOptions({ runId: '../bad', spawnImpl, exit }))
+    expect(exit).toHaveBeenCalledTimes(3)
     expect(exit).toHaveBeenCalledWith(64)
     expect(spawnImpl).not.toHaveBeenCalled()
   })
@@ -189,10 +237,13 @@ describe('local-bridge 停止(win32 注入模拟)', () => {
     removeTempDir(dataDir)
   })
 
+  const runPidPath = (configPath: string, args: readonly string[]) => `${configPath}.${args[4]}.pid`
+
   // 审计 A2(2026-09-12 上线检查):runner 被 TerminateProcess 硬杀时 close 钩子不跑,
   // pid 记档留在磁盘、xray.exe 还活着。旧启动路径不读旧记档、直接覆盖,孤儿无人清扫
   // (证据 repro-win-xray-orphan-pid.json:4001 → 4002,对 4001 零次 kill)。
-  function fakeRunnerSpawn(calls: Array<{ cmd: string, args: readonly string[] }>, onServer: (server: Server) => void) {
+  function fakeRunnerSpawn(calls: Array<{ cmd: string, args: readonly string[] }>, onServer: (server: Server) => void,
+    onStdin?: (stdin: PassThrough) => void) {
     return (cmd: string, args: readonly string[]) => {
       calls.push({ cmd, args })
       if (cmd === 'taskkill') return new EventEmitter() as never
@@ -203,9 +254,10 @@ describe('local-bridge 停止(win32 注入模拟)', () => {
       })
       server.listen(config.inbounds[0].port, '127.0.0.1')
       onServer(server)
-      writeFileSync(`${configPath}.pid`, `${JSON.stringify({ pid: 4002, startedAt: Date.now(), image: 'xray.exe' })}\n`, { mode: 0o600 })
+      writeFileSync(runPidPath(configPath, args), `${JSON.stringify({ pid: 4002, startedAt: Date.now(), image: 'xray.exe', runId: args[4] })}\n`, { mode: 0o600 })
       const stdin = new PassThrough()
       stdin.resume()
+      onStdin?.(stdin)
       const child = new EventEmitter() as EventEmitter & { stdin: PassThrough, exitCode: number | null, signalCode: string | number | null, kill: (signal?: string) => boolean }
       child.stdin = stdin
       child.exitCode = null
@@ -218,6 +270,52 @@ describe('local-bridge 停止(win32 注入模拟)', () => {
       return child as never
     }
   }
+
+  it('监听关闭回调延迟时先停 runner，重叠 close 一起等待中继收尾', async () => {
+    let runnerStdin: PassThrough | undefined
+    let runnerChild: EventEmitter | undefined
+    const calls: Array<{ cmd: string, args: readonly string[] }> = []
+    const executablePath = join(dataDir, 'xray.exe')
+    for (const name of ['xray.exe', 'geoip.dat', 'geosite.dat']) writeFileSync(join(dataDir, name), '')
+    const fakeSpawn = fakeRunnerSpawn(calls, (server) => { socksServer = server }, (stdin) => { runnerStdin = stdin })
+    const bridge = createLocalBridge({
+      listenPort: 0, dataDir, routes: undefined, upstream: { host: '127.0.0.1', port: 1 },
+      spawnImpl: ((cmd: string, args: readonly string[]) => {
+        const spawned = fakeSpawn(cmd, args)
+        if (cmd !== 'taskkill') runnerChild = spawned as EventEmitter
+        return spawned
+      }) as never,
+      platform: 'win32', executablePath
+    })
+    await bridge.listen()
+    const originalClose = Server.prototype.close
+    let finishRelayClose: (() => void) | undefined
+    const spy = vi.spyOn(Server.prototype, 'close').mockImplementation(function (this: Server, callback) {
+      const address = this.address()
+      if (address !== null && typeof address !== 'string' && address.port === bridge.port()) {
+        finishRelayClose = () => { originalClose.call(this, callback) }
+        return this
+      }
+      return originalClose.call(this, callback)
+    })
+    const closing = bridge.close()
+    const closingAgain = bridge.close()
+    let secondSettled = false
+    void closingAgain.then(() => { secondSettled = true })
+    try {
+      await Promise.resolve() // 关闭任务已安排,但中继回调仍被夹具扣住
+      expect(finishRelayClose).toBeDefined()
+      expect(runnerStdin?.writableEnded).toBe(true)
+      runnerChild?.emit('close', 0)
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(secondSettled).toBe(false) // 第二次 close 必须等第一次中继的关闭回调
+      await expect(bridge.listen()).rejects.toThrow('BRIDGE_ALREADY_STARTED')
+    } finally {
+      finishRelayClose?.()
+      spy.mockRestore()
+      await Promise.all([closing, closingAgain])
+    }
+  })
 
   it('启动前清扫上次硬杀留下的内核:先对旧记档 pid 恰好 1 次 taskkill(带映像名过滤),再起新 runner', async () => {
     const pidPath = join(dataDir, 'xray-bridge.json.pid')
@@ -235,8 +333,11 @@ describe('local-bridge 停止(win32 注入模拟)', () => {
     expect(kills[0].args).toEqual(['/F', '/T', '/FI', 'PID eq 4001', '/FI', 'IMAGENAME eq xray.exe'])
     expect(calls[0].cmd).toBe('taskkill') // 清扫在起新 runner 之前
     expect(calls[1].cmd).not.toBe('taskkill')
-    // 新 runner 的记档已就位,旧记档没有被当成新内核留下来
-    expect(JSON.parse(readFileSync(pidPath, 'utf8')) as { pid: number }).toEqual(expect.objectContaining({ pid: 4002 }))
+    // 新 runner 的独占记档已就位,旧共用记档已清掉。
+    expect(existsSync(pidPath)).toBe(false)
+    const runner = calls.find((call) => call.cmd !== 'taskkill')
+    expect(JSON.parse(readFileSync(runPidPath(join(dataDir, 'xray-bridge.json'), runner!.args), 'utf8')) as { pid: number })
+      .toEqual(expect.objectContaining({ pid: 4002 }))
     await bridge.close()
   })
 
@@ -250,7 +351,7 @@ describe('local-bridge 停止(win32 注入模拟)', () => {
         socket.on('data', (chunk) => { if (chunk[0] === 5) socket.write(Buffer.from([5, 0])) })
       })
       socksServer.listen(config.inbounds[0].port, '127.0.0.1')
-      writeFileSync(`${configPath}.pid`, `${JSON.stringify({ pid: 4002, startedAt: Date.now(), image: 'xray.exe' })}\n`, { mode: 0o600 })
+      writeFileSync(runPidPath(configPath, args), `${JSON.stringify({ pid: 4002, startedAt: Date.now(), image: 'xray.exe', runId: args[4] })}\n`, { mode: 0o600 })
       const stdin = new PassThrough()
       stdin.resume()
       const child = new EventEmitter() as EventEmitter & { stdin: PassThrough, exitCode: number | null, signalCode: string | number | null, kill: (signal?: string) => boolean }
@@ -289,53 +390,96 @@ describe('local-bridge 停止(win32 注入模拟)', () => {
     await bridge.close()
   })
 
-  it('关管道后 runner 停不住 → 1 秒兜底按记档 pid taskkill /T /F,再杀 runner(⛔ 留孤儿)', async () => {
+  it('启动清扫仍兼容旧版裸数字共用记档', async () => {
     const FAKE_XRAY_PID = 424242
-    const taskkillCalls: Array<{ cmd: string, args: readonly string[] }> = []
-    let stdinEnded = false
-    const spawnImpl = (cmd: string, args: readonly string[]) => {
-      if (cmd === 'taskkill') {
-        taskkillCalls.push({ cmd, args })
-        return new EventEmitter() as never
-      }
-      // 假 runner:起 SOCKS 应答服务(让 listen 探测通过)、写 pid 档;关管道后故意不退出,
-      // 模拟 Windows 上管道之外没有可靠停止信号的残局。
-      const configPath = args[2] as string
-      const config = JSON.parse(readFileSync(configPath, 'utf8')) as { inbounds: Array<{ port: number }> }
-      socksServer = createServer((socket) => {
-        socket.on('data', (chunk) => {
-          if (chunk[0] === 5) socket.write(Buffer.from([5, 0]))
-        })
-      })
-      socksServer.listen(config.inbounds[0].port, '127.0.0.1')
-      writeFileSync(`${configPath}.pid`, `${FAKE_XRAY_PID}\n`, { mode: 0o600 })
-      const stdin = new PassThrough()
-      stdin.resume() // 与真实 process.stdin 一致:流动后才会在管道关闭时触发 'end'
-      stdin.on('end', () => { stdinEnded = true })
-      const child = new EventEmitter() as EventEmitter & { stdin: PassThrough, exitCode: number | null, signalCode: string | number | null, kill: (signal?: string) => boolean }
-      child.stdin = stdin
-      child.exitCode = null
-      child.signalCode = null
-      child.kill = (signal?: string) => {
-        child.signalCode = signal ?? 'SIGKILL'
-        queueMicrotask(() => child.emit('close', null, child.signalCode))
-        return true
-      }
-      void realSpawn // 保持导入(真实平台兜底路径不在此测)
-      return child as never
-    }
+    const pidPath = join(dataDir, 'xray-bridge.json.pid')
+    writeFileSync(pidPath, `${FAKE_XRAY_PID}\n`, { mode: 0o600 })
+    const calls: Array<{ cmd: string, args: readonly string[] }> = []
     const bridge = createLocalBridge({
       listenPort: 0, dataDir, routes: undefined, upstream: { host: '127.0.0.1', port: 1 },
-      spawnImpl: spawnImpl as never, platform: 'win32'
+      spawnImpl: fakeRunnerSpawn(calls, (server) => { socksServer = server }) as never, platform: 'win32'
+    })
+    await bridge.listen()
+    expect(calls.filter((call) => call.cmd === 'taskkill')).toEqual([
+      { cmd: 'taskkill', args: ['/F', '/T', '/FI', `PID eq ${FAKE_XRAY_PID}`, '/FI', 'IMAGENAME eq xray'] }
+    ])
+    expect(existsSync(pidPath)).toBe(false)
+    await bridge.close()
+    expect(bridge.isAlive()).toBe(false)
+  })
+
+  it('启动清扫跳过仍有原 runner 持有的独占记档', async () => {
+    const activePath = join(dataDir, 'xray-bridge.json.33333333-3333-4333-8333-333333333333.pid')
+    writeFileSync(activePath, `${JSON.stringify({ pid: 4001, startedAt: Date.now(), image: 'xray.exe',
+      runId: '33333333-3333-4333-8333-333333333333',
+      owner: { pid: process.pid, startedAt: currentProcessStartedAt(), at: Date.now() } })}\n`)
+    const calls: Array<{ cmd: string, args: readonly string[] }> = []
+    const bridge = createLocalBridge({
+      listenPort: 0, dataDir, routes: undefined, upstream: { host: '127.0.0.1', port: 1 },
+      spawnImpl: fakeRunnerSpawn(calls, (server) => { socksServer = server }) as never, platform: 'win32'
+    })
+
+    await bridge.listen()
+
+    expect(calls.filter((call) => call.cmd === 'taskkill')).toEqual([])
+    expect(existsSync(activePath)).toBe(true)
+    await bridge.close()
+  })
+
+  it('启动清扫会清理已退出 runner 留下的独占记档', async () => {
+    const stalePath = join(dataDir, 'xray-bridge.json.33333333-3333-4333-8333-333333333333.pid')
+    writeFileSync(stalePath, `${JSON.stringify({ pid: 4001, startedAt: Date.now(), image: 'xray.exe',
+      runId: '33333333-3333-4333-8333-333333333333',
+      owner: { pid: 999999999, startedAt: Date.now(), at: Date.now() } })}\n`)
+    const calls: Array<{ cmd: string, args: readonly string[] }> = []
+    const bridge = createLocalBridge({
+      listenPort: 0, dataDir, routes: undefined, upstream: { host: '127.0.0.1', port: 1 },
+      spawnImpl: fakeRunnerSpawn(calls, (server) => { socksServer = server }) as never, platform: 'win32'
+    })
+
+    await bridge.listen()
+
+    expect(calls.filter((call) => call.cmd === 'taskkill')).toEqual([
+      { cmd: 'taskkill', args: ['/F', '/T', '/FI', 'PID eq 4001', '/FI', 'IMAGENAME eq xray.exe'] }
+    ])
+    expect(existsSync(stalePath)).toBe(false)
+    await bridge.close()
+  })
+
+  it('旧 bridge 关管道超时，不能按新连接覆盖的 pid 记档强杀新内核', async () => {
+    const calls: Array<{ cmd: string, args: readonly string[] }> = []
+    const bridge = createLocalBridge({
+      listenPort: 0, dataDir, routes: undefined, upstream: { host: '127.0.0.1', port: 1 },
+      spawnImpl: fakeRunnerSpawn(calls, (server) => { socksServer = server }) as never,
+      platform: 'win32'
     })
     await bridge.listen()
     const pidPath = join(dataDir, 'xray-bridge.json.pid')
-    // 这一路的假 runner 故意写旧版裸数字记档:证明升级后 close 兜底仍认得老格式(审计 A2)
-    expect(readFileSync(pidPath, 'utf8')).toBe(`${FAKE_XRAY_PID}\n`)
+    const newerRecord = `${JSON.stringify({ pid: 5000, startedAt: Date.now(), image: 'xray.exe', runId: 'replacement-run' })}\n`
+    writeFileSync(pidPath, newerRecord)
+
     await bridge.close()
-    expect(stdinEnded).toBe(true) // 主通道:管道已关
-    expect(taskkillCalls).toEqual([{ cmd: 'taskkill', args: ['/PID', String(FAKE_XRAY_PID), '/T', '/F'] }])
-    expect(bridge.isAlive()).toBe(false)
+
+    expect(calls.filter((call) => call.cmd === 'taskkill')).toEqual([
+      { cmd: 'taskkill', args: ['/PID', '4002', '/T', '/F'] }
+    ])
+    expect(readFileSync(pidPath, 'utf8')).toBe(newerRecord)
+  })
+
+  it('当前 bridge 关管道超时仍按自己 runId 的记档停止内核', async () => {
+    const calls: Array<{ cmd: string, args: readonly string[] }> = []
+    const bridge = createLocalBridge({
+      listenPort: 0, dataDir, routes: undefined, upstream: { host: '127.0.0.1', port: 1 },
+      spawnImpl: fakeRunnerSpawn(calls, (server) => { socksServer = server }) as never,
+      platform: 'win32'
+    })
+    await bridge.listen()
+
+    await bridge.close()
+
+    expect(calls.filter((call) => call.cmd === 'taskkill')).toEqual([
+      { cmd: 'taskkill', args: ['/PID', '4002', '/T', '/F'] }
+    ])
   })
 })
 
@@ -358,7 +502,9 @@ describe('local-bridge 真实进程(darwin):断开后不留 xray 孤儿', () => 
       routes: { tunnelSuffixes: ['foreign.test'], directSuffixes: [], protectedDirectSuffixes: [] }
     })
     await bridge.listen()
-    const pidPath = join(dataDir, 'xray-bridge.json.pid')
+    const pidRecords = readdirSync(dataDir).filter((name) => /^xray-bridge\.json\.[0-9a-f-]+\.pid$/.test(name))
+    expect(pidRecords).toHaveLength(1)
+    const pidPath = join(dataDir, pidRecords[0])
     await expect.poll(() => existsSync(pidPath), { timeout: 5_000 }).toBe(true)
     const xrayPid = (JSON.parse(readFileSync(pidPath, 'utf8')) as { pid: number }).pid
     expect(Number.isSafeInteger(xrayPid)).toBe(true)

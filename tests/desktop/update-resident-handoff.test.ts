@@ -150,87 +150,137 @@ it('交接要带的三样跟着更新任务一起发给助手，「本来连着�
   expect(residentHandoffFields(userData, {})).toMatchObject({ tunnelResume: false })
 })
 
-it('Windows 卸载钩子：四步顺序不能反，升级 ⛔ 删登录任务', async () => {
+it('Windows 卸载钩子：先过任务/进程前置闸，再还原代理；升级 ⛔ 删登录任务', async () => {
   const script = await readFile(join(__dirname, '..', '..', 'build', 'installer.nsh'), 'utf8')
+  const macroStart = script.indexOf('!macro customUnInstall')
+  const macroEnd = script.indexOf('!macroend', macroStart)
+  expect(macroStart).toBeGreaterThan(-1)
+  expect(macroEnd).toBeGreaterThan(macroStart)
+  const body = script.slice(macroStart, macroEnd)
   const at = (needle: string): number => {
-    const index = script.indexOf(needle)
+    const index = body.indexOf(needle)
     expect(index, `installer.nsh 里找不到:${needle}`).toBeGreaterThan(-1)
     return index
   }
   // 「升级」判据 = 命令行上的 --updated（app-builder-lib 调旧卸载器时一定带）
   const guard = at('"--updated"')
-  const deleteTask = at('schtasks.exe /delete')
-  const branchEnd = script.indexOf('${EndIf}', deleteTask)
-  const killDaemon = at('taskkill.exe /f /im "${APP_EXECUTABLE_FILENAME}"')
-  const killKernel = at('taskkill.exe /f /im "xray.exe"')
+  const uninstallPreflight = at('!insertmacro runLaixinWindowsPreflight uninstall')
+  const updatePreflight = at('!insertmacro runLaixinWindowsPreflight update')
   const restore = at('tunnel-daemon.mjs" restore')
-  const fallback = at('"ProxyEnable" 0')
+  const fallback = at('-ProxyFallbackOnly')
+  const aiCleanup = at('--laixin-ai-router-cleanup')
 
-  // 1 删任务 → 2 停守护与内核 → 3 按账本还原 → 4 兜底关代理
-  expect(guard).toBeLessThan(deleteTask)
-  expect(deleteTask).toBeLessThan(killDaemon)
-  expect(killDaemon).toBeLessThan(killKernel)
-  expect(killKernel).toBeLessThan(restore)
+  // 1 区分更新/真卸载 → 2 前置闸收敛任务与精确路径进程 → 3 按账本还原 → 4 兜底关代理
+  expect(guard).toBeLessThan(uninstallPreflight)
+  expect(aiCleanup).toBeLessThan(uninstallPreflight)
+  expect(guard).toBeLessThan(updatePreflight)
+  expect(uninstallPreflight).toBeLessThan(restore)
+  expect(updatePreflight).toBeLessThan(restore)
   expect(restore).toBeLessThan(fallback)
-  // 删任务在「真卸载」分支里；停守护、还原、兜底在分支外 —— 升级时这三样照做，任务不动
-  expect(script.slice(0, deleteTask)).toContain('$5 == "uninstall"')
-  expect(branchEnd).toBeGreaterThan(deleteTask)
-  expect(branchEnd).toBeLessThan(killDaemon)
-  // 任务名与主进程装的那一套一致:新路径(\Laixin\ 子文件夹,真机非提升可建)+ 旧版根路径残账清理
-  expect(script).toContain('/tn "\\Laixin\\cn.laixin.toolbox.tunnel"')
-  expect(script).toContain(`/tn "${RESIDENT_LABEL}"`)
+  // 真卸载走 delete+回读不存在；升级走 disable+回读 Disabled。入口不再直接吞 schtasks/taskkill 结果。
+  expect(body.slice(0, uninstallPreflight)).toContain('$5 == "uninstall"')
+  expect(script).toContain('windows-preflight ${MODE}')
+  expect(script).not.toMatch(/taskkill(?:\.exe)?[^\r\n]*\/im\s+"?(?:xray\.exe|\$\{APP_EXECUTABLE_FILENAME\})/i)
 })
 
-// 兜底关代理的两条判据。原来那条两头都不对：只认 18 开头的口（候选全被占时系统随便挑一个高位口，
-// 认不出 → 客户卸完永久断网、且工具箱已经没了没法修），而且不管还原成没成都开火。
-it('兜底只在还原没成功时开火，且认整个回环而不是只认 18 开头的口', async () => {
+// N-44:端口号不再证明归属；空账本或其他软件接管后必须留下现场。
+it('卸载兜底只在还原未完成时开火，并按同会话账本与端口监听判定归属', async () => {
   const script = await readFile(join(__dirname, '..', '..', 'build', 'installer.nsh'), 'utf8')
+  const helper = await readFile(join(__dirname, '..', '..', 'resources', 'uninstall-task-cleanup.ps1'), 'utf8')
 
   // 正向证据：还原那一步确实把退出码留下来了（⛔ Pop 完就丢）
-  expect(script).toMatch(/Pop \$0\s+StrCpy \$6 \$0/)
+  expect(script).toMatch(/Pop \$0\s+\$\{If\} \$0 == "error"\s+StrCpy \$6 "not-run"\s+\$\{Else\}\s+StrCpy \$6 \$0\s+\$\{EndIf\}/)
   // 兜底整段在「还原没成功」的判断里
   const guard = script.indexOf('${If} $6 != "0"')
-  const readProxy = script.indexOf('"ProxyServer"')
-  const writeEnable = script.indexOf('"ProxyEnable" 0')
+  const invokeFallback = script.indexOf('-ProxyFallbackOnly')
   expect(guard).toBeGreaterThan(-1)
-  expect(guard).toBeLessThan(readProxy)
-  expect(readProxy).toBeLessThan(writeEnable)
+  expect(guard).toBeLessThan(invokeFallback)
+  expect(script.slice(invokeFallback)).toMatch(/Pop \$0[\s\S]*\$0 != "0"[\s\S]*StrCpy \$7 \$0/)
 
-  // 认口放宽到整个回环：取前 10 个字符比 `127.0.0.1:` / `localhost:`
-  expect(script).toContain('StrCpy $2 $1 10')
-  expect(script).toContain('${If} $2 == "127.0.0.1:"')
-  expect(script).toContain('${OrIf} $2 == "localhost:"')
-  // ⛔ 回到只认 18 开头
-  expect(script).not.toContain('"127.0.0.1:18"')
-  expect(script).not.toContain('StrCpy $2 $1 12')
+  expect(script.slice(invokeFallback)).toContain('-TunnelDataDir')
+  expect(helper).toContain('LAIXIN_PROXY_LEDGER_OWNERSHIP')
+  expect(helper).toContain('Get-NetTCPConnection -State Listen')
+  expect(helper).toContain("Join-Path $TunnelDataDir 'ledger.json'")
+  expect(helper).toContain('$server.writtenValue.data -ceq [string]$settings.ProxyServer')
+  expect(helper).toContain('if (-not $owned) { exit 3 }')
+  expect(helper).not.toContain('$loopback = $false')
 
   // 只关开关，⛔ 删客户的 ProxyServer 值（他的代理软件下次启动会自己写回去）
-  expect(script).not.toMatch(/DeleteRegValue.*ProxyServer/)
+  expect(helper).not.toMatch(/Remove-ItemProperty[^\r\n]*ProxyServer/)
+})
+
+it('守护实际还原失败时，兜底成功也不能让普通卸载、静默卸载或升级删掉程序', async () => {
+  const script = await readFile(join(__dirname, '..', '..', 'build', 'installer.nsh'), 'utf8')
+  const body = script.slice(script.indexOf('!macro customUnInstall'), script.indexOf('!macroend', script.indexOf('!macro customUnInstall')))
+  const fallback = body.indexOf('-ProxyFallbackOnly')
+  const commit = body.indexOf('!insertmacro commitLaixinWindowsPreflight')
+  const abort = body.indexOf('SetErrorLevel 1\n    Abort')
+  const deleteCache = body.indexOf('RMDir /r "$LOCALAPPDATA\\laixin-ai-toolbox-updater"')
+  expect(fallback).toBeGreaterThan(-1)
+  expect(commit).toBeGreaterThan(fallback)
+  expect(abort).toBeGreaterThan(commit)
+  expect(deleteCache).toBeGreaterThan(abort)
+
+  // 从实际 NSIS 条件读出退出码闸，再用不同入口和返回码求值；兜底只恢复 WinINET。
+  const gate = body.slice(fallback, commit).match(/\$\{If\} \$6 != "0"\s+\$\{AndIf\} \$6 != "not-run"\s+\$\{AndIf\} \$7 == "0"\s+StrCpy \$7 (\$6|"[^"]*")\s+\$\{EndIf\}/)
+  expect(gate).not.toBeNull()
+  const predicates = [...gate![0].matchAll(/\$\{(?:If|AndIf)\} (\$[67]) (==|!=) "([^"]+)"/g)]
+  expect(predicates).toHaveLength(3)
+  const blocksRemoval = (restore: string, fallbackExit: string, preflightExit = '0'): boolean => {
+    const values: Record<string, string> = { $6: restore === 'error' ? 'not-run' : restore, $7: preflightExit }
+    if (restore !== '0' && fallbackExit !== '0') values.$7 = fallbackExit
+    if (predicates.every(([, variable, operator, expected]) => operator === '=='
+      ? values[variable] === expected : values[variable] !== expected)) values.$7 = gate![1] === '$6' ? values.$6 : gate![1].slice(1, -1)
+    return values.$7 !== '0'
+  }
+
+  for (const mode of ['uninstall', '/S', '--updated']) {
+    expect(blocksRemoval('65', '0'), `${mode}: restore=65、fallback=0`).toBe(true)
+    expect(blocksRemoval('error', '0'), `${mode}: 守护未能启动、fallback=0`).toBe(false)
+    expect(blocksRemoval('0', '0'), `${mode}: restore=0`).toBe(false)
+    expect(blocksRemoval('not-run', '0'), `${mode}: 残缺安装无 daemon`).toBe(false)
+    expect(blocksRemoval('65', '7'), `${mode}: 两种恢复都失败`).toBe(true)
+    expect(blocksRemoval('not-run', '3'), `${mode}: 空账本归属不明时不能删掉恢复入口`).toBe(true)
+    expect(blocksRemoval('error', '3'), `${mode}: 程序损坏且归属不明时不能宣称网络已恢复`).toBe(true)
+    expect(blocksRemoval('0', '0', '9'), `${mode}: 前置闸失败`).toBe(true)
+  }
+  expect(body).toMatch(/\$\{GetOptions\} \$3 "--updated" \$4\s+\$\{If\} \$\{Errors\}\s+StrCpy \$5 "uninstall"\s+\$\{Else\}\s+StrCpy \$5 "update"/)
+  const commitGuard = body.lastIndexOf('${If} $5 == "uninstall"', commit)
+  expect(body.slice(commitGuard, commit)).toContain('${AndIf} $7 == "0"')
+  const failureGate = body.indexOf('${If} $7 != "0"', commit)
+  expect(failureGate).toBeGreaterThan(commit)
+  expect(failureGate).toBeLessThan(abort)
+  expect(body.slice(failureGate, abort + 'SetErrorLevel 1\n    Abort'.length)).toMatch(/\$\{If\} \$5 == "uninstall"[\s\S]*\$\{GetOptions\} \$3 "\/S" \$4[\s\S]*\$\{If\} \$\{Errors\}[\s\S]*\$\{EndIf\}\s+\$\{EndIf\}\s+SetErrorLevel 1\s+Abort/)
+})
+
+it('主 EXE 缺失但 sidecar 留存时不尝试启动守护，残缺安装仍可走代理兜底', async () => {
+  const script = await readFile(join(__dirname, '..', '..', 'build', 'installer.nsh'), 'utf8')
+  const body = script.slice(script.indexOf('!macro customUnInstall'), script.indexOf('!macroend', script.indexOf('!macro customUnInstall')))
+  const restore = body.slice(body.indexOf('StrCpy $6 "not-run"'), body.indexOf('; 3) 兜底关代理'))
+  expect(restore).toMatch(/\$\{If\} \$\{FileExists\} "\$INSTDIR\\resources\\sidecar\\win\\tunnel-daemon\.mjs"\s+\$\{AndIf\} \$\{FileExists\} "\$INSTDIR\\\$\{APP_EXECUTABLE_FILENAME\}"/)
+  expect(restore).toMatch(/\$\{If\} \$0 == "error"\s+StrCpy \$6 "not-run"/)
 })
 
 // 2026-09-15 客户实测「连着网点更新重启,又换回旧版」:0.5.5 客户端的更新助手调安装器前不停
 // 守护/内核,旧卸载器的 taskkill 之后常驻任务还开着,每 1 分钟重入可能在「杀掉 → 新文件落盘」
-// 窗口里把守护拉回来占住文件,静默安装失败 → 助手整目录还原。customInit 让安装器自己兜底:
-// 先禁任务(升级 ⛔ 删任务,那会把常驻整个丢掉)再杀进程,早于一切文件操作。
-it('安装器 customInit:先禁新旧两个常驻任务再杀守护与内核,升级链路早于卸载钩子兜底', async () => {
+// 覆盖只能由已安装工具箱的更新助手发起，customInit 重新验证交接；手工覆盖仍拒绝。
+it('安装器 customInit:已安装目标只放行已验证 handoff，首次安装不误拦', async () => {
   const script = await readFile(join(__dirname, '..', '..', 'build', 'installer.nsh'), 'utf8')
   const initMacro = script.indexOf('!macro customInit')
   const uninstallMacro = script.indexOf('!macro customUnInstall')
   expect(initMacro).toBeGreaterThan(-1)
   expect(uninstallMacro).toBeGreaterThan(-1)
 
-  const initBody = script.slice(initMacro)
-  // 顺序钉死:禁 \Laixin\ 新任务 → 禁根路径旧任务 → 杀守护 → 杀内核,⛔ 反了会被任务重入钻空子
-  const disableNew = initBody.indexOf('schtasks.exe /change /tn "\\Laixin\\cn.laixin.toolbox.tunnel" /disable')
-  const disableLegacy = initBody.indexOf('schtasks.exe /change /tn "cn.laixin.toolbox.tunnel" /disable')
-  const killDaemon = initBody.indexOf('taskkill.exe /f /im "${APP_EXECUTABLE_FILENAME}"')
-  const killKernel = initBody.indexOf('taskkill.exe /f /im "xray.exe"')
-  expect(disableNew).toBeGreaterThan(-1)
-  expect(disableLegacy).toBeGreaterThan(disableNew)
-  expect(killDaemon).toBeGreaterThan(disableLegacy)
-  expect(killKernel).toBeGreaterThan(killDaemon)
-  // 升级链路只禁 ⛔ 删:删任务属于真卸载分支(customUnInstall),customInit 里不许出现
+  const initEnd = script.indexOf('!macroend', initMacro)
+  const initBody = script.slice(initMacro, initEnd)
+  const existingInstall = initBody.indexOf('${FileExists} "$INSTDIR\\${APP_EXECUTABLE_FILENAME}"')
+  const handoff = initBody.indexOf('readLaixinWindowsPreflightHandoff')
+  const abort = initBody.indexOf('Abort')
+  expect(existingInstall).toBeGreaterThan(-1)
+  expect(handoff).toBeGreaterThan(existingInstall)
+  expect(abort).toBeGreaterThan(handoff)
+  expect(initBody).not.toContain('runLaixinWindowsPreflight')
+  expect(initBody).toMatch(/readLaixinWindowsPreflightHandoff \$R7[\s\S]*\$R7 != "1"[\s\S]*Abort/)
   expect(initBody).not.toContain('/delete')
-  // customInit 是安装器(.onInit)的钩子,与卸载钩子并存:两道保险缺一不可
-  expect(uninstallMacro).toBeGreaterThan(-1)
+  expect(initBody).not.toMatch(/taskkill(?:\.exe)?[^\r\n]*\/im/i)
 })

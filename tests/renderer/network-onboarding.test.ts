@@ -9,7 +9,7 @@ const signedOut: AccountView = { state: 'signed-out', account: null, overview: n
 const account: AccountView = { ...signedOut, state: 'signed-in', account: { id: 'local-customer', username: '体验客户' }, overview: {
   trial: { available: true, usage: null }, recoveryReady: true, subscription: null, plans: [], networkAvailable: true, paymentChannels: []
 } }
-const status: TunnelStatusView = { state: '未配置', message: '', currentConfig: '', pendingConfig: '', canApplyPending: false,
+const status: TunnelStatusView = { state: '未配置', message: '', pauseReason: '', currentConfig: '', pendingConfig: '', canApplyPending: false,
   source: '', authorization: '', backend: '', nodeLabel: '', exitIp: '', pathSource: '' as const, lastVerifiedAt: '', configVersion: '', expiresAt: '',
   pendingAvailable: false, unrestored: '', componentMissing: '' }
 const usage: NetworkUsageView = { authorizationId: 'local-authorization', kind: 'trial', planId: 'trial-5g', state: 'active',
@@ -18,10 +18,25 @@ const usage: NetworkUsageView = { authorizationId: 'local-authorization', kind: 
 const withTrial = (state: NetworkUsageView['state']): AccountView => ({ ...account, overview: { ...account.overview!, trial: { available: false, usage: { ...usage, state } } } })
 
 describe('首次使用按真实状态给出下一步', () => {
-  it('新用户直接去注册；登录不会自动领取或开始计时', () => {
-    expect(buildNetworkOnboarding(signedOut, status)).toMatchObject({ step: 1, action: 'register' })
+  it('微信入口开放的新用户进入账号入口；登录不会自动领取或开始计时', () => {
+    expect(buildNetworkOnboarding({ ...signedOut, terms: { ...terms, wechatLoginAvailable: true } }, status)).toMatchObject({ step: 1, action: 'account' })
     expect(buildNetworkOnboarding(account, status)).toMatchObject({ step: 2, action: 'claim' })
     expect(buildNetworkOnboarding(account, status).description).toContain('领取时开始计时')
+  })
+  it('微信入口开放时说明两种验证顺序，不再提示另建扫码账号', () => {
+    const view = buildNetworkOnboarding({ ...signedOut, terms: { ...terms, wechatLoginAvailable: true } }, status)
+    expect(view).toMatchObject({ step: 1, title: '先注册或登录', label: '前往账号入口', action: 'account' })
+    expect(view.description).toContain('先扫码，再在网页注册或登录')
+    expect(view.description).toContain('先用账号密码登录，再扫码绑定微信')
+    expect(view.description).not.toContain('扫码注册')
+  })
+  it('微信入口未开放或未知时不误导新用户去注册', () => {
+    for (const availability of [false, undefined]) {
+      const view = buildNetworkOnboarding({ ...signedOut, terms: { ...terms, ...(availability === undefined ? {} : { wechatLoginAvailable: availability }) } }, status)
+      expect(view).toMatchObject({ step: 1, title: '先注册或登录', label: '前往账号入口', action: 'account' })
+      expect(view.description).toContain('微信扫码暂不可用')
+      expect(view.description).toContain('账号密码登录或注册')
+    }
   })
   it('领取页写明一份配置最多 3 台设备同时使用、流量总额另计', () => {
     const claim = buildNetworkOnboarding(account, status)
@@ -46,6 +61,12 @@ describe('首次使用按真实状态给出下一步', () => {
     expect(buildNetworkOnboarding(withTrial('active'), { ...status, currentConfig: 'current', unrestored: '恢复未完成' }).action).toBe('tunnel')
     expect(buildNetworkOnboarding(withTrial('active'), { ...status, currentConfig: 'current', componentMissing: '缺少运行组件' }).action).toBe('tunnel')
     expect(buildNetworkOnboarding(withTrial('active'), { ...status, currentConfig: 'current', state: '异常' }).action).toBe('tunnel')
+  })
+  it('断开在途的引导只去状态页，不让用户再次连接或误认为已暂停', () => {
+    expect(buildNetworkOnboarding(withTrial('active'), { ...status, state: '断开中', currentConfig: 'current' }))
+      .toMatchObject({ step: 3, title: '正在断开网络', action: 'tunnel' })
+    expect(buildNetworkOnboarding(withTrial('active'), { ...status, state: '断开中', currentConfig: 'current', pauseReason: 'entitlement-denied' }))
+      .toMatchObject({ step: 3, title: '权益校验未通过，正在暂停网络', action: 'tunnel' })
   })
   it.each(['expired', 'exhausted', 'disabled'] as const)('体验 %s 不能重新领取或凭旧配置直接连接', (state) => {
     expect(buildNetworkOnboarding(withTrial(state), { ...status, currentConfig: 'old' }).action).toBe('account')

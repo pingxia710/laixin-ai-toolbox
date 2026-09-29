@@ -112,11 +112,36 @@ describe.each([
 
   it('注册表 DWORD 的十进制和十六进制相同值可恢复', () => {
     const dir = temp()
+    ledger.appendSettingEntry(dir, { service: 'WinINET', item: 'ProxyServer', originalValue: null,
+      writtenValue: { type: 'REG_SZ', data: '127.0.0.1:18080' }, sessionToken: 'x', time: 1 })
+    ledger.appendSettingEntry(dir, { service: 'WinINET', item: 'ProxyEnable', originalValue: { type: 'REG_DWORD', data: '0x0' },
+      writtenValue: { type: 'REG_DWORD', data: '1' }, sessionToken: 'x', time: 2 })
+    let server: { type: string; data: string } | null = { type: 'REG_SZ', data: '127.0.0.1:18080' }
+    let value = { type: 'REG_DWORD', data: '0x1' }
+    const result = restore(dir, {
+      read: (ref: { item: string }) => ref.item === 'ProxyServer' ? server : value,
+      write: (ref: { item: string }, next: unknown) => {
+        if (ref.item === 'ProxyServer') server = next as typeof server
+        else value = next as typeof value
+      },
+      identifyPortOwner: () => ({ kind: 'none' })
+    })
+    expect(result.restored).toHaveLength(2)
+    expect(value.data).toBe('0x0')
+    expect(server).toBeNull()
+  })
+
+  it('只有 WinINET 开关账目而无同会话代理地址时不猜归属', () => {
+    const dir = temp()
     ledger.appendSettingEntry(dir, { service: 'WinINET', item: 'ProxyEnable', originalValue: { type: 'REG_DWORD', data: '0x0' },
       writtenValue: { type: 'REG_DWORD', data: '1' }, sessionToken: 'x', time: 1 })
-    let value = { type: 'REG_DWORD', data: '0x1' }
-    expect(restore(dir, { read: () => value, write: (_ref, next) => { value = next as typeof value } }).restored).toHaveLength(1)
-    expect(value.data).toBe('0x0')
+    const value = { type: 'REG_DWORD', data: '0x1' }
+    const write = vi.fn()
+    const result = restore(dir, { read: () => value, write })
+    expect(result.restored).toHaveLength(0)
+    expect(result.keptModified).toHaveLength(1)
+    expect(write).not.toHaveBeenCalled()
+    expect(value.data).toBe('0x1')
   })
 
   it('非法账本持久拒绝，重启不能把它当作空账本', () => {

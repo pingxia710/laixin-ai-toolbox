@@ -36,6 +36,34 @@ try {
       }
       [Console]::WriteLine(($managed | ConvertTo-Json -Compress))
     }
+    'path' {
+      # Reuse must prove the result belongs to the same active path.  The route
+      # plus adapter GUID distinguishes a TUN/VPN/default-route switch without
+      # exposing its name, address, gateway, PAC or process information.
+      $candidates = @(
+        Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop |
+        ForEach-Object {
+          $ip = Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex $_.InterfaceIndex -ErrorAction Stop
+          [PSCustomObject]@{ Route = $_; Metric = ([int64]$_.RouteMetric + [int64]$ip.InterfaceMetric) }
+        } |
+        Sort-Object Metric, @{ Expression = { $_.Route.InterfaceIndex } }
+      )
+      if ($candidates.Count -lt 1) { throw 'Default route unavailable' }
+      # Return every candidate to the JS identity guard. It alone rejects an
+      # equal-metric ECMP/multi-active set instead of sorting InterfaceIndex and
+      # pretending a guessed interface was the active customer path.
+      $identities = @($candidates | ForEach-Object {
+        $route = $_.Route
+        $adapter = Get-NetAdapter -InterfaceIndex $route.InterfaceIndex -IncludeHidden -ErrorAction Stop
+        # Windows can expose InterfaceGuid in brace-wrapped form. Normalize the
+        # value, not its ownership: an absent or empty GUID is still unprovable.
+        $identity = [Guid]::Empty
+        if (-not [Guid]::TryParse([string]$adapter.InterfaceGuid, [ref]$identity) -or $identity -eq [Guid]::Empty) { throw 'Adapter identity unavailable' }
+        $guid = $identity.ToString('D')
+        @{ metric = [int64]$_.Metric; interfaceIndex = [int]$route.InterfaceIndex; interfaceGuid = $guid; kind = $(if ($adapter.Virtual -eq $true) { 'virtual-tun' } else { 'network-interface' }) }
+      })
+      [Console]::WriteLine(($identities | ConvertTo-Json -Compress))
+    }
     'notify' {
       $source = @'
 using System;

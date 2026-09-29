@@ -13,9 +13,8 @@ import { existsSync } from 'node:fs'
 export const LAIXIN_PROCESS_NAMES = Object.freeze(['来信AI工具箱统一版', '来信AI工具箱'])
 
 /**
- * 占着入口端口的**通常不是主程序,而是它起的 xray**(2026-09-15 Windows 真机实测:
- * 中继由 xray 监听,主程序只是它的父进程)。只认主程序名 → 把自己人认成「别家程序」→
- * 换个端口继续抢,端口认人形同虚设。
+ * 当前本地代理入口由守护 Node relay 监听；旧版入口也可能由随包 xray 占用。
+ * 只认主程序名会把旧版自家进程认成「别家程序」并继续抢端口。
  *
  * 判据用**路径结构**,⛔ 只看进程名叫不叫 xray:别家软件也用 xray,认错了会把客户自己的
  * 代理软件说成「另一份来信」。来信的 xray 一定住在 <安装目录>\resources\xray\xray.exe,
@@ -50,27 +49,35 @@ export function isLaixinExePath(exePath, exists = existsSync) {
 const PS_ARGS = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command']
 
 function ownerScript(port) {
-  // 一次 PowerShell 拿齐 pid / 进程名 / 路径。取不到就输出空,调用方按 unknown 处理。
+  // 一次 PowerShell 拿齐 pid / 进程名 / 路径；成功查明无监听才输出专用标记。
+  // ⛔ 用 SilentlyContinue：查询失败与无监听会变成同一个空输出。
   return [
     // 输出必须显式转 UTF-8:PowerShell 默认按控制台代码页(中文机器上是 GBK)写 stdout,
     // 而我们按 utf8 读 —— 产品名与路径里的中文会变成乱码,匹配必然失败
     // (2026-09-15 Windows 真机实测:name 读出来是「????AI??????」,端口认人因此形同虚设)。
     '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8',
-    "$ErrorActionPreference = 'SilentlyContinue'",
-    `$c = Get-NetTCPConnection -LocalPort ${String(port)} -State Listen | Select-Object -First 1`,
-    'if ($null -ne $c) {',
-    '  $p = Get-Process -Id $c.OwningProcess',
-    '  "{0}|{1}|{2}" -f $c.OwningProcess, $p.ProcessName, $p.Path',
-    '}'
+    "$ErrorActionPreference = 'Stop'",
+    `$listeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop | Where-Object { $_.LocalPort -eq ${String(port)} })`,
+    "if ($listeners.Count -eq 0) { 'LAIXIN_NO_LISTENER'; exit 0 }",
+    // WinINET 指向 127.0.0.1。::1-only 不能服务这个 IPv4 入口；:: 可能是双栈，
+    // 多 PID 也不能凭第一条猜归属。
+    "if (@($listeners | Where-Object { [string]$_.LocalAddress -like '*:*' -and $_.LocalAddress -ne '::1' }).Count -gt 0) { 'LAIXIN_ADDRESS_AMBIGUOUS'; exit 0 }",
+    "$ipv4 = @($listeners | Where-Object { $_.LocalAddress -eq '127.0.0.1' -or $_.LocalAddress -eq '0.0.0.0' })",
+    "if ($ipv4.Count -eq 0) { 'LAIXIN_NO_LISTENER'; exit 0 }",
+    "$ids = @($ipv4 | Select-Object -ExpandProperty OwningProcess -Unique)",
+    "if ($ids.Count -ne 1) { 'LAIXIN_ADDRESS_AMBIGUOUS'; exit 0 }",
+    "$c = $ipv4 | Select-Object -First 1",
+    '$p = Get-Process -Id $c.OwningProcess -ErrorAction Stop',
+    '"{0}|{1}|{2}" -f $c.OwningProcess, $p.ProcessName, $p.Path'
   ].join('\n')
 }
 
 /**
  * 谁在监听这个端口。
- * → { kind: 'laixin' | 'other' | 'unknown', pid?, name?, path? }
+ * → { kind: 'laixin' | 'other' | 'none' | 'unknown', pid?, name?, path? }
  *   laixin  = 另一份来信(进程名对得上)。调用方应进「已有另一份来信在运行」的稳定态,⛔ 换端口继续抢。
  *   other   = 别的程序占着。沿用原行为(换下一个候选端口),⛔ 把它说成旧版来信。
- *   unknown = 查不出来(命令不可用/超时/权限)。按 other 处理但话要说得谨慎。
+ *   none    = 查询成功且确无监听；unknown = 命令不可用/超时/权限/结果不可解析。
  */
 export function identifyPortOwner(port, { exec = execFileSync, timeoutMs = 4000 } = {}) {
   if (!Number.isSafeInteger(port) || port <= 0 || port > 65535) return { kind: 'unknown' }
@@ -84,6 +91,8 @@ export function identifyPortOwner(port, { exec = execFileSync, timeoutMs = 4000 
 /** 解析与判定分开,便于用例喂真实输出逐字核对。 */
 export function parsePortOwner(raw, exists = existsSync) {
   const line = String(raw ?? '').split(/\r?\n/).map((value) => value.trim()).find((value) => value.length > 0)
+  if (line === 'LAIXIN_NO_LISTENER') return { kind: 'none' }
+  if (line === 'LAIXIN_ADDRESS_AMBIGUOUS') return { kind: 'unknown', reason: 'address-ambiguous' }
   if (line === undefined) return { kind: 'unknown' }
   const [pidText, name = '', path = ''] = line.split('|')
   const pid = Number.parseInt(pidText, 10)

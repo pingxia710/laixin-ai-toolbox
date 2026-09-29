@@ -8,7 +8,7 @@ import { displayReleaseVersion } from '../../release-version'
 import { ApplicationLauncher } from './applications'
 import { quotaAlerts } from './alerts'
 import { debounce, DesktopStore, FAILURE_REPORT_DEFAULT_ENABLED, visibleBounds } from './preferences'
-import { keepWindowInBackground } from './window-lifecycle'
+import { keepWindowInBackground, showCloseToTrayHintOnce } from './window-lifecycle'
 import { loginItemStatus, setLoginItem, type LoginItemController } from './login-item'
 import {
   RESIDENT_DEFAULT_ENABLED, applyResidentChoice, residentToggleStatus, systemResidentController,
@@ -16,9 +16,14 @@ import {
 } from './resident-preference'
 import { calibrateResident } from '../tunnel/resident-owner'
 import { updateConnectOutcome } from '../tunnel/runtime-owner'
-import { acknowledgeUpdate, ToolboxUpdater } from './updater'
+import { resolveTunnelDataDir } from '../tunnel/paths'
+import { readDaemonState } from '../tunnel/status-service'
+import { acknowledgeUpdate, dismissCommittedUpdate, ToolboxUpdater, waitForCommittedUpdate } from './updater'
 import { AUTO_UPDATE_TICK_MS, AutoUpdateCoordinator, updateReadyMessage } from './auto-update'
 import { applicationMenuTemplate } from './app-menu'
+import { pendingRecoveryNotice } from './recovery-notice'
+import { prepareAiRouterUpdate, restoreAiRouterAfterUpdate } from '../ai-access/router-upgrade-handoff'
+import { acceptVerifiedProductionAiRouterRecovery } from '../actions/ai-access'
 import { recipeStore } from '../shells/context'
 import { asTrayNetworkStatus, TRAY_NETWORK_OPERATION_INCOMPLETE, trayNetworkFailureMessage, trayMenuSignature, trayNetworkPresentation, type TrayNetworkStatus } from './tray-network'
 
@@ -59,8 +64,18 @@ export class DesktopRuntime {
   // resize/move 防抖落盘;签名未变化时不重建托盘菜单。
   private readonly persistWindowBounds = debounce(() => { void this.saveWindowAsync() }, 300)
   private lastMenuSignature = ''
+  // N-27:守护恢复事件从这里读(与主进程同一套数据目录规则,updater.ts 同先例)。
+  private readonly tunnelDataDir = resolveTunnelDataDir(process.env, app.getPath('userData'))
   // 常驻项(mac LaunchAgent / Windows 登录任务)。这里只用来「看还在不在」和「撤掉」,装归连接路径。
   private readonly resident: ResidentController = systemResidentController()
+
+  private aiRouterResidentSpec() {
+    return {
+      executable: process.execPath,
+      ...(app.isPackaged ? {} : { appPath: app.getAppPath() }),
+      logDir: join(app.getPath('userData'), 'logs')
+    }
+  }
 
   constructor(private readonly registry: BridgeRegistry) {
     if (process.platform === 'win32') app.setAppUserModelId('com.laixin.ai-toolbox.ui-capabilities')
@@ -71,7 +86,8 @@ export class DesktopRuntime {
       origin: __TOOLBOX_UPDATE_ORIGIN__, githubRepository: __TOOLBOX_GITHUB_REPOSITORY__,
       mirrorHosts: __TOOLBOX_UPDATE_MIRROR_HOSTS__, publicKey: __TOOLBOX_UPDATE_PUBLIC_KEY__, directory: this.updateDirectory,
       executable: process.execPath, helperPath: join(resources, process.platform === 'win32' ? 'update-helper.ps1' : 'update-helper.cjs'),
-      packaged: app.isPackaged, quit: () => app.quit() })
+      packaged: app.isPackaged, quit: () => app.quit(),
+      prepareAiRouterUpdate: () => prepareAiRouterUpdate(app.getPath('userData'), this.aiRouterResidentSpec()) })
     this.autoUpdate = new AutoUpdateCoordinator(this.updater,
       { autoUpdate: () => this.store.preferences().autoUpdate, notified: (key) => this.store.notified(key),
         remember: (key) => { try { this.store.rememberNotification(key) } catch { console.error('[toolbox-desktop] NOTIFICATION_PREFERENCES_UNAVAILABLE') } } },
@@ -109,7 +125,16 @@ export class DesktopRuntime {
   attach(window: BrowserWindow): void {
     this.window = window
     const maximized = this.store.window().maximized
-    keepWindowInBackground(window, () => !!this.tray && !this.quitting, () => this.saveWindow())
+    keepWindowInBackground(window, () => !!this.tray && !this.quitting, () => this.saveWindow(), () => {
+      try {
+        showCloseToTrayHintOnce(this.store, () => {
+          dialog.showMessageBoxSync(window, { type: 'info', title: '来信 AI 工具箱',
+            message: '窗口会收起到托盘，工具箱继续在后台运行',
+            detail: `如需完全退出并断开 AI 网络，请在${process.platform === 'win32' ? '任务栏右下角' : '屏幕顶部菜单栏'}打开来信图标菜单，选择“退出工具箱（断开 AI网络）”。`,
+            buttons: ['知道了'], noLink: true })
+        })
+      } catch { console.error('[toolbox-desktop] CLOSE_TO_TRAY_HINT_UNAVAILABLE') }
+    })
     window.webContents.on('did-finish-load', () => {
       window.webContents.setZoomFactor(this.store.preferences().zoom)
     })
@@ -125,8 +150,16 @@ export class DesktopRuntime {
     // 客户要能看到「从哪版升上来、这版改了什么」,⛔ 让更新成功这件事悄无声息。
     void acknowledgeUpdate(this.updateDirectory, app.getVersion(), {
       outcome: () => updateConnectOutcome(),
-      giveUp: () => { this.quitting = true; app.quit() }
-    }).then((success) => {
+      giveUp: () => { this.quitting = true; app.quit() },
+      routerOutcome: async () => {
+        const outcome = await restoreAiRouterAfterUpdate(app.getPath('userData'), this.aiRouterResidentSpec())
+        if (outcome === 'ready') await acceptVerifiedProductionAiRouterRecovery()
+        return outcome
+      },
+      deferSuccessUntilCommit: process.platform === 'win32'
+    }).then(async (acknowledged) => {
+      const success = process.platform === 'win32'
+        ? await waitForCommittedUpdate(this.updateDirectory, app.getVersion()) : acknowledged
       if (!success) return
       this.successNotice = { version: app.getVersion(), ...success }
       // 推送为主(回执可能等网络连上才写好,渲染层启动时拉取会扑空),拉取兜底,两边都有去重。
@@ -139,6 +172,12 @@ export class DesktopRuntime {
   // 弹窗由渲染层启动时主动问一次。这份信息只在装完后的第一次启动存在,天然只弹一次。
   updateSuccess(): UpdateSuccessNotice {
     return this.successNotice ?? { version: '', previous: '', notes: '' }
+  }
+
+  async dismissUpdateSuccess(version: string): Promise<void> {
+    if (this.successNotice?.version !== version) return
+    if (process.platform === 'win32') await dismissCommittedUpdate(this.updateDirectory, version)
+    this.successNotice = undefined
   }
 
   show(tab?: string): void {
@@ -298,7 +337,29 @@ export class DesktopRuntime {
     } finally {
       this.tunnelStatusPending = false
       this.refreshMenu()
+      this.checkRecoveryNotice()
     }
+  }
+
+  // N-27:「断了又自己接上」给客户一句知情——守护把恢复事件写进 state,这里读到就弹一次系统通知。
+  // 去重键落桌面偏好(跨重启)、在途通知也并闸(pendingRecoveryNotice),⛔ 因 5 秒轮询/守护重启重复打扰。
+  // 通知是连接的旁观者:任何失败只记一行,⛔ 影响轮询与连接。
+  private checkRecoveryNotice(): void {
+    if (this.disposed) return
+    try {
+      const text = pendingRecoveryNotice(readDaemonState(this.tunnelDataDir),
+        (key) => this.store.notified(key) || this.notifications.has(key), this.tunnelStatus)
+      if (text === undefined || !Notification.isSupported()) return
+      const notification = new Notification({ title: text.title, body: text.body, silent: true })
+      this.notifications.set(text.key, notification)
+      notification.on('show', () => {
+        try { this.store.rememberNotification(text.key) } catch { console.error('[toolbox-desktop] NOTIFICATION_PREFERENCES_UNAVAILABLE') }
+      })
+      notification.on('click', () => this.show('tunnel'))
+      notification.on('close', () => { if (this.notifications.get(text.key) === notification) this.notifications.delete(text.key) })
+      notification.on('failed', () => { if (this.notifications.get(text.key) === notification) this.notifications.delete(text.key) })
+      notification.show()
+    } catch { console.error('[toolbox-desktop] RECOVERY_NOTICE_UNAVAILABLE') }
   }
 
   private async runTrayNetworkAction(action: 'start' | 'stop'): Promise<void> {

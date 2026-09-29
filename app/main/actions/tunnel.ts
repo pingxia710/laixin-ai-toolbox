@@ -3,7 +3,7 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { join } from 'node:path'
-import { app, dialog, powerMonitor } from 'electron'
+import { app, dialog, powerMonitor, safeStorage } from 'electron'
 import type { BridgeRegistry } from '../bridge/bridge-registry'
 import { actionLocalFault } from '../bridge/local-fault'
 import { schema } from '../bridge/schema'
@@ -24,6 +24,20 @@ import { NetworkAccountError } from '../tunnel/account-client'
 import { PackageReject } from '../tunnel/package-format'
 import type { SpawnedDaemon } from '../tunnel/supervisor'
 import type { Platform } from '../precheck/software-platform'
+import type { EncryptedQueueCodec } from '../tunnel/diagnostic-event-queue'
+
+function diagnosticQueueCodec(): EncryptedQueueCodec {
+  const available = () => {
+    if (!safeStorage.isEncryptionAvailable() ||
+        process.platform === 'linux' && safeStorage.getSelectedStorageBackend() === 'basic_text') {
+      throw new Error('DIAGNOSTIC_EVENT_STORAGE_UNAVAILABLE')
+    }
+  }
+  return {
+    encrypt(plain) { available(); return safeStorage.encryptString(plain) },
+    decrypt(encrypted) { available(); return safeStorage.decryptString(encrypted) }
+  }
+}
 
 /** 动作异常就地翻译成受控失败(⛔ 落到桥层「重新导入配置包」的通用兜底——那个兜底只留给
  *  真正不可归因的情况)。受控账号/包异常按原码原话透传;stop 的本机异常按 N-18 判据分
@@ -76,6 +90,7 @@ const importResultSchema = schema.object({
 export const statusResultSchema = schema.object({
   state: schema.string({ maxLength: 30 }),
   message: schema.string({ maxLength: 300 }),
+  pauseReason: schema.string({ maxLength: 20 }),
   source: schema.string({ maxLength: 80 }),
   authorization: schema.string({ maxLength: 80 }),
   backend: schema.string({ maxLength: 40 }),
@@ -93,7 +108,10 @@ export const statusResultSchema = schema.object({
   unrestored: schema.string({ maxLength: 600 }),
   componentMissing: schema.string({ maxLength: 400 }),
   sshBinary: schema.string({ maxLength: 8 }),
-  traffic: schema.string({ maxLength: 160 })
+  traffic: schema.string({ maxLength: 160 }),
+  // N-55:仅传控制器的脱敏阶段和已证实限制原因；对象、快照和租约留在守护/账本。
+  availabilityStatus: schema.string({ maxLength: 20 }),
+  availabilityReason: schema.string({ maxLength: 300 })
 })
 
 const routeExplainParamsSchema = schema.object({
@@ -203,6 +221,7 @@ function productionDeps(deps: TunnelActionDeps) {
     })
   })
   setResidentRuntime(resident)
+  const queueCodec = diagnosticQueueCodec()
   return {
     dataDir,
     platform,
@@ -223,7 +242,9 @@ function productionDeps(deps: TunnelActionDeps) {
           return typeof saved.failureReport === 'boolean' ? saved.failureReport : FAILURE_REPORT_DEFAULT_ENABLED
         } catch { return FAILURE_REPORT_DEFAULT_ENABLED }
       },
-      version: () => app.getVersion()
+      version: () => app.getVersion(),
+      queueCodec,
+      eventQueue: { codec: queueCodec }
     },
     picker:
       deps.picker ??

@@ -2,11 +2,78 @@
 $ErrorActionPreference = 'Stop'
 $job = Get-Content -LiteralPath $JobPath -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($job.platform -ne 'win' -or $job.parentPid -lt 1 -or $job.asarSha256 -notmatch '^[a-f0-9]{64}$' -or $job.assetSha256 -notmatch '^[a-f0-9]{64}$') { exit 1 }
+Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class LaixinUpdateResultMove { [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern bool MoveFileEx(string source, string target, uint flags); }'
 function Write-Result($state, $message) {
-  # ⛔ Set-Content -Encoding UTF8:PowerShell 5.1 写出的是带 BOM 的 UTF-8,主进程 JSON.parse 对 BOM 直接抛,
-  # 等于把失败回执写成「没有回执」(客户端永远读不到上次为什么失败)。用 WriteAllText + 无 BOM UTF-8。
-  $text = @{version=$job.version;state=$state;message=$message} | ConvertTo-Json -Compress
-  [IO.File]::WriteAllText($job.result, $text, (New-Object System.Text.UTF8Encoding($false)))
+  # PS5.1 的 Set-Content -Encoding UTF8 带 BOM；先在同目录无 BOM 写满并刷盘，再原子替换结果。
+  $result = @{version=$job.version;state=$state;message=$message}
+  if ($state -eq 'complete') {
+    $result.previous = [string]$job.previous
+    $result.notes = [string]$job.notes
+  }
+  $text = $result | ConvertTo-Json -Compress
+  $temporary = $job.result + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
+  try {
+    $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($text)
+    $stream = [IO.File]::Open($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+    if (-not [LaixinUpdateResultMove]::MoveFileEx($temporary, $job.result, 9)) { throw 'UPDATE_RESULT_COMMIT_FAILED' }
+  } catch {
+    try { Remove-Item -LiteralPath $temporary -Force -ErrorAction Stop } catch { }
+    throw
+  }
+}
+function Invoke-WindowsPreflight {
+  $helper = Join-Path $PSScriptRoot 'update-helper.cjs'
+  if (-not (Test-Path -LiteralPath $helper)) { throw 'UPDATE_PREFLIGHT_HELPER_MISSING' }
+  $previousRunAsNode = $env:ELECTRON_RUN_AS_NODE
+  $previousOwnerPid = $env:LAIXIN_PREFLIGHT_OWNER_PID
+  $previousOwnerExecutable = $env:LAIXIN_PREFLIGHT_OWNER_EXECUTABLE
+  try {
+    $env:ELECTRON_RUN_AS_NODE = '1'
+    $env:LAIXIN_PREFLIGHT_OWNER_PID = [string]$PID
+    $env:LAIXIN_PREFLIGHT_OWNER_EXECUTABLE = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    # 路径作为 Start-Process 参数传递，不经 cmd；用户名里的 &/%/空格不能变成命令。
+    $arguments = @('"' + $helper + '"', 'windows-preflight', 'update', '"' + $JobPath + '"')
+    $preflight = Start-Process -FilePath $job.executable -ArgumentList $arguments -PassThru -WindowStyle Hidden
+    # CJS 内是一个 165 秒总事务窗(含持久恢复闸与失败补偿)，外层给 185 秒，不能在合法串行预算中途杀掉它。
+    if (-not $preflight.WaitForExit(185000)) {
+      try { $preflight.Kill() } catch { }
+      # 不允许本脚本先返回、留下仍可能改任务/注册表的 helper。Kill 后的有界窗口只用于正常收尸；
+      # 极端情况下继续持有同一个 Process 句柄直到它真的退出。
+      if (-not $preflight.WaitForExit(5000)) { [void]$preflight.WaitForExit() }
+      throw 'UPDATE_PREFLIGHT_TIMEOUT'
+    }
+    if ($preflight.ExitCode -ne 0) { throw 'UPDATE_PREFLIGHT_FAILED' }
+    $markerPath = Join-Path (Split-Path $job.result) 'windows-preflight-recovery.json'
+    $marker = Get-Content -LiteralPath $markerPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($marker.ownerPid -ne $PID -or [string]::IsNullOrEmpty([string]$marker.transactionId)) { throw 'UPDATE_PREFLIGHT_OWNER_MISMATCH' }
+    return [string]$marker.transactionId
+  } finally {
+    if ($null -eq $previousRunAsNode) { Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue }
+    else { $env:ELECTRON_RUN_AS_NODE = $previousRunAsNode }
+    if ($null -eq $previousOwnerPid) { Remove-Item Env:LAIXIN_PREFLIGHT_OWNER_PID -ErrorAction SilentlyContinue }
+    else { $env:LAIXIN_PREFLIGHT_OWNER_PID = $previousOwnerPid }
+    if ($null -eq $previousOwnerExecutable) { Remove-Item Env:LAIXIN_PREFLIGHT_OWNER_EXECUTABLE -ErrorAction SilentlyContinue }
+    else { $env:LAIXIN_PREFLIGHT_OWNER_EXECUTABLE = $previousOwnerExecutable }
+  }
+}
+function Invoke-WindowsPreflightCommit([string]$Transaction) {
+  $directory = Split-Path $job.result
+  $helper = Join-Path $directory 'windows-preflight-recovery.cjs'
+  if (-not (Test-Path -LiteralPath $helper)) { throw 'UPDATE_PREFLIGHT_COMMIT_HELPER_MISSING' }
+  $previousRunAsNode = $env:ELECTRON_RUN_AS_NODE
+  try {
+    $env:ELECTRON_RUN_AS_NODE = '1'
+    $arguments = @('"' + $helper + '"', 'windows-preflight-commit', '"' + $directory + '"', [string]$PID, '"' + $Transaction + '"')
+    $commit = Start-Process -FilePath $job.executable -ArgumentList $arguments -PassThru -WindowStyle Hidden
+    # 提交命令自己的原生调用有超时和收尸。外层若先杀 Node，遗留的 PowerShell 子进程仍可能写
+    # 注册表/提交记录并与恢复看守竞跑；这里一直持有更新者进程，直到整个提交子树自行收敛。
+    [void]$commit.WaitForExit()
+    if ($commit.ExitCode -ne 0) { throw 'UPDATE_PREFLIGHT_COMMIT_FAILED' }
+  } finally {
+    if ($null -eq $previousRunAsNode) { Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue }
+    else { $env:ELECTRON_RUN_AS_NODE = $previousRunAsNode }
+  }
 }
 Remove-Item -LiteralPath $job.acknowledgement -Force -ErrorAction SilentlyContinue
 Set-Content -LiteralPath $job.ready -Value 'ready' -Encoding UTF8
@@ -15,49 +82,12 @@ while (Get-Process -Id $job.parentPid -ErrorAction SilentlyContinue) {
   if ((Get-Date) -ge $deadline) { Write-Result 'error' '工具箱尚未完成退出，更新已取消。'; exit 1 }
   Start-Sleep -Milliseconds 100
 }
-# 换文件前先让网络进程退场。这一步 mac 侧 update-helper.cjs 有(handOffResident:写接续标记 + bootout
-# 等守护真停),Windows 这份此前一直缺——2026-09-15 客户实测:连着 AI 网络点「更新并重启」,主进程退出
-# 只等守护 4 秒(supervisor.waitForExit),守护停内核、还原系统代理、自禁任务常常超过 4 秒;助手在守护
-# (主程序当 node 跑)和 xray.exe 还活着时就 NSIS 覆盖被占用的文件,失败后按设计整目录还原旧版,
-# 客户看到的就是「点了更新重启,又换回旧版」。另有雪上加霜的一刀:常驻任务每 1 分钟重入,守护没来得及
-# 自禁时会在换文件窗口里把守护再拉起来。
-# 顺序:先禁常驻任务(新旧两个任务名都禁);再给守护自然收尾的宽限——主进程退出前已写 shutdown 意图,
-# 守护会自己退,到点还在才强杀,⛔ 一上来就杀会把客户的系统代理留在指向死端口的位置。
-# ⛔ 按进程名一律杀:只清「从安装目录跑起来的」那几个——主程序名且可执行路径(或命令行)落在 target 下、
-# xray.exe 同理(xray.exe 名字见 app/main/tunnel/sidecar-path.ts,别处不存在第二个来源)。
-$label = [string]$job.residentLabel
-if ($label -ne '') {
-  foreach ($task in @('\Laixin\' + $label, $label)) {
-    try { & schtasks.exe /change /tn $task /disable | Out-Null } catch { } # 没装常驻或已停:都不是失败
-  }
-}
-$targetPrefix = $job.target.TrimEnd('\') + '\'
-$mainName = [IO.Path]::GetFileName($job.executable)
-$left = @()
-$settleDeadline = (Get-Date).AddSeconds(12)
-do {
-  # -ErrorAction SilentlyContinue ⛔ 省:脚本第 2 行是 $ErrorActionPreference='Stop',而这一段在下面那个
-  # 大 try 之外(try 从「校验安装包」才开始)。CIM 在 WMI 库损坏/服务停用的机器上会抛 CimException,
-  # 抛在这里 = 脚本当场终止、连 result.json 都不写,客户端收不到任何回执——客户看到的还是「点了更新
-  # 重启又是旧版」,而且这次连句说明都没有,比修之前更难查(2026-09-16 Windows 真机实测确认)。
-  # 读不到进程表就当作「没枚举到」:$left 为空会立刻 break,直接进备份和 NSIS,退回修复前的行为——
-  # 那条路占用失败会走 catch,有还原也有回执。⛔ 让一次读不到进程表把整个更新变成静默失败。
-  $left = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-    if ($_.Name -ne $mainName -and $_.Name -ne 'xray.exe') { return $false }
-    $fromTarget = $false
-    if ($_.ExecutablePath) { $fromTarget = $_.ExecutablePath.StartsWith($targetPrefix, [System.StringComparison]::OrdinalIgnoreCase) }
-    if (-not $fromTarget -and $_.CommandLine) { $fromTarget = $_.CommandLine.ToLowerInvariant().Contains($job.target.ToLowerInvariant()) }
-    $fromTarget
-  })
-  if ($left.Count -eq 0) { break }
-  Start-Sleep -Milliseconds 250
-} while ((Get-Date) -lt $settleDeadline)
-foreach ($process in $left) { Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue }
-if ($left.Count -gt 0) { Start-Sleep -Milliseconds 500 }
 $asar = Join-Path $job.target 'resources\app.asar'
 $backup = $null
 $backupReady = $false
+$installerStarted = $false
 $started = $null
+$preflightCommitted = $false
 try {
   if ((Get-Item -LiteralPath $job.installer).Length -ne $job.assetSize -or (Get-FileHash -LiteralPath $job.installer -Algorithm SHA256).Hash.ToLowerInvariant() -ne $job.assetSha256) { throw 'UPDATE_ASSET_CHANGED' }
   # 覆盖前整目录备份:NSIS /S 换的是整个安装目录(resources\sidecar、resources\xray、主程序 exe/dll 全换),
@@ -68,9 +98,25 @@ try {
   if (-not (Test-Path -LiteralPath (Join-Path $backup 'resources\app.asar'))) { throw 'UPDATE_BACKUP_INCOMPLETE' }
   # 备份没落全就抛在这里:安装目录此刻还没被动过,原程序完好。
   $backupReady = $true
+  # 只有包校验和完整备份都落盘后才停网络后台，缩短任何异常退出可能影响客户网络的窗口。
+  # 前置闸会先持久化原任务状态并启动独立恢复看守，再停用任务/按精确路径停进程。
+  $preflightTransaction = Invoke-WindowsPreflight
   # 本脚本自己也在被替换的安装目录里,但 PowerShell 先整文件解析再执行,NSIS 覆盖它不影响本次运行。
-  $installer = Start-Process -FilePath $job.installer -ArgumentList @('/S', '--updated', "/D=$($job.target)") -PassThru
-  if (-not $installer.WaitForExit(180000)) { Write-Result 'error' '安装仍在进行，请等待安装结束后重新打开工具箱。'; exit 1 }
+  # 这次 helper 已完成唯一一次前置闸。把安装目录标记交给新安装器 customInit 与旧卸载器
+  # customUnInstall，避免后者只看见 Disabled 后重新拍错快照；标记只在 NSIS 子进程树内有效。
+  $previousPreflightHandoff = $env:LAIXIN_PREFLIGHT_HANDOFF_TARGET
+  $installer = $null
+  try {
+    $env:LAIXIN_PREFLIGHT_HANDOFF_TARGET = [IO.Path]::GetFullPath([string]$job.target).TrimEnd('\')
+    $installer = Start-Process -FilePath $job.installer -ArgumentList @('/S', '--updated', "/D=$($job.target)") -PassThru
+    $installerStarted = $true
+    # NSIS 会同步等待旧卸载器，旧卸载器失败还会重试。这里不再设一个比合法嵌套路径更短的外层
+    # 180 秒闸，更不能先写失败回执并退出、任由后台安装器继续改目录；本进程持有到 NSIS 真正退出。
+    [void]$installer.WaitForExit()
+  } finally {
+    if ($null -eq $previousPreflightHandoff) { Remove-Item Env:LAIXIN_PREFLIGHT_HANDOFF_TARGET -ErrorAction SilentlyContinue }
+    else { $env:LAIXIN_PREFLIGHT_HANDOFF_TARGET = $previousPreflightHandoff }
+  }
   if ($installer.ExitCode -ne 0) { throw 'UPDATE_INSTALL_FAILED' }
   if ((Get-FileHash -LiteralPath $asar -Algorithm SHA256).Hash.ToLowerInvariant() -ne $job.asarSha256) { throw 'UPDATE_ASAR_INVALID' }
   # 回退备份要活到「新版确实启动了」之后:先删备份再启动,新版一起不来就再没有退路,
@@ -92,16 +138,32 @@ try {
     }
   } while (-not $acknowledged -and (Get-Date) -lt $deadline)
   if (-not $acknowledged) { throw 'UPDATE_STARTUP_UNCONFIRMED' }
-  # 收到本次版本的启动回执 ⇒ 新版可用,到这里才删回退备份。
-  Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue
+  # 新版已启动并按 requireConnected 写回执后，才提交持久恢复事务。提交失败时保留 marker，
+  # 独立看守会在本 PowerShell 退出后按原快照补偿，不能为清理文件牺牲客户网络。
+  Invoke-WindowsPreflightCommit $preflightTransaction
+  $preflightCommitted = $true
+  # final result 在持久提交之后落盘；后续清理失败不能把已展示的成功改写成失败。
+  Write-Result 'complete' '工具箱已更新，账号和配置已保留。'
+  # 最终结果未能写出时必须保留回退材料；成功落盘后清理备份只是磁盘卫生，失败不改事务结果。
+  try { Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction Stop } catch { }
   $backup = $null
   $backupReady = $false
-  Write-Result 'complete' '工具箱已更新，账号和配置已保留。'
-  Remove-Item -LiteralPath (Join-Path (Split-Path $job.result) 'pending.json') -Force
+  try { Remove-Item -LiteralPath (Join-Path (Split-Path $job.result) 'pending.json') -Force -ErrorAction Stop } catch { }
   exit 0
 } catch {
   $reason = $_.Exception.Message
   $restored = $false
+  if ($preflightCommitted) {
+    # 任务/网络提交已确认，不能写「提交未确认」或回滚正在运行的新版。结果落盘失败时保留旧版备份。
+    try { Write-Result 'error' '新版已启动，网络恢复已提交，但最终更新结果未能写入。原版本备份已保留，请联系来信客服协助。' } catch { }
+    exit 1
+  }
+  if ($acknowledged -and $null -ne $started) {
+    # 新版已确认启动却没有得到持久提交证明：不能把备份删掉或把此次更新报成完成，
+    # 也不能在新版仍运行时强行挪安装目录。恢复看守会保留网络原快照供重启续行。
+    Write-Result 'error' '新版已启动，但网络恢复提交未确认。原版本备份已保留，请联系来信客服协助。'
+    exit 1
+  }
   if ($reason -eq 'UPDATE_STARTUP_UNCONFIRMED' -and $null -ne $started) {
     # 新版进程还活着 ⇒ 它正占着安装目录。把目录从一个跑着的进程底下挪走,换来的是个半死不活的状态;
     # 备份原样留在盘上交下一次启动或人工处理。与 mac 侧 update-helper.cjs 的 appRunning() 分支对称。
@@ -120,7 +182,7 @@ try {
       exit 1
     }
   }
-  if ($backupReady -and (Test-Path -LiteralPath $backup)) {
+  if ($backupReady -and $installerStarted -and (Test-Path -LiteralPath $backup)) {
     # 整目录还原:失败的安装目录先挪开,再把备份挪回原位。两步里任何一步失败都不删副本,
     # 让 .laixin-update-failed-* 与 .laixin-update-backup-* 都留在盘上交人工,⛔ 把客户留在无程序状态。
     try {
@@ -146,7 +208,7 @@ try {
   }
   Write-Result 'error' '更新未完成，原程序可用，账号和配置已保留，请重新打开工具箱后重试。'
   # 没动过安装目录(备份未完成)或已整目录还原,才允许拉起原程序;混合态 ⛔ 启动。
-  if (-not $backupReady -or $restored) {
+  if (-not $installerStarted -or $restored) {
     if (Test-Path -LiteralPath $job.executable) { Start-Process -FilePath $job.executable -ArgumentList "--user-data-dir=`"$($job.userData)`"" }
   }
   exit 1

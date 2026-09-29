@@ -9,14 +9,12 @@ export function prepareVerificationProject(tempRoot) {
   writeFileSync(join(tempRoot, 'app/main/actions/download.ts'), mainActionSource)
 }
 
-// AC-01 起工具箱免费,download.* 不再有付费闸(app/main/account/toolbox-access.ts 已删除),
-// 真实 Electron 里未登录直接调用 download.start 就能通——本变体验的是桥接线通不通。
-// 若有人把付费闸加回装配层,这里的未登录调用会拒成 ACCOUNT_LOGIN_REQUIRED,变体当场红。
+// SW-01 起安装入口只负责打开官方页；本变体钉住当前 download.openExternal 桥接线。
 
 export function mutateVerificationProject(tempRoot) {
   const path = join(tempRoot, 'app/main/actions/download.ts')
   const source = readFileSync(path, 'utf8')
-  const needle = "name: 'download.start'"
+  const needle = "name: 'download.openExternal'"
   if (!source.includes(needle)) throw new Error(`VERIFY_BRIDGE_MUTATION_TARGET_MISSING:${path}`)
   writeFileSync(path, source.replace(needle, "name: 'download.absent'"))
 }
@@ -55,7 +53,7 @@ async function invokeDownloadBridge(tempRoot, root) {
     if (requestUrl.pathname === '/probe.js') {
       response.setHeader('content-type', 'application/javascript; charset=utf-8')
       response.end(
-        "window.toolbox.download.start('fixture').then((value) => fetch(`/result?status=resolved&taskId=${encodeURIComponent(value.taskId)}&state=${encodeURIComponent(value.state)}`)).catch((error) => fetch(`/result?status=rejected&message=${encodeURIComponent(String(error.message))}`));"
+        "window.toolbox.download.openExternal('fixture').then((value) => fetch(`/result?status=resolved&taskId=${encodeURIComponent(value.taskId)}&state=${encodeURIComponent(value.state)}`)).catch((error) => fetch(`/result?status=rejected&message=${encodeURIComponent(String(error.message))}`));"
       )
       return
     }
@@ -78,18 +76,34 @@ async function invokeDownloadBridge(tempRoot, root) {
   if (address === null || typeof address === 'string') {
     throw new Error('DOWNLOAD_BRIDGE_PROBE_LISTEN_FAILED')
   }
-  const electron = spawn(join(root, 'node_modules/.bin/electron'), ['out/main/index.js'], {
+  const electron = spawn(join(root, 'node_modules/.bin/electron'), [
+    `--user-data-dir=${join(tempRoot, '.download-bridge-user-data')}`,
+    'out/main/index.js'
+  ], {
     cwd: tempRoot,
     env: { ...process.env, ELECTRON_RENDERER_URL: `http://127.0.0.1:${address.port}/index.html` },
     stdio: ['ignore', 'pipe', 'pipe']
   })
-  const timeout = setTimeout(() => rejectResult(new Error('DOWNLOAD_BRIDGE_PROBE_TIMEOUT')), 10_000)
+  let stdout = ''
+  let stderr = ''
+  electron.stdout.on('data', chunk => { stdout += chunk.toString() })
+  electron.stderr.on('data', chunk => { stderr += chunk.toString() })
+  electron.on('exit', code => rejectResult(new Error(
+    `DOWNLOAD_BRIDGE_PROBE_EXIT:${String(code)} stdout=${stdout.slice(-2_000)} stderr=${stderr.slice(-2_000)}`
+  )))
+  const timeout = setTimeout(() => rejectResult(new Error(
+    `DOWNLOAD_BRIDGE_PROBE_TIMEOUT stdout=${stdout.slice(-2_000)} stderr=${stderr.slice(-2_000)}`
+  )), 10_000)
   try {
     return await result
   } finally {
     clearTimeout(timeout)
+    const exited = electron.exitCode === null
+      ? new Promise(resolve => electron.once('exit', resolve))
+      : Promise.resolve()
     electron.kill()
-    server.close()
+    await exited
+    await new Promise(resolve => server.close(resolve))
   }
 }
 
@@ -99,7 +113,7 @@ import { schema } from '../bridge/schema'
 
 export function registerActions(registry: BridgeRegistry): void {
   registry.registerAction({
-    name: 'download.start',
+    name: 'download.openExternal',
     paramsSchema: schema.object({ resourceId: schema.string({ maxLength: 100 }) }),
     resultSchema: schema.object({
       taskId: schema.string({ maxLength: 100 }),
