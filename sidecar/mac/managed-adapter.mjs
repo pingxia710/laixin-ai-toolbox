@@ -176,7 +176,7 @@ export function composeManagedAdapters(networkAdapter, terminalAdapter, acquireW
     read(ref) {
       return isTerminalRef(ref) ? terminalOperation(() => terminalAdapter.read(ref)) : networkAdapter.read(ref)
     },
-    write(ref, value) {
+    write(ref, value, options) {
       // 原始文件席位可能被外部替换/误删；每次真正改系统设置前都核 inode+token。
       // 没有注入写权原语的纯适配器测试维持原契约；生产 mac 适配器必经 guardedAcquire。
       if (guardedAcquire !== undefined) {
@@ -185,7 +185,7 @@ export function composeManagedAdapters(networkAdapter, terminalAdapter, acquireW
         }
         activeWriteRight.acquired.assertHeld?.()
       }
-      return isTerminalRef(ref) ? terminalOperation(() => terminalAdapter.write(ref, value)) : networkAdapter.write(ref, value)
+      return isTerminalRef(ref) ? terminalOperation(() => terminalAdapter.write(ref, value)) : networkAdapter.write(ref, value, options)
     },
     preserveExternalChanges: (ref) => !isTerminalRef(ref) && networkAdapter.preserveExternalChanges?.(ref) === true,
     reapplyOnChange: (ref) => !isTerminalRef(ref) && networkAdapter.reapplyOnChange?.(ref) === true,

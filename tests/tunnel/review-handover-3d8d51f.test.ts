@@ -114,6 +114,7 @@ it('PAC 连续三次外部改写会有界夺回，第四次受限；退出仍保
   writeIntentFile(root, intent('pac'))
   const adapterUrl = new URL('../../sidecar/mac/adapter-networksetup.mjs', import.meta.url).href
   const daemonUrl = new URL('../../sidecar/mac/daemon-core.mjs', import.meta.url).href
+  const fixtureWriteUrl = new URL('./fixtures/mac-networksetup-write.mjs', import.meta.url).href
   const script = `
     import cp from 'node:child_process'
     import { syncBuiltinESMExports } from 'node:module'
@@ -121,9 +122,13 @@ it('PAC 连续三次外部改写会有界夺回，第四次受限；退出仍保
     let pacEnabled = true
     let pacUrl = 'http://127.0.0.1:7890/a.pac'
     const settings = Object.fromEntries(['webproxy','securewebproxy','socksfirewallproxy'].map(k=>[k,{enabled:false,host:'',port:0}]))
-    cp.execFileSync = (command,args) => {
+    cp.execFileSync = (command,args,options) => {
+      if (command.endsWith('/bin/proxy-helper') && args[0] === 'request' &&
+          JSON.parse(options.input).op === 'status') return JSON.stringify({ ok: true, version: 3 })
+      if (command === '/sbin/route' && args.join(' ') === '-n get default') return '   interface: en0\\n'
       if(command !== 'networksetup') throw Error('UNEXPECTED_COMMAND')
       const op = args[0]
+      if(op === '-listnetworkserviceorder') return '(1) Wi-Fi\\n(Hardware Port: Wi-Fi, Device: en0)\\n'
       if(op === '-listallnetworkservices') return 'An asterisk (*) denotes...\\nWi-Fi\\n'
       if(op === '-getautoproxyurl') return 'URL: '+pacUrl+'\\nEnabled: '+(pacEnabled?'Yes':'No')+'\\n'
       if(op === '-setautoproxystate') { pacEnabled=args[2]==='on'; return '' }
@@ -138,8 +143,9 @@ it('PAC 连续三次外部改写会有界夺回，第四次受限；退出仍保
     syncBuiltinESMExports()
     const {createAdapter}=await import(${JSON.stringify(adapterUrl)})
     const {createDaemon}=await import(${JSON.stringify(daemonUrl)})
+    const { createNetworksetupFixtureWrite } = await import(${JSON.stringify(fixtureWriteUrl)})
     const root=${JSON.stringify(root)}
-    const daemon=createDaemon({ dataDir:root,adapter:createAdapter(),
+    const daemon=createDaemon({ dataDir:root,adapter:createAdapter({ writeProxy: createNetworksetupFixtureWrite(cp.execFileSync) }),
       clock:{now:Date.now,setInterval:()=>0,setTimeout:()=>0,clearTimer:()=>{}},parentAlive:()=>true,onExit:()=>{},
       connectorFactory:()=>({kind:'loopback-probe',start:async()=>{},stop:async()=>{},localProxyPort:()=>1,onLost:()=>{},verify:async()=>({exitIp:'203.0.113.1'})}),
       bridgeFactory:()=>({listen:async()=>{},close:async()=>{},isAlive:()=>true,onLost:()=>{}})})

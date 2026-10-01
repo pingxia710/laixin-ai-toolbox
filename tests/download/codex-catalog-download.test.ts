@@ -4,6 +4,7 @@ import { registerDownloadActions } from '../../app/main/actions/download'
 import { BridgeRegistry } from '../../app/main/bridge/bridge-registry'
 import { loadCatalog } from '../../app/main/download/catalog'
 import { DownloadManager, type DownloadCompletion, type DownloadEngine, type DownloadTransfer } from '../../app/main/download/download-manager'
+import { waitForSettled } from './helpers'
 import type { ArtifactDigest, DownloadArtifactInspector, DownloadCatalog, DownloadResource, DownloadTaskStore, StoredDownloadTask, TunnelSnapshot } from '../../app/main/download/types'
 
 // 判据纪律:结论落在输出面,判据必须来自输出面。目录读数经真实 loadCatalog()(⛔ 直接 import JSON 断言);
@@ -62,6 +63,8 @@ class MemoryStore implements DownloadTaskStore {
   async deleteArtifact(task: StoredDownloadTask): Promise<void> {
     void task
   }
+  async deleteRecord(): Promise<void> {}
+  async sweepOrphanDirectories(): Promise<number> { return 0 }
 
   async artifactStatus(): Promise<{ size: number; mtimeMs: number } | undefined> {
     return { size: this.served.byteLength, mtimeMs: 1_000 }
@@ -173,7 +176,7 @@ async function settleViaBridge(
   const started = (await registry.execute('download.start', { resourceId: 'codex-macos-arm64' })) as { taskId: string; state: string }
   expect(started.state).toBe('downloading')
   engine.transfers[0].finish('completed')
-  await manager.waitForSettled(started.taskId)
+  await waitForSettled(manager, started.taskId)
   return (await registry.execute('download.status', { taskId: started.taskId })) as Record<string, string>
 }
 
@@ -243,7 +246,7 @@ describe('Codex 下载核验三态(签名是信任根,快照只判「变没变�
     await expect.poll(() => engine.transfers.length).toBe(2)
     expect(engine.requests[1]).toMatchObject({ network: 'tunnel', proxyUrl: connectedTunnel.localProxyUrl, sourceId: 'official-tunnel' })
     engine.transfers[1].finish('completed', false, 'text/html') // 备用源返回网页 ⇒ 仍按原包校验拒绝
-    expect(await manager.waitForSettled(started.taskId)).toMatchObject({ state: 'failed', reason: 'not-installer' })
+    expect(await waitForSettled(manager, started.taskId)).toMatchObject({ state: 'failed', reason: 'not-installer' })
   })
 
   it('通道未接时不偷跑通道源:直连失败后如实报 needs-tunnel', async () => {
@@ -251,7 +254,7 @@ describe('Codex 下载核验三态(签名是信任根,快照只判「变没变�
     const { manager, engine } = createCodexManager(inspectors.measured, fixtureArtifact, codexResource!, stopped)
     const started = await manager.start('codex-macos-arm64')
     engine.transfers[0].finish('interrupted')
-    const settled = await manager.waitForSettled(started.taskId)
+    const settled = await waitForSettled(manager, started.taskId)
     expect(settled).toMatchObject({ state: 'needs-tunnel', reason: 'tunnel-not-connected' })
     expect(engine.requests.every((request) => request.network === 'direct')).toBe(true)
   })

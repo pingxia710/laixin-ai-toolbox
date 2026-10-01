@@ -55,6 +55,22 @@ describe('一次性恢复路径必须持有写入权', () => {
 
   const registry = () => JSON.parse(readFileSync(store, 'utf8')) as Record<string, { data: string }>
 
+  it.each([
+    ['unavailable', 'TUNNEL_WRITE_RIGHT_UNKNOWN'],
+    ['recovery-incomplete', 'TUNNEL_RESTORE_INCOMPLETE'],
+    ['release-incomplete', 'TUNNEL_WRITE_RIGHT_RELEASE_INCOMPLETE']
+  ])('restore 子命令准确保留 %s 原因，不冒充另一个安装占用', async (reason, expected) => {
+    const { code } = await runDaemon(['restore'], { FAKE_WRITE_RIGHT: reason, FAKE_PORT_OWNER: 'none' })
+    expect(code).toBe(65)
+    const state = JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8')) as { code: string; message: string }
+    expect(state.code).toBe(expected)
+    expect(state.message).not.toContain('另一个')
+    if (reason === 'release-incomplete') {
+      expect(registry()['WinINET/ProxyServer'].data).toBe('127.0.0.1:7890')
+      expect(state.message).not.toMatch(/未改动|不改动/)
+    } else expect(registry()['WinINET/ProxyServer'].data).toBe('127.0.0.1:18080')
+  })
+
   it('restore 子命令:持权方存在时一个字节都不写,并如实报未完成(⛔ 让主进程以为已还干净)', async () => {
     const { code, output } = await runDaemon(['restore'], { FAKE_WRITE_RIGHT: 'held' })
     // 客户的现值原样停着,⛔ 被越权还原成 7890。

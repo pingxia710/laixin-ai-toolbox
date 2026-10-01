@@ -13,7 +13,7 @@ export function actionButton(label: string, action: () => void, primary = false)
   button.type = 'button'; button.addEventListener('click', action); return button
 }
 const amount = (value: number | null) => value === null || !Number.isFinite(value) ? '暂时无法获取' : `${(value / 1024 ** 3).toFixed(2)} GB`
-const statusLabels: Record<string, string> = { pending: '待付款', queued: '历史套餐同步中', provisioning: '系统处理异常', active: '可用', exhausted: '已用完', expired: '已到期', disabled: '已停用', unknown: '暂时无法确认' }
+const statusLabels: Record<string, string> = { pending: '待付款', queued: '已付款·等待节点开通', provisioning: '已付款·正在完成开通', active: '可用', exhausted: '已用完', expired: '已到期', disabled: '已停用', unknown: '暂时无法确认' }
 const rewardStateLabels: Record<string, string> = { pending: '待开通', provisioning: '正在开通', active: '可用', exhausted: '已用完', expired: '已到期', disabled: '已停用', unknown: '暂时无法确认', unavailable: '暂时无法确认' }
 const rewardSourceLabels: Record<string, string> = { inviter: '邀请好友所得', invitee: '好友邀请奖励' }
 
@@ -88,12 +88,13 @@ export function mountAccountOverview(element: HTMLElement, view: AccountView, fr
     else if (!subscriptions.length) renderEmptyUsage(paidCard, '尚未购买网络套餐，可在下方选择。')
     else {
       const effective = subscriptions.filter((item) => !['pending', 'queued', 'provisioning', 'expired', 'exhausted', 'disabled'].includes(item.state))
-      const remaining = effective.length > 0 && effective.every((item) => item.measurement === 'current' && item.remainingBytes !== null)
+      const allTerminal = subscriptions.every((item) => ['expired', 'exhausted', 'disabled'].includes(item.state))
+      const remaining = allTerminal ? 0 : effective.length > 0 && effective.every((item) => item.measurement === 'current' && item.remainingBytes !== null)
         ? effective.reduce((total, item) => total + item.remainingBytes!, 0) : null
       paidCard.append(textNode('p', `有效套餐 ${effective.length} 份 · 总剩余 ${amount(remaining)}`, 'account-note'))
       for (const item of subscriptions) renderUsage(paidCard, item, view.terms?.plans ?? view.overview.plans)
       if (subscriptions.some((item) => ['queued', 'provisioning'].includes(item.state))) {
-        paidCard.append(textNode('p', '付款对应套餐未正常写入可用状态，系统会沿原订单重试；请勿重复付款。', 'account-note'))
+        paidCard.append(textNode('p', '付款对应套餐已记入权益，节点配置尚未完成；系统会沿原订单重试，无需重复付款。', 'account-note'))
       }
     }
   }

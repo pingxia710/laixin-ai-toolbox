@@ -58,6 +58,8 @@ class MemoryStore implements DownloadTaskStore {
   async promotePart(): Promise<void> {}
   async deletePart(): Promise<void> {}
   async deleteArtifact(): Promise<void> {}
+  async deleteRecord(): Promise<void> {}
+  async sweepOrphanDirectories(): Promise<number> { return 0 }
   async artifactStatus(): Promise<{ size: number; mtimeMs: number } | undefined> {
     return undefined
   }

@@ -80,9 +80,9 @@ function readInfo(dataDir: string, batchId: string): CurrentInfo | undefined {
     ) {
       return undefined
     }
-    const credentialName = Object.keys(manifest.files ?? {})
-      .find((path) => path.startsWith('credentials/'))
-      ?.slice('credentials/'.length)
+    const credentialName = manifest.protocol === 'vless-reality'
+      ? Object.hasOwn(manifest.files ?? {}, 'credentials/vless.json') ? 'vless.json' : undefined
+      : Object.keys(manifest.files ?? {}).find((path) => path.startsWith('credentials/'))?.slice('credentials/'.length)
     if (credentialName === undefined || credentialName.includes('/')) {
       return undefined
     }

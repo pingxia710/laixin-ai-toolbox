@@ -193,7 +193,7 @@ function recoverLedgerLocked(dataDir, adapter) {
     if (equal(current, entry.writtenValue, entry)) {
       try {
         assertSettingsLockHeld(dataDir)
-        adapter.write({ service: entry.service, item: entry.item }, entry.originalValue)
+        adapter.write({ service: entry.service, item: entry.item }, entry.originalValue, { restoring: true })
         if (!equal(adapter.read({ service: entry.service, item: entry.item }), entry.originalValue, entry)) {
           throw new Error('原设置写回后读数不一致')
         }
@@ -315,7 +315,7 @@ function restoreLedgerLocked(dataDir, adapter) {
     }
     try {
       assertSettingsLockHeld(dataDir)
-      adapter.write({ service: entry.service, item: entry.item }, entry.originalValue)
+      adapter.write({ service: entry.service, item: entry.item }, entry.originalValue, { restoring: true })
       if (!restoredValueMatches(adapter.read({ service: entry.service, item: entry.item }))) {
         throw new Error('原设置写回后读数不一致')
       }
@@ -357,7 +357,7 @@ function restoreLedgerLocked(dataDir, adapter) {
     if (equalFn(current, entry.originalValue, entry) || !equalFn(current, entry.writtenValue, entry)) continue
     try {
       assertSettingsLockHeld(dataDir)
-      adapter.write({ service: entry.service, item: entry.item }, entry.originalValue)
+      adapter.write({ service: entry.service, item: entry.item }, entry.originalValue, { restoring: true })
       if (!equalFn(adapter.read({ service: entry.service, item: entry.item }), entry.originalValue, entry)) continue
       entries[index] = { ...entries[index], note: '还原后被系统连带改写回,已重写原值' }
     } catch {

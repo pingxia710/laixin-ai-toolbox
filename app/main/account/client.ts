@@ -87,6 +87,8 @@ export const accountMessages: Record<string, string> = {
   INVITE_REWARD_RECORD_LIMIT: '该邀请码的邀请记录已达安全上限，请联系客服处理；也可清空邀请码直接注册。'
 }
 const canonicalAccountOrigin = 'https://laixin.work/'
+/** catalog/订单列表类端点（1MB 响应上限）在慢链路（≈1Mbps）合法需要超过 12s 才能收完；其余端点维持 12s。 */
+const catalogTimeoutMs = 25_000
 const migratedAccountOrigins = new Set(['https://laixin.net.cn/', 'https://laixin.net.cn/AI-tools/'])
 const signedOut = (code = '', message = ''): AccountView => ({ state: 'signed-out', account: null, code, message, overview: null })
 
@@ -153,14 +155,13 @@ export class AccountClient {
   }
 
   private async request(path: string, body?: unknown, token?: string, maxBytes = 128 * 1024, signal?: AbortSignal,
-    onResponse?: (status: number) => void): Promise<unknown> {
+    onResponse?: (status: number) => void, timeoutMs = 12_000): Promise<unknown> {
     if (!this.base) throw new AccountClientError('ACCOUNT_NOT_CONFIGURED')
-    const overviewRequest = path === '/v1/account/overview'
     let stage: AccountRequestStage = 'prepare'
     let httpStatus: number | undefined
     try {
       const url = this.resolve(path)
-      const requestSignal = AbortSignal.any([this.controller.signal, AbortSignal.timeout(12_000), ...(signal ? [signal] : [])])
+      const requestSignal = AbortSignal.any([this.controller.signal, AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : [])])
       stage = 'fetch'
       const response = await fetch(url, {
         method: body === undefined ? 'GET' : 'POST', redirect: 'error', cache: 'no-store',
@@ -213,14 +214,23 @@ export class AccountClient {
       }
       return data
     } catch (error) {
-      if (error instanceof AccountClientError) {
-        if (!overviewRequest) throw error
-        throw new AccountClientError(error.message, error.detail, error.httpStatus ?? httpStatus, error.serverCode,
+      // stage/exception/causeCode 对全部端点富化:登录/支付等失败与 overview 一样需要机器可读归因(支持包按行检索)。
+      const failure = error instanceof AccountClientError
+        ? new AccountClientError(error.message, error.detail, error.httpStatus ?? httpStatus, error.serverCode,
           error.requestStage ?? stage, error.exception, error.causeCode)
+        : new AccountClientError('ACCOUNT_SERVICE_UNAVAILABLE', undefined, httpStatus, undefined,
+          stage, safeExceptionName(error), safeCauseCode(error))
+      // 写操作的网络层失败(未到达业务语义)留痕一次;⛔ 记录请求体或异常原文(可能含凭据)。
+      if (body !== undefined && failure.message === 'ACCOUNT_SERVICE_UNAVAILABLE' &&
+        (['prepare', 'fetch', 'response', 'body'].includes(failure.requestStage ?? '') ||
+          (failure.requestStage === 'http' && (failure.httpStatus ?? 0) >= 500))) {
+        try {
+          this.logFailure?.('account-request-failed', JSON.stringify({ path, code: failure.message, stage: failure.requestStage ?? null,
+            status: failure.httpStatus ?? null, serverCode: failure.serverCode ?? null,
+            exception: failure.exception ?? null, causeCode: failure.causeCode ?? null }))
+        } catch { /* 诊断旁路 ⛔ 挡请求主流程 */ }
       }
-      throw new AccountClientError('ACCOUNT_SERVICE_UNAVAILABLE', undefined, httpStatus, undefined,
-        overviewRequest ? stage : undefined, overviewRequest ? safeExceptionName(error) : undefined,
-        overviewRequest ? safeCauseCode(error) : undefined)
+      throw failure
     }
   }
 
@@ -334,10 +344,10 @@ export class AccountClient {
       current()
       if (!validSession({ ...data, accessToken: this.session.accessToken }) || data.account.id !== this.session.account.id) throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
       this.session = { ...data, accessToken: this.session.accessToken }
-      await this.bindDevice(this.session, signal)
+      const boundId = await this.bindDevice(this.session, signal)
       current()
-      // Both reads use the validated session, allowing the backend to share current usage I/O.
-      const deviceId = await this.store.deviceId?.()
+      // bindDevice 内部已读过一次 store；仅当它返回空（未生成/未确认）才回落再读，⛔ 同一轮双读。
+      const deviceId = boundId ?? await this.store.deviceId?.()
       current()
       // 商业参数串行预取:⛔ 与通道同步请求并发,避免扰动后台按客户的用量串行化。
       await this.ensureTerms(signal)
@@ -801,7 +811,7 @@ export class AccountClient {
 
   /** Fixed business routes only; neither renderer-supplied URLs nor session tokens cross this boundary. */
   async subscription(operation: SubscriptionOperation, input: Record<string, string> = {}): Promise<unknown> {
-    if (operation === 'catalog') return this.request('/v1/subscription/catalog', undefined, undefined, 1024 * 1024)
+    if (operation === 'catalog') return this.request('/v1/subscription/catalog', undefined, undefined, 1024 * 1024, undefined, undefined, catalogTimeoutMs)
     const session = this.session
     if (!session || this.view.state !== 'signed-in') throw new AccountClientError('ACCOUNT_LOGIN_REQUIRED')
     const base = '/v1/subscription/orders'
@@ -817,16 +827,16 @@ export class AccountClient {
       path = `${base}/${input.orderId}${operation === 'detail' ? '' : `/${operation}`}`
       body = operation === 'detail' ? undefined : operation === 'report' ? { issue: input.issue } : {}
     }
-    const data = await this.request(path, body, session.accessToken, 1024 * 1024)
+    const data = await this.request(path, body, session.accessToken, 1024 * 1024, undefined, undefined, catalogTimeoutMs)
     if (this.session?.accessToken !== session.accessToken || this.view.state !== 'signed-in') throw new AccountClientError('ACCOUNT_LOGIN_REQUIRED')
     return data
   }
 
   /** 与 subscription() 同一约束:固定业务路由,渲染进程不提供 URL,会话 token 不过桥。 */
   async sharing(operation: SharingOperation, input: Record<string, string> = {}): Promise<unknown> {
-    if (operation === 'catalog') return this.request('/v1/sharing/catalog', undefined, undefined, 1024 * 1024)
-    if (operation === 'standards') return this.request('/v1/sharing/standard-products', undefined, undefined, 1024 * 1024)
-    if (operation === 'posts') return this.request('/v1/sharing/posts', undefined, undefined, 1024 * 1024)
+    if (operation === 'catalog') return this.request('/v1/sharing/catalog', undefined, undefined, 1024 * 1024, undefined, undefined, catalogTimeoutMs)
+    if (operation === 'standards') return this.request('/v1/sharing/standard-products', undefined, undefined, 1024 * 1024, undefined, undefined, catalogTimeoutMs)
+    if (operation === 'posts') return this.request('/v1/sharing/posts', undefined, undefined, 1024 * 1024, undefined, undefined, catalogTimeoutMs)
     const session = this.session
     if (!session || this.view.state !== 'signed-in') throw new AccountClientError('ACCOUNT_LOGIN_REQUIRED')
     const orderId = /^lx-[a-f0-9]{32}$/
@@ -899,24 +909,30 @@ export class AccountClient {
       path = `${orders}/${input.orderId}${operation === 'detail' ? '' : `/${operation}`}`
       body = operation === 'detail' ? undefined : operation === 'report' ? { issue: input.issue } : {}
     }
-    const data = await this.request(path, body, session.accessToken, 1024 * 1024)
+    const data = await this.request(path, body, session.accessToken, 1024 * 1024, undefined, undefined, catalogTimeoutMs)
     if (this.session?.accessToken !== session.accessToken || this.view.state !== 'signed-in') throw new AccountClientError('ACCOUNT_LOGIN_REQUIRED')
     return data
   }
 
   claimTrial(): Promise<AccountView> { return this.run(async () => {
     if (!this.session) return signedOut('ACCOUNT_LOGIN_REQUIRED', accountMessages.ACCOUNT_LOGIN_REQUIRED)
-    let failed = false
     try { await this.request('/v1/account/trial', {}, this.session.accessToken) }
     catch (error) {
       if (error instanceof AccountClientError && error.message === 'ACCOUNT_LOGIN_REQUIRED') throw error
-      failed = true
+      // A lost response does not prove that provisioning failed. Read back the entitlement.
     }
     await this.setNetwork({ client: new NetworkAccountClient(new URL('v1/network/', this.base!).href),
       session: { accountId: this.session.account.id, accessToken: this.session.accessToken, deviceId: await this.store.deviceId?.() } })
     const view = await this.overview()
-    return { ...view, message: failed ? '暂时无法完成领取，后台已保留领取状态。可重试；从未开通成功且过期的体验可补发一次。'
-      : trialClaimedCopy(this.terms) }
+    if (!view.overview) return { ...view, message: '领取结果暂时无法确认，请稍后刷新权益查看。' }
+    const { usage, retryable } = view.overview.trial
+    const message = !usage ? '暂未确认领取成功，请稍后重试。'
+      : usage.state === 'active' ? trialClaimedCopy(this.terms)
+        : retryable || ['pending', 'queued', 'provisioning'].includes(usage.state) ? '体验领取记录已保存，开通中，可稍后重试。'
+          : usage.state === 'expired' ? '已领取的体验已到期。'
+            : usage.state === 'exhausted' ? '已领取的体验流量已用完。'
+              : '已查到体验记录，但暂时无法确认是否可用，请刷新权益后查看。'
+    return { ...view, message }
   }) }
 
   async recover(username: string, recoveryCode: string, password: string): Promise<RecoveryResult> {

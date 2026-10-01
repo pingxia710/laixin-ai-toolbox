@@ -3,7 +3,7 @@
 import { pendingSettingEntries, pendingSettingEntriesCached, ledgerFailure, ledgerFailureCached } from '../../../sidecar/mac/ledger.mjs'
 import { randomUUID } from 'node:crypto'
 import { readDaemonState, type DaemonStateView } from './status-service'
-import { layout, writeFileAtomic } from './paths'
+import { layout, statSignature, writeFileAtomic } from './paths'
 import { restoreDeadlineMs } from './repair-budget'
 import { firstLineOf } from './failure-log'
 
@@ -11,6 +11,8 @@ export interface SpawnedDaemon {
   readonly pid?: number | undefined
   on(event: 'exit', callback: (code: number | null, signal: string | null) => void): void
   once?(event: 'error', callback: (error: Error) => void): void
+  /** stderr 接流在进程收尾时冲洗尾巴用(actions/tunnel 的接线)。 */
+  once?(event: 'exit', callback: (code: number | null, signal: string | null) => void): void
   /** N-23:deadline 到点杀掉楔死的一次性恢复子进程;真实 ChildProcess 本就带 kill。 */
   kill?(signal?: NodeJS.Signals): unknown
 }
@@ -81,6 +83,9 @@ export interface SupervisorDeps {
   /** Phase 1 ④:结构化失败日志(进 <userData>/logs/tunnel-daemon.log,诊断包收录)。
    *  FB-1 的 UNKNOWN 多来自「现件随进程丢失」——意外退出/叫醒耗尽/恢复非正常退,这里留第一现场。 */
   readonly logFailure?: (event: string, detail?: string) => void
+  /** 叫醒周期的客户意愿闸(生产读意图文件 desired === 'user-disconnected'):客户在叫醒窗口内
+   *  点了断开,下一轮 ⛔ 再把守护叫回来打断他明示的意愿。不给 = 无此闸(行为不变)。 */
+  readonly shouldAbortWake?: () => boolean
 }
 
 export class DaemonSupervisor {
@@ -140,6 +145,12 @@ export class DaemonSupervisor {
 
   /** 主进程自己起一份守护(spawn 老路;含退出检测与退避重启的接线)。 */
   private spawnOwnDaemon(): void {
+    this.spawnTrackedDaemon()
+  }
+
+  /** 发一份守护并接线退出检测:非预期退出记时刻并排退避重启,预期退出只清位。
+   *  首轮与退避重启两处调用点原本逐字节重复——⛔ 各留一份漂移。 */
+  private spawnTrackedDaemon(): void {
     this.runId = randomUUID()
     const child = this.deps.spawnDaemon(this.runId)
     this.daemon = child
@@ -217,20 +228,7 @@ export class DaemonSupervisor {
   }
 
   private spawnRestartDaemon(): void {
-    this.runId = randomUUID()
-    const child = this.deps.spawnDaemon(this.runId)
-    this.daemon = child
-    const exited = () => {
-      if (this.daemon !== child) return
-      this.daemon = undefined
-      if (!this.expectExit) {
-        this.unexpectedExit = { at: Date.now() }
-        this.scheduleNextRestart()
-      }
-      this.expectExit = false
-    }
-    child.on('exit', exited)
-    child.once?.('error', exited)
+    this.spawnTrackedDaemon()
   }
 
   private surrenderAndRestore(): void {
@@ -252,7 +250,9 @@ export class DaemonSupervisor {
     const wait = this.deps.wait ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
     for (let attempt = 0; attempt < RESIDENT_WAKE_BACKOFF_MS.length; attempt += 1) {
       // 客户中途点了退出/断开,或一次性恢复接管了:立刻收手,⛔ 把守护叫回来打断客户明示的意愿。
-      if (this.quitting || this.restoring !== undefined || !this.residentActive()) return
+      // 断开按意图文件判(shouldAbortWake,生产读 user-disconnected)——点断开不设 quitting(那属退出交接)。
+      if (this.quitting || this.restoring !== undefined || !this.residentActive() ||
+          this.deps.shouldAbortWake?.() === true) return
       // 叫醒失败也要探:kickstart 可能报错而守护其实已经起来了(⛔ 拿返回值当结论)。
       // Phase 1 ④:抛错/被拒都留痕——基线「叫不动就靠下一轮」把 reason 全吞了。
       try { await resident.wake() } catch (error) { this.deps.logFailure?.('wake-error', firstLineOf(error)) }
@@ -357,6 +357,7 @@ export class DaemonSupervisor {
   private watchRestore(child: SpawnedDaemon | void): void {
     if (!child) return
     this.restoring = child
+    const stateBefore = statSignature(layout.state(this.deps.dataDir))
     let settled = false
     // deadline 与修复预算同源伸缩(N-23):慢机上一轮合法的恢复就要 2-5 分钟,固定 60s 会把它
     // 拦腰杀掉——那正是「把进行中说成失败」的翻版。按账本待结算条数放大,60s 保底。
@@ -375,8 +376,13 @@ export class DaemonSupervisor {
         this.deps.logFailure?.('restore-failed', failure.code)
         this.recordRestoreFailure(failure)
       } else if (code !== 0) {
-        // 恢复子命令自己的退出码(65=未结算/写权被占):state.json 由子命令写过,这里补一行现场。
         this.deps.logFailure?.('restore-exit', `exit=${String(code)}`)
+        // 原生加载失败可能发生在 JS 入口之前，不能假定子进程一定写过结果。
+        const reported = readDaemonState(this.deps.dataDir)
+        const freshFailure = statSignature(layout.state(this.deps.dataDir)) !== stateBefore &&
+          reported?.state === 'error' && Boolean(reported.code)
+        if (!freshFailure) this.recordRestoreFailure({ code: 'TUNNEL_RESTORE_PROCESS_FAILED',
+          message: '恢复程序意外退出，尚未确认恢复完成；请点击「重试恢复原设置」，仍失败请导出诊断给客服' })
       }
       // 一次性恢复也可清理旧崩溃；否则新权益的配置替换会永远被旧异常挡住。
       const complete = failure === undefined && code === 0 && !ledgerFailure(this.deps.dataDir) &&
@@ -390,7 +396,10 @@ export class DaemonSupervisor {
       done(null, { code: 'TUNNEL_RESTORE_TIMEOUT',
         message: '恢复原设置的操作没能在限定时间内完成，已中止这一轮。请再点一次「重试恢复原设置」；电脑很卡时请等它跑完，不要连续点击' })
     }, deadlineMs)
-    child.on('exit', (code) => done(code))
+    child.on('exit', (code, signal) => {
+      if (signal) this.deps.logFailure?.('restore-signal', signal)
+      done(code)
+    })
     child.once?.('error', () => done(null, { code: 'TUNNEL_RESTORE_SPAWN_FAILED',
       message: '恢复程序未能启动，原设置还没有恢复。请再点一次「重试恢复原设置」；仍不行请重启电脑后重试' }))
   }

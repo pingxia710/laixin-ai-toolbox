@@ -36,6 +36,7 @@ export interface TunnelStatusView {
   readonly expiresAt: string
   readonly pendingAvailable: boolean
   readonly unrestored: string
+  readonly recoveryState?: 'idle' | 'running' | 'required'
   readonly componentMissing: string
   readonly traffic?: string
   /** N-55 控制器阶段；为空表示当前没有受控网络设置动作。 */

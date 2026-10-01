@@ -3,6 +3,7 @@
 import { createHash } from 'node:crypto'
 import { afterEach, describe, expect, it } from 'vitest'
 import { DownloadManager, type DownloadCompletion, type DownloadEngine, type DownloadTransfer } from '../../app/main/download/download-manager'
+import { waitForSettled } from './helpers'
 import { parseCatalog } from '../../app/main/download/catalog'
 import { DOWNLOAD_VERIFY_TIMEOUT } from '../../app/main/download/types'
 import type { ArtifactDigest, DownloadArtifactInspector, DownloadTaskStore, StoredDownloadTask } from '../../app/main/download/types'
@@ -26,6 +27,8 @@ class MemoryStore implements DownloadTaskStore {
   async promotePart(task: StoredDownloadTask) { this.artifacts.add(task.taskId) }
   async deletePart() {}
   async deleteArtifact(task: StoredDownloadTask) { this.deleteArtifactCalls += 1; this.artifacts.delete(task.taskId) }
+  async deleteRecord(taskId: string) { this.tasks.delete(taskId) }
+  async sweepOrphanDirectories(): Promise<number> { return 0 }
   async artifactStatus(task: StoredDownloadTask) {
     return this.artifacts.has(task.taskId) ? { size: artifact.byteLength, mtimeMs: 1000 } : undefined
   }
@@ -70,7 +73,7 @@ async function reachFailure(inspector: DownloadArtifactInspector, tunnel = { sta
   managers.push(manager)
   const task = await manager.start('fixture-dmg')
   engine.transfers[0].finish('completed')
-  const settled = await manager.waitForSettled(task.taskId)
+  const settled = await waitForSettled(manager, task.taskId)
   return { manager, engine, store, task, settled }
 }
 
@@ -98,7 +101,7 @@ describe('校验超时与「不是安装包」分开', () => {
     const retried = await manager.retry(task.taskId)
     expect(retried.taskId).toBe(task.taskId)
     expect(engine.starts).toBe(startsBefore)
-    expect((await manager.waitForSettled(task.taskId)).state).toBe('ready')
+    expect((await waitForSettled(manager, task.taskId)).state).toBe('ready')
     expect(attempt).toBe(2)
   })
 

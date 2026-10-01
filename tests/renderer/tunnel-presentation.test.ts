@@ -12,6 +12,17 @@ function status(partial: Partial<TunnelStatusView>): TunnelStatusView {
 }
 
 describe('网络页状态呈现', () => {
+  it('旧账号配置已隐藏也必须按恢复阶段给动作，不诱导导入新配置', () => {
+    const hidden = status({ state: '异常', currentConfig: '', unrestored: '', message: '原设置恢复待确认' })
+    expect(buildTunnelPresentation({ ...hidden, recoveryState: 'running' })).toMatchObject({
+      headline: '正在恢复原设置', primaryAction: 'none', primaryLabel: '恢复中'
+    })
+    expect(buildTunnelPresentation({ ...hidden, recoveryState: 'required' })).toMatchObject({
+      headline: '原设置尚未恢复', primaryAction: 'stop', primaryLabel: '重试恢复原设置'
+    })
+    expect(buildTunnelPresentation({ ...hidden, state: '未配置', recoveryState: 'idle' })).toMatchObject({ primaryAction: 'guide' })
+  })
+
   it('读取失败或加载中不把状态描绘成已连接', () => {
     expect(buildTunnelPresentation(undefined)).toMatchObject({ headline: '正在读取通道状态', tone: 'neutral', primaryAction: 'none' })
     expect(buildTunnelPresentation(status({ state: '未配置' }))).toMatchObject({ headline: '国外AI需要配置网络', primaryAction: 'guide', primaryLabel: '开始设置网络' })

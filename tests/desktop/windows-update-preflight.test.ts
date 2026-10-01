@@ -25,6 +25,7 @@ interface WindowsPreflightOptions {
   readonly tunnelDataDir?: string
   readonly ownerPid?: number
   readonly ownerExecutable?: string
+  readonly allowRecoveryGuardFallback?: boolean
   readonly recoveryOwnerAlive?: (pid: number) => boolean
   readonly acquireRecoveryMutex?: () => Promise<() => Promise<void>>
   readonly recoveryIdentitySnapshot?: () => Promise<{ ownerStartFileTime: string; workerStartFileTime: string }>
@@ -46,6 +47,9 @@ interface WindowsPreflightOptions {
     }
     readonly transactionId: string
   }) => Promise<number>
+}
+interface WindowsPreflightOutcome {
+  readonly recoveryArmed: boolean
 }
 interface WindowsHelper {
   defaultRecoveryGuardLauncher(options: {
@@ -70,7 +74,7 @@ interface WindowsHelper {
     unref(): void
   }): Promise<number>
   runNative(file: string, args: readonly string[], options?: { timeoutMs?: number }): Promise<NativeResult>
-  windowsPreflight(options: WindowsPreflightOptions, runner?: NativeRunner): Promise<void>
+  windowsPreflight(options: WindowsPreflightOptions, runner?: NativeRunner): Promise<WindowsPreflightOutcome>
   recoverWindowsPreflight(markerPath: string, runner: NativeRunner, transactionId: string): Promise<void>
   commitWindowsPreflight(recoveryDirectory: string, runner: NativeRunner, ownerPid: number, transactionId?: string): Promise<void>
   commitWindowsPreflightCommand(recoveryDirectory: string, runner: NativeRunner, ownerPid: number, transactionId?: string): Promise<void>
@@ -742,6 +746,75 @@ describe('Windows 更新/卸载前置闸', () => {
     }
   })
 
+  it('真卸载的恢复守卫未就绪时降级为无守卫预检，仍须完成任务删除和精确进程停止', async () => {
+    const recoveryDirectory = await mkdtemp(join(tmpdir(), 'laixin-preflight-guard-fallback-'))
+    const f = fixture({ tasks: { [TASKS[0]]: 'Enabled', [TASKS[1]]: 'Disabled' } })
+    try {
+      const outcome = await helper.windowsPreflight({
+        mode: 'uninstall', target: TARGET, executable: EXECUTABLE, residentLabel: LABEL,
+        currentPid: 999, ownerPid: 4242, ownerExecutable: POWERSHELL,
+        recoveryDirectory, now: f.now, recoveryIdentitySnapshot,
+        allowRecoveryGuardFallback: true,
+        launchRecoveryGuard: async () => {
+          throw new Error('UPDATE_RECOVERY_GUARD_TIMEOUT:WAITED_MS_20027')
+        }
+      }, f.runner)
+
+      expect(outcome).toEqual({ recoveryArmed: false })
+      expect([...f.tasks.values()]).toEqual(['missing', 'missing'])
+      expect(f.killed.sort()).toEqual([101, 102])
+      expect(await readFile(join(recoveryDirectory, 'windows-preflight-last-error.log'), 'utf8'))
+        .toContain('UPDATE_RECOVERY_GUARD_BYPASSED GUARD_REASON=UPDATE_RECOVERY_GUARD_TIMEOUT')
+    } finally {
+      await rm(recoveryDirectory, { recursive: true, force: true })
+    }
+  })
+
+  it('升级即使误传降级开关也不绕过恢复守卫', async () => {
+    const recoveryDirectory = await mkdtemp(join(tmpdir(), 'laixin-preflight-update-no-fallback-'))
+    const f = fixture({ tasks: { [TASKS[0]]: 'Enabled' } })
+    try {
+      await expect(helper.windowsPreflight({
+        mode: 'update', target: TARGET, executable: EXECUTABLE, residentLabel: LABEL,
+        currentPid: 999, ownerPid: 4242, ownerExecutable: POWERSHELL,
+        recoveryDirectory, now: f.now, recoveryIdentitySnapshot,
+        allowRecoveryGuardFallback: true,
+        launchRecoveryGuard: async () => {
+          throw new Error('UPDATE_RECOVERY_GUARD_TIMEOUT:WAITED_MS_20027')
+        }
+      }, f.runner)).rejects.toThrow('UPDATE_RECOVERY_GUARD_TIMEOUT')
+
+      expect(f.tasks.get(TASKS[0])).toBe('Enabled')
+      expect(f.killed).toEqual([])
+    } finally {
+      await rm(recoveryDirectory, { recursive: true, force: true })
+    }
+  })
+
+  it('真卸载降级后任务删除失败仍补偿并阻止卸载', async () => {
+    const recoveryDirectory = await mkdtemp(join(tmpdir(), 'laixin-preflight-fallback-cleanup-failure-'))
+    const f = fixture({
+      tasks: { [TASKS[0]]: 'Enabled', [TASKS[1]]: 'Enabled' },
+      deleteCode: { [TASKS[1]]: 5 }
+    })
+    try {
+      await expect(helper.windowsPreflight({
+        mode: 'uninstall', target: TARGET, executable: EXECUTABLE, residentLabel: LABEL,
+        currentPid: 999, ownerPid: 4242, ownerExecutable: POWERSHELL,
+        recoveryDirectory, now: f.now, recoveryIdentitySnapshot,
+        allowRecoveryGuardFallback: true,
+        launchRecoveryGuard: async () => {
+          throw new Error('UPDATE_RECOVERY_GUARD_TIMEOUT:WAITED_MS_20027')
+        }
+      }, f.runner)).rejects.toThrow('UPDATE_RESIDENT_TASK_DELETE_FAILED')
+
+      expect([...f.tasks.values()]).toEqual(['Enabled', 'Enabled'])
+      expect(f.fallbackCalls).toBe(1)
+    } finally {
+      await rm(recoveryDirectory, { recursive: true, force: true })
+    }
+  })
+
   it('commit 撤销 Run 失败：保留 marker+commit，由消费者只重试清理而不回滚已确认新版', async () => {
     const recoveryDirectory = await mkdtemp(join(tmpdir(), 'laixin-preflight-commit-'))
     const guardPid = 997
@@ -837,7 +910,7 @@ describe('Windows 更新/卸载前置闸', () => {
       await expect(helper.commitWindowsPreflight(recoveryDirectory, runner, 4242, oldTransaction)).rejects.toThrow(/UNREGISTER/)
       failUnregister = false
       const fallbackBefore = f.fallbackCalls
-      await expect(helper.windowsPreflight(options, runner)).resolves.toBeUndefined()
+      await expect(helper.windowsPreflight(options, runner)).resolves.toEqual({ recoveryArmed: true })
       const newTransaction = JSON.parse(await readFile(markerPath, 'utf8')).transactionId as string
       expect(newTransaction).not.toBe(oldTransaction)
       expect(f.fallbackCalls).toBe(fallbackBefore) // Commit residue never rolls back the live version.
@@ -885,9 +958,9 @@ describe('Windows 更新/卸载前置闸', () => {
     const f = fixture()
     try {
       await writeFile(join(recoveryDirectory, 'windows-preflight-recovery.json'), '{bad')
-      await expect(helper.windowsPreflight({ mode: 'update', target: TARGET, executable: EXECUTABLE,
+      await expect(helper.windowsPreflight({ mode: 'uninstall', target: TARGET, executable: EXECUTABLE,
         residentLabel: LABEL, currentPid: 999, ownerPid: 4242, ownerExecutable: POWERSHELL,
-        recoveryDirectory, now: f.now }, f.runner)).rejects.toThrow(/MARKER_INVALID/)
+        recoveryDirectory, now: f.now, allowRecoveryGuardFallback: true }, f.runner)).rejects.toThrow(/MARKER_INVALID/)
       expect(f.calls).toEqual([])
     } finally {
       await rm(recoveryDirectory, { recursive: true, force: true })
@@ -1161,8 +1234,9 @@ describe('真实入口守卫', () => {
     expect(preflightMacro).toContain('LAIXIN_PREFLIGHT_OWNER_EXECUTABLE')
     const uninstallMacro = source.slice(source.indexOf('!macro customUnInstall'), source.indexOf('!macroend', source.indexOf('!macro customUnInstall')))
     expect(uninstallMacro).toContain('${GetOptions} $3 "/S" $4')
-    expect(uninstallMacro).toContain('关闭所有来信 AI 工具箱的安装和卸载窗口')
+    expect(uninstallMacro).toContain('检测并修复连接')
     expect(uninstallMacro).toContain('一键诊断')
+    expect(uninstallMacro).not.toContain('请关闭所有来信 AI 工具箱的安装和卸载窗口')
     expect(uninstallMacro).not.toContain('退出码 $7')
     const initMacro = source.slice(source.indexOf('!macro customInit'), source.indexOf('!macroend', source.indexOf('!macro customInit')))
     expect(initMacro).toMatch(/\$INSTDIR\\\$\{APP_EXECUTABLE_FILENAME\}[\s\S]+SetErrorLevel 1[\s\S]+Abort/)
@@ -1173,6 +1247,8 @@ describe('真实入口守卫', () => {
     expect(source).not.toMatch(/taskkill(?:\.exe)?[^\r\n]*\/im\s+"?xray\.exe/i)
     expect(source).not.toMatch(/taskkill(?:\.exe)?[^\r\n]*\/im\s+"?\$\{APP_EXECUTABLE_FILENAME\}/i)
     const helperSource = await readFile(join(__dirname, '..', '..', 'resources', 'update-helper.cjs'), 'utf8')
+    expect(helperSource).toContain("allowRecoveryGuardFallback: mode === 'uninstall'")
+    expect(helperSource).toContain("if (mode === 'uninstall' && outcome.recoveryArmed === false) process.exitCode = 2;")
     const guardSource = await readFile(join(__dirname, '..', '..', 'build', 'windows-recovery-guard.nsi'), 'utf8')
     expect(helperSource).toContain("'windows-preflight-recovery-guard.exe'")
     expect(helperSource).toContain("includes('--laixin-recovery-guard')")
@@ -1190,11 +1266,17 @@ describe('真实入口守卫', () => {
     expect(check).toContain('!insertmacro runLaixinWindowsPreflight uninstall')
     expect(check).toContain('StrCpy $laixinEarlyUninstallTarget "$INSTDIR"')
     expect(check).toContain('StrCpy $laixinEarlyUninstallPreflight $7')
+    expect(check).toMatch(/\$7 == "2"[\s\S]*StrCpy \$laixinEarlyUninstallPreflight "0"[\s\S]*StrCpy \$laixinEarlyUninstallRecoveryArmed "0"/)
     const uninstall = source.slice(source.indexOf('!macro customUnInstall'),
       source.indexOf('!macroend', source.indexOf('!macro customUnInstall')))
     expect(uninstall).toContain('!insertmacro runLaixinWindowsPreflight uninstall')
     expect(uninstall).toContain('lstrcmpiW(w "$laixinEarlyUninstallTarget", w "$INSTDIR")')
     expect(uninstall).toContain('StrCpy $7 $laixinEarlyUninstallPreflight')
+    expect(uninstall).toContain('StrCpy $laixinUninstallRecoveryArmed $laixinEarlyUninstallRecoveryArmed')
+    expect(uninstall).toMatch(/!insertmacro runLaixinWindowsPreflight uninstall[\s\S]*\$7 == "2"[\s\S]*StrCpy \$7 "0"/)
+    const commit = uninstall.indexOf('!insertmacro commitLaixinWindowsPreflight')
+    const commitGuard = uninstall.lastIndexOf('${If} $5 == "uninstall"', commit)
+    expect(uninstall.slice(commitGuard, commit)).toContain('${AndIf} $laixinUninstallRecoveryArmed == "1"')
 
     const root = dirname(requireFromTest.resolve('app-builder-lib/package.json'))
     const template = await readFile(join(root, 'templates', 'nsis', 'uninstaller.nsh'), 'utf8')

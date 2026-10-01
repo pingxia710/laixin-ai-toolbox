@@ -63,7 +63,9 @@ it('macOS 存在旧代理配置时，不能不检查它是否可用就直接拒�
   const script = `
     import cp from 'node:child_process'
     import { syncBuiltinESMExports } from 'node:module'
-    cp.execFileSync = (command, args) => {
+    cp.execFileSync = (command, args, options) => {
+      if (command.endsWith('/bin/proxy-helper') && args[0] === 'request' &&
+          JSON.parse(options.input).op === 'status') return JSON.stringify({ ok: true, version: 3 })
       if(command !== 'networksetup') throw Error('UNEXPECTED_COMMAND')
       if(args[0] === '-listallnetworkservices') return 'An asterisk (*) denotes...\\nWi-Fi\\n'
       if(args[0] === '-getautoproxyurl') return 'Enabled: No\\nURL: (null)\\n'

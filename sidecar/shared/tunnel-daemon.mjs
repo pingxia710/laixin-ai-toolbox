@@ -17,7 +17,7 @@ import { createVlessConnector } from './vless-connector.mjs'
 import { createDaemon, installCrashBailout, readIntent, startPowerEvents, statePath, writeState,
   SHUTDOWN_RESTORE_RETRY_MS, SHUTDOWN_RESTORE_SLOW_MS, SHUTDOWN_RESTORE_SLOW_ROUNDS } from './daemon-core.mjs'
 import { acquireInstanceLock } from './instance-lock.mjs'
-import { guardedResidentSelfHeal, withWriteRight } from './write-right-owner.mjs'
+import { guardedResidentSelfHeal, withWriteRight, writeRightFailure } from './write-right-owner.mjs'
 import { createResidentIntegrityCheck, runResidentSelfHeal } from './resident-integrity.mjs'
 import { ENTRY_STATUS, lastIntent, ledgerFailure, loadLedger } from './ledger.mjs'
 import { createLocalBridge } from './local-bridge.mjs'
@@ -230,8 +230,7 @@ async function main() {
       guarded = attempt()
     }
     if (!guarded.ok) {
-      writeState(dataDir, { state: 'error', code: 'TUNNEL_WRITE_RIGHT_HELD',
-        message: '这台电脑的网络设置正由另一个来信后台管理，本次未改动；请先退出那一份再重试恢复' })
+      writeState(dataDir, { state: 'error', ...writeRightFailure(guarded.reason) })
       process.exitCode = 65
       process.stdout.write(`${JSON.stringify({ restored: 0, keptModified: [], failed: [], writeRight: guarded.reason })}\n`)
       return
@@ -357,18 +356,24 @@ function numberFlag(flags, name, fallback) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
 }
 
-function makeRealClock() {
+// 真时钟:一次性定时器触发即从 Map 自摘(常驻守护按周跑,⛔ 到期条目永驻);interval 条目
+// 保留到显式 clear。pendingTimers 仅供测试观察定时器表规模。
+export function makeRealClock() {
   const timers = new Map()
   let sequence = 0
-  const register = (handle) => {
-    sequence += 1
-    timers.set(sequence, handle)
-    return sequence
-  }
   return {
     now: () => Date.now(),
-    setTimeout: (fn, ms) => register(setTimeout(fn, ms)),
-    setInterval: (fn, ms) => register(setInterval(fn, ms)),
+    setTimeout: (fn, ms) => {
+      sequence += 1
+      const id = sequence
+      timers.set(id, setTimeout(() => { timers.delete(id); fn() }, ms))
+      return id
+    },
+    setInterval: (fn, ms) => {
+      sequence += 1
+      timers.set(sequence, setInterval(fn, ms))
+      return sequence
+    },
     clearTimer: (id) => {
       const handle = timers.get(id)
       if (handle !== undefined) {
@@ -376,11 +381,15 @@ function makeRealClock() {
         clearTimeout(handle)
         timers.delete(id)
       }
-    }
+    },
+    pendingTimers: () => timers.size
   }
 }
 
-main().catch((error) => {
-  logDaemon(`致命错误:${error instanceof Error ? error.message : String(error)}`)
-  process.exit(70)
-})
+// 直接以脚本运行时才启动 main;⛔ 模块被 import(测试拿 makeRealClock)时跑 main 会按用法错误退出。
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((error) => {
+    logDaemon(`致命错误:${error instanceof Error ? error.message : String(error)}`)
+    process.exit(70)
+  })
+}

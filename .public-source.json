@@ -1,5 +1,7 @@
 {
-  "sourceVersion": "0.6.1",
-  "sourceCommit": "45224ffc427894b36b78dd03fac9ed54cfba5a75",
-  "generatedAt": "2026-09-29T07:51:58.820Z"
+  "sourceVersion": "0.6.2",
+  "sourceCommit": "41c5481edbccf4d60ee9bd7efe71df98e35f2f37",
+  "generatedAt": "2026-10-01T09:54:43.520Z",
+  "testFixtureSourceCommit": "72519cc18e86fa798a48e0eee43725440ed1ab5e",
+  "exportFollowup": "Include prepare-sidecar type declaration for public typecheck. Product source remains at sourceCommit."
 }

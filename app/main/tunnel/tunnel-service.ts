@@ -8,10 +8,10 @@ import { parseProxyServer } from '../../../sidecar/win/wininet-values.mjs'
 import { unrestoredEntriesCached } from '../../../sidecar/mac/restore.mjs'
 import { readInstanceLockCached } from '../../../sidecar/shared/instance-lock.mjs'
 import { importAccountConfig, commitPickedConfig, readPackageEntries, type ImportOutcome } from './import-service'
-import { PackageReject, composeRoutes, packageDigest, sha256Hex, validatePackage, type RouteOverlay } from './package-format'
+import { PackageReject, composeRoutes, packageDigest, sha256Hex, validatePackage, type RejectCode, type RouteOverlay } from './package-format'
 import { readCurrentInfo, readPendingInfo, type CurrentInfo } from './import-meta'
 import { parseTarEntries } from './tar'
-import { NetworkAccountError, type AccountConfiguration, type NetworkAccountAccess } from './account-client'
+import { NetworkAccountError, type AccountConfiguration, type ConfigurationCache, type NetworkAccountAccess } from './account-client'
 import { CONNECTION_LEASE_MS, verifyConnectionLease, type ConnectionLease } from './connection-lease'
 import { DiagnosisReporter, type DiagnosisPayload, type DiagnosisStage } from './diagnosis-reporter'
 import { DiagnosticEventQueue, diagnosticEventBelongsToAuthorization, type DiagnosticEvent, type EncryptedQueueCodec } from './diagnostic-event-queue'
@@ -40,6 +40,7 @@ export { repairBudgetMs, REPAIR_BUDGET_BASE_MS, REPAIR_BUDGET_PER_ENTRY_MS, REPA
 /** 入口端口候选:18080 在开发者机器上常被 Tomcat/Jenkins/别的代理占着,占了就换下一个,⛔ 直接报「端口占用」让客户自己找。 */
 export const BRIDGE_PORT_CANDIDATES: readonly number[] = Object.freeze([18080, 18180, 18280, 18380, 18480, 0]) // 0 = 兜底任选空闲口(硬标准:点了连接就要连上)
 export const DEFAULT_LOCAL_SOCKS_PORT = 18081
+const REJECTED_CONFIG_RETRY_MS = 5 * 60_000
 
 /** 仅从当前守护代次、当前活动 macOS 服务的未结算恢复证据里重建接管前代理；Windows 规则不变。 */
 export function diagnosticExistingProxyFromLedger(
@@ -137,6 +138,8 @@ export interface ImportResult extends ActionResult {
 }
 
 export interface TunnelServiceDeps {
+  /** 仅 GUI 显式操作调用；后台守护不弹密码框，只返回受控的本地权限故障。 */
+  readonly ensureProxyAuthorization?: () => Promise<{ code: string; message: string } | undefined>
   readonly dataDir: string
   // 接收方运行平台;缺省按进程平台推导(开发与测试在 mac 上即 macos)。
   readonly platform?: Platform
@@ -203,6 +206,8 @@ export const REPAIR_REASONS: Record<string, string> = {
   '授权失效': '网络授权已到期，请在我的账号查看流量与有效期；修复不会延长或购买套餐。',
   '配额或授权问题': '网络流量或授权不可用，请在我的账号核对权益。',
   'TUNNEL_SETTINGS_NOT_APPLIED': '本机接入设置没有生效。已停止连接，请关闭其他代理后重试；仍失败请复制诊断给客服。',
+  'TUNNEL_PROXY_AUTH_REQUIRED': '需要管理员授权，请点击连接并在 macOS 弹窗中允许；没有管理员密码请联系电脑管理员。',
+  'TUNNEL_PROXY_HELPER_FAILED': '系统代理助手未完成操作，已停止重连。请重新点击连接；仍失败请联系来信客服。',
   'TUNNEL_RESTORE_INCOMPLETE': '原设置仍未恢复：存在其他软件改动或读写失败。已保留现场，请关闭其他代理或 PAC 后重试；仍不行请复制诊断给客服。',
   // N-23:一次性恢复的受控失败从守护/主进程落盘后,修复流程遇到同样要给客户可照做的一句。
   'TUNNEL_RESTORE_TIMEOUT': '恢复原设置这一轮超时被中止。请再点一次「重试恢复原设置」；电脑很卡时请等它跑完，不要连续点击。',
@@ -237,8 +242,16 @@ export class TunnelService {
   private signedOutExplicitly: boolean
   private pausedAccount?: string
   private configCache?: { accountId: string; batchId: string; digest: string; id: string; expiresAt: number; etag: string }
+  // Negative cache is never an authorization/cacheConfiguration entry. Its ETag only
+  // avoids downloading the same rejected bytes; every refresh still checks the server.
+  private rejectedConfiguration?: { access: NetworkAccountAccess; code: RejectCode; digest: string;
+    retryAt: number; candidate?: ConfigurationCache }
   private connectionLease?: { value: ConnectionLease; token: string; sessionToken: string; monotonicDeadline: number }
   private leaseTimer?: ReturnType<typeof setTimeout>
+  // 本地续期(accountTemporary)的自查周期:后台问不到时「按本地有效期继续」是主进程的承诺,
+  // 到期收口 ⛔ 依赖界面轮询 status()(UI 不开就永不断开)。与 leaseTimer 同款:置位即武装、
+  // 清理即拆卸(acceptConnectionLease/clearConnectionLease 都会走到);退出走 clearConnectionLease。
+  private continuationTimer?: ReturnType<typeof setInterval>
   private accountTemporary = false
   private acknowledgementPending = false
   private acknowledgedConfiguration = ''
@@ -311,7 +324,10 @@ export class TunnelService {
       },
       spawnRestore: () => deps.spawnRestore(deps.dataDir),
       resident: deps.resident,
-      logFailure: deps.logFailure
+      logFailure: deps.logFailure,
+      // 叫醒周期的客户意愿闸:客户在叫醒窗口内点了断开(意图 user-disconnected),
+      // 下一轮 ⛔ 再把守护叫回来打断他明示的意愿。intentSnapshot 是记忆化读,轮询开销只剩 stat。
+      shouldAbortWake: () => this.intentSnapshot()?.desired === 'user-disconnected'
     })
     const current = readCurrentInfo(deps.dataDir)
     if (current?.accountId && this.shouldResumeOnBoot(current)) {
@@ -450,6 +466,7 @@ export class TunnelService {
     this.acknowledgedConfiguration = ''
     const next = access ? { client: access.client, session: { ...access.session } } : undefined
     this.accountAccess = next
+    this.rejectedConfiguration = undefined
     this.accountDenied = false
     const previousRequest = this.accountRequestDone
     this.accountRequest?.abort()
@@ -531,12 +548,18 @@ export class TunnelService {
     const assertSession = () => {
       if (this.accountAccess !== access || controller.signal.aborted) throw new NetworkAccountError('NETWORK_SESSION_CHANGED')
     }
+    let config: AccountConfiguration | undefined
     try {
       const cached = this.validConfigCache(access)
+      const rejected = this.rejectedConfiguration
+      const now = this.deps.now()
+      const retryCache = !forConnectionAttempt && cached && this.intentSnapshot()?.desired === 'connected' &&
+        rejected?.access === access && now < rejected.retryAt && now >= rejected.retryAt - REJECTED_CONFIG_RETRY_MS
+        ? rejected.candidate : undefined
       // 网络往返在锁外:后台再慢,互斥锁也只盖住「拿到结果写本地状态」的短窗口。
       // ⛔ 整个往返攥着锁——后台一慢,应用配置/导入配置全吃「另一个通道正在进行」,点什么都没反应;
       // 断开靠中止在途请求自救,其余动作没有这条退路(0.4.x 线上:后台一慢界面像卡死)。
-      const config = await access.client.claim(access.session, controller.signal, cached)
+      config = await access.client.claim(access.session, controller.signal, retryCache ?? cached)
       assertSession()
       if (this.rawStatus().state === DISPLAY_STATES.disconnecting) return rejectedBusy()
       if (this.stopConfirmationPending()) return unconfirmedStop()
@@ -547,8 +570,11 @@ export class TunnelService {
       try {
         const current = readCurrentInfo(this.deps.dataDir)
         if (config.unchanged) {
+          // A 304 for rejected bytes is not a successful validation, lease or receipt.
+          if (retryCache) throw new PackageReject(rejected!.code)
           if (!cached || !this.validConfigCache(access)) throw new NetworkAccountError('NETWORK_RESPONSE_INVALID')
           this.acceptConnectionLease(access, config, current!.configVersion)
+          this.rejectedConfiguration = undefined
           this.accountDenied = false
           await this.resumeAccountConnection(access, assertSession)
           const acknowledgement = this.acknowledgeConfiguration(access, controller.signal)
@@ -664,12 +690,21 @@ export class TunnelService {
         return accountFailure(localCode)
       }
       if (this.accountAccess === access && !(error instanceof NetworkAccountError && error.message === 'NETWORK_SESSION_CHANGED')) {
+        if (error instanceof PackageReject && config && !config.unchanged) {
+          const digest = sha256Hex(config.archive)
+          const previous = this.rejectedConfiguration
+          this.rejectedConfiguration = { access, code: error.code, digest, retryAt: this.deps.now() + REJECTED_CONFIG_RETRY_MS,
+            ...(config.etag === `"${digest}"` ? { candidate: { id: config.id, expiresAt: config.expiresAt, etag: config.etag } } : {}) }
+          if (previous?.access !== access || previous.code !== error.code || previous.digest !== digest) {
+            try { this.deps.logFailure?.('account-config-rejected', error.code) } catch { /* Logging cannot stop a valid old connection. */ }
+          }
+        }
         // 只有后台明确说「不能用了」才断客户的网;后台打不通、回包不对、新包校验不过、登录态 401,
         // 都不是撤销——本地配置没到期就继续用(创始人 09-13:「点连接一定要连上」「前面动不动就死」)。
         const definitive = error instanceof NetworkAccountError && DEFINITIVE_DENIALS.has(error.message)
         if (!definitive && this.retainLocalConnection()) {
           if (error instanceof NetworkAccountError && error.message === 'NETWORK_LOGIN_REQUIRED') this.accountAccess = undefined
-          return localContinuation()
+          return error instanceof PackageReject ? rejectedConfigContinuation(error.code) : localContinuation()
         }
         const previousIntent = this.intentSnapshot()
         const previousAutoPause = previousIntent?.desired === 'user-disconnected' &&
@@ -680,7 +715,7 @@ export class TunnelService {
           error instanceof NetworkAccountError ? error.message : undefined
         this.clearConnectionLease()
         if (!definitive) this.rememberAccountPause()
-        else { this.pausedAccount = undefined; this.configCache = undefined; this.accountDenied = true }
+        else { this.pausedAccount = undefined; this.configCache = undefined; this.rejectedConfiguration = undefined; this.accountDenied = true }
         if (error instanceof NetworkAccountError && error.message === 'NETWORK_LOGIN_REQUIRED') this.accountAccess = undefined
         if (definitive && readCurrentInfo(this.deps.dataDir)?.accountId && !previousAutoPause) {
           this.disconnect('entitlement-denied', autoPauseCode)
@@ -750,6 +785,17 @@ export class TunnelService {
         }
         if (this.accountAccess !== accountAtEntry) return accountFailure('NETWORK_SESSION_CHANGED')
       }
+      const configured = readCurrentInfo(this.deps.dataDir)
+      if (configured !== undefined && missingSidecarComponents(this.platform, this.deps.sidecarDir, {
+        requireSshBinary: configured.protocol !== 'vless-reality'
+      }).length === 0) {
+        const failure = await this.deps.ensureProxyAuthorization?.()
+        if (this.userStopSequence !== stopsAtEntry) {
+          return { outcome: 'cancelled', code: 'TUNNEL_START_CANCELLED', message: '已保持断开状态' }
+        }
+        if (this.accountAccess !== accountAtEntry) return accountFailure('NETWORK_SESSION_CHANGED')
+        if (failure) return { outcome: 'rejected', ...failure }
+      }
       const result = await this.startConnection()
       // FB-1:发起即失败的终态。互斥忙(TUNNEL_BUSY)是「另一个操作在途」不是连不上;
       // cancelled 是客户自己取消——两类 ⛔ 冒充失败终态回传。窗口内客户主动断开同样 ⛔。
@@ -815,6 +861,7 @@ export class TunnelService {
         const proceedLocally = (BACKEND_TRANSIENT_FAILURES.has(checked.code) || loginLapsed) && this.localAuthorizationValid(readCurrentInfo(this.deps.dataDir))
         if (!proceedLocally) return checked
         this.accountTemporary = true
+        this.syncContinuationTimer()
       }
       // 收敛包3·件5:网络请求后重新检查用户意图——同步窗口内的断开,⛔ 被迟到的连接流程顶掉。
       if (intentBefore?.desired === 'connected') {
@@ -871,24 +918,26 @@ export class TunnelService {
     if (repairing) {
       // 修复正在核对配置时持有互斥：先中止它在途的账号请求（让核对立刻收尾），再等它让出互斥，
       // ⛔ 把「另一个通道操作正在进行」红字回给刚点了取消的客户。
-      // 锁也可能被别的操作占着：给 10 秒兜底（N-24）。正常情况锁是短事务，等它让出把断开真正做完；
-      // 但持锁段一旦挂死，⛔ 永久转圈——到点不抢锁，直接写断开意图（意图写不需要锁），守护按意图真停，
-      // 并如实说「不能确认已断开」：要么真停、要么如实说，⛔ 谎称已断开 ⛔ 回 TUNNEL_BUSY 让客户再点。
+      // 锁也可能被别的操作占着：给 10 秒兜底（N-24）。等待走 mutex.acquire 的 FIFO 唤醒
+      // （N-24 延伸:⛔ 200ms 自旋空转）；到点不抢锁，直接写断开意图（意图写不需要锁），
+      // 守护按意图真停，并如实说「不能确认已断开」：要么真停、要么如实说，
+      // ⛔ 谎称已断开 ⛔ 回 TUNNEL_BUSY 让客户再点。等到的锁直接带进 stopConnection,不放手再抢。
       this.accountRequest?.abort()
       await this.accountRequestDone
-      let freed = false
-      const lockDeadline = Date.now() + STOP_LOCK_DEADLINE_MS
-      while (!freed) {
-        const release = this.mutex.tryAcquire()
-        if (release) { release(); freed = true }
-        else if (Date.now() >= lockDeadline) {
-          this.pausedAccount = undefined
-          this.disconnect('user-stop')
-          return { outcome: 'unknown', code: 'TUNNEL_STOP_TIMEOUT',
-            message: '已写入断开意图；通道停止确认超时，请重启工具箱后重试' }
-        }
-        else await new Promise((resolve) => setTimeout(resolve, 200)) // N-25:等待类轮询放宽到 200ms
+      let owned: (() => void) | undefined
+      try { owned = await this.mutex.acquire(AbortSignal.timeout(STOP_LOCK_DEADLINE_MS)) }
+      catch { owned = undefined }
+      if (owned === undefined) {
+        this.pausedAccount = undefined
+        this.disconnect('user-stop')
+        return { outcome: 'unknown', code: 'TUNNEL_STOP_TIMEOUT',
+          message: '已写入断开意图；通道停止确认超时，请重启工具箱后重试' }
       }
+      const result = await this.stopConnection(undefined, 'user-stop', owned)
+      // N-26 轻暂停:客户断开就是暂停(共用 user-disconnected 意图)。落定后确保常驻任务禁用——
+      // 「开机不会自动连接」的主进程侧轻保证;守护自禁(settleResidentTask)仍是主机制,这里是补手。
+      if (result.outcome === 'stopped') this.ensureResidentDisabledAfterSettle()
+      return result
     }
     const result = await this.stopConnection()
     // N-26 轻暂停:客户断开就是暂停(共用 user-disconnected 意图)。落定后确保常驻任务禁用——
@@ -915,23 +964,31 @@ export class TunnelService {
         const stopped = daemon?.state === 'stopped-restored' && daemon.intentToken === stopToken
         const neverStarted = !existsSync(layout.state(this.deps.dataDir)) && !this.supervisor.isRunning()
         // 账本结清不等于后台已停；超时退出仍要靠常驻重启收尾，不能提前撤掉它。
-        if ((stopped || neverStarted) && !ledgerFailure(this.deps.dataDir) &&
-            pendingSettingEntries(this.deps.dataDir).length === 0 && !this.supervisor.isRestoring()) {
+        // N-25:复查走记忆化账本读(supervisor.runRecoveryOnce 同款)——恢复子进程改写账本后
+        // mtime 必变,拿到的必是新账;等待期盘面未变时 ⛔ 每轮全量重读解析。
+        if ((stopped || neverStarted) && !ledgerFailureCached(this.deps.dataDir) &&
+            pendingSettingEntriesCached(this.deps.dataDir).length === 0 && !this.supervisor.isRestoring()) {
           try { await resident.ensureDisabled?.() } catch { /* 已尽力:守护自禁仍是主机制 */ }
           return
         }
-        await new Promise((resolve) => setTimeout(resolve, 100))
+        // N-25:等待类轮询放宽到 200ms(与 supervisor 的恢复等待同款节奏)。
+        await new Promise((resolve) => setTimeout(resolve, 200))
       }
     })()
   }
 
-  private async stopConnection(signal?: AbortSignal, reason: DisconnectReason = 'user-stop'): Promise<ActionResult> {
+  private async stopConnection(signal?: AbortSignal, reason: DisconnectReason = 'user-stop',
+    preAcquired?: () => void): Promise<ActionResult> {
     this.pausedAccount = undefined
     this.clearConnectionLease()
     this.accountRequest?.abort()
     await this.accountRequestDone
-    if (signal?.aborted) return { outcome: 'cancelled', code: 'TUNNEL_REPAIR_CANCELLED', message: '已取消修复' }
-    const release = this.mutex.tryAcquire()
+    if (signal?.aborted) {
+      preAcquired?.() // 带进来的锁不能因取消路径漏放(当前调用面不会同时给两者,防御性收口)
+      return { outcome: 'cancelled', code: 'TUNNEL_REPAIR_CANCELLED', message: '已取消修复' }
+    }
+    // 调用方已等到的锁直接用(stop 的 FIFO 等待路径);⛔ 放手再抢——那会给并发操作插队窗口。
+    const release = preAcquired ?? this.mutex.tryAcquire()
     if (release === undefined) {
       return rejectedBusy()
     }
@@ -1006,12 +1063,7 @@ export class TunnelService {
     // N-23:预算按此刻账本里真正待结算的条数伸缩(⛔ 固定 45 秒——慢机上一轮恢复就要 2-5 分钟)。
     const budgetInput = pendingSettingEntries(this.deps.dataDir).length
     const budget = this.deps.repairTimeoutMs ?? this.deps.repairBudgetMs?.(budgetInput) ?? repairBudgetMs(budgetInput)
-    const timeout = setTimeout(() => {
-      timedOut = true
-      controller.abort()
-      this.accountRequest?.abort()
-      requestStop('repair-timeout')
-    }, budget)
+    let timeout: ReturnType<typeof setTimeout> | undefined
     const check = () => { if (controller.signal.aborted) throw new Error('repair-interrupted') }
     const finish = (outcome: NetworkRepairStatus['outcome'], code: string, message: string) => {
       if (stopFailed) { outcome = 'unknown'; code = 'TUNNEL_REPAIR_LOCAL_FAILURE'; message = '未能写入停止连接指令，无法确认已经断开。请退出工具箱后重开；仍不行请联系来信客服。' }
@@ -1040,6 +1092,19 @@ export class TunnelService {
     }
     try {
       // 按原账本恢复，不清账、不接管他人设置；等待守护确认本次断开，不能拿旧状态过关。
+      const authorizationFailure = await this.deps.ensureProxyAuthorization?.()
+      check()
+      if (authorizationFailure) {
+        finish('still_failing', authorizationFailure.code, authorizationFailure.message)
+        return
+      }
+      // 输入管理员密码使用授权流程自身的有界等待，不消耗网络复验预算。
+      timeout = setTimeout(() => {
+        timedOut = true
+        controller.abort()
+        this.accountRequest?.abort()
+        requestStop('repair-timeout')
+      }, budget)
       await this.stopConnection(controller.signal, 'repair-start')
       check()
       const stopToken = this.intentSnapshot()?.sessionToken
@@ -1184,12 +1249,13 @@ export class TunnelService {
   }
 
   status(): TunnelStatus {
-    if (this.accountTemporary && !this.localAuthorizationValid()) this.expireLocalContinuation()
-    // N-25:一次状态读只碰一次盘——配置信息在这里读一份,一路透传给 rawStatus/computeStatus
-    // 与本函数共用(现状是同一表达式读两三次)。
+    // 只读:本地续期到期收口由 continuationTimer 周期完成(30s),⛔ 在 getter 里做副作用——
+    // status() 被渲染层多路轮询,UI 不开就永远不触发,收口就成了界面开关的函数。
     const currentInfo = readCurrentInfo(this.deps.dataDir)
     const pendingInfo = readPendingInfo(this.deps.dataDir)
-    const status = this.rawStatus(currentInfo, pendingInfo)
+    const observed = this.rawStatus(currentInfo, pendingInfo)
+    const status: TunnelStatus = { ...observed,
+      recoveryState: this.supervisor.isRestoring() ? 'running' : observed.recoveryState ?? 'idle' }
     // 甲-1 返工:常驻接续等待期(开机接续等校准落定 / supervisor 正在叫醒守护)界面必须如实说
     // 「正在接续」。此刻席位是空的,computeStatus 只能算出「已停止并恢复原设置」——客户照着
     // 旁边的「连接通道」按钮点下去,推迟的叫醒一执行就是双守护(Windows 真机实测)。
@@ -1200,9 +1266,14 @@ export class TunnelService {
         this.intentSnapshot()?.desired !== 'user-disconnected') {
       return { ...status, state: DISPLAY_STATES.resuming, message: '正在接续上次的连接，请稍候' }
     }
-    if (this.accountTemporary && !status.unrestored && status.state !== DISPLAY_STATES.disconnecting && !this.stopConfirmationPending()) return { ...status,
-      message: '账号后台暂时问不到，按本地套餐有效期继续提供网络；恢复后自动核验',
-      backend: '后台暂不可达，按本地有效期继续', authorization: '本地配置有效期内，等待重新核验' }
+    if (this.accountTemporary && !status.unrestored && status.state !== DISPLAY_STATES.disconnecting && !this.stopConfirmationPending()) {
+      const rejected = this.rejectedConfiguration?.access === this.accountAccess ? this.rejectedConfiguration : undefined
+      return { ...status,
+        message: rejected ? rejectedConfigContinuation(rejected.code).message
+          : '账号后台暂时问不到，按本地套餐有效期继续提供网络；恢复后自动核验',
+        backend: rejected ? `新配置校验失败：${rejected.code}` : '后台暂不可达，按本地有效期继续',
+        authorization: '本地配置有效期内，等待重新核验' }
+    }
     if (this.pausedAccount && !status.unrestored && (status.state !== DISPLAY_STATES.error || !this.stopConfirmationPending())) return { ...status,
       state: status.state === DISPLAY_STATES.disconnecting ? DISPLAY_STATES.disconnecting : DISPLAY_STATES.error,
       message: status.state === DISPLAY_STATES.disconnecting
@@ -1223,6 +1294,7 @@ export class TunnelService {
     const recoveryActive = this.supervisor.isRunning() || this.supervisor.isRestoring()
     return { ...status, state: status.state === DISPLAY_STATES.disconnecting ? DISPLAY_STATES.disconnecting
       : restoring ? DISPLAY_STATES.error : DISPLAY_STATES.unconfigured,
+      recoveryState: restoring ? recoveryActive ? 'running' : 'required' : 'idle',
       message: ledgerFailure(this.deps.dataDir)?.message ?? (status.state === DISPLAY_STATES.error && this.stopConfirmationPending()
         ? status.message : restoring
         ? recoveryActive ? '账号已退出或切换，正在恢复原设置；请等待完成。若长时间不变，请点击「重试恢复原设置」'
@@ -1515,6 +1587,7 @@ export class TunnelService {
   }
 
   private cacheConfiguration(access: NetworkAccountAccess, config: { id: string; expiresAt: number; etag?: string }, batchId: string, digest: string): void {
+    this.rejectedConfiguration = undefined
     this.configCache = config.etag ? { accountId: access.session.accountId, batchId, digest, id: config.id, expiresAt: config.expiresAt, etag: config.etag } : undefined
   }
 
@@ -1531,6 +1604,7 @@ export class TunnelService {
     this.connectionLease = { value, token: config.lease, sessionToken: access.session.accessToken,
       monotonicDeadline: old?.token === config.lease ? Math.min(old.monotonicDeadline, deadline) : deadline }
     this.accountTemporary = false
+    this.syncContinuationTimer()
     if (this.leaseTimer) clearTimeout(this.leaseTimer)
     this.leaseTimer = undefined
   }
@@ -1559,6 +1633,7 @@ export class TunnelService {
     if (!this.localAuthorizationValid()) return false
     if (this.intentSnapshot()?.desired !== 'connected') return false
     this.accountTemporary = true
+    this.syncContinuationTimer()
     if (this.leaseTimer) clearTimeout(this.leaseTimer)
     this.leaseTimer = undefined
     return true
@@ -1571,11 +1646,31 @@ export class TunnelService {
     this.disconnect('authorization-expired')
   }
 
+  /** accountTemporary 位变化后调用:续期中武装 30s 自查周期,结束即拆卸(leaseTimer 同款纪律)。 */
+  private syncContinuationTimer(): void {
+    if (this.accountTemporary && this.continuationTimer === undefined) {
+      this.continuationTimer = setInterval(() => this.checkLocalContinuationExpiry(), 30_000)
+    } else if (!this.accountTemporary && this.continuationTimer !== undefined) {
+      clearInterval(this.continuationTimer)
+      this.continuationTimer = undefined
+    }
+  }
+
+  /** 周期收口:本地续期只在本地配置有效期内继续;到期即断(与旧 status() 触发同一动作/原因码)。 */
+  private checkLocalContinuationExpiry(): void {
+    if (!this.accountTemporary) { this.syncContinuationTimer(); return }
+    if (!this.localAuthorizationValid()) {
+      this.expireLocalContinuation() // 内部经 clearConnectionLease 拆卸周期
+      this.syncContinuationTimer()
+    }
+  }
+
   private clearConnectionLease(): void {
     if (this.leaseTimer) clearTimeout(this.leaseTimer)
     this.leaseTimer = undefined
     this.connectionLease = undefined
     this.accountTemporary = false
+    this.syncContinuationTimer()
   }
 
   private async acknowledgeConfiguration(access: NetworkAccountAccess, signal: AbortSignal): Promise<void> {
@@ -1719,6 +1814,11 @@ export class TunnelService {
 
 function localContinuation(): ActionResult {
   return { outcome: 'continued', code: 'NETWORK_LEASE_CONTINUATION', message: '账号后台暂时问不到，按本地套餐有效期继续提供网络' }
+}
+
+function rejectedConfigContinuation(code: RejectCode): ActionResult {
+  return { outcome: 'continued', code,
+    message: `新${new PackageReject(code).message}；按本地套餐有效期继续提供网络，正在等待有效的新配置` }
 }
 
 // N-18:「真写入失败」判据,照 ai-access/config-write-fault.ts 先例(具体 fs 错误码,

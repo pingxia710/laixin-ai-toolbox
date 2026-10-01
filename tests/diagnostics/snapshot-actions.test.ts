@@ -165,3 +165,60 @@ it('路径上下文持续读不到时，已明确标为无法核对的矩阵仍�
   const copied = JSON.parse(((await registry.execute('diagnostics.copy', { id: snapshot.id })) as { snapshot: string }).snapshot)
   expect(copied).toMatchObject({ copied: true, stale: false })
 })
+
+it('支持包中段读数并行拉取：总耗时≈最慢一项，且仍夹在两次 captureContext 之间', async () => {
+  vi.useFakeTimers()
+  try {
+    const calls: string[] = []
+    const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+    const registry = new FakeRegistry()
+    const actions: Record<string, (params?: unknown) => unknown> = {
+      'app.info': async () => { calls.push('app.info'); await delay(30); return { version: '0.5.14', platform: 'darwin', architecture: 'arm64', packaged: true } },
+      'tunnel.status': () => { calls.push('tunnel.status'); return { state: '未配置', lastVerifiedAt: '', configVersion: '', nodeLabel: '', unrestored: '', componentMissing: '' } },
+      'tunnel.repairStatus': () => { calls.push('tunnel.repairStatus'); return { running: false, phase: 'idle', outcome: 'idle', code: '', message: '' } },
+      'networkdiagnostics.run': () => { calls.push('networkdiagnostics.run'); return wrapped(network) },
+      'shells.inventory': async () => { calls.push('shells.inventory'); await delay(30); return wrapped([]) },
+      'aiaccess.status': () => { calls.push('aiaccess.status'); return wrapped({ shells: { hermes: { selected: 'deepseek' }, codex: { selected: 'kimi' } } }) },
+      'aiaccess.verifyConfiguration': () => { calls.push('aiaccess.verifyConfiguration'); return wrapped({ hermes: 'ok' }) },
+      'aiaccess.serviceStatus': () => { calls.push('aiaccess.serviceStatus'); return wrapped({ running: true, requests: [], usage: [] }) },
+      'aiaccess.providerConfiguration': () => { calls.push('aiaccess.providerConfiguration'); return wrapped({ endpoint: 'https://api.deepseek.com/' }) },
+      'aiaccess.providerBalance': async (params) => {
+        const provider = (params as { provider: string }).provider
+        calls.push(`balance:${provider}`); await delay(40); return wrapped({ provider, supported: false })
+      },
+      'desktop.status': async () => { calls.push('desktop.status'); await delay(30); return wrapped({}) }
+    }
+    for (const [name, handler] of Object.entries(actions)) registry.handlers.set(name, handler)
+    registerActions(registry as unknown as BridgeRegistry, {
+      now: () => checkedAt + 1_000,
+      createId: () => 'DG-PARALL1',
+      recentFaults: async () => [],
+      recipesVersion: () => 7,
+      installStatus: () => ({ phase: 'idle' }),
+      copyText: clipboardWriteText,
+      collectLocalEgress: async () => ({ platform: 'windows' as const, sampledAt: checkedAt + 900,
+        interface: 'none' as const, ipv4DefaultRoute: 'absent' as const, ipv6DefaultRoute: 'absent' as const })
+    })
+    const pending = registry.execute('diagnostics.run', { software: 'hermes' })
+    let done = false
+    const settled = pending.then(() => { done = true }, () => { done = true })
+    let elapsed = 0
+    while (!done && elapsed < 400) { await vi.advanceTimersByTimeAsync(10); elapsed += 10 }
+    await settled
+    // 串行中段 = 30+30+30+40+40 = 170；并行后只等最慢的余额 40。
+    expect(elapsed).toBeGreaterThanOrEqual(40)
+    expect(elapsed).toBeLessThanOrEqual(40)
+    // 夹逼窗口不变：前次 capture 的读数全部在中段之前，后次 capture 全部在中段之后。
+    expect(calls.indexOf('tunnel.status')).toBeLessThan(calls.indexOf('app.info'))
+    expect(calls.indexOf('aiaccess.verifyConfiguration')).toBeLessThan(calls.indexOf('app.info'))
+    expect(calls.lastIndexOf('aiaccess.verifyConfiguration')).toBeGreaterThan(calls.indexOf('desktop.status'))
+    expect(calls.lastIndexOf('tunnel.status')).toBeGreaterThan(calls.indexOf('desktop.status'))
+    // 读数一项不少、一项不多：中段 5 项 + 两个不同服务商余额各一次。
+    expect(calls.filter((name) => name === 'app.info')).toHaveLength(1)
+    expect(calls.filter((name) => name === 'shells.inventory')).toHaveLength(1)
+    expect(calls.filter((name) => name === 'desktop.status')).toHaveLength(1)
+    expect(calls.filter((name) => name.startsWith('balance:')).sort()).toEqual(['balance:deepseek', 'balance:kimi'])
+  } finally {
+    vi.useRealTimers()
+  }
+})

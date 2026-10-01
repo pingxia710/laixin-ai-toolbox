@@ -110,6 +110,10 @@ export interface DownloadTaskStore {
   promotePart(task: StoredDownloadTask): Promise<void>
   deletePart(task: StoredDownloadTask): Promise<void>
   deleteArtifact(task: StoredDownloadTask): Promise<void>
+  /** 删除任务记录本身(保留策略淘汰旧 ready 工件时用);工件文件走 deleteArtifact。 */
+  deleteRecord(taskId: string): Promise<void>
+  /** 清扫无任何任务记录引用的孤儿下载目录;只删工具箱自己命名规则下的目录。 */
+  sweepOrphanDirectories(): Promise<number>
   artifactStatus(task: StoredDownloadTask): Promise<{ readonly size: number; readonly mtimeMs: number } | undefined>
   hashArtifact(task: StoredDownloadTask): Promise<ArtifactDigest | undefined>
 }

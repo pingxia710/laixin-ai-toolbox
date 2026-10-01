@@ -22,6 +22,14 @@ function dataDirWithUnresolved(count: number): string {
 }
 
 describe('未恢复项汇总不再撑爆 tunnel.status 的结果限长', () => {
+  it('恢复进程启动前崩溃且账本为空，仍明确要求重试恢复', () => {
+    const status = computeStatus({ dataDir: dataDirWithUnresolved(0),
+      daemonState: { state: 'error', code: 'TUNNEL_RESTORE_PROCESS_FAILED', message: '恢复程序意外退出' },
+      daemonUnexpectedExitAt: undefined, componentMissing: [], sshBinary: '' })
+    expect(status).toMatchObject({ state: '异常', recoveryState: 'required', unrestored: '', message: '恢复程序意外退出' })
+    expect(matchesSchema(status, statusResultSchema)).toBe(true)
+  })
+
   it('20 个未恢复服务：动作结果通过 schema 校验并标注「等 20 项」', () => {
     const status = computeStatus({ dataDir: dataDirWithUnresolved(20), daemonState: undefined, daemonUnexpectedExitAt: undefined, componentMissing: [], sshBinary: '' })
     expect(status.unrestored).toContain('等20项')

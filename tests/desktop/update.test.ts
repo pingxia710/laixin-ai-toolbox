@@ -47,6 +47,22 @@ describe('更新信任边界', () => {
     expect(() => readUpdateManifest(envelope({ ...official, version: '0.5.20-test.2' }), publicKey, origin,
       'darwin-arm64', '0.5.20-test.1')).toThrow('UPDATE_MANIFEST_INVALID')
   })
+  it('Intel 特殊5可接续正式版，仍拒绝特殊版发布、缺平台和篡改清单', () => {
+    expect(newerVersion('0.6.2', '0.6.1-special.5')).toBe(true)
+    expect(newerVersion('0.6.1-special.5', '0.6.2')).toBe(false)
+    expect(newerVersion('0.6.1', '0.6.1-special.5')).toBe(true)
+    expect(newerVersion('0.6.2', '0.6.1-special.bad')).toBe(false)
+    const official = { ...release, version: '0.6.2', assets: { 'darwin-x64': asset } }
+    expect(readUpdateManifest(envelope(official), publicKey, origin, 'darwin-x64', '0.6.1-special.5')).toEqual(official)
+    expect(() => readUpdateManifest(envelope({ ...official, version: '0.6.2-special.1' }), publicKey, origin,
+      'darwin-x64', '0.6.1-special.5')).toThrow('UPDATE_MANIFEST_INVALID')
+    expect(() => readUpdateManifest(envelope({ ...official, assets: {} }), publicKey, origin,
+      'darwin-x64', '0.6.1-special.5')).toThrow('UPDATE_PLATFORM_UNAVAILABLE')
+    const tampered = JSON.parse(envelope(official))
+    tampered.payload = Buffer.from(JSON.stringify({ ...official, notes: 'tampered' })).toString('base64')
+    expect(() => readUpdateManifest(JSON.stringify(tampered), publicKey, origin,
+      'darwin-x64', '0.6.1-special.5')).toThrow('UPDATE_SIGNATURE_INVALID')
+  })
   it('只有发布密钥签名的清单和同源更新包才能被接受', () => {
     expect(readUpdateManifest(envelope(release), publicKey, origin, 'darwin-arm64', '0.4.1-unified.12')).toEqual(release)
     const intel = { ...release, assets: { ...release.assets, 'darwin-x64': asset } }

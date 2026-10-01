@@ -344,18 +344,36 @@ export function registerActions(registry: BridgeRegistry, deps: DiagnosticsActio
     const blocked = network.checks.find((check) => check.state === 'attention' || check.state === 'unknown')
     if (blocked) await recordNetworkFault(blocked.code).catch(() => undefined)
     const before = await captureContext(registry, software, network, now, recentFaults, pathContext)
-    const appInfo = await read<DiagnosticsInput['app']>('app.info')
-    const shells = unwrap<Record<string, unknown>[]>(await read('shells.inventory'))
-    const access = unwrap<Record<string, unknown>>(await read('aiaccess.status'))
-    const service = unwrap<Record<string, unknown>>(await read('aiaccess.serviceStatus'))
-    const desktop = unwrap<Record<string, unknown>>(await read('desktop.status'))
-    const balances: Record<string, unknown>[] = []
-    for (const [shell, detail] of Object.entries((access?.shells ?? {}) as Record<string, Record<string, unknown>>)) {
-      const provider = detail.selected
-      if (typeof provider !== 'string' || provider === 'official' || provider === 'zai') continue
-      const balance = unwrap<Record<string, unknown>>(await read('aiaccess.providerBalance', { shell, provider }))
-      if (balance && !balances.some((item) => item.provider === balance.provider)) balances.push(balance)
-    }
+    // 中段补充读数互不依赖：并行拉取，只等最慢一项。⛔ 必须保持在 before/after 两次 captureContext 之间（夹逼核对依赖这个窗口）。
+    const accessRead = read<{ snapshot: string }>('aiaccess.status')
+    const balancesRead = accessRead.then(async (accessSnapshot) => {
+      // 各 shell 余额互不依赖：aiaccess.status 一到就并行读取；去重仍按 shell 迭代顺序保留首个。
+      const selected = Object.entries(((unwrap<Record<string, unknown>>(accessSnapshot)?.shells ?? {}) as Record<string, Record<string, unknown>>))
+        .flatMap(([shell, detail]) => {
+          const provider = detail.selected
+          return typeof provider === 'string' && provider !== 'official' && provider !== 'zai' ? [[shell, provider] as const] : []
+        })
+      const readings = await Promise.all(selected.map(([shell, provider]) =>
+        read<{ snapshot: string }>('aiaccess.providerBalance', { shell, provider })))
+      const balances: Record<string, unknown>[] = []
+      for (const snapshot of readings) {
+        const balance = unwrap<Record<string, unknown>>(snapshot)
+        if (balance && !balances.some((item) => item.provider === balance.provider)) balances.push(balance)
+      }
+      return balances
+    })
+    const [appInfo, shellsSnapshot, accessSnapshot, serviceSnapshot, desktopSnapshot, balances] = await Promise.all([
+      read<DiagnosticsInput['app']>('app.info'),
+      read<{ snapshot: string }>('shells.inventory'),
+      accessRead,
+      read<{ snapshot: string }>('aiaccess.serviceStatus'),
+      read<{ snapshot: string }>('desktop.status'),
+      balancesRead
+    ])
+    const shells = unwrap<Record<string, unknown>[]>(shellsSnapshot)
+    const access = unwrap<Record<string, unknown>>(accessSnapshot)
+    const service = unwrap<Record<string, unknown>>(serviceSnapshot)
+    const desktop = unwrap<Record<string, unknown>>(desktopSnapshot)
     const after = await captureContext(registry, software, network, now, recentFaults, pathContext)
     if (request !== generation) throw new Error('DIAGNOSTIC_CONTEXT_CHANGED')
     if (supportSessionInvalidReason(network, before.context, after.context, after.capturedAt) !== undefined) throw new Error('DIAGNOSTIC_CONTEXT_CHANGED')

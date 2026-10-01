@@ -30,7 +30,7 @@ describe('仅改变工具箱本次下载会话的路由', () => {
     const downloadSession = fixtureSession(item, { clearStorageData: vi.fn(), closeAllConnections: vi.fn() })
     vi.doMock('electron', () => ({ session: { fromPartition: () => downloadSession } }))
     const { ElectronDownloadEngine } = await import('../../app/main/download/electron-download-engine')
-    const transfer = await new ElectronDownloadEngine().start({ taskId: 'interrupt', assetUrl: 'https://downloads.example.cn/app.dmg', allowedHosts: ['downloads.example.cn'], network: 'direct', proxyUrl: '', partPath: '/tmp/interrupt-fixture.part' })
+    const transfer = await new ElectronDownloadEngine().start({ taskId: 'interrupt', resourceId: 'source-routing', assetUrl: 'https://downloads.example.cn/app.dmg', allowedHosts: ['downloads.example.cn'], network: 'direct', proxyUrl: '', partPath: '/tmp/interrupt-fixture.part' })
     item.emit('updated', undefined, 'interrupted')
     item.emit('updated', undefined, 'interrupted')
     expect(await transfer.waitForCompletion()).toMatchObject({ state: 'interrupted', canResume: true })
@@ -56,7 +56,7 @@ describe('仅改变工具箱本次下载会话的路由', () => {
     vi.doMock('electron', () => ({ session: { fromPartition: (partition: string) => { partitions.push(partition); return session } } }))
     const { ElectronDownloadEngine } = await import('../../app/main/download/electron-download-engine')
     const engine = new ElectronDownloadEngine()
-    const request = { taskId: 'source-routing', assetUrl: 'https://downloads.example.cn/app.dmg', allowedHosts: ['downloads.example.cn'], proxyUrl: '', partPath: '/tmp/source-routing-fixture.part' }
+    const request = { taskId: 'source-routing', resourceId: 'source-routing', assetUrl: 'https://downloads.example.cn/app.dmg', allowedHosts: ['downloads.example.cn'], proxyUrl: '', partPath: '/tmp/source-routing-fixture.part' }
     await engine.start({ ...request, network: 'direct' })
     await engine.start({ ...request, network: 'tunnel', proxyUrl: 'http://127.0.0.1:19080' })
     expect(modes).toEqual([{ mode: 'direct' }, { mode: 'fixed_servers', proxyRules: 'http://127.0.0.1:19080', proxyBypassRules: '<-loopback>' }])
@@ -75,8 +75,9 @@ describe('仅改变工具箱本次下载会话的路由', () => {
     vi.doMock('electron', () => ({ session: { fromPartition: (partition: string) => { partitions.push(partition); return downloadSession } } }))
     const { ElectronDownloadEngine } = await import('../../app/main/download/electron-download-engine')
     const engine = new ElectronDownloadEngine()
-    const transfer = await engine.start({ taskId: 'release-partition', sourceId: 'official', assetUrl: 'https://downloads.example.cn/app.dmg', allowedHosts: ['downloads.example.cn'], network: 'direct', proxyUrl: '', partPath: '/tmp/release-fixture.part' })
-    expect(partitions).toEqual(['toolbox-download-release-partition-official'])
+    const transfer = await engine.start({ taskId: 'release-partition', resourceId: 'release-partition', sourceId: 'official', assetUrl: 'https://downloads.example.cn/app.dmg', allowedHosts: ['downloads.example.cn'], network: 'direct', proxyUrl: '', partPath: '/tmp/release-fixture.part' })
+    // 分区名按 resourceId:同资源的换源/重试共用分区,不再随 taskId+sourceId 增长。
+    expect(partitions).toEqual(['toolbox-download-release-partition'])
     expect(partitions[0].startsWith('persist:')).toBe(false)
     expect(clearStorageData).not.toHaveBeenCalled()
     await transfer.release!()
@@ -95,7 +96,7 @@ describe('仅改变工具箱本次下载会话的路由', () => {
     vi.doMock('electron', () => ({ session: { fromPartition: () => downloadSession } }))
     const { ElectronDownloadEngine } = await import('../../app/main/download/electron-download-engine')
     const engine = new ElectronDownloadEngine()
-    const transfer = await engine.start({ taskId: 'stall-watchdog', assetUrl: 'https://downloads.example.cn/app.dmg', allowedHosts: ['downloads.example.cn'], network: 'direct', proxyUrl: '', partPath: '/tmp/stall-fixture.part' })
+    const transfer = await engine.start({ taskId: 'stall-watchdog', resourceId: 'stall-watchdog', assetUrl: 'https://downloads.example.cn/app.dmg', allowedHosts: ['downloads.example.cn'], network: 'direct', proxyUrl: '', partPath: '/tmp/stall-fixture.part' })
     const settled = transfer.waitForCompletion()
     // 传输开始后持续有字节推进:不判 stall。
     for (let second = 1; second <= 6; second += 1) {

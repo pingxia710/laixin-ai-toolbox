@@ -4,7 +4,7 @@
 // 成功应用后清理。取消 / 失败 / 崩溃只清 staging,⛔ 删 current 引用的任何文件。
 import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { layout, writeFileAtomic } from './paths'
+import { layout, statSignature, writeFileAtomic } from './paths'
 
 const BATCH_ID = /^[0-9]{14}-[a-f0-9]{8}$/
 
@@ -15,17 +15,46 @@ function pointerValue(path: string): string | undefined {
   } catch { return undefined }
 }
 
+// N-25:指针文件的盘面签名缓存(statSignature,mtime+size 失效,intentCache/ledgerCache 同一模式)。
+// 状态轮询每轮经 hasInvalidPointers(3×lstat+read)与 readCurrentInfo/readPendingInfo(各 1×lstat+read)
+// 碰指针;指针没动就只剩 stat。指针写入全部走原子替换 + 写侧显式失效,⛔ 依赖时间戳粒度。
+const pointerCache = new Map<string, { key: string; value: string | undefined }>()
+const invalidPointersCache = new Map<string, { key: string; invalid: boolean }>()
+let pointerDiskReadCount = 0
+
+/** 诊断计数:指针文件真实读盘(lstat+read 体)次数,供测试断言读取节奏。 */
+export function pointerDiskReads(): number {
+  return pointerDiskReadCount
+}
+
+function invalidatePointer(path: string): void {
+  pointerCache.delete(path)
+}
+
 export function readPointer(path: string): string | undefined {
+  const key = statSignature(path)
+  const cached = pointerCache.get(path)
+  if (cached !== undefined && cached.key === key) return cached.value
+  pointerDiskReadCount += 1
   const content = pointerValue(path)
-  return content !== undefined && BATCH_ID.test(content) ? content : undefined
+  const value = content !== undefined && BATCH_ID.test(content) ? content : undefined
+  pointerCache.set(path, { key, value })
+  return value
 }
 
 export function hasInvalidPointers(dataDir: string): boolean {
-  return [layout.currentPointer(dataDir), layout.pendingPointer(dataDir), layout.rollbackPointer(dataDir)].some((path) => {
+  const paths = [layout.currentPointer(dataDir), layout.pendingPointer(dataDir), layout.rollbackPointer(dataDir)]
+  const key = paths.map((path) => statSignature(path)).join('|')
+  const cached = invalidPointersCache.get(dataDir)
+  if (cached !== undefined && cached.key === key) return cached.invalid
+  pointerDiskReadCount += 1
+  const invalid = paths.some((path) => {
     try { lstatSync(path) } catch (error) { return (error as NodeJS.ErrnoException).code !== 'ENOENT' }
     const content = pointerValue(path)
     return content === undefined || (content !== '' && !BATCH_ID.test(content))
   })
+  invalidPointersCache.set(dataDir, { key, invalid })
+  return invalid
 }
 
 // 只删本数据目录下的常规批次目录；imports 或批次被换成链接时保留现场。
@@ -48,7 +77,9 @@ export function pendingBatchId(dataDir: string): string | undefined {
 
 export function writePendingPointer(dataDir: string, batchId: string): void {
   if (!BATCH_ID.test(batchId)) throw new Error('TUNNEL_POINTER_INVALID')
-  writeFileAtomic(layout.pendingPointer(dataDir), `${batchId}\n`)
+  const path = layout.pendingPointer(dataDir)
+  writeFileAtomic(path, `${batchId}\n`)
+  invalidatePointer(path)
 }
 
 export type ApplyOutcome =
@@ -83,6 +114,10 @@ export function applyPending(
   if (previousId !== undefined) {
     writeFileAtomic(layout.rollbackPointer(dataDir), `${previousId}\n`)
   }
+  // 写后失效:指针事务内的后续读取(含记忆化)必拿新值。
+  for (const path of [layout.currentPointer(dataDir), layout.pendingPointer(dataDir), layout.rollbackPointer(dataDir)]) {
+    invalidatePointer(path)
+  }
   return { outcome: 'applied', batchId: pendingId, previousBatchId: previousId }
 }
 
@@ -91,7 +126,9 @@ export function reconcilePointers(dataDir: string): void {
   const pendingId = pendingBatchId(dataDir)
   const currentId = currentBatchId(dataDir)
   if (pendingId !== undefined && pendingId === currentId) {
-    writeFileAtomic(layout.pendingPointer(dataDir), '')
+    const path = layout.pendingPointer(dataDir)
+    writeFileAtomic(path, '')
+    invalidatePointer(path)
   }
 }
 

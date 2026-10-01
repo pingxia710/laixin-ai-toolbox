@@ -2,12 +2,12 @@
 // 职责:持账本执行写入与恢复、意图与实际分离(用户主动断开持久化、守护 ⛔ 拉起)、
 // 状态机、五次快速退避后低频同节点恢复、短确认与探测目标故障区分、
 // 父进程消失 → 按账本恢复再退出。全部 I/O 经注入的适配器 / 连接器 / bridge / 时钟。
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { join } from 'node:path'
 import { CONTROL_CODES } from './connectors.mjs'
 import { appendIntentEntry, appendSettingEntry, generateSessionToken, isOptionalSettingService, isSettledSetting, lastIntent, loadLedger, markEntry, pendingSettingEntries, updateSettingEntry, withSettingsLock, assertSettingsLockHeld, SettingsBusyError, ENTRY_STATUS, LedgerError, ledgerFailure } from './ledger.mjs'
-import { clearWriteRightOwner, publishWriteRightOwner, readWriteRightOwner, withWriteRight } from './write-right-owner.mjs'
+import { clearWriteRightOwner, publishWriteRightOwner, readWriteRightOwner, withWriteRight, writeRightFailure } from './write-right-owner.mjs'
 import { markNotifyOwed, rebroadcastSettings, restoreLedger, unrestoredEntries, deepEqual } from './restore.mjs'
 import { AI_SERVICE_PROBE_URLS, probeDirectReachability, probeExistingProxy } from './vless-connector.mjs'
 import { CONNECTION_FLAGS, hexToBlob, readConnectionSettings } from './connection-settings.mjs'
@@ -23,6 +23,8 @@ export const SHUTDOWN_RESTORE_SLOW_MS = 30_000
 export const SHUTDOWN_RESTORE_SLOW_ROUNDS = 60
 const RECOVERY_OWNER_PUBLISH_FAILED = 'TUNNEL_RECOVERY_OWNER_PUBLISH_FAILED'
 const CONTINUITY_HEARTBEAT_MS = 5 * 60_000
+// 连续性留证的 per-key 冷却表上限:超过即先清过期再挤最旧,⛔ 无上限攒 Map(常驻守护按周跑)。
+const CONTINUITY_COOLDOWN_KEYS = 32
 
 // 系统代理守卫(硬标准 09-13 晚:客户点了连接就要连上,⛔ 放弃):另一款代理软件也在守它的设置时,我们每次核对
 // 都改回来,⛔ 止损、⛔ 停网;只在状态里说一句「另一款代理软件在反复修改系统代理」,提示客户关掉它。
@@ -79,6 +81,8 @@ const FATAL_CODES = new Set([
   // 系统代理来回翻的根源。进稳定态等客户显式重新接管,⛔ 退避重连、⛔ 被网络事件唤起。
   'TUNNEL_WRITE_RIGHT_HELD',
   'TUNNEL_WRITE_RIGHT_UNKNOWN',
+  'TUNNEL_PROXY_AUTH_REQUIRED',
+  'TUNNEL_PROXY_HELPER_FAILED',
   // N-55 的有界夺回到顶或恢复合同不可证实后，停止本地承接并按账本保留外部现值；
   // 这不是“第二次争用就停”，而是已经耗尽本意图允许的有证据动作。
   'TUNNEL_AVAILABILITY_RECLAIM_LIMIT',
@@ -154,21 +158,49 @@ export function trafficPath(dataDir) {
   return join(dataDir, 'traffic.json')
 }
 
+// 意图文件读取的记忆化(仿 ledger.loadLedgerCached):500ms 轮询只在 mtime+size 变化时才真正
+// 读盘解析。⛔ 缓存「读失败」与「损坏」结果——损坏改名、下个 tick 重试的语义必须保留(不入缓存,
+// 下次调用自然重读)。意图文件由主进程以 tmp+rename 原子写入,签名变化即失效;rename 后的 corrupt
+// 分支本守护只改名不写回,缓存键随 stat 变化/缺失自洽。
+const intentCache = new Map()
+let intentDiskReadCount = 0
+
+/** 诊断计数:readIntentChecked 真正读盘解析意图文件的次数(供测试与巡检断言)。 */
+export function intentDiskReads() {
+  return intentDiskReadCount
+}
+
 export function readIntentChecked(dataDir) {
   const path = intentPath(dataDir)
-  if (!existsSync(path)) return { intent: undefined, corrupted: false }
+  let stat
+  try { stat = lstatSync(path) } catch { stat = undefined }
+  const key = stat === undefined ? 'missing' : `${stat.mtimeMs}:${stat.size}`
+  const cached = intentCache.get(dataDir)
+  if (cached !== undefined && cached.key === key) return cached.result
+  intentDiskReadCount += 1
+  if (stat === undefined) {
+    const result = { intent: undefined, corrupted: false }
+    intentCache.set(dataDir, { key, result })
+    return result
+  }
   let source
   try {
     source = readFileSync(path, 'utf8')
   } catch {
+    // 瞬时读失败(杀软/同步盘占用)⛔ 入缓存:下个 tick 必须再试盘。
+    intentCache.delete(dataDir)
     return { intent: undefined, corrupted: false }
   }
   try {
-    return { intent: JSON.parse(source), corrupted: false }
+    const result = { intent: JSON.parse(source), corrupted: false }
+    intentCache.set(dataDir, { key, result })
+    return result
   } catch {
     // intent.json 被杀软/同步盘弄脏(收敛包3·件1):改名留证,当「无意图」处理,
     // ⛔ 让 500ms 轮询把守护打死。
     try { renameSync(path, `${path}.corrupt-${Date.now()}`) } catch { /* 改不动就下个 tick 再试 */ }
+    // 损坏结果 ⛔ 入缓存:改名失败时下个 tick 还要再试改名,缓存会把重试冻死。
+    intentCache.delete(dataDir)
     return { intent: undefined, corrupted: true }
   }
 }
@@ -219,7 +251,7 @@ export function installCrashBailout({ dataDir, adapterOf, runId = '', exit = (co
     // 归属判定与恢复在同一把跨进程锁里做(⛔ 判完别人再插进来);锁等不到就不动设置,留给下一个恢复者。
     let restored = false
     let handedOver = false
-    let writeRightHeldByOther = false
+    let writeRightError
     try {
       const adapter = adapterOf()
       // 兜底恢复也是写系统代理(P1):没拿到全局写入权就一个字节都不碰——
@@ -232,7 +264,7 @@ export function installCrashBailout({ dataDir, adapterOf, runId = '', exit = (co
           restored = result.failed.length === 0 && unrestoredEntries(dataDir).length === 0
         }, { owner: `crash:${runId}`, timeoutMs: 5_000 })
       }, log)
-      writeRightHeldByOther = !guarded.ok
+      if (!guarded.ok) { writeRightError = writeRightFailure(guarded.reason); restored = false }
     } catch { /* 账本/适配器/锁不可用也要退出,不能卡死在兜底里 */ }
     try {
       // 拿不到全局写权时也可能是同目录的新守护已经接手；最终状态与恢复权在同一把锁内再核对。
@@ -244,8 +276,8 @@ export function installCrashBailout({ dataDir, adapterOf, runId = '', exit = (co
           code: 'DAEMON_CRASH',
           message: restored
             ? '守护异常退出，已恢复原设置；请重新连接'
-            : writeRightHeldByOther
-              ? '守护异常退出；这台电脑的网络设置正由另一个来信后台管理，本次未改动'
+            : writeRightError
+              ? `守护异常退出；${writeRightError.message}`
               : '守护异常退出，原设置恢复未完成，请重新打开工具箱重试'
         })
       }, { owner: `crash-state:${runId}`, timeoutMs: SETTINGS_BUSY_LOCK_WAIT_MS })
@@ -339,8 +371,7 @@ class DaemonCore {
     this.log = log
     this.continuityEvidence = options.continuityEvidence === true
     this.readContinuityFaces = options.readContinuityFaces
-    this.lastContinuityKey = undefined
-    this.lastContinuityAt = -Infinity
+    this.continuityCooldowns = new Map()
     this.continuityProbeActive = false
     this.continuityPending = undefined
 
@@ -724,7 +755,9 @@ class DaemonCore {
     if (this.transitioning && next.desired === 'connected' && this.intent?.desired !== 'user-disconnected') return
     this.transitioning = true
     const generation = ++this.intentTransitionGeneration
-    void this.applyIntent(next).catch(() => {
+    void this.applyIntent(next).catch((error) => {
+      // 甲-6 同款留证:错误名+截断首行。⛔ 整段吞掉——随后 requestShutdown 很快退出,日志是唯一第一现场。
+      this.log(`意图切换中断[${errorNameOf(error)}]:${firstLineOf(error)}`)
       if (!this.exited && this.intent === next) this.requestShutdown()
     }).finally(() => {
       if (this.intentTransitionGeneration === generation) this.transitioning = false
@@ -1677,7 +1710,7 @@ class DaemonCore {
         if (owner?.kind === 'other' || owner?.kind === 'unknown') {
           lastObservedPortOwner = { listenPort, owner }
         }
-        this.log(`入口端口 ${String(listenPort)} 被占,换下一个候选${listenPort === 0 ? '' : ''}`)
+        this.log(`入口端口 ${String(listenPort)} 被占,换下一个候选`)
         this.bridge = undefined
         continue
       }
@@ -1842,15 +1875,9 @@ class DaemonCore {
 
   /** 拿不到写入权时的受控错误。⛔ 走重连退避——那正是这次反复横跳的来源。 */
   writeRightConflict({ reason, holder }) {
-    if (reason === 'recovery-incomplete') {
-      return Object.assign(new Error('上一次的网络设置尚未完全还原，本次不改动系统设置；请重试恢复'), {
-        code: 'TUNNEL_RESTORE_INCOMPLETE', holder
-      })
-    }
-    if (reason === 'unavailable') {
-      return Object.assign(new Error('无法确认系统代理的归属，本次不改动系统设置'), {
-        code: 'TUNNEL_WRITE_RIGHT_UNKNOWN', holder
-      })
+    if (reason !== 'held') {
+      const failure = writeRightFailure(reason)
+      return Object.assign(new Error(failure.message), { code: failure.code, holder })
     }
     const word = this.peerStateWord(holder)
     const who = holder?.dataDir !== undefined && holder.dataDir !== this.dataDir
@@ -2041,6 +2068,7 @@ class DaemonCore {
         assertSettingsLockHeld(this.dataDir)
         try { this.adapter.write(ref, value) } catch (error) {
           this.failAvailabilityAction(this.availabilityReclaimOperation, 'WRITE_FAILED')
+          if (['TUNNEL_PROXY_AUTH_REQUIRED', 'TUNNEL_PROXY_HELPER_FAILED'].includes(error?.code)) throw error
           throw Object.assign(new Error('本机网络设置夺回写入失败'), { code: 'TUNNEL_AVAILABILITY_WRITE_FAILED', cause: error })
         }
         applied.value = value
@@ -2271,7 +2299,9 @@ class DaemonCore {
       // 复查的拿锁用短上限(撞锁就顺延,见 catch):复查不是要紧着拿锁的路径,⛔ 用默认上限把主线程冻住。
       this.verifySettings(true, { timeoutMs: SETTINGS_BUSY_LOCK_WAIT_MS })
       const { exitIp } = await this.verifyConnection(connector)
-      if (stillCurrent()) { this.applySettings({ timeoutMs: SETTINGS_BUSY_LOCK_WAIT_MS }); this.verifySettings(false, { timeoutMs: SETTINGS_BUSY_LOCK_WAIT_MS }) }
+      // applySettings 内部在 settingsApplied 时已复验一轮(其内 mismatch 会 throw,与再显式 verify 等价);
+      // 稳态下其后零写入,⛔ 再跑第三次逐项读回(Windows 每读 = spawn reg.exe,30s 一拍全是纯重复)。
+      if (stillCurrent()) { this.applySettings({ timeoutMs: SETTINGS_BUSY_LOCK_WAIT_MS }) }
       if (stillCurrent()) {
         this.completeAvailabilityAction(this.availabilityReclaimOperation, { readbackMatches: true, targetReachable: true })
         this.availabilityReclaimOperation = undefined
@@ -3127,9 +3157,22 @@ class DaemonCore {
       const code = extra.code
       const safeCode = typeof code === 'string' && /^[A-Z0-9_]{1,80}$/.test(code) ? code : ''
       const key = `${state}:${safeCode}`
-      if (key === this.lastContinuityKey && now - this.lastContinuityAt < CONTINUITY_HEARTBEAT_MS) return
-      this.lastContinuityKey = key
-      this.lastContinuityAt = now
+      // per-key 冷却:重连风暴里 connecting↔error(code) 交替,只比「上一个 key」会让每次都过闸、
+      // 每次都拉起取证子进程。同 key 心跳窗口内跳过;不同 key 首次必过。
+      const cooledAt = this.continuityCooldowns.get(key)
+      if (cooledAt !== undefined && now - cooledAt < CONTINUITY_HEARTBEAT_MS) return
+      this.continuityCooldowns.delete(key)
+      this.continuityCooldowns.set(key, now)
+      if (this.continuityCooldowns.size > CONTINUITY_COOLDOWN_KEYS) {
+        for (const [staleKey, staleAt] of this.continuityCooldowns) {
+          if (this.continuityCooldowns.size <= CONTINUITY_COOLDOWN_KEYS) break
+          if (now - staleAt >= CONTINUITY_HEARTBEAT_MS) this.continuityCooldowns.delete(staleKey)
+        }
+        for (const [oldestKey] of this.continuityCooldowns) {
+          if (this.continuityCooldowns.size <= CONTINUITY_COOLDOWN_KEYS) break
+          this.continuityCooldowns.delete(oldestKey)
+        }
+      }
       const desired = this.intent?.desired
       const bridge = this.bridge === undefined ? 'absent' : this.bridge.isAlive?.() === false ? 'stopped' : 'present'
       const evidence = { event: 'continuity', phase: 'transition', state, code: safeCode,

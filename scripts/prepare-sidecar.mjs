@@ -1,4 +1,4 @@
-import { copyFileSync, mkdirSync, readdirSync, statSync } from 'node:fs'
+import { copyFileSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { pathToFileURL, fileURLToPath } from 'node:url'
 
@@ -13,6 +13,10 @@ export function prepareSidecar(rootDir = root) {
   for (const platform of platforms) {
     const target = join(rootDir, 'sidecar', platform)
     mkdirSync(target, { recursive: true })
+    // DL-03: old generated copies must not survive a rebuild after retiring download scheduling.
+    for (const retired of ['download-concurrency.mjs', 'download-concurrency.d.mts']) {
+      rmSync(join(target, retired), { force: true })
+    }
     for (const entry of readdirSync(source)) {
       if (!statSync(join(source, entry)).isFile()) continue
       if (entry === 'README.md') continue // shared 自身说明,非运行文件

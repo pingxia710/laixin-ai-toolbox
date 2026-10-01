@@ -53,6 +53,8 @@ export interface TunnelStatus {
   readonly pendingConfig: string
   readonly canApplyPending: boolean
   readonly unrestored: string
+  /** 与配置可见性独立；退出账号后隐藏旧配置不等于无需恢复。 */
+  readonly recoveryState?: 'idle' | 'running' | 'required'
   readonly componentMissing: string
   // 随包 OpenSSH(Windows)有无的如实读数:有/无;非 Windows 为空串不展示。
   readonly sshBinary: string
@@ -169,6 +171,12 @@ export function computeStatus(input: StatusInput): TunnelStatus {
   }
   const active = [DISPLAY_STATES.connected, DISPLAY_STATES.connecting, DISPLAY_STATES.degraded].some((value) => value === state)
   const unresolved = unrestored.filter((entry) => !active || entry.status !== 'applied')
+  const failedRecovery = daemon?.state === 'error' &&
+    (daemon.code?.startsWith('TUNNEL_RESTORE_') === true || daemon.code === 'TUNNEL_WRITE_RIGHT_RELEASE_INCOMPLETE')
+  if (failedRecovery) {
+    state = DISPLAY_STATES.error
+    message = connectionMessage(daemon)
+  }
   if (unresolved.length > 0) {
     state = DISPLAY_STATES.error
     message = `${message ? `${message}；` : ''}原设置尚未恢复，请重试恢复；其他软件修改的设置会保留`
@@ -196,6 +204,7 @@ export function computeStatus(input: StatusInput): TunnelStatus {
     state,
     message,
     pauseReason: '',
+    recoveryState: failedRecovery ? 'required' : 'idle',
     source: info?.sourceLine ?? '',
     authorization: info === undefined ? '' : STATUS_LINES.authorization,
     backend: info === undefined ? '' : STATUS_LINES.backend,
@@ -301,14 +310,12 @@ export function readTrafficObservation(dataDir: string): TrafficObservation | un
     const value = JSON.parse(readFileSync(join(dataDir, 'traffic.json'), 'utf8')) as Record<string, unknown>
     const numericKeys = ['uploadBytes', 'downloadBytes', 'uploadBytesPerSecond', 'downloadBytesPerSecond',
       'activeStreams', 'interruptedStreams', 'updatedAt']
+    // 第二轮字段校验曾是第一轮的严格子集(同五个字段、同一谓词),永不为真——已删除。
     if (value.source !== 'local-proxy-entry' || !Object.entries(value).every(([key, item]) =>
       key === 'source' || (numericKeys.includes(key) && Number.isSafeInteger(item) && (item as number) >= 0))) {
       observation = undefined
     } else {
-      const fields = ['uploadBytes', 'downloadBytes', 'uploadBytesPerSecond', 'downloadBytesPerSecond', 'updatedAt'] as const
-      observation = fields.some((key) => !Number.isSafeInteger(value[key]) || (value[key] as number) < 0)
-        ? undefined
-        : value as unknown as TrafficObservation
+      observation = value as unknown as TrafficObservation
     }
   } catch { observation = undefined }
   trafficCache.set(dataDir, { key: signature, observation })
@@ -385,6 +392,8 @@ export function connectionMessage(daemon: DaemonStateView): string {
   const message = daemon.message || daemon.code || ''
   const instructions: Record<string, string> = {
     'TUNNEL_SETTINGS_NOT_APPLIED': '本机接入设置暂未生效，正在重试写入',
+    'TUNNEL_PROXY_AUTH_REQUIRED': '需要管理员授权，请点击连接并在 macOS 弹窗中允许；没有管理员密码请联系电脑管理员',
+    'TUNNEL_PROXY_HELPER_FAILED': '系统代理助手未完成操作，已停止重连；请重新点击连接，仍失败请联系来信客服',
     // 设置锁忙(甲-5 返工):另一项设置任务占着跨进程设置锁,与通道无关;这两个码可能短暂出现在 state.json。
     // ⛔ 落成裸码——连接失败路径写的就是 message=code,漏映射客户就会看到「SETTINGS_LOCK_BUSY」。
     'SETTINGS_LOCK_BUSY': '系统设置正被电脑上的另一项任务占用，正在等它完成后自动继续；若长时间不变，请重启那个程序',
@@ -411,6 +420,8 @@ export function connectionMessage(daemon: DaemonStateView): string {
     'TUNNEL_AVAILABILITY_EVIDENCE_CHANGED': '无法安全自动处理：网络路径或冲突对象在操作期间发生变化，正在等待重新取证',
     'TUNNEL_WRITE_RIGHT_HELD': '这台电脑的网络设置正由另一个来信后台管理，本次没有改动；请先退出那一份，再点击重新连接',
     'TUNNEL_WRITE_RIGHT_UNKNOWN': '暂时无法确认系统代理归属，本次没有改动网络设置；请点击重新连接，若仍不行请联系来信客服',
+    'TUNNEL_WRITE_RIGHT_RELEASE_INCOMPLETE': '网络设置处理后，尚未确认交还管理权；请点击「重试恢复原设置」完成收尾',
+    'TUNNEL_RESTORE_PROCESS_FAILED': '恢复程序意外退出，尚未确认恢复完成；请点击「重试恢复原设置」，仍失败请导出诊断给客服',
     // N-23:一次性恢复的两类受控失败(supervisor 落盘)。基线是静默吞掉,客户对着「未完成(进程中断)」永远转圈。
     'TUNNEL_RESTORE_TIMEOUT': '恢复原设置这一轮没有在限定时间内完成，已中止。请再点一次「重试恢复原设置」；电脑很卡时请等它跑完，不要连续点击',
     'TUNNEL_RESTORE_SPAWN_FAILED': '恢复程序未能启动，原设置还没有恢复。请再点一次「重试恢复原设置」；仍不行请重启电脑后重试'

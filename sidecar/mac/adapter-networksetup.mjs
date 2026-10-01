@@ -6,6 +6,7 @@ import { execFileSync } from 'node:child_process'
 import { ConnectorError, CONTROL_CODES } from './connectors.mjs'
 import { isOurProxy } from './proxy-identity.mjs'
 import { resolveActiveNetworkPath } from './active-network-path.mjs'
+import { proxyRequest } from './proxy-privilege.mjs'
 
 if (process.env.TOOLBOX_REAL_NETWORK_ADAPTER !== '1') {
   throw new Error('REAL_ADAPTER_GUARD:真实网络适配器未获放行(TOOLBOX_REAL_NETWORK_ADAPTER!=1)')
@@ -16,17 +17,19 @@ if (process.env.TOOLBOX_REAL_NETWORK_ADAPTER !== '1') {
 const AUTO_PROXY_ITEM = 'auto-proxy'
 
 const PROXY_ITEMS = Object.freeze([
-  { item: 'web-proxy', read: '-getwebproxy', write: '-setwebproxy', state: '-setwebproxystate' },
-  { item: 'secure-web-proxy', read: '-getsecurewebproxy', write: '-setsecurewebproxy', state: '-setsecurewebproxystate' },
-  { item: 'socks-proxy', read: '-getsocksfirewallproxy', write: '-setsocksfirewallproxy', state: '-setsocksfirewallproxystate' }
+  { item: 'web-proxy', read: '-getwebproxy' },
+  { item: 'secure-web-proxy', read: '-getsecurewebproxy' },
+  { item: 'socks-proxy', read: '-getsocksfirewallproxy' }
 ])
 
-export function createAdapter() {
+export function createAdapter({ writeProxy = (ref, value, options) => proxyRequest({
+  op: options?.restoring ? 'restore' : 'write', ref, value
+}) } = {}) {
   const proxySnapshots = new WeakMap()
   return {
     // 已有代理不再是拒绝理由(发布审查 R4 / 创始人 09-13 晚标准):能出外网就复用(守护先探),出不了就接管,
     // 原值记进账本、退出还回去。这里只保留「读不到系统代理」这类真正的前置失败。
-    preflight() {},
+    preflight() { proxyRequest({ op: 'status' }) },
     // N-55:接管动作取证和目标实测结束后都读取默认路由与唯一映射服务；切到另一条网络服务即作废旧路径证据。
     currentPathIdentity() {
       const active = activeNetworkPath()
@@ -113,24 +116,15 @@ export function createAdapter() {
       const output = run('networksetup', [item.read, itemRef.service])
       return parseProxy(output)
     },
-    write(itemRef, value) {
-      if (itemRef?.item === AUTO_PROXY_ITEM) { assertService(itemRef); writeAutoProxy(itemRef.service, value); return }
-      const item = proxyItem(itemRef)
-      if (value === null) {
-        run('networksetup', [item.state, itemRef.service, 'off'])
-        return
+    write(itemRef, value, options) {
+      if (itemRef?.item === AUTO_PROXY_ITEM) {
+        assertService(itemRef)
+        if (value !== null && !isAutoProxyValue(value)) throw settingsError('系统 PAC 设置值无效')
+      } else {
+        proxyItem(itemRef)
+        if (value !== null && !isProxyValue(value)) throw settingsError('系统代理设置值无效')
       }
-      if (!isProxyValue(value)) throw settingsError('系统代理设置值无效')
-      // networksetup 在关闭代理时仍会保留服务器和端口；恢复该类原值时先写回地址再关闭。
-      if (value.enabled === false) {
-        if (value.host !== '' || value.port !== 0) {
-          run('networksetup', [item.write, itemRef.service, value.host, String(value.port)])
-        }
-        run('networksetup', [item.state, itemRef.service, 'off'])
-        return
-      }
-      run('networksetup', [item.write, itemRef.service, value.host, String(value.port)])
-      run('networksetup', [item.state, itemRef.service, 'on'])
+      writeProxy(itemRef, value, options)
     }
   }
 }
@@ -146,14 +140,6 @@ function isAutoProxyValue(value) {
 
 function assertService(itemRef) {
   if (typeof itemRef?.service !== 'string' || itemRef.service === '') throw settingsError('系统网络服务无效')
-}
-
-// PAC 写入:-setautoproxyurl 会顺手把开关打开,所以「关着但保留地址」要先写地址再关;地址为空只动开关。
-function writeAutoProxy(service, value) {
-  if (value === null) { run('networksetup', ['-setautoproxystate', service, 'off']); return }
-  if (!isAutoProxyValue(value)) throw settingsError('系统 PAC 设置值无效')
-  if (value.url !== '') run('networksetup', ['-setautoproxyurl', service, value.url])
-  run('networksetup', ['-setautoproxystate', service, value.enabled ? 'on' : 'off'])
 }
 
 function proxyItem(itemRef) {
@@ -237,7 +223,10 @@ function parseFields(output) {
 // networksetup -getautoproxyurl 的读数:「URL: …」+「Enabled: Yes/No」;没设过时 URL 是 (null)。
 function readAutoProxyUrl(service) {
   const fields = parseFields(run('networksetup', ['-getautoproxyurl', service]))
-  const url = fields.URL ?? ''
+  const url = fields.URL
+  if (!['Yes', 'No'].includes(fields.Enabled) || typeof url !== 'string') {
+    throw settingsError('无法核对系统自动代理读数')
+  }
   return { enabled: fields.Enabled === 'Yes', url: url === '(null)' ? '' : url }
 }
 

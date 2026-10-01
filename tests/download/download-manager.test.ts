@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { registerDownloadActions } from '../../app/main/actions/download'
 import { BridgeRegistry } from '../../app/main/bridge/bridge-registry'
 import { DownloadManager, type DownloadCompletion, type DownloadEngine, type DownloadTransfer } from '../../app/main/download/download-manager'
+import { waitForSettled } from './helpers'
 import { parseCatalog } from '../../app/main/download/catalog'
 import type { ArtifactDigest, DownloadArtifactInspector, DownloadTaskStore, StoredDownloadTask, TunnelSnapshot } from '../../app/main/download/types'
 
@@ -75,6 +76,14 @@ class MemoryStore implements DownloadTaskStore {
   async deleteArtifact(task: StoredDownloadTask): Promise<void> {
     void task
   }
+  deletedRecords: string[] = []
+  async deleteRecord(taskId: string): Promise<void> {
+    this.deletedRecords.push(taskId)
+    this.tasks.delete(taskId)
+  }
+  async sweepOrphanDirectories(): Promise<number> {
+    return 0
+  }
   async artifactStatus(task: StoredDownloadTask): Promise<{ size: number; mtimeMs: number } | undefined> {
     void task
     return { size: artifact.byteLength, mtimeMs: 1_000 }
@@ -90,6 +99,7 @@ class ControlledTransfer implements DownloadTransfer {
   private readonly completionWaiters: Array<(value: DownloadCompletion) => void> = []
   cancelled = false
   resumed = false
+  readonly calls: string[] = []
 
   onProgress(listener: (receivedBytes: number, totalBytes: number) => void): void {
     this.progressListeners.push(listener)
@@ -100,8 +110,14 @@ class ControlledTransfer implements DownloadTransfer {
   }
 
   cancel(): void {
+    this.calls.push('cancel')
     this.cancelled = true
     this.finish('cancelled', false)
+  }
+
+  release(): Promise<void> {
+    this.calls.push('release')
+    return Promise.resolve()
   }
 
   resume(): void {
@@ -190,7 +206,7 @@ it('安装包打开失败保留已核验文件，下一次只重新核验并打�
   const manager = new DownloadManager({ catalog, engine, store, inspector, tunnel: () => connectedTunnel,
     installerHandoff: async () => { if (++attempts === 1) throw new Error('temporary open failure'); return 'opened' } })
   managers.push(manager)
-  const task = await manager.start('fixture-dmg'); engine.transfers[0].finish('completed'); await manager.waitForSettled(task.taskId)
+  const task = await manager.start('fixture-dmg'); engine.transfers[0].finish('completed'); await waitForSettled(manager, task.taskId)
   expect(await manager.openInstaller(task.taskId)).toMatchObject({ state: 'ready', reason: 'installer-open-failed' })
   expect(await manager.openInstaller(task.taskId)).toMatchObject({ state: 'handed-off-install' })
   expect(engine.starts).toHaveLength(1)
@@ -222,7 +238,7 @@ describe('下载任务状态机', () => {
     expect(task.state).toBe('downloading')
     expect(sourceEngine.requests[0]).toMatchObject({ network: 'direct', proxyUrl: '', assetUrl: 'http://127.0.0.1:8080/primary.dmg' })
     sourceEngine.transfers[0].finish('completed')
-    expect((await manager.waitForSettled(task.taskId)).state).toBe('ready')
+    expect((await waitForSettled(manager, task.taskId)).state).toBe('ready')
   })
 
   it('主渠道启动失败会换备用渠道，同一任务仍执行原包校验', async () => {
@@ -233,7 +249,7 @@ describe('下载任务状态机', () => {
     expect(sourceEngine.requests.map((r) => r.assetUrl)).toEqual(['http://127.0.0.1:8080/primary.dmg', 'http://127.0.0.1:8080/backup.dmg'])
     expect(new Set(sourceEngine.requests.map((r) => r.taskId)).size).toBe(1)
     sourceEngine.transfers[0].finish('completed')
-    expect((await manager.waitForSettled(task.taskId)).localSha256).toBe(sha256)
+    expect((await waitForSettled(manager, task.taskId)).localSha256).toBe(sha256)
   })
 
   it('中途不可恢复的断网换备用源，但备用源返回网页仍拒绝安装', async () => {
@@ -243,7 +259,7 @@ describe('下载任务状态机', () => {
     sourceEngine.transfers[0].finish('interrupted')
     await expect.poll(() => sourceEngine.transfers.length).toBe(2)
     sourceEngine.transfers[1].finish('completed', false, 'text/html')
-    expect(await manager.waitForSettled(task.taskId)).toMatchObject({ state: 'failed', reason: 'not-installer' })
+    expect(await waitForSettled(manager, task.taskId)).toMatchObject({ state: 'failed', reason: 'not-installer' })
     expect(sourceEngine.requests.length).toBe(2)
   })
 
@@ -254,7 +270,7 @@ describe('下载任务状态机', () => {
     sourceEngine.transfers[0].finish('interrupted')
     await expect.poll(() => sourceEngine.transfers.length).toBe(2)
     sourceEngine.transfers[1].finish('interrupted')
-    expect((await manager.waitForSettled(task.taskId)).state).toBe('needs-tunnel')
+    expect((await waitForSettled(manager, task.taskId)).state).toBe('needs-tunnel')
     expect(sourceEngine.requests.every((r) => r.network === 'direct')).toBe(true)
   })
 
@@ -266,7 +282,17 @@ describe('下载任务状态机', () => {
     await expect.poll(() => sourceEngine.transfers.length).toBe(2)
     expect(sourceEngine.transfers[0].cancelled).toBe(true)
     sourceEngine.transfers[1].finish('completed')
-    expect((await manager.waitForSettled(task.taskId)).state).toBe('ready')
+    expect((await waitForSettled(manager, task.taskId)).state).toBe('ready')
+  })
+
+  it('换备用源时先 cancel 再 release,⛔ release 后才 cancel——连接已断仍可能回包', async () => {
+    const sourceEngine = new SourceEngine()
+    const { manager } = createManager(stoppedTunnel, sourceEngine, new MemoryStore(), () => false, multiSourceCatalog())
+    await manager.start('fixture-dmg')
+    sourceEngine.transfers[0].finish('interrupted', true)
+    await expect.poll(() => sourceEngine.transfers.length).toBe(2)
+    // 与 beginTransfer 启动后取消路径(:179-182)同一顺序:先 cancel 传输,再释放引擎会话。
+    expect(sourceEngine.transfers[0].calls).toEqual(['cancel', 'release'])
   })
 
   it('已有通道时可在两个直连渠道失败后使用境外备用', async () => {
@@ -279,7 +305,7 @@ describe('下载任务状态机', () => {
     await expect.poll(() => sourceEngine.transfers.length).toBe(3)
     expect(sourceEngine.requests[2]).toMatchObject({ network: 'tunnel', proxyUrl: connectedTunnel.localProxyUrl })
     sourceEngine.transfers[2].finish('completed')
-    expect((await manager.waitForSettled(task.taskId)).state).toBe('ready')
+    expect((await waitForSettled(manager, task.taskId)).state).toBe('ready')
   })
 
   it('客户取消下载后不会启动备用来源', async () => {
@@ -314,7 +340,7 @@ describe('下载任务状态机', () => {
     const started = await manager.start('fixture-dmg')
     engine.transfers[0].emitProgress(4)
     engine.transfers[0].finish('completed')
-    await manager.waitForSettled(started.taskId)
+    await waitForSettled(manager, started.taskId)
 
     await expect(manager.status(started.taskId)).resolves.toMatchObject({
       state: 'ready',
@@ -331,14 +357,14 @@ describe('下载任务状态机', () => {
     const { manager, engine } = createManager(connectedTunnel)
     const resumable = await manager.start('fixture-dmg')
     engine.transfers[0].finish('interrupted', true)
-    await manager.waitForSettled(resumable.taskId)
+    await waitForSettled(manager, resumable.taskId)
     await expect(manager.resume(resumable.taskId)).resolves.toMatchObject({ state: 'downloading' })
     expect(engine.transfers[0].resumed).toBe(true)
 
     await manager.cancel(resumable.taskId)
     const terminal = await manager.start('fixture-dmg')
     engine.transfers[1].finish('interrupted', false)
-    await manager.waitForSettled(terminal.taskId)
+    await waitForSettled(manager, terminal.taskId)
     await expect(manager.resume(terminal.taskId)).rejects.toThrow('DOWNLOAD_RESUME_NOT_ALLOWED')
     await expect(manager.retry(terminal.taskId)).resolves.toMatchObject({ taskId: expect.not.stringMatching(new RegExp(`^${terminal.taskId}$`)) })
   })
@@ -367,7 +393,7 @@ describe('终态从活动表移除传输对象(审计 R5)', () => {
     for (let round = 0; round < 3; round += 1) {
       const task = await manager.start('fixture-dmg')
       engine.transfers.at(-1)!.finish('completed')
-      expect((await manager.waitForSettled(task.taskId)).state).toBe('ready')
+      expect((await waitForSettled(manager, task.taskId)).state).toBe('ready')
     }
     expect(activeOf(manager).size).toBe(0)
   })
@@ -376,13 +402,13 @@ describe('终态从活动表移除传输对象(审计 R5)', () => {
     const cancelled = createManager(connectedTunnel)
     const c1 = await cancelled.manager.start('fixture-dmg')
     cancelled.engine.transfers[0].finish('cancelled')
-    expect((await cancelled.manager.waitForSettled(c1.taskId)).state).toBe('cancelled')
+    expect((await waitForSettled(cancelled.manager, c1.taskId)).state).toBe('cancelled')
     expect(activeOf(cancelled.manager).size).toBe(0)
 
     const interrupted = createManager(connectedTunnel)
     const c2 = await interrupted.manager.start('fixture-dmg')
     interrupted.engine.transfers[0].finish('interrupted', false)
-    expect((await interrupted.manager.waitForSettled(c2.taskId)).state).toBe('interrupted-terminal')
+    expect((await waitForSettled(interrupted.manager, c2.taskId)).state).toBe('interrupted-terminal')
     expect(activeOf(interrupted.manager).size).toBe(0)
   })
 })
@@ -456,7 +482,7 @@ describe('下载校验三态:签名是信任根,快照只判「变没变」', ()
   async function settle(manager: DownloadManager, engine: FakeEngine, resourceId: string): Promise<StoredDownloadTask> {
     const started = await manager.start(resourceId)
     engine.transfers[0].finish('completed')
-    return manager.waitForSettled(started.taskId)
+    return waitForSettled(manager, started.taskId)
   }
 
   it('签名一致且快照一致 ⇒ 一致 ⇒ 放行(读数与 f08133d 一致)', async () => {
@@ -512,7 +538,7 @@ describe('下载校验三态:签名是信任根,快照只判「变没变」', ()
     const started = (await registry.execute('download.start', { resourceId: 'pinned-dmg' })) as { taskId: string; state: string }
     expect(started.state).toBe('downloading')
     engine.transfers[0].finish('completed')
-    await manager.waitForSettled(started.taskId)
+    await waitForSettled(manager, started.taskId)
 
     const status = (await registry.execute('download.status', { taskId: started.taskId })) as {
       state: string

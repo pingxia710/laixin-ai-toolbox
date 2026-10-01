@@ -52,11 +52,12 @@ export function createAdapter(env = process.env) {
     ...(env.FAKE_WRITE_RIGHT === undefined ? {} : {
       acquireWriteRight: () => {
         if (env.FAKE_WRITE_RIGHT === 'held') return { acquired: false, reason: 'held' }
+        if (['unavailable', 'recovery-incomplete'].includes(env.FAKE_WRITE_RIGHT)) return { acquired: false, reason: env.FAKE_WRITE_RIGHT }
         writeRightHeld = true
         return {
           acquired: true,
           abandoned: env.FAKE_WRITE_RIGHT === 'abandoned',
-          release: () => { writeRightHeld = false }
+          release: () => { writeRightHeld = false; return env.FAKE_WRITE_RIGHT !== 'release-incomplete' }
         }
       }
     }),
