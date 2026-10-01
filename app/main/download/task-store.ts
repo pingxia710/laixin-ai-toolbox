@@ -40,6 +40,12 @@ export function createFileTaskStore(root: string): DownloadTaskStore {
     },
     deletePart: async (task) => removeTaskPath(root, task.partPath),
     deleteArtifact: async (task) => removeTaskPath(root, task.artifactPath),
+    deleteRecord: async (taskId) => {
+      // taskId 先过与读取一致的字符白名单,⛔ 路径段注入。
+      if (!/^[a-zA-Z0-9-]{1,100}$/.test(taskId)) return
+      await rm(withinRoot(recordsRoot, `${taskId}.json`), { force: true })
+    },
+    sweepOrphanDirectories: async () => sweepOrphanDownloadDirectories(root, await listTasks(recordsRoot)),
     artifactStatus: async (task) => {
       if (task.artifactPath === '') return undefined
       try {

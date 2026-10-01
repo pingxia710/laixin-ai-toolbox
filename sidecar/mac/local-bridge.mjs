@@ -10,7 +10,6 @@ import { TUNNEL_PROBE_URLS, probeTunnelReachability, verifyWithFallback } from '
 import { CONTROL_CODES, ConnectorError } from './connectors.mjs'
 import { validVerifyFallbackUrl } from './vless-settings.mjs'
 import { lockHolderAlive } from './ledger.mjs'
-import { createDeliveryOptimizationAdmission, createProxyDestinationAdmissionTransform } from './download-concurrency.mjs'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 
@@ -190,8 +189,7 @@ export function createLocalBridge(options) {
           if (failure !== undefined) break
           if (await probeSocks(xrayPort)) {
             const detector = createFailureDetector({ onDegraded: () => degraded?.() })
-            const listener = await startTrafficRelay(requestedPort, xrayPort, traffic, relaySockets, options.idleStreamMs, detector,
-              createDeliveryOptimizationAdmission())
+            const listener = await startTrafficRelay(requestedPort, xrayPort, traffic, relaySockets, options.idleStreamMs, detector)
             relay = listener.server
             port = listener.port
             if (await probeSocks(port)) return
@@ -244,10 +242,9 @@ export function createLocalBridge(options) {
   }
 }
 
-function startTrafficRelay(port, targetPort, traffic, sockets, idleStreamMs = IDLE_STREAM_MS, detector = createFailureDetector(), downloadAdmission = createDeliveryOptimizationAdmission()) {  return new Promise((resolve, reject) => {
+function startTrafficRelay(port, targetPort, traffic, sockets, idleStreamMs = IDLE_STREAM_MS, detector = createFailureDetector()) {  return new Promise((resolve, reject) => {
     const server = createServer((client) => {
       const upstream = connect({ host: '127.0.0.1', port: targetPort })
-      const destinationAdmission = createProxyDestinationAdmissionTransform(downloadAdmission)
       sockets.add(client); sockets.add(upstream)
       // 「在途流」= 这条连接**此刻正在往回吐回答**。⛔ 记它连的是谁。
       // 起算点是正文第一个字节,⛔ 上游回的第一个字节——relay 与 xray 之间走 SOCKS5,
@@ -267,9 +264,15 @@ function startTrafficRelay(port, targetPort, traffic, sockets, idleStreamMs = ID
         life.streaming = false
         traffic.activeStreams = Math.max(0, traffic.activeStreams - 1)
       }
+      // 剩余窗口过半就不重挂(64KB 流式 ≈ 320 次/秒的 clearTimeout+setTimeout 纯属空转);
+      // 计时基准是挂表时刻,最坏让销账早到半个窗口,下一个字节会重新挂表补回。
+      let idleArmedAt = 0
       const keepAlive = () => {
+        const now = Date.now()
+        if (life.idle !== undefined && idleArmedAt + idleStreamMs - now > idleStreamMs / 2) return
         if (life.idle !== undefined) clearTimeout(life.idle)
         // ⛔ 让这个定时器把进程吊住:它只是计量,进程该退就退。
+        idleArmedAt = now
         life.idle = setTimeout(settle, idleStreamMs)
         life.idle.unref?.()
       }
@@ -278,17 +281,17 @@ function startTrafficRelay(port, targetPort, traffic, sockets, idleStreamMs = ID
       client.on('data', (chunk) => { traffic.uploadBytes += chunk.length; payload.noteRequest(chunk) })
       upstream.on('data', (chunk) => {
         traffic.downloadBytes += chunk.length
-        destinationAdmission.noteBytes(chunk.length)
         if (!payload.consume(chunk)) return // 还在握手应答里,⛔ 当成回答
         if (!life.streaming) { life.streaming = true; traffic.activeStreams += 1 }
         keepAlive()
       })
-      client.once('error', close); upstream.once('error', close); destinationAdmission.stream.once('error', close)
+      client.once('error', close); upstream.once('error', close)
       // 上游把回答发完并收尾(FIN):这条回答结束了,⛔ 等空闲窗口才销账。
       upstream.once('end', settle)
-      client.once('close', () => { destinationAdmission.stream.destroy(); settle(); forget(); report() })
-      upstream.once('close', () => { destinationAdmission.stream.destroy(); settle(); forget(); report() })
-      client.pipe(destinationAdmission.stream).pipe(upstream); upstream.pipe(client)
+      client.once('close', () => { settle(); forget(); report() })
+      upstream.once('close', () => { settle(); forget(); report() })
+      // DL-03: all destinations use ordinary forwarding; download scheduling belongs to the client.
+      client.pipe(upstream); upstream.pipe(client)
     })
     server.once('error', () => reject(new ConnectorError(CONTROL_CODES.portBusy)))
     server.listen(port, '127.0.0.1', () => {

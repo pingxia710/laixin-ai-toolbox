@@ -9,6 +9,7 @@ let pendingRefresh: Promise<AccountView> | undefined
 let revision = 0
 let returnTab: TabId | undefined
 let entryMode: 'login' | 'register' = 'login'
+const transientRefreshDelays = [5_000, 15_000, 30_000] as const
 export function takeAccountEntryMode(): 'login' | 'register' { const mode = entryMode; entryMode = 'login'; return mode }
 let selectedPlan: string | undefined
 export function selectedNetworkPlan(): string | undefined { return selectedPlan }
@@ -63,9 +64,17 @@ export function refreshAccount(): Promise<AccountView> {
 export function startAccountRefreshLoop(): () => void {
   let stopped = false
   let timer: ReturnType<typeof setTimeout> | undefined
+  let transientFailures = 0
   const refresh = async () => {
-    await refreshAccount()
-    if (!stopped) timer = setTimeout(() => { void refresh() }, 60_000 + Math.floor(Math.random() * 15_000))
+    const view = await refreshAccount()
+    const transientFailure = view.code === 'ACCOUNT_SERVICE_UNAVAILABLE'
+    let delay = 60_000 + Math.floor(Math.random() * 15_000)
+    if (transientFailure && transientFailures < transientRefreshDelays.length) {
+      delay = transientRefreshDelays[transientFailures]
+      transientFailures += 1
+    }
+    if (!transientFailure) transientFailures = 0
+    if (!stopped) timer = setTimeout(() => { void refresh() }, delay)
   }
   void refresh()
   return () => { stopped = true; if (timer) clearTimeout(timer) }

@@ -12,7 +12,7 @@ interface SidecarPlatformSpec {
 const SIDECAR_BY_PLATFORM: Record<Platform, SidecarPlatformSpec> = {
   macos: {
     directory: 'mac',
-    components: ['tunnel-daemon.mjs', 'adapter-networksetup.mjs', 'active-network-path.mjs', 'managed-adapter.mjs', 'port-owner.mjs', 'macos-write-right.mjs', 'terminal-environment.mjs', 'power-events.mjs', 'ledger.mjs', 'restore.mjs', 'daemon-core.mjs', 'routes.default.json', 'local-bridge.mjs', 'xray-runner.mjs', 'vless-connector.mjs', 'vless-settings.mjs', 'instance-lock.mjs', 'resident-integrity.mjs']
+    components: ['tunnel-daemon.mjs', 'adapter-networksetup.mjs', 'proxy-privilege.mjs', 'bin/proxy-helper', 'active-network-path.mjs', 'managed-adapter.mjs', 'port-owner.mjs', 'macos-write-right.mjs', 'bin/write-lock', 'terminal-environment.mjs', 'power-events.mjs', 'ledger.mjs', 'restore.mjs', 'daemon-core.mjs', 'routes.default.json', 'local-bridge.mjs', 'xray-runner.mjs', 'vless-connector.mjs', 'vless-settings.mjs', 'instance-lock.mjs', 'resident-integrity.mjs']
   },
   windows: {
     directory: 'win',
@@ -77,7 +77,7 @@ export function missingSidecarComponents(
   const runtimeRoot = join(sidecarDir, '..', '..')
   const requireSsh = options.requireSshBinary === true
   const target = `${platform === 'macos' ? 'mac' : 'win'}-${process.arch}`
-  const watchedDirs = [sidecarDir, sshBinaryPath(sidecarDir), join(runtimeRoot, 'xray'),
+  const watchedDirs = [sidecarDir, join(sidecarDir, 'bin'), sshBinaryPath(sidecarDir), join(runtimeRoot, 'xray'),
     join(runtimeRoot, 'vendor', 'xray', target)]
   const cacheKey = `${platform}\u0000${sidecarDir}\u0000${requireSsh ? 'ssh' : 'base'}\u0000${watchedDirs.map(statSignature).join(':')}`
   const cached = componentGateCache.get(cacheKey)

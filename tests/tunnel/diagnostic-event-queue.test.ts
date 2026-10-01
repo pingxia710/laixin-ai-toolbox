@@ -47,8 +47,11 @@ function testCodec(): EncryptedQueueCodec {
   }
 }
 
-function readEvents(path: string, codec: EncryptedQueueCodec): DiagnosticEvent[] {
-  return JSON.parse(codec.decrypt(readFileSync(path))) as DiagnosticEvent[]
+/** 盘面条目 = 白名单事件 + 本机剪枝用的入队时刻(recordedAt 只落盘,不上送)。 */
+type StoredEvent = DiagnosticEvent & { readonly recordedAt: number }
+
+function readEvents(path: string, codec: EncryptedQueueCodec): StoredEvent[] {
+  return JSON.parse(codec.decrypt(readFileSync(path))) as StoredEvent[]
 }
 
 function ids() {
@@ -129,10 +132,12 @@ describe('N-53 加密离线事件队列', () => {
     expect(() => JSON.parse(encrypted.toString('utf8'))).toThrow()
 
     const [event] = readEvents(f.queuePath, f.codec)
+    // 事件本体仍是十字段白名单;recordedAt 只是本机剪枝用的入队时刻,⛔ 进上送 payload。
     expect(Object.keys(event).sort()).toEqual([
       'authorizationHash', 'clientVersion', 'durationBucket', 'eventId', 'failureCategory',
-      'pathType', 'platform', 'repairAction', 'repairResult', 'resultBucket'
+      'pathType', 'platform', 'recordedAt', 'repairAction', 'repairResult', 'resultBucket'
     ])
+    expect(Number.isSafeInteger(event.recordedAt)).toBe(true)
     expect(event).toMatchObject({
       failureCategory: failure.failureCategory,
       resultBucket: 'failed',
@@ -154,11 +159,35 @@ describe('N-53 加密离线事件队列', () => {
     const sameWindow = readEvents(f.queuePath, f.codec)
     expect(sameWindow[0].authorizationHash).toBe(sameWindow[1].authorizationHash)
 
-    clock += 8 * 24 * 60 * 60_000
+    // 跨窗即跨过首个轮换边界(7d 网格):推进到边界后 1ms——跨窗口又不超 7 天留存期。
+    clock = 7 * 24 * 60 * 60_000 + 1
     await f.queue.recordFailure(failure)
     const rotated = readEvents(f.queuePath, f.codec)
     expect(rotated[2].authorizationHash).not.toBe(rotated[1].authorizationHash)
     expect(f.codec.decrypt(readFileSync(f.queuePath))).not.toContain(failure.authorizationId)
+  })
+
+  it('超龄事件在读写时被清除:换号后旧授权 failed 不再永久留队空转', async () => {
+    let clock = 1_000_000
+    const f = fixture({ now: () => clock })
+    await f.queue.recordFailure(failure)
+    expect(f.queue.state()).toEqual({ pending: 1, ready: 0 })
+    // 8 天后:读(state)即清——旧授权的 failed 事件超龄出队
+    clock += 8 * 24 * 60 * 60_000
+    expect(f.queue.state()).toEqual({ pending: 0, ready: 0 })
+    // 盘上也剪掉:之后的状态轮询不再整文件解密空转
+    expect(readEvents(f.queuePath, f.codec)).toEqual([])
+    // 写路径同源:超龄旧事件不因新事件入队而续命
+    await f.queue.recordFailure(failure)
+    const events = readEvents(f.queuePath, f.codec)
+    expect(events).toHaveLength(1)
+    expect(events[0].eventId).toBeDefined()
+    // 7 天内的事件保留(对照 diagnosis-reporter 的过滤形状:age <= 7d 留)
+    clock = 1_000_000
+    const fresh = fixture({ now: () => clock })
+    await fresh.queue.recordFailure(failure)
+    clock += 6 * 24 * 60 * 60_000
+    expect(fresh.queue.state()).toEqual({ pending: 1, ready: 0 })
   })
 
   it('崩溃重开后恢复同一事件；验证失败不补传，验证成功才形成闭环并清队列', async () => {

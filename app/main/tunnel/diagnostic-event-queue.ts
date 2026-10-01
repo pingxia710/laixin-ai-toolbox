@@ -15,6 +15,16 @@ import { KNOWN_FAILURE_CODES } from './failure-codes'
 
 export type { DiagnosticEvent } from '../../diagnostic-event-types'
 
+/** 队列条目留存窗:与诊断六字段队列(diagnosis-reporter)同一个 7 天窗,⛔ 两侧各造一套。
+ *  事件本体(上送合同)不带时间戳——recordedAt 只随加密队列落盘,用于超龄剪枝。 */
+export const DIAGNOSIS_MAX_AGE_MS = 7 * 24 * 60 * 60_000
+
+/** 加密队列的盘面条目:白名单事件 + 入队时刻(本机剪枝用,⛔ 进上送 payload)。 */
+export interface StoredDiagnosticEvent {
+  readonly event: DiagnosticEvent
+  readonly recordedAt: number
+}
+
 export interface EncryptedQueueCodec {
   readonly encrypt: (plain: string) => Buffer
   readonly decrypt: (encrypted: Buffer) => string
@@ -52,6 +62,23 @@ type FailureInput = {
   readonly failureCategory: string
   readonly pathType: DiagnosticPathType
   readonly authorizationId: string
+}
+
+/** 盘面条目解析:recordedAt 必须是非负安全整数;事件本体走 parseDiagnosticEvent 白名单。
+ *  旧版文件(升级前)没有 recordedAt:按文件 mtime 记龄——队列只在写时被原子替换,mtime 即最后落盘时刻,
+ *  升级后第一次读写即可对旧条目施以同一留存窗。 */
+function parseStoredEvent(entry: unknown, legacyRecordedAt: number): StoredDiagnosticEvent | undefined {
+  if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return undefined
+  const value = entry as Record<string, unknown>
+  const rawRecordedAt = value.recordedAt
+  const recordedAt = Number.isSafeInteger(rawRecordedAt) && (rawRecordedAt as number) >= 0
+    ? rawRecordedAt as number
+    : rawRecordedAt === undefined ? legacyRecordedAt : undefined
+  if (recordedAt === undefined) return undefined
+  const rest = { ...value }
+  delete rest.recordedAt
+  const event = parseDiagnosticEvent(rest)
+  return event === undefined ? undefined : { event, recordedAt }
 }
 
 /**
@@ -95,8 +122,8 @@ export class DiagnosticEventQueue {
     await this.serialized(() => {
       const queue = this.readQueue()
       this.openedAt.set(event.eventId, this.deps.now())
-      const retained = [...queue, event].slice(-DIAGNOSTIC_EVENT_QUEUE_LIMIT)
-      const retainedIds = new Set(retained.map((entry) => entry.eventId))
+      const retained = [...queue, { event, recordedAt: this.deps.now() }].slice(-DIAGNOSTIC_EVENT_QUEUE_LIMIT)
+      const retainedIds = new Set(retained.map((stored) => stored.event.eventId))
       for (const id of this.openedAt.keys()) if (!retainedIds.has(id)) this.openedAt.delete(id)
       this.writeQueue(retained)
     })
@@ -119,10 +146,10 @@ export class DiagnosticEventQueue {
     }
     await this.serialized(() => {
       const queue = this.readQueue()
-      const index = queue.findIndex((event) => event.eventId === eventId && event.resultBucket === 'failed')
+      const index = queue.findIndex((stored) => stored.event.eventId === eventId && stored.event.resultBucket === 'failed')
       if (index < 0) return
-      this.writeQueue(queue.map((event, eventIndex) => eventIndex === index
-        ? { ...event, repairAction: 'repair', repairResult: result } : event))
+      this.writeQueue(queue.map((stored, storedIndex) => storedIndex === index
+        ? { ...stored, event: { ...stored.event, repairAction: 'repair', repairResult: result } } : stored))
     })
   }
 
@@ -135,18 +162,21 @@ export class DiagnosticEventQueue {
       const now = this.deps.now()
       const queue = this.readQueue()
       let changed = false
-      const next = queue.map((event): DiagnosticEvent => {
-        if (event.resultBucket !== 'failed' || !this.matchesAuthorization(event, input.authorizationId, now)) return event
+      const next = queue.map((stored): StoredDiagnosticEvent => {
+        if (stored.event.resultBucket !== 'failed' || !this.matchesAuthorization(stored.event, input.authorizationId, now)) return stored
         changed = true
-        const startedAt = this.openedAt.get(event.eventId)
+        const startedAt = this.openedAt.get(stored.event.eventId)
         return {
-          ...event,
-          resultBucket: 'recovered',
-          durationBucket: diagnosticDurationBucket(startedAt === undefined ? undefined : now - startedAt),
-          pathType: input.pathType,
-          repairAction: event.repairAction === 'none' ? 'reconnect' : event.repairAction,
-          repairResult: event.repairAction === 'repair' && event.repairResult !== 'running'
-            ? event.repairResult : 'recovered'
+          ...stored,
+          event: {
+            ...stored.event,
+            resultBucket: 'recovered',
+            durationBucket: diagnosticDurationBucket(startedAt === undefined ? undefined : now - startedAt),
+            pathType: input.pathType,
+            repairAction: stored.event.repairAction === 'none' ? 'reconnect' : stored.event.repairAction,
+            repairResult: stored.event.repairAction === 'repair' && stored.event.repairResult !== 'running'
+              ? stored.event.repairResult : 'recovered'
+          }
         }
       })
       if (changed) this.writeQueue(next)
@@ -162,8 +192,9 @@ export class DiagnosticEventQueue {
         const event = await this.serialized(() => {
           // rerun 只要求本次按当前会话筛选；在实际筛选回调内消费，不能影响随后一次发送的退避。
           this.rerunFlush = false
-          return this.readQueue().find((entry) => entry.resultBucket === 'recovered' &&
-            (this.deps.canSend?.(entry) ?? true))
+          const found = this.readQueue().find((stored) => stored.event.resultBucket === 'recovered' &&
+            (this.deps.canSend?.(stored.event) ?? true))
+          return found?.event
         })
         if (event === undefined) break
         // 候选返回后可能已微任务级换号或关闭上报；重查与 send 调用之间不得让出执行权。
@@ -187,9 +218,9 @@ export class DiagnosticEventQueue {
         this.nextRetryAt = 0
         await this.serialized(() => {
           const queue = this.readQueue()
-          if (!queue.some((entry) => entry.eventId === event.eventId)) return
+          if (!queue.some((stored) => stored.event.eventId === event.eventId)) return
           this.openedAt.delete(event.eventId)
-          this.writeQueue(queue.filter((entry) => entry.eventId !== event.eventId))
+          this.writeQueue(queue.filter((stored) => stored.event.eventId !== event.eventId))
         })
       }
     } finally {
@@ -217,8 +248,8 @@ export class DiagnosticEventQueue {
   state(): { readonly pending: number; readonly ready: number } {
     const queue = this.readQueue()
     return {
-      pending: queue.filter((event) => event.resultBucket === 'failed').length,
-      ready: queue.filter((event) => event.resultBucket === 'recovered').length
+      pending: queue.filter((stored) => stored.event.resultBucket === 'failed').length,
+      ready: queue.filter((stored) => stored.event.resultBucket === 'recovered').length
     }
   }
 
@@ -230,8 +261,9 @@ export class DiagnosticEventQueue {
       const queue = this.readQueue()
       const index = this.latestPendingIndex(queue, authorizationId, now)
       if (index < 0) return undefined
-      this.writeQueue(queue.map((event, eventIndex) => eventIndex === index ? update(event) : event))
-      return queue[index].eventId
+      this.writeQueue(queue.map((stored, storedIndex) => storedIndex === index
+        ? { ...stored, event: update(stored.event) } : stored))
+      return queue[index].event.eventId
     })
   }
 
@@ -258,11 +290,11 @@ export class DiagnosticEventQueue {
     return diagnosticEventBelongsToAuthorization(event, authorizationId, now)
   }
 
-  private latestPendingIndex(queue: readonly DiagnosticEvent[], authorizationId: string, now: number): number {
+  private latestPendingIndex(queue: readonly StoredDiagnosticEvent[], authorizationId: string, now: number): number {
     for (let index = queue.length - 1; index >= 0; index -= 1) {
-      const event = queue[index]
-      if (event.resultBucket === 'failed' &&
-          this.matchesAuthorization(event, authorizationId, now)) return index
+      const stored = queue[index]
+      if (stored.event.resultBucket === 'failed' &&
+          this.matchesAuthorization(stored.event, authorizationId, now)) return index
     }
     return -1
   }
@@ -277,7 +309,7 @@ export class DiagnosticEventQueue {
     return result
   }
 
-  private readQueue(): DiagnosticEvent[] {
+  private readQueue(): StoredDiagnosticEvent[] {
     if (!existsSync(this.deps.queuePath)) return []
     try {
       const info = lstatSync(this.deps.queuePath)
@@ -285,15 +317,24 @@ export class DiagnosticEventQueue {
           process.platform !== 'win32' && (info.mode & 0o077) !== 0) return []
       const parsed: unknown = JSON.parse(this.deps.codec.decrypt(readFileSync(this.deps.queuePath)))
       if (!Array.isArray(parsed) || parsed.length > DIAGNOSTIC_EVENT_QUEUE_LIMIT) return []
-      const queue = parsed.map((entry) => parseDiagnosticEvent(entry))
-      return queue.every((event) => event !== undefined) ? queue as DiagnosticEvent[] : []
+      const queue = parsed.map((entry) => parseStoredEvent(entry, info.mtimeMs))
+      if (queue.some((stored) => stored === undefined)) return []
+      // 超龄剪枝(diagnosis-reporter.flushPending 同一形状/同一 7 天窗):换号后旧授权的 failed
+      // 事件再也没有补传时机,永久留队会让连接期状态轮询每轮整文件解密空转。读侧清、盘上剪。
+      const now = this.deps.now()
+      const retained = (queue as StoredDiagnosticEvent[]).filter((stored) => now - stored.recordedAt <= DIAGNOSIS_MAX_AGE_MS)
+      if (retained.length !== queue.length) {
+        this.hasQueued = retained.length > 0
+        try { this.writeQueue(retained) } catch { /* 剪枝落盘失败:本轮仍按剪枝后结果返回 */ }
+      }
+      return retained
     } catch {
       return []
     }
   }
 
-  private writeQueue(queue: readonly DiagnosticEvent[]): void {
-    const plain = `${JSON.stringify(queue)}\n`
+  private writeQueue(queue: readonly StoredDiagnosticEvent[]): void {
+    const plain = `${JSON.stringify(queue.map((stored) => ({ ...stored.event, recordedAt: stored.recordedAt })))}\n`
     const encrypted = this.deps.codec.encrypt(plain)
     if (!Buffer.isBuffer(encrypted) || encrypted.length <= 0 || encrypted.length > MAX_ENCRYPTED_QUEUE_BYTES) {
       throw new Error('DIAGNOSTIC_EVENT_STORAGE_UNAVAILABLE')

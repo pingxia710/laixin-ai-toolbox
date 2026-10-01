@@ -40,6 +40,8 @@ describe.each([
     let connectorStarts = 0
     let nextStopGate: Promise<void> | undefined
     const startErrors: Error[] = []
+    let preflightError: Error | undefined
+    let preflightCalls = 0
     const lossCallbacks: Array<(error: ConnectorError) => void> = []
     const writes: unknown[] = []
     const bridges: Array<{ closed: boolean }> = []
@@ -53,6 +55,7 @@ describe.each([
     writeIntentFile(dataDir, intent('fatal-r1'))
 
     const adapter = {
+      preflight: () => { preflightCalls += 1; if (preflightError) throw preflightError },
       managedItems: () => [{ ref: { service: 'test', item: 'proxy' }, value: DEAD_PROXY }],
       read: () => value,
       write: (_ref: unknown, next: unknown) => {
@@ -118,6 +121,8 @@ describe.each([
       setValue: (next: unknown) => { value = next },
       failNextRestores: (count = 1) => { restoreFailures = count },
       failNextStart: (error: Error) => startErrors.push(error),
+      setPreflightError: (error?: Error) => { preflightError = error },
+      preflightCalls: () => preflightCalls,
       blockNextConnectorStop: () => {
         let release = () => {}
         nextStopGate = new Promise<void>((resolve) => { release = resolve })
@@ -130,6 +135,27 @@ describe.each([
       writes: () => [...writes]
     }
   }
+
+  it.each(['TUNNEL_PROXY_AUTH_REQUIRED', 'TUNNEL_PROXY_HELPER_FAILED'])('%s 不启动连接器、不轮换入口、不被唤醒事件重新连接', async (code) => {
+    const h = harness()
+    h.setPreflightError(Object.assign(new Error('local authorization failure'), { code }))
+    await h.daemon.run()
+    await settle()
+    expect(h.state()).toMatchObject({ state: 'error', code })
+    expect(h.connectorStarts()).toBe(0)
+    expect(h.writes()).toEqual([])
+    h.daemon.notifyEvent('wake')
+    h.daemon.notifyEvent('network-change')
+    await h.advance(120_000)
+    expect(h.connectorStarts()).toBe(0)
+    expect(h.preflightCalls()).toBe(1)
+    expect(h.settingStatuses()).toEqual([])
+    h.setPreflightError()
+    writeIntentFile(h.dataDir, h.intent('authorized-r2'))
+    await h.advance(200)
+    expect(h.connectorStarts()).toBe(1)
+    expect(h.value()).toBe(DEAD_PROXY)
+  })
 
   it('已连接后首次致命故障：bridge 关闭且首次还原失败时继续按梯子恢复，wake 不会重连', async () => {
     const h = harness()

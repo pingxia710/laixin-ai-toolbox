@@ -31,16 +31,25 @@ node_modules
 # 本机安装更新时的旧应用备份(整包二进制),只留本地 ⛔ 入库(曾在 3914f37 误提交)
 /local-app-backups/
 # sidecar 平台目录中的共享文件是构建期副本,唯一源在 sidecar/shared/(scripts/prepare-sidecar.mjs)
+sidecar/mac/connection-settings.mjs
+sidecar/mac/connection-settings.d.mts
+sidecar/mac/continuity-evidence.mjs
+sidecar/mac/continuity-evidence.d.mts
+sidecar/mac/continuity-probe.mjs
 sidecar/mac/daemon-core.mjs
 sidecar/mac/daemon-core.d.mts
 sidecar/mac/download-concurrency.mjs
 sidecar/mac/download-concurrency.d.mts
+sidecar/mac/instance-lock.mjs
+sidecar/mac/instance-lock.d.mts
 sidecar/mac/ledger.mjs
 sidecar/mac/ledger.d.mts
 sidecar/mac/local-bridge.mjs
 sidecar/mac/local-bridge.d.mts
 sidecar/mac/network-availability-controller.mjs
 sidecar/mac/network-availability-controller.d.mts
+sidecar/mac/proxy-identity.mjs
+sidecar/mac/proxy-identity.d.mts
 sidecar/mac/resident-integrity.mjs
 sidecar/mac/resident-integrity.d.mts
 sidecar/mac/restore.mjs
@@ -49,22 +58,34 @@ sidecar/mac/routes.default.json
 sidecar/mac/socks5.mjs
 sidecar/mac/socks5.d.mts
 sidecar/mac/tunnel-daemon.mjs
+sidecar/mac/tunnel-daemon.d.mts
 sidecar/mac/vless-connector.mjs
 sidecar/mac/vless-connector.d.mts
 sidecar/mac/vless-settings.mjs
 sidecar/mac/vless-settings.d.mts
+sidecar/mac/write-right-owner.mjs
+sidecar/mac/write-right-owner.d.mts
 sidecar/mac/xray-runner.mjs
 sidecar/mac/xray-runner.d.mts
+sidecar/win/connection-settings.mjs
+sidecar/win/connection-settings.d.mts
+sidecar/win/continuity-evidence.mjs
+sidecar/win/continuity-evidence.d.mts
+sidecar/win/continuity-probe.mjs
 sidecar/win/daemon-core.mjs
 sidecar/win/daemon-core.d.mts
 sidecar/win/download-concurrency.mjs
 sidecar/win/download-concurrency.d.mts
+sidecar/win/instance-lock.mjs
+sidecar/win/instance-lock.d.mts
 sidecar/win/ledger.mjs
 sidecar/win/ledger.d.mts
 sidecar/win/local-bridge.mjs
 sidecar/win/local-bridge.d.mts
 sidecar/win/network-availability-controller.mjs
 sidecar/win/network-availability-controller.d.mts
+sidecar/win/proxy-identity.mjs
+sidecar/win/proxy-identity.d.mts
 sidecar/win/resident-integrity.mjs
 sidecar/win/resident-integrity.d.mts
 sidecar/win/restore.mjs
@@ -73,12 +94,16 @@ sidecar/win/routes.default.json
 sidecar/win/socks5.mjs
 sidecar/win/socks5.d.mts
 sidecar/win/tunnel-daemon.mjs
+sidecar/win/tunnel-daemon.d.mts
 sidecar/win/vless-connector.mjs
 sidecar/win/vless-connector.d.mts
 sidecar/win/vless-settings.mjs
 sidecar/win/vless-settings.d.mts
+sidecar/win/write-right-owner.mjs
+sidecar/win/write-right-owner.d.mts
 sidecar/win/xray-runner.mjs
 sidecar/win/xray-runner.d.mts
 
 # 本地运行状态与演示数据
 evidence/
+sidecar/mac/bin/

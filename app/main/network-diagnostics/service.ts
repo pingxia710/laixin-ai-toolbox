@@ -122,8 +122,29 @@ export async function runNetworkDiagnostics(software: string, options: Diagnosti
   try { selection = await options.selection?.(software); selectionReadable = true } catch { /* 读不到当前选择就按官方站点检查，并在文案里说明判不出。 */ }
   const target = resolveDiagnosticTarget(software, selection)
   const checks: DiagnosticCheck[] = []
+  // internet 与目标服务探测互不依赖：先读通道快照（同步），再同时发出两探。
+  // ⛛ service 探测不得消费 internet 结果；internet 失败也不得跳过 service 探测。
+  const internetProbe = options.probe(domesticDiagnosticUrl, 'direct')
+  let tunnel: DiagnosticTunnel | undefined
+  let tunnelReadable = false
+  try { tunnel = options.status(); tunnelReadable = true } catch { /* Missing state is unknown, never a connected result. */ }
+  const verified = tunnel !== undefined && freshDiagnosticConnection(tunnel, now())
+  const primaryPathSkipped = target.route === 'tunnel' && !verified
+  let primaryPathFailed = primaryPathSkipped
+  const serviceProbe = primaryPathSkipped ? undefined : (async () => {
+    try {
+      if (target.route === 'isolated') {
+        if (options.probeIsolated === undefined || !selection?.routeRevision) throw new DiagnosticProbeError('path-unavailable')
+        return serviceResult(await options.probeIsolated(software, selection.routeRevision))
+      }
+      return serviceResult(await options.probe(target.url, target.route))
+    } catch (error) {
+      primaryPathFailed = true
+      return serviceFailure(probeFailure(error))
+    }
+  })()
   try {
-    const response = await options.probe(domesticDiagnosticUrl, 'direct')
+    const response = await internetProbe
     const elapsedMs = checkedDuration(response.durationMs)
     checks.push(response.status === 204
       ? check('internet', 'passed', 'AI_DIAG_INTERNET_OK', '基础网络可用。', elapsedMs, 'http')
@@ -132,10 +153,6 @@ export async function runNetworkDiagnostics(software: string, options: Diagnosti
     const failure = probeFailure(error)
     checks.push(internetFailure(failure))
   }
-  let tunnel: DiagnosticTunnel | undefined
-  let tunnelReadable = false
-  try { tunnel = options.status(); tunnelReadable = true } catch { /* Missing state is unknown, never a connected result. */ }
-  const verified = tunnel !== undefined && freshDiagnosticConnection(tunnel, now())
   checks.push(target.route === 'isolated'
     ? check('tunnel', 'not-checked', 'AI_DIAG_ISOLATED_SERVICE', `${shellNames[software]} 的模型 API 正使用应用隔离出口，本次沿用该出口检查；不涉及登录流量。`)
     : target.route === 'direct'
@@ -144,26 +161,11 @@ export async function runNetworkDiagnostics(software: string, options: Diagnosti
     : verified ? check('tunnel', 'passed', 'AI_DIAG_TUNNEL_VERIFIED', '通道出口最近已通过校验。')
       : check('tunnel', 'attention', 'AI_DIAG_TUNNEL_REQUIRED', tunnel?.unrestored ? '请先在上方恢复原设置，再重新连接。'
         : tunnel?.componentMissing ? '工具箱网络组件不完整，请重新安装或联系客服。' : '请先连接 AI网络并等待校验完成，再重新检查。'))
-  let primaryPathFailed = false
-  if (target.route === 'tunnel' && !verified) {
-    primaryPathFailed = true
-    checks.push(check('service', 'unknown', 'AI_DIAG_PRIMARY_PATH_UNAVAILABLE',
-      '当前通道尚未确认，本次主路径未检查；下方独立比较直连和系统现有代理，不会自动连接或修改设置。'))
-  } else {
-    let result: DiagnosticCheck
-    try {
-      if (target.route === 'isolated') {
-        if (options.probeIsolated === undefined || !selection?.routeRevision) throw new DiagnosticProbeError('path-unavailable')
-        result = serviceResult(await options.probeIsolated(software, selection.routeRevision))
-      } else result = serviceResult(await options.probe(target.url, target.route))
-    }
-    catch (error) {
-      primaryPathFailed = true
-      const failure = probeFailure(error)
-      result = serviceFailure(failure)
-    }
-    checks.push(result)
-  }
+  // 分层顺序固定为 internet → tunnel → service；service 探测虽已提前发出，仍排在两层之后落账。
+  checks.push(primaryPathSkipped
+    ? check('service', 'unknown', 'AI_DIAG_PRIMARY_PATH_UNAVAILABLE',
+      '当前通道尚未确认，本次主路径未检查；下方独立比较直连和系统现有代理，不会自动连接或修改设置。')
+    : await serviceProbe!)
   const matrixContextBefore = primaryPathFailed ? await readMatrixContext(target.url, options) : undefined
   const matrixEntries = primaryPathFailed ? await compareDiagnosticPaths(target.url, options, verified) : undefined
   let contextChanged = false

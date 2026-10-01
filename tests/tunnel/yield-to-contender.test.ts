@@ -243,6 +243,7 @@ describe('争抢时先看对方能不能用', () => {
   it('macOS 真实适配器捕获普通 endpoint 后先修回我方，锁外仍能探 rival 并让路', () => {
     const adapterUrl = new URL('../../sidecar/mac/adapter-networksetup.mjs', import.meta.url).href
     const daemonUrl = new URL('../../sidecar/mac/daemon-core.mjs', import.meta.url).href
+    const fixtureWriteUrl = new URL('./fixtures/mac-networksetup-write.mjs', import.meta.url).href
     const script = `
       import cp from 'node:child_process'
       import { mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
@@ -255,7 +256,9 @@ describe('争抢时先看对方能不能用', () => {
       const output = (value) => 'Enabled: ' + (value.enabled ? 'Yes' : 'No') + '\\nServer: ' + value.host +
         '\\nPort: ' + String(value.port) + '\\nAuthenticated Proxy Enabled: ' + value.authenticated + '\\n'
       const itemFor = (command) => command.includes('secure') ? proxies.secure : command.includes('socks') ? proxies.socks : proxies.web
-      cp.execFileSync = (command, args) => {
+      cp.execFileSync = (command, args, options) => {
+        if (command.endsWith('/bin/proxy-helper') && args[0] === 'request' &&
+            JSON.parse(options.input).op === 'status') return JSON.stringify({ ok: true, version: 3 })
         if (command === '/sbin/route' && args.join(' ') === '-n get default') return '   interface: en0\\n'
         if (command !== 'networksetup') throw Error('UNEXPECTED_COMMAND ' + command)
         const action = args[0]
@@ -284,6 +287,7 @@ describe('争抢时先看对方能不能用', () => {
       renameSync(join(root, 'intent.json.tmp'), join(root, 'intent.json'))
       const { createAdapter } = await import(${JSON.stringify(adapterUrl)})
       const { createDaemon } = await import(${JSON.stringify(daemonUrl)})
+      const { createNetworksetupFixtureWrite } = await import(${JSON.stringify(fixtureWriteUrl)})
       const clock = {
         now: () => Date.now(),
         setTimeout: (fn, ms) => setTimeout(fn, ms),
@@ -296,7 +300,7 @@ describe('争抢时先看对方能不能用', () => {
       const daemon = createDaemon({
         dataDir: root,
         clock,
-        adapter: createAdapter(),
+        adapter: createAdapter({ writeProxy: createNetworksetupFixtureWrite(cp.execFileSync) }),
         random: () => 0,
         parentAlive: () => true,
         onExit: exit,

@@ -175,8 +175,9 @@ export class NetworkAccountClient {
       return { body: Buffer.concat(chunks), etag: /^"[a-f0-9]{64}"$/.test(receivedEtag) ? receivedEtag : undefined, ...metadata }
     } catch (error) {
       if (signal.aborted) throw new NetworkAccountError('NETWORK_SESSION_CHANGED')
-      if (error instanceof NetworkAccountError) throw error
-      throw error // 原样上抛给 request 分诊:幂等 GET 抖动重试,重试用尽再包「服务不可用」
+      // 原样上抛给 request 分诊:幂等 GET 抖动重试,重试用尽再包「服务不可用」。
+      // ⛔ 按 instanceof 单列分支:它与此处抛的是同一个 error,两支等价。
+      throw error
     }
   }
 }

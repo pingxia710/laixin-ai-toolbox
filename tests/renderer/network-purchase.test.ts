@@ -83,6 +83,13 @@ it.each(['active', 'unknown', 'provisioning'] as const)('套餐 %s 时仍可购�
   expect(openPaymentDialog).toHaveBeenCalledExactlyOnceWith(networkPlans[1], 'alipay')
 })
 
+it('已付款权益在节点开通失败时明确显示已入账，不限制继续购买', () => {
+  const nodes = render('signed-in', { ...pending, state: 'queued', startsAt: Date.now(), expiresAt: Date.now() + 86400_000 })
+  expect(nodes.some((node) => node.textContent.includes('20 GB 月套餐 · 已付款·等待节点开通'))).toBe(true)
+  expect(nodes.some((node) => node.textContent.includes('已记入权益'))).toBe(true)
+  expect(nodes.filter((node) => node.tag === 'button' && node.textContent === '支付宝购买')).toHaveLength(4)
+})
+
 it('付款渠道不可用时给出明确状态，不退回提交申请', () => {
   const nodes = render('signed-in', null, false)
   expect(nodes.some((node) => node.textContent.startsWith('在线购买暂时无法使用'))).toBe(true)

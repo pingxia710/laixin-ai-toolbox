@@ -3,6 +3,7 @@
 import { createHash } from 'node:crypto'
 import { afterEach, describe, expect, it } from 'vitest'
 import { DownloadManager, type DownloadCompletion, type DownloadEngine, type DownloadTransfer } from '../../app/main/download/download-manager'
+import { waitForSettled } from './helpers'
 import { parseCatalog } from '../../app/main/download/catalog'
 import type { ArtifactDigest, DownloadArtifactInspector, DownloadTaskStore, StoredDownloadTask } from '../../app/main/download/types'
 
@@ -23,6 +24,8 @@ class MemoryStore implements DownloadTaskStore {
   async promotePart() {}
   async deletePart() {}
   async deleteArtifact() { this.deletedArtifacts += 1 }
+  async deleteRecord(): Promise<void> {}
+  async sweepOrphanDirectories(): Promise<number> { return 0 }
   async artifactStatus() { return { size: artifact.byteLength, mtimeMs: 1000 } }
   async hashArtifact(): Promise<ArtifactDigest> { return { byteLength: artifact.byteLength, sha256, mtimeMs: 1000 } }
 }
@@ -97,6 +100,6 @@ describe('校验期可取消', () => {
     const { manager, engine } = managerWith(slow)
     const task = await manager.start('fixture-dmg')
     engine.transfers[0].finish('completed')
-    await expect(manager.waitForSettled(task.taskId)).resolves.toMatchObject({ state: 'ready' })
+    await expect(waitForSettled(manager, task.taskId)).resolves.toMatchObject({ state: 'ready' })
   })
 })

@@ -24,9 +24,12 @@
 !ifdef BUILD_UNINSTALLER
 Var /GLOBAL laixinEarlyUninstallPreflight
 Var /GLOBAL laixinEarlyUninstallTarget
+Var /GLOBAL laixinEarlyUninstallRecoveryArmed
+Var /GLOBAL laixinUninstallRecoveryArmed
 Var /GLOBAL laixinAiRouterCleanup
 !macro customCheckAppRunning
   StrCpy $laixinEarlyUninstallPreflight "not-run"
+  StrCpy $laixinEarlyUninstallRecoveryArmed "not-run"
   ClearErrors
   ${GetParameters} $3
   ${GetOptions} $3 "--updated" $4
@@ -35,6 +38,13 @@ Var /GLOBAL laixinAiRouterCleanup
       StrCpy $laixinEarlyUninstallTarget "$INSTDIR"
       !insertmacro runLaixinWindowsPreflight uninstall
       StrCpy $laixinEarlyUninstallPreflight $7
+      ${If} $7 == "0"
+        StrCpy $laixinEarlyUninstallRecoveryArmed "1"
+      ${ElseIf} $7 == "2"
+        ; 退出码 2 = 真卸载已完成无守卫安全预检；没有恢复事务，后续不得再调用 commit。
+        StrCpy $laixinEarlyUninstallPreflight "0"
+        StrCpy $laixinEarlyUninstallRecoveryArmed "0"
+      ${EndIf}
     ${EndIf}
   ${EndIf}
 !macroend
@@ -139,6 +149,7 @@ Var /GLOBAL laixinAiRouterCleanup
   InitPluginsDir
   SetOutPath "$PLUGINSDIR"
   File /oname=laixin-uninstall-task-cleanup.ps1 "${PROJECT_DIR}/resources/uninstall-task-cleanup.ps1"
+  StrCpy $laixinUninstallRecoveryArmed "0"
 
   ; AI 路由与网络隧道是两个独立 owner。在任何文件替换前，让已安装的 D+
   ; 用 HMAC + runtime + seat 证明并停止自己的 headless。结果单独保留，网络恢复完成后再统一失败关闭。
@@ -158,6 +169,7 @@ Var /GLOBAL laixinAiRouterCleanup
       System::Call 'Kernel32::lstrcmpiW(w "$laixinEarlyUninstallTarget", w "$INSTDIR") i .r8'
       ${If} $8 == 0
         StrCpy $7 $laixinEarlyUninstallPreflight
+        StrCpy $laixinUninstallRecoveryArmed $laixinEarlyUninstallRecoveryArmed
       ${Else}
         StrCpy $7 "target-changed"
       ${EndIf}
@@ -165,6 +177,12 @@ Var /GLOBAL laixinAiRouterCleanup
     ${Else}
       ${If} ${FileExists} "$INSTDIR\${APP_EXECUTABLE_FILENAME}"
         !insertmacro runLaixinWindowsPreflight uninstall
+        ${If} $7 == "0"
+          StrCpy $laixinUninstallRecoveryArmed "1"
+        ${ElseIf} $7 == "2"
+          StrCpy $7 "0"
+          StrCpy $laixinUninstallRecoveryArmed "0"
+        ${EndIf}
       ${Else}
         ; 安装目录已残缺时没有可运行 CJS 的 Electron。真卸载仍先清理两代任务，随后继续走
         ; ledger restore 尝试与代理兜底；⛔ 因主 EXE 缺失在恢复网络之前 Abort。
@@ -230,6 +248,7 @@ Var /GLOBAL laixinAiRouterCleanup
   ; 看守会在卸载器退出后按原快照恢复，而不是留下半卸载。升级必须等新版启动回执，不能在旧卸载器里提交。
   ${If} $5 == "uninstall"
   ${AndIf} $7 == "0"
+  ${AndIf} $laixinUninstallRecoveryArmed == "1"
   ${AndIf} ${FileExists} "$INSTDIR\${APP_EXECUTABLE_FILENAME}"
     !insertmacro commitLaixinWindowsPreflight
   ${EndIf}
@@ -241,7 +260,7 @@ Var /GLOBAL laixinAiRouterCleanup
       ClearErrors
       ${GetOptions} $3 "/S" $4
       ${If} ${Errors}
-        MessageBox MB_OK|MB_ICONSTOP "卸载前检查未完成，程序尚未删除。请关闭所有来信 AI 工具箱的安装和卸载窗口，等待几秒后重新尝试卸载；仍失败时，请重新打开工具箱使用“一键诊断”联系来信客服。"
+        MessageBox MB_OK|MB_ICONSTOP "卸载前未能安全还原网络或停止后台组件，程序尚未删除。请重新打开工具箱，点击“检测并修复连接”，确认连接状态恢复后再卸载；仍失败时，请使用“一键诊断”联系来信客服。"
       ${EndIf}
     ${EndIf}
     SetErrorLevel 1

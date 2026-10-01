@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { diagnosticProbeAllowed, DiagnosticProbeError, resolveDiagnosticTarget, runNetworkDiagnostics, type DiagnosticSelection, type DiagnosticTunnel } from '../../app/main/network-diagnostics/service'
 
 const now = 1_800_000_000_000
@@ -191,5 +191,109 @@ describe('按这个软件实际在用的服务检查', () => {
     expect(diagnosticProbeAllowed('https://api.deepseek.com/v1/models?token=private-fixture', 'direct')).toBe(false)
     expect(diagnosticProbeAllowed('https://evil.example/', 'direct')).toBe(false)
     expect(diagnosticProbeAllowed('https://relay.example.com/', 'tunnel', ['https://relay.example.com/v1/responses'])).toBe(true)
+  })
+})
+
+describe('internet 与目标服务探测并行', () => {
+  afterEach(() => vi.useRealTimers())
+
+  // 以 10ms 步进推进假时钟直到诊断落定；推进量即整次检查的端到端等待下界。
+  async function untilSettled(pending: Promise<unknown>, limitMs: number): Promise<number> {
+    let done = false
+    const settled = pending.then(() => { done = true }, () => { done = true })
+    let elapsed = 0
+    while (!done && elapsed < limitMs) { await vi.advanceTimersByTimeAsync(10); elapsed += 10 }
+    await settled
+    return elapsed
+  }
+
+  it('两探互不依赖：总耗时取决于较慢一方而非两者之和，调用顺序仍是 internet 先发', async () => {
+    vi.useFakeTimers()
+    const probe = vi.fn(async (url: string) => {
+      await new Promise((resolve) => setTimeout(resolve, url.includes('generate_204') ? 60 : 40))
+      return { status: url.includes('generate_204') ? 204 : 200, durationMs: 5 }
+    })
+    const pending = runNetworkDiagnostics('codex', { ...options(), probe })
+    const elapsed = await untilSettled(pending, 500)
+    // 串行实现要等 60+40=100；并行只等较慢的 60。
+    expect(elapsed).toBeGreaterThanOrEqual(60)
+    expect(elapsed).toBeLessThanOrEqual(60)
+    expect(probe.mock.calls).toEqual([
+      ['https://connectivitycheck.platform.hicloud.com/generate_204', 'direct'], ['https://chatgpt.com/', 'tunnel']
+    ])
+  })
+
+  it('直连目标与 internet 同为 direct 时也并行；internet 失败不阻塞 service 探测', async () => {
+    vi.useFakeTimers()
+    const probe = vi.fn(async (url: string) => {
+      await new Promise((resolve) => setTimeout(resolve, url.includes('generate_204') ? 50 : 20))
+      if (url.includes('generate_204')) throw new DiagnosticProbeError('unavailable', 19)
+      return { status: 200, durationMs: 5 }
+    })
+    const pending = runNetworkDiagnostics('codex', { ...options(), selection: vi.fn(async () => ({ mode: 'deepseek' as const })), probe })
+    const elapsed = await untilSettled(pending, 500)
+    expect(elapsed).toBeGreaterThanOrEqual(50)
+    expect(elapsed).toBeLessThanOrEqual(50)
+    expect(probe.mock.calls).toEqual([
+      ['https://connectivitycheck.platform.hicloud.com/generate_204', 'direct'], ['https://api.deepseek.com/', 'direct']
+    ])
+    const report = await pending
+    expect(report.checks.map((check) => check.id)).toEqual(['internet', 'tunnel', 'service', 'account', 'application'])
+    expect(report.checks.find((check) => check.id === 'internet')).toMatchObject({ state: 'unknown', code: 'AI_DIAG_INTERNET_UNAVAILABLE' })
+    expect(report.checks.find((check) => check.id === 'service')).toMatchObject({ state: 'passed', code: 'AI_DIAG_SERVICE_REACHABLE' })
+  })
+
+  it('fixture 矩阵：分层顺序、检查码与结论和串行版逐例一致', async () => {
+    const codes = (report: Awaited<ReturnType<typeof runNetworkDiagnostics>>) => report.checks.map((check) => check.code)
+    const ids = (report: Awaited<ReturnType<typeof runNetworkDiagnostics>>) => report.checks.map((check) => check.id)
+
+    const officialOk = await runNetworkDiagnostics('codex', options())
+    expect(ids(officialOk)).toEqual(['internet', 'tunnel', 'service', 'account', 'application'])
+    expect(codes(officialOk)).toEqual(['AI_DIAG_INTERNET_OK', 'AI_DIAG_TUNNEL_VERIFIED', 'AI_DIAG_SERVICE_REACHABLE',
+      'AI_DIAG_ACCOUNT_MANUAL', 'AI_DIAG_APPLICATION_UNCONFIRMED'])
+    expect(officialOk.conclusion).toMatchObject({ status: 'unknown', ruleId: 'DG01_APPLICATION_UNCONFIRMED' })
+
+    const internetOnlyFail = await runNetworkDiagnostics('codex', { ...options(), probe: vi.fn(async (url: string) => {
+      if (url.includes('generate_204')) throw new DiagnosticProbeError('unavailable', 19)
+      return { status: 200, durationMs: 31, phase: 'http' as const }
+    }) })
+    expect(codes(internetOnlyFail)).toEqual(['AI_DIAG_INTERNET_UNAVAILABLE', 'AI_DIAG_TUNNEL_VERIFIED', 'AI_DIAG_SERVICE_REACHABLE',
+      'AI_DIAG_ACCOUNT_MANUAL', 'AI_DIAG_APPLICATION_UNCONFIRMED'])
+    expect(internetOnlyFail.conclusion).toMatchObject({ status: 'unknown', ruleId: 'DG01_APPLICATION_UNCONFIRMED' })
+
+    const direct = await runNetworkDiagnostics('hermes', { ...options(), selection: vi.fn(async () => ({ mode: 'deepseek' as const })) })
+    expect(codes(direct)).toEqual(['AI_DIAG_INTERNET_OK', 'AI_DIAG_DIRECT_SERVICE', 'AI_DIAG_SERVICE_REACHABLE',
+      'AI_DIAG_ACCOUNT_PROVIDER', 'AI_DIAG_APPLICATION_UNCONFIRMED'])
+
+    const auth = await runNetworkDiagnostics('codex', { ...options(), probe: vi.fn(async (url: string) =>
+      ({ status: url.includes('generate_204') ? 204 : 401, durationMs: 9 })) })
+    expect(auth.checks.find((check) => check.id === 'service')).toMatchObject({ state: 'attention', code: 'AI_DIAG_SERVICE_AUTH' })
+    expect(auth.conclusion).toMatchObject({ status: 'limited', ruleId: 'DG01_TARGET_RESPONSE_BOUNDARY' })
+
+    // 未连通道：主路径跳过 + 独立比较，探测仍共 3 次（N-64 的路径/选路查询次数不得回升）。
+    const matrixProbe = vi.fn(async (url: string, route: string) => {
+      if (url.includes('generate_204')) return { status: 204, durationMs: 7 }
+      if (route === 'existing-proxy') throw new DiagnosticProbeError('unavailable', 17, 'tls')
+      return { status: 200, durationMs: 11, phase: 'http' as const }
+    })
+    const matrixReport = await runNetworkDiagnostics('codex', { ...options({ ...connected, state: '未配置', lastVerifiedAt: '' }), probe: matrixProbe })
+    expect(matrixProbe.mock.calls).toEqual([
+      ['https://connectivitycheck.platform.hicloud.com/generate_204', 'direct'],
+      ['https://chatgpt.com/', 'direct'],
+      ['https://chatgpt.com/', 'existing-proxy']
+    ])
+    expect(matrixReport.checks.find((check) => check.id === 'service')).toMatchObject({ state: 'unknown', code: 'AI_DIAG_PRIMARY_PATH_UNAVAILABLE' })
+    expect(matrixReport.pathMatrix?.entries.map((entry) => entry.state)).toEqual(['reachable', 'failed', 'unavailable'])
+    expect(matrixReport.conclusion).toMatchObject({ status: 'blocked', ruleId: 'DG01_TUNNEL_REQUIRED' })
+
+    // service 探测期间通道变化：两探并行后首次通道读数仍在探测前完成，结论一致。
+    let current = connected
+    const changedReport = await runNetworkDiagnostics('codex', { ...options(), status: () => current,
+      probe: vi.fn(async (_url: string, route: string) => {
+        if (route === 'tunnel') current = { ...connected, state: '已停止并恢复原设置' }
+        return { status: 200, durationMs: 12 }
+      }) })
+    expect(changedReport.checks.find((check) => check.id === 'service')).toMatchObject({ state: 'unknown', code: 'AI_DIAG_TUNNEL_CHANGED' })
+    expect(changedReport.conclusion).toMatchObject({ ruleId: 'DG01_EVIDENCE_CHANGED' })
   })
 })

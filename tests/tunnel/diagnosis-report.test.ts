@@ -37,7 +37,7 @@ function seedImported(dataDir: string): string {
   writeFileSync(join(batchDir, 'manifest.json'), JSON.stringify({
     protocol: 'vless-reality', configVersion: 1, authorizationId: `lx-${'a'.repeat(32)}`,
     node: { host: 'node.test.invalid', port: 443 }, expiresAt: '2027-01-01T00:00:00.000Z',
-    files: { 'credentials/default': {} }
+    files: { 'credentials/vless.json': {} }
   }))
   writeFileSync(join(batchDir, 'import-meta.json'), JSON.stringify({ accountId: 'customer-a', sourceLine: 'vless://fixture' }))
   writeFileSync(join(dataDir, 'current'), `${batchId}\n`)

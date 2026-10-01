@@ -92,7 +92,9 @@ function macProbe(scenario: 'http' | 'socks' | 'pac' | 'ours' | 'none' | 'servic
     const off = 'Enabled: No\\nServer: \\nPort: 0\\nAuthenticated Proxy Enabled: 0\\n'
     const on = (host, port) => 'Enabled: Yes\\nServer: ' + host + '\\nPort: ' + port + '\\nAuthenticated Proxy Enabled: 0\\n'
     const authenticated = (host, port) => 'Enabled: Yes\\nServer: ' + host + '\\nPort: ' + port + '\\nAuthenticated Proxy Enabled: 1\\n'
-    cp.execFileSync = (command, args) => {
+    cp.execFileSync = (command, args, options) => {
+      if (command.endsWith('/bin/proxy-helper') && args[0] === 'request' &&
+          JSON.stringify(JSON.parse(options.input)) === JSON.stringify({ op: 'status' })) return JSON.stringify({ ok: true, version: 3 })
       if (command === '/sbin/route' && args.join(' ') === '-n get default') return scenario === 'no-active' ? 'route to: default\\n' : '   interface: ' + activeDevice + '\\n'
       if (command !== 'networksetup') throw Error('UNEXPECTED_COMMAND ' + command)
       if (args[0] === '-listnetworkserviceorder') return scenario === 'ambiguous'

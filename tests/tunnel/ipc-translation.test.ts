@@ -108,7 +108,7 @@ describe('status 字段限长:超长内容源头截断,轮询不塌', () => {
     writeFileSync(join(batchDir, 'manifest.json'), JSON.stringify({
       protocol: 'vless-reality', configVersion: 1, authorizationId: `lx-${'a'.repeat(32)}`,
       node: { host: longHost, port: 443 }, expiresAt: '2027-01-01T00:00:00.000Z',
-      files: { 'credentials/default': {} }
+      files: { 'credentials/vless.json': {} }
     }))
     writeFileSync(join(batchDir, 'import-meta.json'), JSON.stringify({ accountId: 'customer-a', sourceLine: 'vless://fixture' }))
     writeFileSync(join(dataDir, 'current'), `${batchId}\n`)

@@ -8,11 +8,30 @@ function probe(platform: 'mac' | 'win', body: string): Record<string, unknown> {
     import childProcess from 'node:child_process'
     import { syncBuiltinESMExports } from 'node:module'
     let execute = () => { throw new Error('UNEXPECTED_SYSTEM_COMMAND') }
-    childProcess.execFileSync = (...args) => execute(...args)
+    childProcess.execFileSync = (...args) => String(args[0]).endsWith('/bin/proxy-helper')
+      ? JSON.stringify({ok:true,version:3}) : execute(...args)
     syncBuiltinESMExports()
     process.env.TOOLBOX_REAL_NETWORK_ADAPTER = '1'
     const { createAdapter } = await import(${JSON.stringify(path)})
-    const adapter = createAdapter()
+    // 写入协议已移至原生助手；这里注入旧 networksetup 读数模型，继续守恢复/外部改动契约。
+    // 真实生产 DTO 和原生 IPC 在 mac-proxy-authorization/helper 两组用例单独覆盖。
+    const adapter = createAdapter({ writeProxy: (ref, value) => {
+      const legacyWrite = (args) => {
+        try {
+          const result = execute('networksetup', args)
+          if (/^\\*\\* Error:/m.test(result)) throw new Error('legacy-write-error')
+        } catch { throw Object.assign(new Error('legacy-write-failed'), {code:'TUNNEL_SETTINGS_NOT_APPLIED'}) }
+      }
+      const commands = {
+        'web-proxy': ['-setwebproxy','-setwebproxystate'],
+        'secure-web-proxy': ['-setsecurewebproxy','-setsecurewebproxystate'],
+        'socks-proxy': ['-setsocksfirewallproxy','-setsocksfirewallproxystate'],
+        'auto-proxy': ['-setautoproxyurl','-setautoproxystate']
+      }[ref.item]
+      if (value && ref.item === 'auto-proxy' && value.url) legacyWrite([commands[0], ref.service, value.url])
+      if (value && ref.item !== 'auto-proxy' && (value.host || value.port)) legacyWrite([commands[0], ref.service, value.host, String(value.port)])
+      legacyWrite([commands[1], ref.service, value?.enabled ? 'on' : 'off'])
+    } })
     const denied = () => { throw Object.assign(new Error('Access is denied'), { status: 1 }) }
     const rejected = (action) => { try { action(); return false } catch { return true } }
     ${body}
@@ -73,6 +92,39 @@ function restoreMacProxy(
 }
 
 describe('真实适配器的命令与读数协议（系统调用已封闭替换）', () => {
+  it.each(['', 'URL: (null)\n', 'Enabled: No\n', 'URL: (null)\nEnabled: Maybe\n'])('macOS PAC 非完整读数必须拒绝，不能冒充已关闭：%j', (output) => {
+    const result = probe('mac', `
+      const calls = []
+      execute = (file, args) => {
+        calls.push([file, ...args])
+        if (file !== 'networksetup' || args[0] !== '-getautoproxyurl') throw new Error('UNEXPECTED_SYSTEM_COMMAND')
+        return ${JSON.stringify(output)}
+      }
+      let code = ''
+      try { adapter.read({service: 'Wi-Fi', item: 'auto-proxy'}) } catch (error) { code = error.code }
+      console.log(JSON.stringify({code, calls}))
+    `)
+    expect(result.code).toBe('TUNNEL_SETTINGS_NOT_APPLIED')
+    expect(result.calls).toEqual([['networksetup', '-getautoproxyurl', 'Wi-Fi']])
+  })
+
+  it.each([
+    ['URL: (null)\nEnabled: No\n', false, ''],
+    ['URL: \nEnabled: No\n', false, ''],
+    ['URL: (null)\nEnabled: Yes\n', true, ''],
+    ['URL: \nEnabled: Yes\n', true, ''],
+    ['URL: https://proxy.invalid/a.pac\nEnabled: No\n', false, 'https://proxy.invalid/a.pac'],
+    ['URL: file:///tmp/local.pac\nEnabled: Yes\n', true, 'file:///tmp/local.pac']
+  ])('macOS PAC 合法读数保留原值：%j', (output, enabled, url) => {
+    expect(probe('mac', `
+      execute = (file, args) => {
+        if (file !== 'networksetup' || args[0] !== '-getautoproxyurl') throw new Error('UNEXPECTED_SYSTEM_COMMAND')
+        return ${JSON.stringify(output)}
+      }
+      console.log(JSON.stringify(adapter.read({service: 'Wi-Fi', item: 'auto-proxy'})))
+    `)).toEqual({enabled, url})
+  })
+
   it('macOS 只报告默认路由对应服务的 Secure Web Proxy；非活动服务与普通 Web Proxy 都不能冒充', () => {
     const script = (proxies: Record<string, { enabled: boolean; host: string; port: number }>, activeDevice = 'en0') => `
       const services = ${JSON.stringify(Object.keys(proxies))}

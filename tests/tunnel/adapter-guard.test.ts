@@ -59,6 +59,7 @@ describe('真实适配器守卫(判据 7)与平台原语', () => {
       'sidecar/win/adapter-wininet.mjs',
       'tests/tunnel/adapter-guard.test.ts',
       // 守护常驻的描述文件必须把放行钥匙原样带上,否则常驻起来的守护写不了系统设置;这条用例就是在钉它。
+      'tests/tunnel/mac-proxy-authorization.test.ts',
       'tests/tunnel/resident-agent.test.ts',
       'tests/tunnel/system-adapters-reliability.test.ts',
       'tests/tunnel/win-adapter.test.ts',
@@ -90,10 +91,13 @@ describe('真实适配器守卫(判据 7)与平台原语', () => {
     expect(missingSidecarComponents('macos', '/nonexistent')).toEqual([
       'tunnel-daemon.mjs',
       'adapter-networksetup.mjs',
+      'proxy-privilege.mjs',
+      'bin/proxy-helper',
       'active-network-path.mjs',
       'managed-adapter.mjs',
       'port-owner.mjs',
       'macos-write-right.mjs',
+      'bin/write-lock',
       'terminal-environment.mjs',
       'power-events.mjs',
       'ledger.mjs',

@@ -36,6 +36,8 @@ export interface DownloadTransfer {
 export interface DownloadEngine {
   start(request: {
     readonly taskId: string
+    // 引擎按 resourceId 划分下载分区:同资源的重试/续传/换源复用同一分区,⛔ 按 taskId。
+    readonly resourceId: string
     readonly sourceId?: string
     readonly assetUrl: string
     readonly allowedHosts: readonly string[]
@@ -63,6 +65,8 @@ interface ActiveTransfer {
 const PROGRESS_PERSIST_INTERVAL_MS = 500
 // 自动恢复中断的指数退避:第 1/2/3 次重试分别等待 2s/8s/30s,⛔ 瞬间烧完重试次数。
 const RETRY_BACKOFF_MS = [2_000, 8_000, 30_000] as const
+// 启动恢复时每个软件保留的已核验工件份数:再新的留作安装,更旧的淘汰,⛔ ready 目录无限堆积。
+const READY_ARTIFACTS_KEPT = 2
 
 export interface DownloadManagerOptions {
   readonly catalog: DownloadCatalog
@@ -170,7 +174,7 @@ export class DownloadManager {
       await this.update(task.taskId, { state: 'downloading', reason: '', receivedBytes: '0', retryCount: '0', resumeEtag: '', resumeLastModified: '', message: index === 0 ? '下载中' : '正在尝试备用下载渠道' })
       let transfer: DownloadTransfer
       try {
-        transfer = await this.options.engine.start({ taskId: task.taskId, sourceId: source.id, assetUrl: source.assetUrl, allowedHosts: source.allowedHosts, proxyUrl, network: source.network, partPath: task.partPath })
+        transfer = await this.options.engine.start({ taskId: task.taskId, resourceId: resource.id, sourceId: source.id, assetUrl: source.assetUrl, allowedHosts: source.allowedHosts, proxyUrl, network: source.network, partPath: task.partPath })
       } catch {
         if (this.disposed || (await this.requireTask(task.taskId)).state === 'cancelled') return
         await this.options.store.appendEvent({ at: this.now(), result: 'download-source-unavailable', sourceId: source.id })
@@ -393,17 +397,42 @@ export class DownloadManager {
         await this.persist({ ...task, state: 'interrupted-terminal', reason: 'app-restarted', message: '上次下载因工具箱退出而中断，无法续传原分段。点击“重新下载”继续，原安装步骤保留。', resumeEtag: '', resumeLastModified: '', endedAt: this.now() }, 'interrupted-after-restart')
       }
     }
+    // 先核对再淘汰最后清扫:核对把失工件的任务判下去,淘汰按存活集合裁剪,清扫收走无引用目录。
+    await this.pruneReadyArtifacts()
+    await this.options.store.sweepOrphanDirectories()
   }
 
-  async waitForSettled(taskId: string): Promise<DownloadTaskSnapshot> {
-    for (let attempt = 0; attempt < 200; attempt += 1) {
-      const task = await this.requireTask(taskId)
-      if (task.state !== 'downloading' && task.state !== 'verifying') {
-        return task
-      }
-      await new Promise((resolve) => setTimeout(resolve, 5))
+  /**
+   * 每个软件只保留最新 READY_ARTIFACTS_KEPT 份已核验工件:反复重下/换版本会让几百 MB 的
+   * ready 目录无限堆积。淘汰旧份时删记录+删工件文件,目录随后由孤儿清扫收走;
+   * 只裁 download 类资源,⛔ external-entry(无工件)记录。
+   */
+  private async pruneReadyArtifacts(): Promise<void> {
+    const bySoftware = new Map<string, StoredDownloadTask[]>()
+    for (const task of await this.options.store.list()) {
+      if (task.state !== 'ready' && task.state !== 'handed-off-install') continue
+      const resource = this.resources.get(task.resourceId)
+      if (resource?.type !== 'download') continue
+      const group = bySoftware.get(resource.software) ?? []
+      group.push(task)
+      bySoftware.set(resource.software, group)
     }
-    throw new DownloadManagerError('DOWNLOAD_SETTLE_TIMEOUT')
+    for (const [software, tasks] of bySoftware) {
+      const stale = [...tasks].sort((a, b) => b.startedAt.localeCompare(a.startedAt)).slice(READY_ARTIFACTS_KEPT)
+      for (const task of stale) {
+        await this.options.store.deleteArtifact(task)
+        await this.options.store.deleteRecord(task.taskId)
+        await this.options.store.appendEvent({
+          at: this.now(),
+          software,
+          version: this.requireResource(task.resourceId).version,
+          taskId: task.taskId,
+          result: 'ready-artifact-pruned',
+          bytes: '0',
+          retryCount: task.retryCount
+        })
+      }
+    }
   }
 
   private async monitor(taskId: string): Promise<void> {
@@ -449,8 +478,9 @@ export class DownloadManager {
           const backoffIndex = Math.min(Number(retried.retryCount) - 1, this.retryBackoffMs.length - 1)
           setTimeout(() => void this.resume(taskId).catch(() => undefined), this.retryBackoffMs[Math.max(0, backoffIndex)])
         } else if (active.sourceIndex + 1 < active.sources.length) {
-          await this.releaseTransfer(active.transfer)
+          // 先 cancel 再 release,⛔ 反过来——release 已断连接,item 却还活着,期间回包没人接。
           active.transfer.cancel()
+          await this.releaseTransfer(active.transfer)
           await this.beginTransfer(resumable, active.resource, active.sources, active.sourceIndex + 1)
         }
         return

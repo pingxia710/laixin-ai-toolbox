@@ -196,19 +196,21 @@ describe.each([['macOS', macDaemon], ['Windows', winDaemon]] as const)('%s bound
   it('夺回写入后设置锁暂忙时保留当前租约并顺延，不误报目标不可达', async () => {
     const h = harness()
     await h.daemon.run()
-    const daemonWithSettings = h.daemon as unknown as { verifySettings(repair?: boolean, options?: Record<string, unknown>): unknown }
-    const originalVerifySettings = daemonWithSettings.verifySettings.bind(daemonWithSettings)
-    let normalReadbacks = 0
-    vi.spyOn(daemonWithSettings, 'verifySettings').mockImplementation((repair = false, options = {}) => {
-      if (!repair && normalReadbacks++ === 0) throw new SettingsBusy('test-holder')
-      return originalVerifySettings(repair, options)
+    // 稳态第三轮显式 verifySettings(false) 已删(纯重复):补验撞锁的注入点移到 applySettings——
+    // 夺回写入后的复读与补写都在它内部的锁里;撞锁(SettingsBusyError → 顺延、租约保留)语义不变。
+    const daemonWithSettings = h.daemon as unknown as { applySettings(options?: Record<string, unknown>): unknown }
+    const originalApplySettings = daemonWithSettings.applySettings.bind(daemonWithSettings)
+    let busyApplies = 0
+    vi.spyOn(daemonWithSettings, 'applySettings').mockImplementation((options = {}) => {
+      if (busyApplies++ === 0) throw new SettingsBusy('test-holder')
+      return originalApplySettings(options)
     })
     h.setValue('external-value')
     const writesBefore = h.write.mock.calls.length
     await h.advance(30_000)
     const internal = h.daemon as unknown as { availabilityReclaimOperation?: { action: string; lease?: { id: string } } }
     expect(h.write).toHaveBeenCalledTimes(writesBefore + 1)
-    expect(normalReadbacks).toBe(1)
+    expect(busyApplies).toBe(1)
     expect(internal.availabilityReclaimOperation).toMatchObject({ action: 'reclaim', lease: { id: expect.any(String) } })
     expect(h.state()).toMatchObject({ state: 'connected', availability: { status: 'reclaiming' } })
     await h.advance(2_000)

@@ -3,7 +3,7 @@
 // FB-1 的 UNKNOWN(9/45,TOP2)多数来自「意外退出/叫醒耗尽」这类现件丢失路径——现在起每一处都落
 // 结构化事件(进 <userData>/logs/tunnel-daemon.log,诊断包既有通道收录),UNKNOWN 从此可归因。
 import { describe, expect, it } from 'vitest'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createFailureLog } from '../../app/main/tunnel/failure-log'
@@ -32,6 +32,39 @@ describe('createFailureLog(结构化失败日志)', () => {
     try {
       const log = createFailureLog(join(dir, 'not-a-dir', 'file', 'tunnel-daemon.log'))
       expect(() => log('wake-error', 'x')).not.toThrow()
+    } finally { rmSync(dir, { recursive: true, force: true }) }
+  })
+
+  it('超过上限后轮转:旧内容进 .1,新文件从头写且保持 0600', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'failure-log-rot-'))
+    const path = join(dir, 'tunnel-daemon.log')
+    try {
+      // 测试注入收紧阈值(生产默认 10MB/每 64 次):每次写入前都检查大小,200 字节即轮转。
+      const log = createFailureLog(path, { checkEveryWrites: 1, maxBytes: 200 })
+      const filler = 'x'.repeat(120)
+      log('e1', filler)
+      log('e2', filler) // 第二条落完后文件已超 200 字节
+      log('e3', filler) // 第三条写入前轮转:e1/e2 进 .1,e3 从头写
+      expect(readFileSync(path, 'utf8')).toContain('e3')
+      expect(readFileSync(path, 'utf8')).not.toContain('e1')
+      expect(readFileSync(`${path}.1`, 'utf8')).toContain('e1')
+      expect(readFileSync(`${path}.1`, 'utf8')).toContain('e2')
+      // 轮转后新文件按 0600 重建(appendFileSync 的 mode 只在建文件时生效)。
+      expect(statSync(path).mode & 0o777).toBe(0o600)
+    } finally { rmSync(dir, { recursive: true, force: true }) }
+  })
+
+  it('未超上限时不轮转:同一文件继续追加,.1 不出现', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'failure-log-keep-'))
+    const path = join(dir, 'tunnel-daemon.log')
+    try {
+      const log = createFailureLog(path, { checkEveryWrites: 1, maxBytes: 200 })
+      log('e1', 'x')
+      log('e2', 'x')
+      const text = readFileSync(path, 'utf8')
+      expect(text).toContain('e1')
+      expect(text).toContain('e2')
+      expect(existsSync(`${path}.1`)).toBe(false)
     } finally { rmSync(dir, { recursive: true, force: true }) }
   })
 })

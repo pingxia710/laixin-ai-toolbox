@@ -26,7 +26,7 @@ function failingSession(mode: 'timeout' | 'throw') {
 }
 
 const request = {
-  taskId: 'release-fixture', assetUrl: 'https://downloads.example.cn/app.dmg',
+  taskId: 'release-fixture', resourceId: 'release-fixture', assetUrl: 'https://downloads.example.cn/app.dmg',
   allowedHosts: ['downloads.example.cn'], network: 'direct' as const, proxyUrl: '',
   partPath: '/tmp/release-fixture.part'
 }

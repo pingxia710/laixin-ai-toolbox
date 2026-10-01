@@ -67,6 +67,18 @@ export function clearWriteRightOwner(pid = process.pid, path = writeRightOwnerPa
   try { rmSync(path, { force: true }); return true } catch { return false }
 }
 
+/** 恢复各入口共用原因分类；交还失败发生在操作后，不能声称“本次未改动”。 */
+export function writeRightFailure(reason) {
+  if (reason === 'held') return { code: 'TUNNEL_WRITE_RIGHT_HELD',
+    message: '这台电脑的网络设置正由另一个来信后台管理，本次未改动；请先退出那一份再重试恢复' }
+  if (reason === 'recovery-incomplete') return { code: 'TUNNEL_RESTORE_INCOMPLETE',
+    message: '上一次的网络设置尚未完全还原；请点击「重试恢复原设置」' }
+  if (reason === 'release-incomplete') return { code: 'TUNNEL_WRITE_RIGHT_RELEASE_INCOMPLETE',
+    message: '网络设置处理后，尚未确认交还管理权；请点击「重试恢复原设置」完成收尾' }
+  return { code: 'TUNNEL_WRITE_RIGHT_UNKNOWN',
+    message: '无法确认系统代理的归属，本次不改动系统设置；请点击「重试恢复原设置」，仍失败请联系来信客服' }
+}
+
 /**
  * 在同一把系统代理写入权下执行一段**恢复写入**(创始人 2026-09-15 P1 第二轮)。
  *
@@ -113,5 +125,5 @@ export function guardedResidentSelfHeal(adapter, run, log = () => undefined) {
   const guarded = withWriteRight(adapter, run, log)
   if (guarded.ok) return guarded.value
   return { restored: 0, keptModified: 0, failed: [], unrestored: 0, residentRemoved: false,
-    shouldExit: false, settingsBusy: true, reason: 'write-right-held' }
+    shouldExit: false, settingsBusy: true, reason: `write-right-${guarded.reason}` }
 }

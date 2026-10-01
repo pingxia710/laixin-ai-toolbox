@@ -688,6 +688,19 @@ async function writeRecoveryGuardFailure(guardErrorPath, code) {
   try { await fs.writeFile(guardErrorPath, code, { mode: 0o600 }); } catch { /* The caller still receives the failure code. */ }
 }
 
+function recoveryGuardReason(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /^UPDATE_RECOVERY_GUARD_FAILED:(UPDATE_RECOVERY_GUARD_[A-Z_]+)$/.exec(message)?.[1] ??
+    /^([A-Z][A-Z0-9_]+)(?::|$)/.exec(message)?.[1] ?? 'UPDATE_RECOVERY_GUARD_UNKNOWN';
+}
+
+async function recordRecoveryGuardFallback(recoveryDirectory, error) {
+  const reason = recoveryGuardReason(error);
+  const line = `${new Date().toISOString()} UPDATE_RECOVERY_GUARD_BYPASSED GUARD_REASON=${reason}\n`;
+  try { await fs.appendFile(join(recoveryDirectory, 'windows-preflight-last-error.log'), line, { mode: 0o600 }); }
+  catch { /* The uninstall still has to prove task, process and network cleanup below. */ }
+}
+
 function recoveryGuardFailure(code) {
   return new Error(`UPDATE_RECOVERY_GUARD_FAILED:${code}`);
 }
@@ -1250,7 +1263,15 @@ async function windowsPreflightLocked(options, commands) {
   }
   let recovery;
   if (options.recoveryDirectory !== undefined || options.ownerPid !== undefined) {
-    recovery = await armWindowsPreflightRecovery(snapshots, options, commands, native, workDeadline, now);
+    try {
+      recovery = await armWindowsPreflightRecovery(snapshots, options, commands, native, workDeadline, now);
+    } catch (error) {
+      // The recovery guard protects against an interrupted preflight; it must not make the product
+      // impossible to uninstall. Only an explicit real-uninstall caller may degrade here, before any
+      // task/process mutation. The existing preflight and ledger restore still have to finish cleanly.
+      if (options.mode !== 'uninstall' || options.allowRecoveryGuardFallback !== true) throw error;
+      await recordRecoveryGuardFallback(options.recoveryDirectory, error);
+    }
   }
   const guardedOptions = recovery === undefined
     ? options
@@ -1298,6 +1319,7 @@ async function windowsPreflightLocked(options, commands) {
     }
     throw error;
   }
+  return { recoveryArmed: recovery !== undefined };
 }
 
 async function run(job, commands = exec) {
@@ -1455,10 +1477,14 @@ async function main() {
       ? dirname(source.result)
       : process.env.LAIXIN_PREFLIGHT_RECOVERY_DIRECTORY;
     const ownerPid = Number(process.env.LAIXIN_PREFLIGHT_OWNER_PID);
-    await windowsPreflight({ mode, target: source.target, executable: source.executable,
+    const outcome = await windowsPreflight({ mode, target: source.target, executable: source.executable,
       residentLabel: source.residentLabel, recoveryDirectory, ownerPid,
       tunnelDataDir: jobPath ? source.tunnelDataDir : process.env.LAIXIN_PREFLIGHT_TUNNEL_DIRECTORY,
-      ownerExecutable: process.env.LAIXIN_PREFLIGHT_OWNER_EXECUTABLE });
+      ownerExecutable: process.env.LAIXIN_PREFLIGHT_OWNER_EXECUTABLE,
+      allowRecoveryGuardFallback: mode === 'uninstall' });
+    // NSIS exit 2 means the real-uninstall-only guard fallback completed its remaining preflight.
+    // It is success, but there is no recovery transaction for customUnInstall to commit.
+    if (mode === 'uninstall' && outcome.recoveryArmed === false) process.exitCode = 2;
     return;
   }
   if (process.argv[2] === 'windows-preflight-recover') {

@@ -18,22 +18,22 @@ const directory = () => { const root = mkdtempSync(join(tmpdir(), 'restore-settl
 
 interface RestoreChildControl {
   child: unknown
-  exit: (code: number | null) => void
+  exit: (code: number | null, signal?: string | null) => void
   fail: () => void
   killCalls: string[]
 }
 
 function makeRestoreChild(): RestoreChildControl {
-  const exitListeners: Array<(code: number | null) => void> = []
+  const exitListeners: Array<(code: number | null, signal?: string | null) => void> = []
   const errorListeners: Array<() => void> = []
   const killCalls: string[] = []
   return {
     child: {
-      on: (event: string, callback: (code: number | null) => void) => { if (event === 'exit') exitListeners.push(callback) },
+      on: (event: string, callback: (code: number | null, signal?: string | null) => void) => { if (event === 'exit') exitListeners.push(callback) },
       once: (event: string, callback: () => void) => { if (event === 'error') errorListeners.push(callback) },
       kill: (signal?: string) => { killCalls.push(signal ?? 'SIGTERM') }
     },
-    exit: (code) => { for (const listener of exitListeners.splice(0)) listener(code) },
+    exit: (code, signal = null) => { for (const listener of exitListeners.splice(0)) listener(code, signal) },
     fail: () => { for (const listener of errorListeners.splice(0)) listener() },
     killCalls
   }
@@ -51,6 +51,34 @@ function seedInterruptedLedger(root: string): void {
 const readState = (root: string): { state?: string; code?: string; message?: string } | undefined => {
   try { return JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')) } catch { return undefined }
 }
+
+it.each([[null, 'SIGABRT'], [65, null]] as const)('恢复进程 %s/%s 没有写结果时必须落明确失败', async (code, signal) => {
+  const h = makeHarness({ residentAlive: false })
+  seedInterruptedLedger(h.root)
+  const result = h.supervisor.runRecoveryOnce()
+  h.restoreChildren[0].exit(code, signal)
+  expect(await result).toBe(false)
+  expect(readState(h.root)).toMatchObject({ state: 'error', code: 'TUNNEL_RESTORE_PROCESS_FAILED' })
+  expect(KNOWN_FAILURE_CODES.has('TUNNEL_RESTORE_PROCESS_FAILED')).toBe(true)
+  expect(connectionMessage({ state: 'error', code: 'TUNNEL_RESTORE_PROCESS_FAILED', message: '' })).toContain('重试恢复原设置')
+})
+
+it('恢复进程明确写出的本轮业务失败保留，上一轮旧错误不能冒充本轮结果', async () => {
+  const h = makeHarness({ residentAlive: false })
+  seedInterruptedLedger(h.root)
+  const old = { state: 'error', code: 'TUNNEL_WRITE_RIGHT_HELD', message: '旧结果', updatedAt: 1 }
+  writeFileSync(join(h.root, 'state.json'), JSON.stringify(old))
+  const first = h.supervisor.runRecoveryOnce()
+  h.restoreChildren[0].exit(65)
+  expect(await first).toBe(false)
+  expect(readState(h.root)?.code).toBe('TUNNEL_RESTORE_PROCESS_FAILED')
+  const second = h.supervisor.runRecoveryOnce()
+  const fresh = { state: 'error', code: 'TUNNEL_WRITE_RIGHT_UNKNOWN', message: '本轮结果', updatedAt: Date.now() }
+  writeFileSync(join(h.root, 'state.json'), JSON.stringify(fresh))
+  h.restoreChildren[1].exit(65)
+  expect(await second).toBe(false)
+  expect(readState(h.root)).toEqual(fresh)
+})
 
 interface HarnessOptions {
   residentAlive?: boolean

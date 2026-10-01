@@ -8,8 +8,12 @@ import {
   existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync
 } from 'node:fs'
 import type { EncryptedQueueCodec } from './diagnostic-event-queue'
+import { DIAGNOSIS_MAX_AGE_MS } from './diagnostic-event-queue'
 import { KNOWN_FAILURE_CODES } from './failure-codes'
 import { DIAGNOSTIC_CLIENT_VERSION_PATTERN } from '../../diagnostic-event-types'
+
+// 留存窗与事件队列(diagnostic-event-queue)同一个 7 天,单一源在那一侧;此处再出口,引用面不变。
+export { DIAGNOSIS_MAX_AGE_MS } from './diagnostic-event-queue'
 
 export type DiagnosisStage = 'connect-start' | 'connect-run' | 'repair'
 
@@ -48,7 +52,6 @@ export interface DiagnosisReporterDeps {
 }
 
 export const DIAGNOSIS_QUEUE_LIMIT = 50
-export const DIAGNOSIS_MAX_AGE_MS = 7 * 24 * 60 * 60_000
 const DIAGNOSIS_MAX_QUEUE_BYTES = 256 * 1024
 
 export class DiagnosisReporter {

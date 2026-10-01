@@ -1,7 +1,7 @@
 // macOS 同一用户的系统代理全局写权。
 //
 // Windows 用内核命名互斥体；macOS 没有可由纯 Node 长期持有、且随进程死亡自动释放的同类原语。
-// 这里用用户私有目录中的原子硬链接作为席位，并用 lockf 串行化席位切换：
+// 这里用用户私有目录中的原子硬链接作为席位，并用随包 flock 启动器串行化席位切换：
 //   · 创建、stale 回收与释放共享同一 flock 临界区，席位里的 PID/出生标识/随机令牌作 CAS；
 //   · 活持有者永不按时间抢占，timeoutMs 只表示等待多久；
 //   · 进程死亡或 PID 已被复用时才回收；移除旧席位前先持久化恢复责任，账本还原后才清除；
@@ -21,7 +21,7 @@ const MAX_OWNER_BYTES = 8_192
 const POLL_MS = 50
 const PRIVATE_MASK = 0o077
 const TRANSITION_MODE = '--macos-write-right-transition'
-const LOCKF = '/usr/bin/lockf'
+const WRITE_LOCK = fileURLToPath(new URL('./bin/write-lock', import.meta.url))
 
 export function writeRightPath(home = homedir()) {
   return join(home, 'Library', 'Application Support', 'Laixin', 'system-proxy-write-right.json')
@@ -385,15 +385,15 @@ function runTransition(request) {
   const encoded = Buffer.from(JSON.stringify(request), 'utf8').toString('base64url')
   const lockWaitSeconds = request.operation === 'release' ? '1' : '0'
   try {
-    const raw = execFileSync(LOCKF, [
-      '-s', '-t', lockWaitSeconds, '-k', transitionLockPath(path),
+    const raw = execFileSync(WRITE_LOCK, [
+      lockWaitSeconds, transitionLockPath(path),
       process.execPath, fileURLToPath(import.meta.url), TRANSITION_MODE, encoded
     ], { encoding: 'utf8', timeout: 5_000, env: process.env })
     return JSON.parse(raw)
   } catch (error) {
     const committed = recoverCommittedTransition(request)
     if (committed !== undefined) return committed
-    // lockf 的 EX_TEMPFAIL(75)只表示另一个 acquire/reclaim 正在极短临界区内；调用方按 deadline 重读。
+    // EX_TEMPFAIL(75)只表示另一个 acquire/reclaim 正在极短临界区内；调用方按 deadline 重读。
     return error?.status === 75 ? { kind: 'busy' } : { kind: 'unavailable' }
   }
 }

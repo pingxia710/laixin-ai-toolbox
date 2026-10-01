@@ -1,5 +1,6 @@
 import { afterEach, expect, it, vi } from 'vitest'
 import type { AccountView, CommercialTerms } from '../../app/account-types'
+import type { NetworkUsageView } from '../../app/shared/network-usage-types'
 import { mountAccountOverview } from '../../app/renderer/src/ui/account-overview'
 import { accountAction } from '../../app/renderer/src/account-state'
 import { openPaymentDialog } from '../../app/renderer/src/ui/payment-dialog'
@@ -101,4 +102,25 @@ it('多份月套餐同时展示并汇总剩余，同档和换档仍可继续购�
   expect(nodes.some((node) => node.textContent.includes('有效套餐 2 份'))).toBe(true)
   expect(nodes.some((node) => node.textContent.includes('69.00 GB'))).toBe(true)
   expect(nodes.some((node) => node.textContent.includes('待接续'))).toBe(false)
+})
+
+const subscriptionUsage = (state: NetworkUsageView['state']): NetworkUsageView => ({
+  authorizationId: 'lx-' + '2'.repeat(32), kind: 'subscription', planId: '20g', state,
+  measurement: 'not-requested', totalBytes: 20 * 1024 ** 3, usedBytes: null, remainingBytes: null,
+  expiresAt: Date.parse('2026-10-01T00:00:00Z'), observedAt: null, reasonCode: ''
+})
+
+it.each(['expired', 'exhausted', 'disabled'] as const)('confirmed terminal %s subscriptions show zero available, not a temporary fault', (state) => {
+  const subscriptions = [subscriptionUsage(state), subscriptionUsage('expired')]
+  const summary = render(undefined, { subscriptions, subscription: subscriptions[0] })
+    .find((node) => node.textContent.includes('总剩余'))!
+  expect(summary.textContent).toBe('有效套餐 0 份 · 总剩余 0.00 GB')
+})
+
+it.each(['unknown', 'pending', 'queued', 'provisioning'] as const)('unresolved %s mixed with terminal subscriptions must not become zero', (state) => {
+  const subscriptions = [subscriptionUsage('expired'), subscriptionUsage(state)]
+  const summary = render(undefined, { subscriptions, subscription: subscriptions[0] })
+    .find((node) => node.textContent.includes('总剩余'))!
+  expect(summary.textContent).toContain('总剩余 暂时无法获取')
+  expect(summary.textContent).not.toContain('0.00 GB')
 })

@@ -121,7 +121,11 @@ export function buildTunnelPresentation(status: TunnelStatusView | undefined): T
       ? '安装包组件不完整，请重新安装工具箱或联系客服。' : '恢复记录无法核对，原记录已保留，请让客服协助恢复。',
     hint: status.message || status.componentMissing, primaryAction: 'support', primaryLabel: '联系来信客服' }
   }
-  if (status.unrestored) {
+  if (status.recoveryState === 'running') {
+    return { tone: 'warning', headline: '正在恢复原设置', description: '正在交还网络设置，完成前请不要重复连接或导入配置。',
+      hint: status.message || '恢复结束后会自动更新状态。', primaryAction: 'none', primaryLabel: '恢复中' }
+  }
+  if (status.recoveryState === 'required' || status.unrestored) {
     return { tone: 'danger', headline: '原设置尚未恢复', description: '通道已停止。可以重试恢复；其他软件修改的设置会保留。',
       hint: status.message || '恢复完成前无法重新连接或应用新配置。', primaryAction: 'stop', primaryLabel: '重试恢复原设置' }
   }

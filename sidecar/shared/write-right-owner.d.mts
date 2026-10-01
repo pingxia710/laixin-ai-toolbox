@@ -16,6 +16,7 @@ export declare function writeRightOwnerPath(platform?: string, env?: Record<stri
 export declare function publishWriteRightOwner(info: Record<string, unknown>, path?: string): boolean
 export declare function readWriteRightOwner(path?: string): WriteRightOwner | undefined
 export declare function clearWriteRightOwner(pid?: number, path?: string): boolean
+export declare function writeRightFailure(reason: string): { code: string; message: string }
 
 export declare function withWriteRight<T>(adapter: unknown, fn: () => T, log?: (line: string) => void):
   { ok: true; value: T } | { ok: false; reason: string }

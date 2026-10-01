@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { DownloadManager, type DownloadCompletion, type DownloadEngine, type DownloadTransfer } from '../../app/main/download/download-manager'
+import { waitForSettled } from './helpers'
 import { createFileTaskStore, sweepOrphanDownloadDirectories, taskPaths } from '../../app/main/download/task-store'
 import { parseCatalog } from '../../app/main/download/catalog'
 import type { ArtifactDigest, DownloadArtifactInspector, DownloadTaskStore, StoredDownloadTask, TunnelSnapshot } from '../../app/main/download/types'
@@ -138,6 +139,14 @@ class MemoryStore implements DownloadTaskStore {
   async deleteArtifact(task: StoredDownloadTask): Promise<void> {
     this.deletedArtifacts.push(task.artifactPath)
   }
+  deletedRecords: string[] = []
+  async deleteRecord(taskId: string): Promise<void> {
+    this.deletedRecords.push(taskId)
+    this.tasks.delete(taskId)
+  }
+  async sweepOrphanDirectories(): Promise<number> {
+    return 0
+  }
   async artifactStatus(): Promise<{ size: number; mtimeMs: number } | undefined> {
     return this.artifactStatusResult
   }
@@ -188,7 +197,7 @@ describe('下载进度落盘节流与写入串行化', () => {
     expect(store.saveCount - savesBefore).toBeLessThanOrEqual(3)
     transfer.finish('completed')
     await vi.advanceTimersByTimeAsync(0)
-    expect((await manager.waitForSettled(task.taskId)).state).toBe('ready')
+    expect((await waitForSettled(manager, task.taskId)).state).toBe('ready')
   })
 
   it('进度回写与状态迁移并发时不互相覆盖(E-7):终态不被迟到的旧进度盖回 downloading', async () => {
@@ -210,7 +219,7 @@ describe('下载进度落盘节流与写入串行化', () => {
     const { manager } = createManager(engine, new MemoryStore())
     const task = await manager.start('fixture-dmg')
     engine.transfers[0].finish('completed')
-    await manager.waitForSettled(task.taskId)
+    await waitForSettled(manager, task.taskId)
     expect(engine.transfers[0].releaseCount).toBe(1)
   })
 })
@@ -254,7 +263,7 @@ describe('启动恢复跳过未变大安装包的重算', () => {
     const { manager } = createManager(engine, store)
     const task = await manager.start('fixture-dmg')
     engine.transfers[0].finish('completed')
-    const ready = await manager.waitForSettled(task.taskId)
+    const ready = await waitForSettled(manager, task.taskId)
     expect(ready.state).toBe('ready')
     expect(ready.artifactSize).toBe(String(artifact.byteLength))
     expect(ready.artifactMtimeMs).toBe('1000')
@@ -281,7 +290,7 @@ describe('启动恢复跳过未变大安装包的重算', () => {
     const { manager } = createManager(engine, store)
     const task = await manager.start('fixture-dmg')
     engine.transfers[0].finish('completed')
-    await manager.waitForSettled(task.taskId)
+    await waitForSettled(manager, task.taskId)
     const ready = await manager.status(task.taskId)
 
     const missingStore = new MemoryStore()
@@ -303,7 +312,7 @@ describe('终态中断清理', () => {
     const task = await manager.start('fixture-dmg')
     const partsBefore = store.deletedParts.length
     engine.transfers[0].finish('interrupted', false)
-    await manager.waitForSettled(task.taskId)
+    await waitForSettled(manager, task.taskId)
     expect((await manager.status(task.taskId)).state).toBe('interrupted-terminal')
     expect(store.deletedParts.length).toBe(partsBefore + 1)
     expect(engine.transfers[0].releaseCount).toBeGreaterThanOrEqual(1)
@@ -316,7 +325,7 @@ describe('终态中断清理', () => {
     const task = await manager.start('fixture-dmg')
     const partsBefore = store.deletedParts.length
     engine.transfers[0].finish('interrupted', true)
-    await manager.waitForSettled(task.taskId)
+    await waitForSettled(manager, task.taskId)
     expect((await manager.status(task.taskId)).state).toBe('interrupted-resumable')
     expect(store.deletedParts.length).toBe(partsBefore)
   })

@@ -230,6 +230,7 @@ describe('五动作与桥注册(判据 3②③主进程侧、6 IPC 负向、12 �
     const status = (await registry.execute('tunnel.status', undefined)) as TunnelStatusView
     expect(status.componentMissing).toContain('组件缺失')
     expect(status.componentMissing).toContain('tunnel-daemon.mjs')
+    expect(status.componentMissing).toContain('bin/proxy-helper')
     const started = (await registry.execute('tunnel.start', undefined)) as { code: string; message: string }
     expect(started.code).toBe('TUNNEL_COMPONENT_MISSING')
     expect(started.message).toContain('组件缺失')

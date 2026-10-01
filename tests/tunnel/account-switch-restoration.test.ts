@@ -59,7 +59,7 @@ it('切换账号时四项 WinINET 恢复超过五秒，恢复完成后自动同�
   expect(result.outcome).toBe('started')
   expect(readCurrentInfo(f.dataDir)?.accountId).toBe('old-account')
   expect(f.claim).not.toHaveBeenCalled()
-  expect(f.service.status()).toMatchObject({ state: '断开中', unrestored: '', message: expect.stringContaining('正在恢复原设置') })
+  expect(f.service.status()).toMatchObject({ state: '断开中', recoveryState: 'running', unrestored: '', message: expect.stringContaining('正在恢复原设置') })
   expect((await f.service.syncAccountConfig()).code).toBe('NETWORK_DISCONNECT_REQUIRED')
   expect((await f.service.setAccountAccess(f.access)).code).toBe('NETWORK_DISCONNECT_REQUIRED')
   expect(f.claim).not.toHaveBeenCalled()
@@ -67,6 +67,7 @@ it('切换账号时四项 WinINET 恢复超过五秒，恢复完成后自动同�
   f.finish(true)
   await vi.waitFor(() => expect(readCurrentInfo(f.dataDir)?.accountId).toBe('new-account'), { timeout: 3_000 })
   expect(f.claim).toHaveBeenCalledTimes(1)
+  expect(f.service.status().recoveryState).toBe('idle')
 }, 15_000)
 
 it('旧设置恢复失败时不读取新账号配置，并提示重试恢复', async () => {
@@ -77,6 +78,17 @@ it('旧设置恢复失败时不读取新账号配置，并提示重试恢复', a
   expect(f.claim).not.toHaveBeenCalled()
   expect(readCurrentInfo(f.dataDir)?.accountId).toBe('old-account')
   expect(f.service.status().message).toContain('重试恢复原设置')
+  expect(f.service.status()).toMatchObject({ recoveryState: 'required', currentConfig: '' })
+}, 15_000)
+
+it('恢复程序异常但账本已无待恢复项，仍保留恢复动作，不把隐藏配置误判为初次使用', async () => {
+  const f = await setup()
+  expect((await f.service.setAccountAccess(f.access)).outcome).toBe('started')
+  writeFileSync(join(f.dataDir, 'ledger.json'), '[]')
+  f.finish(false)
+  await new Promise((resolve) => setTimeout(resolve, 400))
+  expect(f.service.status()).toMatchObject({ recoveryState: 'required', currentConfig: '', unrestored: '' })
+  expect(f.claim).not.toHaveBeenCalled()
 }, 15_000)
 
 it('等待恢复时退出新账号，旧任务不能再为该账号领取配置', async () => {

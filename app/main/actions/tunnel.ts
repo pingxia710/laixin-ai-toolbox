@@ -10,6 +10,7 @@ import { schema } from '../bridge/schema'
 import { recordFault } from '../diagnostics/context'
 import { FAILURE_REPORT_DEFAULT_ENABLED } from '../desktop/preferences'
 import { daemonLaunchFor } from '../tunnel/platform/launch'
+import { createMacProxyAuthorization } from '../tunnel/mac-proxy-authorization'
 import { resolveTunnelDataDir } from '../tunnel/paths'
 import { createCalibrationGate } from '../tunnel/calibration-gate'
 import { initializeTunnelRuntime } from '../tunnel/runtime-owner'
@@ -18,7 +19,7 @@ import { RESIDENT_TASK } from '../tunnel/platform/resident'
 import { setResidentRuntime } from '../tunnel/resident-owner'
 import { platformForRuntime, resolveSidecarDir } from '../tunnel/sidecar-path'
 import { loadTrustContext } from '../tunnel/trust'
-import { createFailureLog, daemonLogPath } from '../tunnel/failure-log'
+import { createFailureLog, createStderrLineSink, daemonLogPath, type FailureLog } from '../tunnel/failure-log'
 import { TunnelService, accountFailure, isLocalWriteFault, type ActionResult } from '../tunnel/tunnel-service'
 import { NetworkAccountError } from '../tunnel/account-client'
 import { PackageReject } from '../tunnel/package-format'
@@ -106,7 +107,8 @@ export const statusResultSchema = schema.object({
   pendingConfig: schema.string({ maxLength: 300 }),
   canApplyPending: schema.boolean(),
   unrestored: schema.string({ maxLength: 600 }),
-  componentMissing: schema.string({ maxLength: 400 }),
+  recoveryState: schema.string({ maxLength: 8 }),
+  componentMissing: schema.string({ maxLength: 600 }),
   sshBinary: schema.string({ maxLength: 8 }),
   traffic: schema.string({ maxLength: 160 }),
   // N-55:仅传控制器的脱敏阶段和已证实限制原因；对象、快照和租约留在守护/账本。
@@ -184,6 +186,16 @@ export function registerActions(registry: BridgeRegistry, deps: TunnelActionDeps
   registry.registerShutdownHook('tunnel', () => service.requestShutdown())
 }
 
+/** stderr 接流对任何来源的子进程都生效:接的是「子进程 stderr → 常驻日志」,
+ *  与子进程从哪来(生产 spawn / 测试注入)无关。行级合并见 createStderrLineSink。 */
+function attachStderrSink(child: SpawnedDaemon, log: FailureLog, event: string): SpawnedDaemon {
+  const sink = createStderrLineSink(log, event)
+  ;(child as { readonly stderr?: { on(event: 'data', callback: (chunk: unknown) => void): void } })
+    .stderr?.on('data', (chunk) => sink.push(String(chunk)))
+  child.once?.('exit', () => sink.flush())
+  return child
+}
+
 function productionDeps(deps: TunnelActionDeps) {
   const platform = deps.platform ?? platformForRuntime(process.platform)
   const dataDir = deps.dataDir ?? resolveTunnelDataDir(process.env, app.getPath('userData'))
@@ -227,6 +239,7 @@ function productionDeps(deps: TunnelActionDeps) {
     platform,
     sidecarDir,
     resident: resident.bridge,
+    ...(platform === 'macos' && app.isPackaged ? { ensureProxyAuthorization: createMacProxyAuthorization(sidecarDir) } : {}),
     // 开发态校准从不发生(desktop 片直接 return):给了通知反而让开机接续永远等,⛔ 给。
     ...(app.isPackaged
       ? { afterResidentCalibration: (fn: () => void) => calibrationGate.afterCalibration(fn) }
@@ -265,34 +278,38 @@ function productionDeps(deps: TunnelActionDeps) {
     // Phase 1 ④:UNKNOWN 归因——监管器的意外退出/叫醒耗尽/恢复失败第一现场进常驻日志。
     logFailure: supervisorLog,
     spawnDaemon:
-      deps.spawnDaemon ??
-      ((dir: string, runId?: string) => {
-        // 独立于主进程 Job 存活，仅为完成关闭恢复；IPC 断开即停止，不能常驻后台。
-        const child = spawn(process.execPath, [launch.daemonPath, 'start', '--data-dir', dir, '--adapter', launch.adapterPath,
-          '--parent-ipc', '1', '--run-id', runId ?? ''], {
-          env: { ...process.env, ...launch.env }, detached: true, windowsHide: true,
-          // Phase 1 ④:spawn 路径守护的 stderr 基线走 inherit(打包后无处可去)——接流进常驻日志。
-          stdio: ['ignore', 'ignore', 'pipe', 'ipc']
-        })
-        child.stderr?.on('data', (chunk) => supervisorLog('daemon-stderr', String(chunk).trim()))
-        const resume = () => { if (child.connected) child.send({ type: 'network-event', event: 'wake' }, () => {}) }
-        powerMonitor.on('resume', resume)
-        const cleanup = () => powerMonitor.removeListener('resume', resume)
-        child.once('exit', cleanup)
-        child.once('error', cleanup)
-        return child
-      }),
+      deps.spawnDaemon ?
+        ((dir: string, runId?: string) => attachStderrSink(deps.spawnDaemon?.(dir, runId) as SpawnedDaemon,
+          supervisorLog, 'daemon-stderr')) :
+        ((dir: string, runId?: string) => {
+          // 独立于主进程 Job 存活，仅为完成关闭恢复；IPC 断开即停止，不能常驻后台。
+          const child = spawn(process.execPath, [launch.daemonPath, 'start', '--data-dir', dir, '--adapter', launch.adapterPath,
+            '--parent-ipc', '1', '--run-id', runId ?? ''], {
+            env: { ...process.env, ...launch.env }, detached: true, windowsHide: true,
+            // Phase 1 ④:spawn 路径守护的 stderr 基线走 inherit(打包后无处可去)——接流进常驻日志。
+            stdio: ['ignore', 'ignore', 'pipe', 'ipc']
+          })
+          const resume = () => { if (child.connected) child.send({ type: 'network-event', event: 'wake' }, () => {}) }
+          powerMonitor.on('resume', resume)
+          const cleanup = () => powerMonitor.removeListener('resume', resume)
+          child.once('exit', cleanup)
+          child.once('error', cleanup)
+          return attachStderrSink(child, supervisorLog, 'daemon-stderr')
+        }),
     spawnRestore:
-      deps.spawnRestore ??
-      ((dir: string) => {
-        const child = spawn(process.execPath, [launch.daemonPath, 'restore', '--data-dir', dir, '--adapter', launch.adapterPath], {
-          env: { ...process.env, ...launch.env }, detached: true, windowsHide: true,
-          // Phase 1 ④:恢复子进程的梯子进度/写权原因都在 stderr,基线 inherit 打包后丢失——接流留痕。
-          stdio: ['ignore', 'ignore', 'pipe']
-        })
-        child.stderr?.on('data', (chunk) => supervisorLog('restore-stderr', String(chunk).trim()))
-        return child
-      }),
+      deps.spawnRestore ?
+        ((dir: string) => {
+          const child = deps.spawnRestore?.(dir)
+          return child ? attachStderrSink(child, supervisorLog, 'restore-stderr') : child
+        }) :
+        ((dir: string) => {
+          const child = spawn(process.execPath, [launch.daemonPath, 'restore', '--data-dir', dir, '--adapter', launch.adapterPath], {
+            env: { ...process.env, ...launch.env }, detached: true, windowsHide: true,
+            // Phase 1 ④:恢复子进程的梯子进度/写权原因都在 stderr,基线 inherit 打包后丢失——接流留痕。
+            stdio: ['ignore', 'ignore', 'pipe']
+          })
+          return attachStderrSink(child, supervisorLog, 'restore-stderr')
+        }),
     routesFile: join(sidecarDir, 'routes.default.json')
   }
 }

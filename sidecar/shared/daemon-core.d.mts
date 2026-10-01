@@ -3,6 +3,8 @@ import type { SettingsAdapter } from './restore.d.mts'
 import type { VlessSpec } from './vless-connector.mjs'
 
 export declare function readIntentChecked(dataDir: string): { intent: DaemonIntent | { desired: 'shutdown' } | undefined; corrupted: boolean }
+/** 诊断计数:readIntentChecked 真正读盘解析意图文件的次数(记忆化后供测试与巡检断言)。 */
+export declare function intentDiskReads(): number
 /** 同一数据目录的恢复权规则(退出流程与崩溃兜底共用):启动后出现更高接管代次才算别的守护已实际接手。 */
 /** 上一轮实际监听的入口端口(候选口占满时会是系统随机分的那个)。 */
 export declare function lastBridgePort(dataDir: string): number | undefined

@@ -5,6 +5,7 @@ import { importConfig, type ImportDeps, type ImportOutcome } from '../../app/mai
 import { REJECT_REASONS, type RejectCode } from '../../app/main/tunnel/package-format'
 import { layout } from '../../app/main/tunnel/paths'
 import { applyPending } from '../../app/main/tunnel/transactions'
+import { readPendingInfo } from '../../app/main/tunnel/import-meta'
 import { loadTrustContext, TRUST_LINES, type TrustContext } from '../../app/main/tunnel/trust'
 import { buildPackageEntries, makeTestKeyPair, writePackageDir, type BuiltPackage } from './fixtures/package-builder'
 import { tarFromPackageEntries, writeTar } from './fixtures/tar-writer'
@@ -81,6 +82,7 @@ describe('配置包导入与信任三档(判据 6/12/14/15/16)', () => {
     expect(credentialMode).toBe(0o600)
     expect(existsSync(layout.currentPointer(dataDir))).toBe(false) // current 一字节不动
     expect(readPending()).toBe(outcome.batchId)
+    expect(readPendingInfo(dataDir)).toMatchObject({ protocol: 'ssh-socks', credentialName: 'id_ed25519' })
     // 摘要脱敏:输出里 grep 不到凭据内容
     expect(JSON.stringify(outcome)).not.toContain('FAKE-TEST-PRIVATE-KEY')
   })
