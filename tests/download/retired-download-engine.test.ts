@@ -53,7 +53,7 @@ it('account client no longer carries the engine-only download report channel', (
 })
 
 // RETIRE03:下载去戏收尾——目录不再携带下载引擎专用的 type:'download' 条目
-//(openExternal 只消费 external-entry);发布测速门禁只守两链(Windows + Mac M);
+//(openExternal 只消费 external-entry);发布测速门禁守三个正式平台;
 //引擎时代的孤儿阶段文案与探针不得回流。
 it('install catalog carries only external-entry resources', () => {
   const catalog = JSON.parse(readFileSync(join(__dirname, '../../resources/catalog.json'), 'utf8'))
@@ -61,11 +61,18 @@ it('install catalog carries only external-entry resources', () => {
   expect(downloadEntries, `catalog 不得再含 download 型条目:${downloadEntries.map((r: { id: string }) => r.id).join(',')}`).toEqual([])
 })
 
-it('release speed gate covers exactly the two shipped installers', () => {
+it('release speed gate covers all three shipped installers', () => {
   const speed = readFileSync(join(__dirname, '../../scripts/verify-download-speed.mjs'), 'utf8')
-  expect(speed.includes('laixin-ai-toolbox-mac-x64.dmg'), '测速门禁不得再要求 Intel 包').toBe(false)
+  expect(speed.includes('laixin-ai-toolbox-mac-x64.dmg')).toBe(true)
   expect(speed.includes('laixin-ai-toolbox-windows-x64.exe')).toBe(true)
   expect(speed.includes('laixin-ai-toolbox-mac-arm64.dmg')).toBe(true)
+})
+
+it('public source export includes the release speed gate consumed by this test', () => {
+  const exporterPath = join(__dirname, '../../scripts/export-public-source.mjs')
+  if (!existsSync(exporterPath)) return // 公开导出本身不携带私库导出器，测速脚本已由上一用例直接核对。
+  const exporter = readFileSync(exporterPath, 'utf8')
+  expect(exporter.includes("'verify-download-speed.mjs'"), '公开导出后不得因缺测速脚本使完整测试失败').toBe(true)
 })
 
 it('engine-era electron probe stays removed', () => {
