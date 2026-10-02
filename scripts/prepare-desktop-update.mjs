@@ -33,10 +33,11 @@ const signedManifest = (release, privateKey) => {
   return JSON.stringify({ payload: payload.toString('base64'), signature: sign(null, payload, privateKey).toString('base64') })
 }
 await mkdir(output, { recursive: true })
-// Intel 构建线已停发(RETIRE02,2026-10-02 创始人拍板):更新清单只发 darwin-arm64。
-// darwin-arm64 是主平台,它不在就是真出事了,必须报错。
+// Intel 包是单独一条构建线(build:mac-intel,Electron 43 支持 macOS 12),
+// 开发中可以缺席并明确跳过；正式发布由三平台发布门禁强制要求它存在。
 const macCandidates = [
-  { platform: 'darwin-arm64', directory: 'mac-arm64', name: `toolbox-${metadata.version}-mac-arm64.zip`, required: true }
+  { platform: 'darwin-arm64', directory: 'mac-arm64', name: `toolbox-${metadata.version}-mac-arm64.zip`, required: true },
+  { platform: 'darwin-x64', directory: 'mac', name: `toolbox-${metadata.version}-mac-x64.zip`, required: false }
 ]
 const macTargets = []
 for (const target of macCandidates) {

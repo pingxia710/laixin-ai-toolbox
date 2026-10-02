@@ -7,13 +7,13 @@ import { performance } from 'node:perf_hooks'
 
 export const SAMPLE_BYTES = 8 * 1024 * 1024
 const MIN_BYTES_PER_SECOND = 1024 * 1024
-// RETIRE02:Intel 线已停发,直装矩阵只守 Windows + Mac M 系列
-const FILENAMES = ['laixin-ai-toolbox-windows-x64.exe', 'laixin-ai-toolbox-mac-arm64.dmg']
+// 正式发布必须同时提供 Windows、Mac M 系列和 Mac Intel 三个直装包。
+const FILENAMES = ['laixin-ai-toolbox-windows-x64.exe', 'laixin-ai-toolbox-mac-arm64.dmg', 'laixin-ai-toolbox-mac-x64.dmg']
 
 export function downloadTargets(html, origin, version) {
   const links = new Set([...html.matchAll(/(?:href|url)\s*[:=]\s*['"]([^'"]*\/downloads\/V[^'"]+)['"]/g)].map(match => new URL(match[1], origin).href))
   const expected = FILENAMES.map(name => new URL(`downloads/V${version}/${name}`, origin).href)
-  if (links.size !== 2 || expected.some(url => !links.has(url))) throw new Error('DOWNLOAD_MATRIX: 官网必须提供当前版本两个精确直装链接')
+  if (links.size !== 3 || expected.some(url => !links.has(url))) throw new Error('DOWNLOAD_MATRIX: 官网必须提供当前版本三个精确直装链接')
   return expected
 }
 
