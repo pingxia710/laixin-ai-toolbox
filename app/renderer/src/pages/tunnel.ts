@@ -43,7 +43,7 @@ function isHealthyLocalBackendContinuation(status: TunnelStatusView, now: number
   const verifiedAt = Date.parse(status.lastVerifiedAt)
   return status.state === '已连' && status.unrestored === '' && status.componentMissing === '' &&
     Number.isFinite(verifiedAt) && verifiedAt <= now && now - verifiedAt <= 90_000 &&
-    (status.pathSource === 'reused' || status.exitIp !== '') &&
+    (status.pathSource === 'reused' || status.exitIp !== '' || status.pathSource === 'laixin' && status.pathVerified === true) &&
     status.authorization === '本地配置有效期内，等待重新核验' &&
     status.backend === '后台暂不可达，按本地有效期继续' &&
     status.message === '账号后台暂时问不到，按本地套餐有效期继续提供网络；恢复后自动核验' &&
@@ -173,7 +173,9 @@ export function buildTunnelPresentation(status: TunnelStatusView | undefined): T
           primaryAction: 'stop', primaryLabel: '停止使用网络'
         }
         : {
-          tone: 'positive', headline: '已连接', description: '本机代理设置和通道出口已完成校验。请打开目标 AI 软件，确认登录并尝试一次对话。',
+          tone: 'positive', headline: '已连接', description: status.exitIp === '' && status.pathVerified === true
+            ? '本机代理设置和通道可达性已完成校验，出口地址暂未取得。请打开目标 AI 软件，确认登录并尝试一次对话。'
+            : '本机代理设置和通道出口已完成校验。请打开目标 AI 软件，确认登录并尝试一次对话。',
           hint: status.lastVerifiedAt === '' ? '等待最近一次校验信息。' : `最近复验：${formatTime(status.lastVerifiedAt)}`,
           primaryAction: 'stop', primaryLabel: '断开通道'
         }
@@ -527,7 +529,8 @@ function detailsCard(status: TunnelStatusView | undefined): HTMLElement {
   appendDetail(details, '当前节点', status?.nodeLabel, '尚未配置节点')
   appendDetail(details, '配置版本', status?.configVersion, '尚未应用')
   appendDetail(details, '最近复验', status?.lastVerifiedAt ? formatTime(status.lastVerifiedAt) : '', '尚未复验')
-  appendDetail(details, '出口 IP', status?.exitIp, status?.pathSource === 'reused' ? '复用本机原有外网，无来信出口' : '连接后校验')
+  appendDetail(details, '出口 IP', status?.exitIp, status?.pathSource === 'reused' ? '复用本机原有外网，无来信出口'
+    : status?.pathVerified === true ? '出口地址暂未取得' : '连接后校验')
   card.append(details)
   return card
 }
@@ -542,7 +545,8 @@ function extraDetails(status: TunnelStatusView | undefined): HTMLElement {
   appendDetail(details, '授权状态', status?.authorization, '尚未取得')
   appendDetail(details, '有效期', status?.expiresAt, '尚未取得')
   appendDetail(details, '后台状态', status?.backend, '尚未取得')
-  appendDetail(details, '出口 IP', status?.exitIp, status?.pathSource === 'reused' ? '复用本机原有外网，无来信出口' : '连接后校验')
+  appendDetail(details, '出口 IP', status?.exitIp, status?.pathSource === 'reused' ? '复用本机原有外网，无来信出口'
+    : status?.pathVerified === true ? '出口地址暂未取得' : '连接后校验')
   appendDetail(details, '代理入口流量', status?.traffic, '连接后显示')
   return details
 }

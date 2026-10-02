@@ -23,8 +23,11 @@ export interface LocalBridgeOptions {
   readonly platform?: NodeJS.Platform | string
 }
 export interface LocalBridgeHandle {
+  restrict(targets: readonly string[] | undefined): void
   verify?: (() => Promise<{ exitIp: string }>) | undefined
   probeReachability?: (() => Promise<{ url: string }>) | undefined
+  /** 多入口专用组独立复验,不以普通组结果代替。 */
+  verifyDedicated?: (() => Promise<void>) | undefined
   /** activeStreams:此刻正在往回吐回答的连接数(D3 在途流)。起算点是**正文**第一个字节
    *  (⛔ SOCKS 握手应答),连接结束或静默超过空闲窗口即销账;只计数 ⛔ 记内容。 */
   traffic(): { uploadBytes: number; downloadBytes: number; activeStreams: number; observedAt: number }
@@ -56,7 +59,7 @@ export declare const DEDICATED_OUTBOUND_TAG: string
 export declare const DEDICATED_BALANCER_TAG: string
 /** 多入口的探活间隔(秒)。 */
 export declare const ENTRY_PROBE_INTERVAL_SECONDS: number
-export declare function buildXrayConfig(options: Pick<LocalBridgeOptions, 'listenPort' | 'upstream' | 'routes' | 'outbound' | 'outbounds' | 'verifyUrl' | 'verifyFallbackUrl' | 'probeUrls' | 'probeIntervalSeconds'>): {
+export declare function buildXrayConfig(options: Pick<LocalBridgeOptions, 'listenPort' | 'upstream' | 'routes' | 'outbound' | 'outbounds' | 'verifyUrl' | 'verifyFallbackUrl' | 'probeUrls' | 'probeIntervalSeconds'> & { dedicatedProbePort?: number }): {
   log: object
   inbounds: object[]
   outbounds: { tag: string }[]

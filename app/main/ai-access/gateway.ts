@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { randomUUID, timingSafeEqual } from 'node:crypto'
-import { apiFailureMessage, classifyProviderFailure, providerRecoveryNotice, type ApiFailure, type ApiLatency, type ApiRequestRecord, type ApiServiceSnapshot, type ApiShell, type CodexDesktopRouteReason, type CodexDesktopRouteVerification, type ModelProviderId } from '../../shared/api-service-types'
+import { apiFailureMessage, classifyProviderFailure, providerRecoveryNotice, providerRecoveryResetAt, type ApiFailure, type ApiLatency, type ApiRequestRecord, type ApiServiceSnapshot, type ApiShell, type CodexDesktopRouteReason, type CodexDesktopRouteVerification, type ModelProviderId } from '../../shared/api-service-types'
 import { isProviderModelAllowed, modelProviderIds, normalizeProviderModel } from '../../shared/model-providers'
 import { ClientAcceptanceTracker, type ClientAcceptanceRoute, type ClientRouteAcceptance, type ClientRouteAttempt } from './client-acceptance'
 import { unavailableDesktopRouteAttestor, unverified, type DesktopRouteAttestor } from './desktop-route-attestation'
@@ -14,6 +14,8 @@ export interface GatewayRoute {
   readonly key: string
   /** An active application-isolation lease may select its private Electron HTTP/CONNECT transport. */
   readonly isolated?: boolean
+  /** Private headless-session identity retained by an in-flight route snapshot. */
+  readonly egressId?: string
   /** Internal only: a successful client call counts only while this revision is still active. */
   readonly revision?: string
   /** Multi-model routes use their immutable local picker ID as an evidence namespace. */
@@ -24,14 +26,13 @@ export interface GatewayRoute {
 export type GatewayFetch = (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1], route?: GatewayRoute) => ReturnType<typeof fetch>
 type ActiveGatewayRoute = GatewayRoute & ClientAcceptanceRoute
 type Json = Record<string, unknown>
-type ProviderFailureDetail = { readonly code: ApiFailure; readonly recoveryNotice?: string }
+type ProviderFailureDetail = { readonly code: ApiFailure; readonly recoveryNotice?: string; readonly retryAt?: number }
 type RetryBlock = { readonly code: ApiFailure; readonly expiresAt: number; readonly recoveryNotice?: string; readonly recoveryId?: string }
 type RetryBlockDecision =
   | { readonly kind: 'open' }
   | { readonly kind: 'blocked'; readonly block: RetryBlock }
   | { readonly kind: 'recovery'; readonly recoveryId: string }
 const paths: Record<ApiShell, string> = { codex: 'responses', claude: 'messages', hermes: 'chat/completions' }
-const maximumBody = 32 * 1024 * 1024
 const maximumConcurrentClients = 16
 /**
  * 转发路径（非测速）的空闲超时：上游这么久一字节都没有才判 timeout；只要还在出字就不掐
@@ -43,21 +44,16 @@ const gatewayIdleTimeoutMs = 600_000
  * 探测两轮串行，最坏 2×它。取消走 cancelTests()，不等超时。
  */
 const probeTimeoutMs = 15_000
-/** 客户端内建的立即重试通常会连续发 8 次；30 秒足以止住风暴，改 Key/路由会换 revision 立即失效。 */
+/** Keep the existing bounded fallback; an explicit earlier upstream recovery must shorten it. */
 const clientRetryBlockWindowMs = 30_000
 const retryBlockedClientFailures = new Set<ApiFailure>([
   'key_rejected', 'key_product_mismatch',
-  // Phase 1(429 短窗):上游自家 429(classify→rate_limited)基线不在白名单——客户端内建
-  // 的连发重试(通常 8 次)全额直打,正撞在限流枪口上。入列后同绑定 30s 内本地理应答,
-  // 状态仍是 429(shell 自己的退避语义不变),换 Key/路由换 revision 立即失效。
+  // A shorter, explicit upstream recovery time ends the cache sooner; Key/route changes retire it.
   'rate_limited',
-  // Phase 1(429 短窗):上游自家 429(classify→rate_limited)基线不在白名单——客户端内建
-  // 的连发重试(通常 8 次)全额直打,正撞在限流枪口上。入列后同绑定 30s 内本地理应答,
-  // 状态仍是 429(shell 自己的退避语义不变),换 Key/路由换 revision 立即失效。
   'membership_quota_exhausted', 'membership_concurrency_limited', 'membership_rate_limited',
   'coding_plan_expired', 'coding_plan_quota_exhausted', 'coding_plan_model_unavailable', 'coding_plan_key_product_mismatch'
 ])
-/** 只有 Codex 增强模式的三类临时限流，在 30 秒短路到期后需要一发客户请求受控确认恢复。 */
+/** Codex's three transient failures use one real request to confirm recovery when the short cache expires. */
 const controlledRecoveryFailures = new Set<ApiFailure>([
   'rate_limited', 'membership_rate_limited', 'membership_concurrency_limited'
 ])
@@ -84,6 +80,7 @@ export interface AiGatewayOptions {
   readonly onUsageEvent?: (event: AiGatewayUsageEvent) => void
   /** Present only in the independent headless router. The GUI gateway has no control plane. */
   readonly routerControl?: (req: IncomingMessage, res: ServerResponse) => Promise<void>
+  readonly onClientFailure?: (record: ApiRequestRecord) => void
 }
 
 /** A Codex picker entry is a stable local ID, never an upstream model name guessed from display text. */
@@ -152,6 +149,7 @@ export class AiGateway {
   constructor(private readonly options: AiGatewayOptions = {}) {
     this.desktopAttestor = options.desktopAttestor ?? unavailableDesktopRouteAttestor()
     this.usageEvent = options.onUsageEvent
+    this.clientFailure = options.onClientFailure
   }
 
   async start(port: number, token: string): Promise<number> {
@@ -174,6 +172,14 @@ export class AiGateway {
   }
   /** 运行中故障的出口：客户端（⛔ 自测）请求失败时回调一次，交给上层记录。 */
   onClientFailure(listener: (record: ApiRequestRecord) => void): void { this.clientFailure = listener }
+  /** Retired private transports may close after these requests finish; GUI exit never waits on them. */
+  async settleCurrentRequests(): Promise<void> {
+    const current = [...this.controllers]
+    while (current.some(controller => this.controllers.has(controller))) await new Promise<void>(resolve => {
+      const timer = setTimeout(resolve, 50)
+      timer.unref?.()
+    })
+  }
   setRoutes(routes: readonly GatewayRoute[]): void {
     const previous = new Map(this.routes.map(route => [route.shell, route]))
     this.routes = routes.map(route => {
@@ -445,8 +451,7 @@ export class AiGateway {
       return
     }
     const recoveryId = retryDecision.kind === 'recovery' ? retryDecision.recoveryId : undefined
-    // 从开始收 body 就占一个槽。否则大量慢上传能在尚未进入 request() 前各自缓存 32MB，
-    // 既绕过并发上限又把本机内存打满。
+    // 从开始收 body 就占一个槽，避免慢上传绕过并发调度。
     if (this.controllers.size >= maximumConcurrentClients) {
       discardRequestBody(req)
       sendError(res, 503, 'local_service_busy')
@@ -461,12 +466,8 @@ export class AiGateway {
     const disconnected = (): void => { if (!res.writableEnded && !res.writableFinished) controller.abort() }
     res.once('close', disconnected)
     try {
-      let size = 0
       const chunks: Buffer[] = []
       for await (const chunk of req) {
-        size += chunk.length
-        // 本机转发上限，不是「接口无有效回复」：如实说超出上限，并把这次请求留进面板与故障记录。
-        if (size > maximumBody) { sendError(res, 413, 'payload_too_large'); this.recordShortCircuitedClientFailure(route, 'payload_too_large', 413); return }
         chunks.push(chunk)
       }
       let body: Json
@@ -504,11 +505,8 @@ export class AiGateway {
     const disconnected = (): void => { if (!res.writableEnded && !res.writableFinished) controller.abort() }
     res.once('close', disconnected)
     try {
-      let size = 0
       const chunks: Buffer[] = []
       for await (const chunk of req) {
-        size += chunk.length
-        if (size > maximumBody) { sendError(res, 413, 'payload_too_large'); return }
         chunks.push(chunk)
       }
       let body: Json
@@ -555,9 +553,9 @@ export class AiGateway {
     let status = 0
     let code: ApiFailure | undefined
     let recoveryNotice: string | undefined
+    let retryAt: number | undefined
     let completedAnswer = false
     let timedOut = false
-    let replyTooLarge = false
     let upstreamCompleted = false
     // 空闲超时：每收到上游一段数据就重置计时，只有真空闲达到上限才中止（API-08）。
     // 测速路径（source === 'test'）保持一次性总超时，上限是 probeTimeoutMs（API-10：45 秒→15 秒）。
@@ -588,9 +586,11 @@ export class AiGateway {
       noteUpstreamActivity()
       status = response.status
       if (!response.ok) {
+        const receivedAt = Date.now()
         const body = await errorBody(response)
         code = classifyProviderFailure(status, body, route.provider)
-        recoveryNotice = providerRecoveryNotice(status, body, code, route.provider, response.headers.get('retry-after'))
+        recoveryNotice = providerRecoveryNotice(status, body, code, route.provider, response.headers.get('retry-after'), receivedAt)
+        retryAt = providerRecoveryResetAt(status, body, code, response.headers.get('retry-after'), receivedAt)
         if (downstream) sendProviderFailure(downstream, code, route.provider, recoveryNotice)
       } else {
         const streaming = response.headers.get('content-type')?.toLowerCase().includes('text/event-stream') === true
@@ -605,7 +605,9 @@ export class AiGateway {
             // 这样即便服务商用 HTTP 200 包 error，也不会把原始详情透传到 Codex、Claude 或 Hermes。
             const eventFailure = sseEventFailure(event, route.provider)
             observer.push(encoder.encode(event))
-            if (eventFailure !== undefined) { code = eventFailure.code; recoveryNotice = eventFailure.recoveryNotice; return false }
+            if (eventFailure !== undefined && !(source === 'client' && eventFailure.code === 'response_truncated' && observer.validPartialAnswer())) {
+              code = eventFailure.code; recoveryNotice = eventFailure.recoveryNotice; retryAt = eventFailure.retryAt; return false
+            }
             if (firstTextMs === null && observer.hasText) firstTextMs = Math.round(performance.now() - responseStarted)
             if (downstream) {
               if (!downstreamStreamStarted) {
@@ -626,14 +628,6 @@ export class AiGateway {
                 if (next.done) break
                 noteUpstreamActivity()
                 sseBuffer += decoder.decode(next.value, { stream: true })
-                if (Buffer.byteLength(sseBuffer) > maximumBody) {
-                  // 永远不构成完整 SSE event 的数据不能积累到 10 分钟超时；直接丢弃并回本地错误。
-                  // 这是上游单条回复超出本机转发上限，⛔ 说成「无有效回复」。
-                  sseBuffer = ''
-                  code = 'payload_too_large'
-                  keepReading = false
-                  break
-                }
                 let boundary: number
                 while ((boundary = sseEventBoundary(sseBuffer)) >= 0) {
                   const event = sseBuffer.slice(0, boundary)
@@ -652,24 +646,21 @@ export class AiGateway {
           const chunks: Buffer[] = []
           if (response.body) {
             const reader = response.body.getReader()
-            let bytes = 0
             try {
               while (true) {
                 const next = await reader.read()
                 if (next.done) break
                 noteUpstreamActivity()
-                bytes += next.value.length
-                // 上游回复超出本机转发上限：如实说超出上限，⛔ 进 catch 被说成「网络未连接」。
-                if (bytes > maximumBody) { replyTooLarge = true; controller.abort(); throw new Error('REPLY_TOO_LARGE') }
                 chunks.push(Buffer.from(next.value))
                 observer.push(next.value)
               }
             } finally { reader.releaseLock() }
           }
           observer.finish()
-          const outcome = replyOutcome(observer, route.provider, allowProbeToolCall)
+          const outcome = replyOutcome(observer, route.provider, allowProbeToolCall, source === 'client')
           code = outcome.code
           recoveryNotice = outcome.recoveryNotice
+          retryAt = outcome.retryAt
           completedAnswer = outcome.kind === 'answer'
           if (code === undefined && downstream) {
             downstream.statusCode = status
@@ -679,9 +670,10 @@ export class AiGateway {
           }
         }
         if (firstTextMs === null && observer.hasText) firstTextMs = Math.round(performance.now() - responseStarted)
-        const outcome = replyOutcome(observer, route.provider, allowProbeToolCall)
+        const outcome = replyOutcome(observer, route.provider, allowProbeToolCall, source === 'client')
         code ??= outcome.code
         recoveryNotice ??= outcome.recoveryNotice
+        retryAt ??= outcome.retryAt
         completedAnswer ||= outcome.kind === 'answer'
         if (code !== undefined) {
           if (downstream) sendReplyFailure(downstream, code, route.provider, streaming, recoveryNotice)
@@ -700,7 +692,7 @@ export class AiGateway {
       } else if (!upstreamCompleted) {
         // 客户取消、界面取消的测速、stop() 关停中止(Phase 2 ⑧)同账 client_aborted:
         // 都是工具箱/客户自己的动作,⛔ 记成 network_error 污染回执与 FB-1 故障统计。
-        code = replyTooLarge ? 'payload_too_large' : timedOut ? 'timeout'
+        code = timedOut ? 'timeout'
           : clientGone || this.cancelledTestControllers.has(controller) || (this.stopping && controller.signal.aborted) ? 'client_aborted' : 'network_error'
         if (downstream && !downstream.destroyed) {
           if (!downstream.headersSent) sendProviderFailure(downstream, code, route.provider)
@@ -717,7 +709,7 @@ export class AiGateway {
       ok: code === undefined, ...(code ? { code } : {}), status, durationMs: Date.now() - started,
       inputTokens: observer.inputTokens, outputTokens: observer.outputTokens
     }
-    this.recordClientResult(route, record, true, completedAnswer, recoveryNotice)
+    this.recordClientResult(route, record, true, completedAnswer, recoveryNotice, retryAt)
     this.recordDesktopRouteOutcome(route, record, completedAnswer, desktopAttestation)
     return { record, json: observer.json, hasText: observer.hasText, completedAnswer, firstTextMs }
   }
@@ -806,10 +798,10 @@ export class AiGateway {
     }, false)
   }
 
-  private recordClientResult(route: GatewayRoute, record: ApiRequestRecord, updateRetryBlock = true, completedAnswer = false, recoveryNotice?: string): void {
+  private recordClientResult(route: GatewayRoute, record: ApiRequestRecord, updateRetryBlock = true, completedAnswer = false, recoveryNotice?: string, retryAt?: number): void {
     this.records = [record, ...this.records].slice(0, 200)
     if (record.source !== 'client') return
-    if (updateRetryBlock) this.updateRetryBlock(route, record, recoveryNotice)
+    if (updateRetryBlock) this.updateRetryBlock(route, record, recoveryNotice, retryAt)
     if (record.code !== 'client_aborted' && route.revision !== undefined && (!record.ok || completedAnswer)) {
       this.acceptance.recordAttempt({ ...route, model: record.model } as ActiveGatewayRoute, record.at, record.ok, record.code)
     }
@@ -828,10 +820,11 @@ export class AiGateway {
     }
   }
 
-  private updateRetryBlock(route: GatewayRoute, record: ApiRequestRecord, recoveryNotice?: string): void {
+  private updateRetryBlock(route: GatewayRoute, record: ApiRequestRecord, recoveryNotice?: string, retryAt?: number): void {
     if (route.revision === undefined || record.code === 'client_aborted') return
     if (!record.ok && record.code !== undefined && retryBlockedClientFailures.has(record.code)) {
-      this.retryBlocks.set(route.revision, { code: record.code, expiresAt: Date.now() + clientRetryBlockWindowMs, ...(recoveryNotice ? { recoveryNotice } : {}) })
+      const fallback = Date.now() + clientRetryBlockWindowMs
+      this.retryBlocks.set(route.revision, { code: record.code, expiresAt: Math.min(fallback, retryAt ?? fallback), ...(recoveryNotice ? { recoveryNotice } : {}) })
       return
     }
     // This request has not proved recovery. Leave the expired block in place so releaseRecovery()
@@ -985,10 +978,11 @@ function providerFailureDetailInBody(body: Json | null, provider: ModelProviderI
   const classified = classifyProviderFailure(200, compact, provider)
   if (classified === 'unknown') return undefined
   const recoveryNotice = providerRecoveryNotice(200, compact, classified, provider)
-  return { code: classified, ...(recoveryNotice ? { recoveryNotice } : {}) }
+  const retryAt = providerRecoveryResetAt(200, compact, classified)
+  return { code: classified, ...(recoveryNotice ? { recoveryNotice } : {}), ...(retryAt === undefined ? {} : { retryAt }) }
 }
 
-type ReplyOutcome = { readonly kind: 'answer' | 'tool'; readonly code?: undefined; readonly recoveryNotice?: undefined } | { readonly kind: 'invalid'; readonly code: ApiFailure; readonly recoveryNotice?: string }
+type ReplyOutcome = { readonly kind: 'answer' | 'tool' | 'partial' | 'refusal'; readonly code?: undefined; readonly recoveryNotice?: undefined; readonly retryAt?: undefined } | ({ readonly kind: 'invalid' } & ProviderFailureDetail)
 
 /**
  * A completed tool turn is a valid protocol response: the native client must receive it so it
@@ -996,8 +990,10 @@ type ReplyOutcome = { readonly kind: 'answer' | 'tool'; readonly code?: undefine
  * never becomes an observed "already using this route" acceptance. In its internal first probe,
  * the gateway accepts either exactly one `toolbox_probe` call or a complete direct answer.
  */
-function replyOutcome(observer: ReplyObserver, provider: ModelProviderId, allowProbeToolCall = false): ReplyOutcome {
+function replyOutcome(observer: ReplyObserver, provider: ModelProviderId, allowProbeToolCall = false, allowClientReply = false): ReplyOutcome {
   if (observer.complete && !observer.failed) {
+    // A refusal belongs to the client, but is neither a successful probe nor a completed-answer proof.
+    if (observer.hasRefusal) return allowClientReply ? { kind: 'refusal' } : { kind: 'invalid', code: 'invalid_reply' }
     if (allowProbeToolCall) {
       if (observer.toolCallCount === 1 && observer.probeToolCallCount === 1) return { kind: 'tool' }
       if (observer.toolCallCount === 0 && observer.hasText) return { kind: 'answer' }
@@ -1008,6 +1004,9 @@ function replyOutcome(observer: ReplyObserver, provider: ModelProviderId, allowP
     if (observer.toolCallCount > 0) return { kind: 'tool' }
     if (observer.hasText) return { kind: 'answer' }
   }
+  // The client owns how to display an output-limit stop. Probes and completed-answer evidence
+  // stay strict; forwarding useful text does not certify that the model finished its answer.
+  if (allowClientReply && observer.validPartialAnswer()) return { kind: 'partial' }
   const failure = observer.failure ?? observer.json
   const detail = providerFailureDetailInBody(failure, provider)
   if (detail !== undefined) return { kind: 'invalid', ...detail }
@@ -1017,13 +1016,7 @@ function replyOutcome(observer: ReplyObserver, provider: ModelProviderId, allowP
 
 /** 每次只判断一个完整 SSE event；原文只在这一小段栈内存中存在，绝不进入记录或客户端响应。 */
 function sseEventFailure(event: string, provider: ModelProviderId): ProviderFailureDetail | undefined {
-  const lines = event.split(/\r?\n/)
-  const eventName = lines.find(line => line.startsWith('event:'))?.slice(6).trim()
-  const payload = lines
-    .filter(line => line.startsWith('data:'))
-    .map(line => line.slice(5).trimStart())
-    .join('\n')
-    .trim()
+  const { eventName, payload } = sseEventData(event)
   const errorEvent = eventName === 'error' || eventName === 'response.failed' || eventName === 'response.incomplete'
   if (!payload || payload === '[DONE]') return errorEvent ? { code: 'upstream_error' } : undefined
   let item: unknown
@@ -1040,8 +1033,23 @@ function sseEventFailure(event: string, provider: ModelProviderId): ProviderFail
 }
 
 function sseEventBoundary(buffer: string): number {
-  const separator = /\r?\n\r?\n/.exec(buffer)
+  const separator = /(?:\r\n|\r(?!\n)|\n){2}/.exec(buffer)
   return separator?.index === undefined ? -1 : separator.index + separator[0].length
+}
+
+/** SSE data fields form one payload; both error checks and reply evidence use that payload. */
+function sseEventData(event: string): { eventName: string | undefined; payload: string } {
+  let eventName: string | undefined
+  const data: string[] = []
+  for (const line of event.replace(/^\uFEFF/, '').split(/\r\n|\r|\n/)) {
+    if (line.startsWith(':')) continue
+    const colon = line.indexOf(':')
+    const field = colon < 0 ? line : line.slice(0, colon)
+    const value = colon < 0 ? '' : line.slice(colon + 1).replace(/^ /, '')
+    if (field === 'event') eventName = value
+    if (field === 'data') data.push(value)
+  }
+  return { eventName, payload: data.join('\n').trim() }
 }
 
 /** Claude Code may choose its configured small/subagent model; all other client model input stays pinned. */
@@ -1074,7 +1082,9 @@ class ReplyObserver {
   failed = false
   /** 回答被输出上限截断（max_tokens / finish_reason=length）：不是服务商故障，单独判类。 */
   truncated = false
+  private otherFailure = false
   hasText = false
+  hasRefusal = false
   toolCallCount = 0
   probeToolCallCount = 0
   inputTokens: number | null = null
@@ -1088,24 +1098,25 @@ class ReplyObserver {
     this.buffer += this.decoder.decode(bytes, { stream: true })
     if (this.streaming) {
       let index: number
-      while ((index = this.buffer.indexOf('\n')) >= 0) {
-        const line = this.buffer.slice(0, index).trim(); this.buffer = this.buffer.slice(index + 1)
-        if (line.startsWith('data:')) this.read(line.slice(5).trim())
+      while ((index = sseEventBoundary(this.buffer)) >= 0) {
+        const event = this.buffer.slice(0, index); this.buffer = this.buffer.slice(index)
+        const { payload } = sseEventData(event)
+        if (payload) this.read(payload)
       }
     }
-    if (this.buffer.length > maximumBody) { this.buffer = ''; this.failed = true }
   }
   finish(): void {
     this.buffer += this.decoder.decode()
-    if (this.streaming) { if (this.buffer.trim().startsWith('data:')) this.read(this.buffer.trim().slice(5).trim()) }
+    if (this.streaming) { const { payload } = sseEventData(this.buffer); if (payload) this.read(payload) }
     else this.read(this.buffer)
     this.buffer = ''
   }
+  validPartialAnswer(): boolean { return this.truncated && this.hasText && !this.otherFailure }
   private read(raw: string): void {
     if (raw === '[DONE]') { this.complete = true; return }
     let item: unknown
-    try { item = JSON.parse(raw) } catch { this.failed = true; return }
-    if (!isJson(item)) { this.failed = true; return }
+    try { item = JSON.parse(raw) } catch { this.failed = true; this.otherFailure = true; return }
+    if (!isJson(item)) { this.failed = true; this.otherFailure = true; return }
     const data = isJson(item.response) ? item.response : item
     if (!this.streaming) this.json = data
     const usage = isJson(data.usage) ? data.usage : isJson(data.message) && isJson(data.message.usage) ? data.message.usage : null
@@ -1116,11 +1127,21 @@ class ReplyObserver {
     if (data.error || ['error', 'response.failed', 'response.incomplete'].includes(String(item.type)) || ['failed', 'incomplete'].includes(String(data.status))) {
       this.failed = true
       this.failure = compactFailureFrame(item, data)
+      const details = isJson(data.incomplete_details) ? data.incomplete_details : undefined
+      const outputLimit = !data.error && (item.type === 'response.incomplete' || data.status === 'incomplete') &&
+        details !== undefined && /^max(_output)?_tokens$/.test(String(details.reason ?? ''))
+      this.otherFailure ||= !outputLimit
     }
     if (item.type === 'response.completed' || item.type === 'message_stop' || data.status === 'completed') this.complete = true
     if (item.type === 'response.output_text.delta' && typeof item.delta === 'string' && item.delta.trim()) this.hasText = true
+    if (item.type === 'response.refusal.delta' && typeof item.delta === 'string' && item.delta.trim()) this.hasRefusal = true
     if (isJson(item.delta) && typeof item.delta.text === 'string' && item.delta.text.trim()) this.hasText = true
-    if (Array.isArray(data.output)) { if (!this.streaming) this.complete = data.status === 'completed'; this.hasText ||= data.output.some(output => isJson(output) && contentText(output.content)) }
+    if (Array.isArray(data.output)) {
+      if (!this.streaming) this.complete = data.status === 'completed'
+      this.hasText ||= data.output.some(output => isJson(output) && contentText(output.content))
+      this.hasRefusal ||= data.output.some(output => isJson(output) && Array.isArray(output.content) &&
+        output.content.some(part => isJson(part) && part.type === 'refusal' && typeof part.refusal === 'string' && part.refusal.trim()))
+    }
     if (Array.isArray(data.content)) { this.hasText ||= contentText(data.content); if (!this.streaming && data.type === 'message' && data.stop_reason) this.complete = true }
     // 截断照样挡住「验收通过」：思考吃光预算时正文可能是空的（provider-rewrite 里有实据），
     // 但判类要单列，⛔ 混进 upstream_error 让客户以为服务商坏了。
@@ -1133,9 +1154,10 @@ class ReplyObserver {
       if (!isJson(choice)) continue
       if (choice.finish_reason) this.complete = true
       if (choice.finish_reason === 'length') { this.failed = true; this.truncated = true }
-      if (choice.finish_reason === 'content_filter') this.failed = true
+      if (choice.finish_reason === 'content_filter') { this.failed = true; this.otherFailure = true }
       const message = isJson(choice.message) ? choice.message : isJson(choice.delta) ? choice.delta : null
       if (message && typeof message.content === 'string' && message.content.trim()) this.hasText = true
+      if (message && typeof message.refusal === 'string' && message.refusal.trim()) this.hasRefusal = true
     }
     const calls = toolCallSummary(item, data)
     this.toolCallCount += calls.total
@@ -1198,7 +1220,7 @@ function contentText(value: unknown): boolean { return Array.isArray(value) && v
 function isJson(value: unknown): value is Json { return !!value && typeof value === 'object' && !Array.isArray(value) }
 function sameRouteBinding(left: ActiveGatewayRoute, right: GatewayRoute): boolean {
   return left.provider === right.provider && left.model === right.model && left.endpoint === right.endpoint && left.key === right.key &&
-    left.routeId === right.routeId && left.isolated === right.isolated
+    left.routeId === right.routeId && left.isolated === right.isolated && left.egressId === right.egressId
 }
 function sameMultiModelBinding(left: ActiveMultiModelGatewayEntry, right: MultiModelGatewayEntry): boolean {
   return left.provider === right.provider && left.model === right.model && left.endpoint === right.endpoint && left.key === right.key
@@ -1225,8 +1247,6 @@ function providerFailureStatus(code: ApiFailure): number {
       return 429
     case 'membership_benefits_unavailable':
       return 529
-    case 'payload_too_large':
-      return 413
     case 'timeout':
       return 504
     case 'provider_outage':

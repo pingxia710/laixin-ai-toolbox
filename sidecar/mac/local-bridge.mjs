@@ -10,6 +10,7 @@ import { TUNNEL_PROBE_URLS, probeTunnelReachability, verifyWithFallback } from '
 import { CONTROL_CODES, ConnectorError } from './connectors.mjs'
 import { validVerifyFallbackUrl } from './vless-settings.mjs'
 import { lockHolderAlive } from './ledger.mjs'
+import { createApiDestinationGate } from './api-destination-gate.mjs'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 
@@ -46,7 +47,7 @@ export const DEDICATED_BALANCER_TAG = 'dedicated'
 // 客户套餐里这是能接受的一笔;缩到 20 秒就是每天 30 MB,⛔。
 export const ENTRY_PROBE_INTERVAL_SECONDS = 300
 
-export function buildXrayConfig({ listenPort, upstream, routes, outbound, outbounds, verifyUrl, verifyFallbackUrl, probeUrls, probeIntervalSeconds }) {
+export function buildXrayConfig({ listenPort, upstream, routes, outbound, outbounds, verifyUrl, verifyFallbackUrl, probeUrls, probeIntervalSeconds, dedicatedProbePort }) {
   const entries = Array.isArray(outbounds) && outbounds.length > 0 ? outbounds : undefined
   const multi = entries !== undefined && entries.length > 1
   const dedicated = routes?.dedicatedSuffixes ?? []
@@ -55,6 +56,9 @@ export function buildXrayConfig({ listenPort, upstream, routes, outbound, outbou
   // 专用流量的去向:与通用同构,单入口指出站、多入口交专用均衡器。
   const dedicatedTarget = multi ? { balancerTag: DEDICATED_BALANCER_TAG } : { outboundTag: DEDICATED_OUTBOUND_TAG }
   const rules = []
+  const probeDedicated = multi && dedicated.length > 0 && dedicatedProbePort !== undefined
+  // 专用组可能与通用组选到不同入口。内部复验必须穿过客户实际使用的专用均衡器。
+  if (probeDedicated) rules.push({ type: 'field', inboundTag: ['dedicated-probe'], ...dedicatedTarget })
   // 复验必须经过通道，不能被本地地址/国内直连规则截走而误报已连。
   if (verifyFallbackUrl !== undefined && !validVerifyFallbackUrl(verifyUrl, verifyFallbackUrl)) throw new Error('VERIFY_FALLBACK_INVALID')
   // 通用探测点与回显地址一样必须走通道,否则测不到通道。
@@ -93,7 +97,10 @@ export function buildXrayConfig({ listenPort, upstream, routes, outbound, outbou
   return {
     // 不记录请求网址、查询参数、报文或认证内容。
     log: { access: 'none', error: 'none', loglevel: 'none' },
-    inbounds: [{ tag: 'local-mixed', listen: '127.0.0.1', port: listenPort, protocol: 'socks', settings: { auth: 'noauth', udp: false } }],
+    inbounds: [
+      { tag: 'local-mixed', listen: '127.0.0.1', port: listenPort, protocol: 'socks', settings: { auth: 'noauth', udp: false } },
+      ...(probeDedicated ? [{ tag: 'dedicated-probe', listen: '127.0.0.1', port: dedicatedProbePort, protocol: 'socks', settings: { auth: 'noauth', udp: false } }] : [])
+    ],
     outbounds: [...tunnelOutbounds, ...dedicatedOutbounds, { tag: 'direct', protocol: 'freedom' }],
     // 多入口才装探活:内核周期性经每个入口打一次通用探测点,均衡器据此排除掉不通的那条。
     // 专用组在列:它和通用一样正常参与故障转移(创始人 09-15 撤「专用不参与」的原设计)。
@@ -123,6 +130,11 @@ export function createLocalBridge(options) {
   let runId
   let closeInFlight
   let port = options.listenPort
+  let kernelPort
+  let apiOnly = false
+  const apiDestinations = createApiDestinationGate()
+  let dedicatedProbePort
+  const probeDedicated = options.outbounds?.length > 1 && options.routes?.dedicatedSuffixes?.length > 0 && !!options.verifyUrl
   const spawnImpl = options.spawnImpl ?? spawn
   const platform = options.platform ?? process.platform
   const relaySockets = new Set()
@@ -134,12 +146,23 @@ export function createLocalBridge(options) {
   const fail = () => new ConnectorError(CONTROL_CODES.upstreamUnreachable, '代理内核未就绪')
 
   return {
+    restrict: targets => { apiOnly = targets !== undefined; apiDestinations.restrict(targets) },
     port: () => port,
-    // 仅累计经过本机代理入口的字节数；不解析或保存主机名、URL、报文和凭据。
+    // 流量统计仅累计字节。退出后的目标限制只在内存保留 CONNECT 目标，不记录报文或凭据。
     traffic: () => ({ ...traffic, observedAt: Date.now() }),
-    verify: options.verifyUrl ? () => verifyWithFallback(port, options.verifyUrl, options.verifyFallbackUrl, options.verifyTimeoutMs) : undefined,
+    verify: options.verifyUrl ? () => verifyWithFallback(apiOnly ? kernelPort : port, options.verifyUrl, options.verifyFallbackUrl, options.verifyTimeoutMs) : undefined,
     // 回显打不通时的第二意见:通用探测点经通道可达 = 通道活着(见 daemon-core.verifyConnection)。
-    probeReachability: options.verifyUrl ? () => probeTunnelReachability(port, options.probeUrls ?? TUNNEL_PROBE_URLS, options.verifyTimeoutMs) : undefined,
+    probeReachability: options.verifyUrl ? () => probeTunnelReachability(apiOnly ? kernelPort : port, options.probeUrls ?? TUNNEL_PROBE_URLS, options.verifyTimeoutMs) : undefined,
+    verifyDedicated: probeDedicated ? async () => {
+      if (stopped || dedicatedProbePort === undefined) throw fail()
+      try {
+        await verifyWithFallback(dedicatedProbePort, options.verifyUrl, options.verifyFallbackUrl, options.verifyTimeoutMs)
+      } catch (error) {
+        // 回显站故障不等于专用通道故障;第二意见仍须走专用组。
+        try { await probeTunnelReachability(dedicatedProbePort, options.probeUrls ?? TUNNEL_PROBE_URLS, options.verifyTimeoutMs) }
+        catch { throw error }
+      }
+    } : undefined,
     isAlive: () => child !== undefined && child.exitCode === null && child.signalCode === null && failure === undefined,
     onLost: (callback) => { lost = callback },
     // 被动检测(照 mihomo 的 onDialFailed):客户真实请求在通道里连续失败,就立刻通知守护复验,⛔ 干等 30 秒定时。
@@ -157,13 +180,18 @@ export function createLocalBridge(options) {
       const requestedPort = port ?? 0
       let xrayPort = await availablePort(0)
       while (requestedPort > 0 && xrayPort === requestedPort) xrayPort = await availablePort(0)
+      kernelPort = xrayPort
+      if (probeDedicated) {
+        do { dedicatedProbePort = await availablePort(0) }
+        while (dedicatedProbePort === requestedPort || dedicatedProbePort === xrayPort)
+      }
       mkdirSync(options.dataDir, { recursive: true })
       const config = join(options.dataDir, 'xray-bridge.json')
       runId = randomUUID()
       // 上次 runner 被硬杀(Windows TerminateProcess)时 close 钩子不跑,pid 记档留在磁盘、
       // 内核还活着。启动前清扫失去 runner 的旧记录；活 runner 的记录保留。
       sweepOrphanXrays(config, platform, imageNameOf(executable), spawnImpl)
-      writeFileSync(config, JSON.stringify(buildXrayConfig({ ...options, listenPort: xrayPort })), { mode: 0o600 })
+      writeFileSync(config, JSON.stringify(buildXrayConfig({ ...options, listenPort: xrayPort, dedicatedProbePort })), { mode: 0o600 })
       stopped = false
       failure = undefined
       // runner 的 stdin 是停止管道:close() 关闭它,runner 见 EOF 即停 xray(跨平台可靠)。
@@ -189,7 +217,7 @@ export function createLocalBridge(options) {
           if (failure !== undefined) break
           if (await probeSocks(xrayPort)) {
             const detector = createFailureDetector({ onDegraded: () => degraded?.() })
-            const listener = await startTrafficRelay(requestedPort, xrayPort, traffic, relaySockets, options.idleStreamMs, detector)
+            const listener = await startTrafficRelay(requestedPort, xrayPort, traffic, relaySockets, options.idleStreamMs, detector, apiDestinations)
             relay = listener.server
             port = listener.port
             if (await probeSocks(port)) return
@@ -242,7 +270,7 @@ export function createLocalBridge(options) {
   }
 }
 
-function startTrafficRelay(port, targetPort, traffic, sockets, idleStreamMs = IDLE_STREAM_MS, detector = createFailureDetector()) {  return new Promise((resolve, reject) => {
+function startTrafficRelay(port, targetPort, traffic, sockets, idleStreamMs = IDLE_STREAM_MS, detector = createFailureDetector(), apiDestinations = createApiDestinationGate()) {  return new Promise((resolve, reject) => {
     const server = createServer((client) => {
       const upstream = connect({ host: '127.0.0.1', port: targetPort })
       sockets.add(client); sockets.add(upstream)
@@ -277,8 +305,13 @@ function startTrafficRelay(port, targetPort, traffic, sockets, idleStreamMs = ID
         life.idle.unref?.()
       }
       const close = () => { client.destroy(); upstream.destroy() }
-      const forget = () => { sockets.delete(client); sockets.delete(upstream) }
-      client.on('data', (chunk) => { traffic.uploadBytes += chunk.length; payload.noteRequest(chunk) })
+      const deny = () => { life.reported = true; close() }
+      const destination = apiDestinations.track(deny)
+      const forget = () => { sockets.delete(client); sockets.delete(upstream); destination.forget() }
+      client.on('data', (chunk) => {
+        if (!destination.consume(chunk)) { deny(); return }
+        traffic.uploadBytes += chunk.length; payload.noteRequest(chunk)
+      })
       upstream.on('data', (chunk) => {
         traffic.downloadBytes += chunk.length
         if (!payload.consume(chunk)) return // 还在握手应答里,⛔ 当成回答

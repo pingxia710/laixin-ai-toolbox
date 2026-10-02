@@ -14,7 +14,7 @@ afterEach(() => { dirs.splice(0).forEach(removeTempDir) })
 
 describe.each([['macOS', macDaemon], ['Windows', winDaemon]] as const)('%s bounded recovery', (_platform, createDaemon) => {
   const SettingsBusy = _platform === 'macOS' ? MacSettingsBusyError : WinSettingsBusyError
-  function harness(random = 0, reachability?: () => Promise<{ url: string }>) {
+  function harness(random = 0, reachability?: () => Promise<{ url: string }>, verifyDedicated?: () => Promise<void>) {
     const dir = makeTempDir('bounded-recovery-'); dirs.push(dir)
     const clock = new FakeClock()
     const intent = { desired: 'connected', sessionToken: 'one', bridgePort: 18080,
@@ -32,7 +32,7 @@ describe.each([['macOS', macDaemon], ['Windows', winDaemon]] as const)('%s bound
       adapter: { managedItems: () => [{ ref: { service: 'test', item: 'proxy' }, value: true }], read: () => value,
         write, reapplyOnChange: () => true, currentPathIdentity: () => ({ id: pathId, kind: 'fake-network-path' }) },
       connectorFactory: () => ({ kind: 'loopback-probe', start, stop, verify, onLost: () => {}, localProxyPort: () => 1 }),
-      bridgeFactory: () => ({ listen: () => {}, close: () => {}, ...(reachability ? { probeReachability: reachability } : {}) }) })
+      bridgeFactory: () => ({ listen: () => {}, close: () => {}, verifyDedicated, ...(reachability ? { probeReachability: reachability } : {}) }) })
     const advance = async (ms: number) => { clock.advance(ms); await flushMicrotasks() }
     return { dir, clock, daemon, start, stop, verify, write, intent, advance, value: () => value,
       offline: () => { offline = true }, online: () => { offline = false },
@@ -93,11 +93,70 @@ describe.each([['macOS', macDaemon], ['Windows', winDaemon]] as const)('%s bound
     h.verify.mockRejectedValue(new ConnectorError(CONTROL_CODES.probeUnavailable))
     for (let index = 0; index < 4; index += 1) {
       await h.advance(30_000)
-      expect(h.state()).toMatchObject({ state: 'connected', code: '' })
+      expect(h.state()).toMatchObject({ state: 'connected', code: '', pathVerified: true })
     }
     expect(reachability).toHaveBeenCalledTimes(4)
     expect(h.start).toHaveBeenCalledTimes(1)
     expect(h.stop).not.toHaveBeenCalled()
+    h.daemon.requestShutdown(); await flushMicrotasks()
+  })
+
+  it.each([false, true])('AI 组失败不能被普通组成功盖住（普通组后备探测=%s）', async (fallback) => {
+    const dedicated = vi.fn(async () => {})
+    const reachability = vi.fn(async () => ({ url: 'https://probe.example/' }))
+    const h = harness(0, reachability, dedicated)
+    await h.daemon.run()
+    if (fallback) h.verify.mockRejectedValue(new ConnectorError(CONTROL_CODES.probeUnavailable))
+    dedicated.mockRejectedValue(new ConnectorError(CONTROL_CODES.upstreamUnreachable))
+    await h.advance(30_000)
+    expect(h.state().state).toBe('degraded')
+    await h.advance(1_000)
+    expect(h.state().state).toBe('error')
+    dedicated.mockResolvedValue()
+    await h.advance(2_000)
+    expect(h.state().state).toBe('connected')
+    expect(h.start).toHaveBeenCalledTimes(2)
+    h.daemon.requestShutdown(); await flushMicrotasks()
+  })
+
+  it('专用组复验尚未结束时断开，迟来的成功不能重新显示已连', async () => {
+    const dedicated = vi.fn(async () => {})
+    const h = harness(0, undefined, dedicated)
+    await h.daemon.run()
+    let finish!: () => void
+    dedicated.mockImplementationOnce(() => new Promise<void>((resolve) => { finish = resolve }))
+    await h.advance(30_000)
+    writeIntentFile(h.dir, { desired: 'user-disconnected' }); await h.advance(500)
+    expect(finish).toBeTypeOf('function')
+    finish(); await flushMicrotasks()
+    expect(h.state().state).toBe('stopped-restored')
+    expect(h.value()).toBeNull()
+    h.daemon.requestShutdown(); await flushMicrotasks()
+  })
+
+  it.each(['general', 'dedicated'] as const)('两组并行复验，最后完成的 %s 组成功前不能宣称已连', async (last) => {
+    let finishGeneral!: (value: { exitIp: string }) => void
+    let finishDedicated!: () => void
+    const dedicated = vi.fn(() => new Promise<void>((resolve) => { finishDedicated = resolve }))
+    const h = harness(0, undefined, dedicated)
+    h.verify.mockImplementation(() => new Promise((resolve) => { finishGeneral = resolve }))
+    const running = h.daemon.run()
+    await flushMicrotasks()
+    // 两组必须已经同时出发；⛔ 串行等第一组耗完整个超时才开始另一组。
+    expect(h.verify).toHaveBeenCalledTimes(1)
+    expect(dedicated).toHaveBeenCalledTimes(1)
+    const finishFirst = () => last === 'general' ? finishDedicated() : finishGeneral({ exitIp: '203.0.113.1' })
+    const finishLast = () => last === 'general' ? finishGeneral({ exitIp: '203.0.113.1' }) : finishDedicated()
+    finishFirst(); await flushMicrotasks()
+    expect(h.state().state).not.toBe('connected')
+    finishLast(); await flushMicrotasks()
+    // 写后复验也要保持同一保证。
+    expect(h.verify).toHaveBeenCalledTimes(2)
+    expect(dedicated).toHaveBeenCalledTimes(2)
+    finishFirst(); await flushMicrotasks()
+    expect(h.state().state).not.toBe('connected')
+    finishLast(); await running
+    expect(h.state().state).toBe('connected')
     h.daemon.requestShutdown(); await flushMicrotasks()
   })
 

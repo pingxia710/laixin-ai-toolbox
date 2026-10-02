@@ -24,6 +24,14 @@ describe('API 面板证据与状态', () => {
     expect(() => readServiceSnapshot('{}')).toThrow()
     expect(() => readServiceSnapshot(JSON.stringify({ running: true, routes: [], checks: [], requests: [{ ...row, outputTokens: 'unknown' }] }))).toThrow()
   })
+  it('请求记录必须已经完成实际模型选路，匿名结果不能伪造有效记录', () => {
+    const unrouted = { ...row, provider: null, model: null, ok: false, status: 413, code: 'content_too_long', inputTokens: null, outputTokens: null }
+    const snapshot = { running: true, routes: [], checks: [], requests: [unrouted] }
+    for (const invalid of [unrouted, { ...unrouted, code: 'key_rejected' }, { ...unrouted, source: 'test' },
+      { ...unrouted, ok: true }, { ...unrouted, model: 'deepseek-flash' }, { ...unrouted, shell: 'claude' }]) {
+      expect(() => readServiceSnapshot(JSON.stringify({ ...snapshot, requests: [invalid] }))).toThrow('API_SERVICE_INVALID')
+    }
+  })
   it('DeepSeek 的限流提示给出账号级的正确处理，其他服务商不混用', () => {
     expect(apiFailureMessage('rate_limited', 'deepseek')).toContain('增加同账号的 Key 不会提高并发')
     expect(apiFailureMessage('rate_limited', 'zhipu')).toBe('服务商限流或额度暂不可用，请稍后重试。')

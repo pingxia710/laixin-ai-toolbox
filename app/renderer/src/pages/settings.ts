@@ -56,7 +56,7 @@ export const page: PageModule = {
     const residentToggle = document.createElement('input'); residentToggle.type = 'checkbox'; residentToggle.disabled = true
     residentLabel.append(Object.assign(document.createElement('span'), { textContent: '工具箱意外退出时，网络不断' }), residentToggle)
     const residentNote = document.createElement('p'); residentNote.className = 'account-note'
-    const residentDefaultNote = '打开后，工具箱崩溃、被系统或安全软件关掉、或者开机后你还没打开工具箱，网络都照常连着。你点断开、退出账号，或选择“退出工具箱”时，网络照样会断开。'
+    const residentDefaultNote = '打开后，工具箱崩溃、被系统或安全软件关掉、或者开机后你还没打开工具箱，网络都照常连着。退出工具箱后仅保留 API 所需通道，并按原套餐计量；点击断开或退出账号会停止通道。'
     // 客户选了开、但这次没装上：开关显示着开而那件事并没有发生，就是假装成功，必须说出来。
     // ⛔ 把开关拨回去（那是替客户改了他的选择，比静默失败更糟），也 ⛔ 弹窗——网络本身好好的，
     // 丢的只是「工具箱不在时保持」。下次打开工具箱会按客户的选择再装一次，所以说得清「还会再试」。
@@ -180,7 +180,7 @@ export const page: PageModule = {
     zoom.addEventListener('change', () => { void configure() }); notify.addEventListener('change', () => { void configure() }); auto.addEventListener('change', () => { void configure() })
     const preferences = (value: DesktopView) => {
       zoom.value = String(value.preferences.zoom); notify.checked = value.preferences.quotaNotifications; auto.checked = value.preferences.autoUpdate
-      backgroundNote.textContent = value.backgroundAvailable ? '关闭窗口后工具箱仍在后台运行，AI网络保持连接。可从系统菜单栏或托盘打开；选择“退出工具箱”才会断开网络。' : '系统托盘暂不可用。关闭窗口将退出工具箱并断开 AI网络，请保持窗口打开。'
+      backgroundNote.textContent = value.backgroundAvailable ? '关闭窗口后工具箱仍在后台运行，AI网络保持连接，可从系统菜单栏或托盘打开。退出工具箱后仅保留 API 所需通道，并按原套餐计量；如需全部停止，请先断开 AI网络。' : '系统托盘暂不可用。关闭窗口将退出工具箱，仅保留 API 所需通道并按原套餐计量；如需全部停止，请先断开 AI网络。'
     }
 
     const help = group('帮助')

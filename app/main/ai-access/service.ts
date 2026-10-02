@@ -26,6 +26,8 @@ import type { UsageReceiptEvent } from './usage-receipt'
 import { legacyKeyFieldNames, savedProviderKey } from './saved-provider-key'
 import type { ApplicationIsolationAdapter, ApplicationIsolationEntry, ApplicationIsolationRestoreResult } from './application-isolation-lease'
 import type { CodexIsolationAdapter } from './codex-app-isolation'
+import type { RouterGatewaySnapshot, RouterIsolationLease } from './router-gateway'
+import { activeRouterRoute, activeSingleRouterRoutes, routerConfigured } from './router-state'
 
 /** 核对结果：按壳的一致性判定，可能带上客户可读的说明（比如别的工具留下的死地址）。 */
 export type ConfigurationVerification = Readonly<Record<AiAccessShell, ConfigurationState>> & {
@@ -76,7 +78,7 @@ export interface AiAccessState {
   readonly codexMode?: CodexRoutingMode
   /** Keys remain only in encrypted shellKeys.codex[provider], never duplicated in this mapping. */
   readonly codexMultiModelPool?: readonly CodexMultiModelPoolEntry[]
-  /** GUI-owned binding; the headless process rotates its client token separately on every boot. */
+  /** Independent router control binding; the historical field name is retained for rollback compatibility. */
   readonly codexMultiRelay?: { readonly port: number; readonly identitySecret: string }
   readonly selected: Readonly<Partial<Record<AiAccessShell, AiAccessMode>>>
 }
@@ -217,6 +219,10 @@ function activeRelayKey(state: AiAccessState, shell: AiAccessShell): string | un
  * The state store is responsible for encrypting the key before it reaches disk.
  */
 export interface AiAccessExtras {
+  /** Production keeps client listeners in the existing headless process; this GUI gateway only probes. */
+  readonly independentRouting?: boolean
+  /** Settle the same verified recipe cache used by the independent runtime before restoring routes. */
+  readonly prepareRouting?: () => Promise<void>
   /** 版本闸门：返回说明文字即拦截，undefined 放行。 */
   readonly gate?: (shell: AiAccessShell, provider: AiAccessProvider) => Promise<string | undefined>
   /** 配方解析：允许后台下发的接口/模型覆盖内置值。 */
@@ -273,6 +279,8 @@ export class AiAccessService {
   private recentClientFaults = new Map<string, number>()
   /** A private transport is eligible only for the exact target identity that owns its live lease. */
   private readonly isolatedShellTargets = new Map<AiAccessShell, string>()
+  private routerSnapshot?: RouterGatewaySnapshot
+  private readonly routerReceiptFacts = new Map<string, string>()
 
   constructor(private readonly store: AiAccessStateStore, adapters: readonly AiAccessAdapter[], private readonly gateway?: AiGateway,
     private readonly extras: AiAccessExtras = {}, private readonly multiRouter?: AiRouterController) {
@@ -290,7 +298,7 @@ export class AiAccessService {
       const previous = this.recentClientFaults.get(signature)
       if (previous !== undefined && now - previous < 60_000) return
       this.recentClientFaults.set(signature, now)
-      this.extras.recordFault?.({ shell: record.shell, provider: record.provider, code })
+      this.extras.recordFault?.({ shell: record.shell, ...(record.provider ? { provider: record.provider } : {}), code })
       this.extras.recordUsageEvent?.({ shell: record.shell, stage: 'client-call', outcome: 'failure', code, at: record.at })
     })
   }
@@ -460,8 +468,19 @@ export class AiAccessService {
         if (active === undefined || capturedTargetIdentity === undefined || !await currentTargetMatchesCapture() ||
             combinedTargetIdentity(active, capturedConfigurationTargetIdentity) !== capturedTargetIdentity) throw new Error('AI_ACCESS_CONFIGURATION_TARGET_BLOCKED')
         await egress.activate(entry.proxyUrl, active.route.endpoint)
+        if (this.extras.independentRouting) {
+          try {
+            await this.multiRouter!.isolation(active.state, { shell, action: 'activate', proxyUrl: entry.proxyUrl,
+              targetIdentity: targetIdentity(active) })
+          } catch (error) {
+            await this.multiRouter!.isolation(active.state, { shell, action: 'deactivate' }).catch(() => undefined)
+            await egress.deactivate()
+            throw error
+          }
+        }
       },
       deactivateEntry: async () => {
+        if (this.extras.independentRouting) await this.multiRouter!.isolation(await this.read(), { shell, action: 'deactivate' })
         this.isolatedShellTargets.delete(shell)
         this.updateRoutes(await this.read())
         await egress.deactivate()
@@ -482,6 +501,9 @@ export class AiAccessService {
           expectedFingerprint = applied.managedFingerprint
           expectedIsolationFingerprint = applied.isolationFingerprint
           expectedTargetIdentity = targetIdentity(after)
+          if (this.extras.independentRouting) await this.multiRouter!.isolation(after.state, { shell, action: 'apply', targetIdentity: expectedTargetIdentity,
+            lease: { leaseId: capturedLeaseId, configurationTargetIdentity: capturedConfigurationTargetIdentity!,
+              managedFingerprint: expectedFingerprint, isolationFingerprint: expectedIsolationFingerprint } })
           this.isolatedShellTargets.set(shell, expectedTargetIdentity)
           this.updateRoutes(active.state)
           return 'applied'
@@ -500,12 +522,52 @@ export class AiAccessService {
           expectedIsolationFingerprint === await this.adapter(shell).readIsolationFingerprint?.(capturedConfigurationTargetIdentity)
       },
       recoverLease: async () => this.adapter(shell).recoverIsolationLease?.() ?? 'none',
+      resumeLease: async () => {
+        if (!this.extras.independentRouting) return undefined
+        const active = await current()
+        if (!active) return undefined
+        const reply = await this.multiRouter!.isolation(active.state, { shell, action: 'status' })
+        if (!reply || typeof reply !== 'object') return undefined
+        const entry = reply as { targetIdentity?: unknown; proxyUrl?: unknown; lease?: Partial<RouterIsolationLease> }
+        const lease = entry.lease
+        if (entry.targetIdentity !== targetIdentity(active) || typeof entry.proxyUrl !== 'string' || !lease ||
+            typeof lease.leaseId !== 'string' || !lease.leaseId || lease.configurationTargetIdentity !== active.configurationTargetIdentity ||
+            typeof lease.managedFingerprint !== 'string' || typeof lease.isolationFingerprint !== 'string' ||
+            lease.managedFingerprint !== await this.adapter(shell).readManagedFingerprint?.() ||
+            lease.isolationFingerprint !== await this.adapter(shell).readIsolationFingerprint?.(active.configurationTargetIdentity)) return undefined
+        // The GUI's private probe session is separate from the forwarding session in the router.
+        await egress.activate(entry.proxyUrl, active.route.endpoint)
+        const after = await current()
+        if (!after || targetIdentity(after) !== entry.targetIdentity || after.configurationTargetIdentity !== lease.configurationTargetIdentity ||
+            lease.managedFingerprint !== await this.adapter(shell).readManagedFingerprint?.() ||
+            lease.isolationFingerprint !== await this.adapter(shell).readIsolationFingerprint?.(after.configurationTargetIdentity)) {
+          await egress.deactivate()
+          return undefined
+        }
+        expectedFingerprint = lease.managedFingerprint
+        expectedIsolationFingerprint = lease.isolationFingerprint
+        expectedTargetIdentity = targetIdentity(active)
+        capturedConfigurationTargetIdentity = active.configurationTargetIdentity
+        capturedTargetIdentity = combinedTargetIdentity(active, capturedConfigurationTargetIdentity)
+        capturedLeaseId = lease.leaseId
+        this.isolatedShellTargets.set(shell, expectedTargetIdentity)
+        this.updateRoutes(after.state)
+        return { leaseId: lease.leaseId, restoreIfOwned: async () => {
+          // Route mutations may be waiting for this release inside the service queue.
+          // Only the captured configuration identity is needed; awaiting current() would
+          // wait for that same mutation and deadlock a reopened GUI's key change.
+          if (capturedConfigurationTargetIdentity !== await configurationTargetIdentity()) return 'preserved-external'
+          const result = await this.adapter(shell).recoverIsolationLease?.()
+          if (!result || result === 'none') throw new Error('AI_ACCESS_ISOLATION_RECOVERY_REQUIRED')
+          return result
+        } }
+      },
       clearLease: async (leaseId) => { await this.adapter(shell).clearIsolationLease?.(leaseId, capturedConfigurationTargetIdentity) },
       verifyTarget: async () => {
         const active = await current()
         return active === undefined || expectedTargetIdentity === undefined || expectedTargetIdentity !== targetIdentity(active) ||
           capturedTargetIdentity !== combinedTargetIdentity(active, capturedConfigurationTargetIdentity) || !await currentTargetMatchesCapture()
-          ? false : (await this.gateway!.probe(this.route(shell, active.provider, active.key, active.state))).ok
+          ? false : (await this.probeRoute(this.route(shell, active.provider, active.key, active.state))).ok
       }
     }
 
@@ -595,7 +657,10 @@ export class AiAccessService {
     if (!key) return { ok: false, latencyMs: null, code: 'key_missing' }
     if (!keyPattern.test(key)) return { ok: false, latencyMs: null, code: 'key_rejected' }
     if (!this.gateway) return { ok: false, latencyMs: null, code: 'not_configured' }
-    return this.gateway.measureLatency(this.route(shell, provider, key, state, model))
+    const route = this.route(shell, provider, key, state, model)
+    const result = await this.gateway.measureLatency(route)
+    if (result.ok) await this.clearIndependentRetryBlock(route)
+    return result
   }
 
   async saveProviderKey(shell: AiAccessShell, provider: AiAccessProvider, value: string): Promise<AiAccessStatus> {
@@ -616,7 +681,7 @@ export class AiAccessService {
       if (this.multiRouter && shell === 'codex' && previous.codexMode === 'multi' &&
         previous.codexMultiModelPool?.some(entry => entry.provider === provider)) {
         if (!this.gateway) throw new Error('AI_ACCESS_PROVIDER_UNSUPPORTED')
-        const result = await this.gateway.probe(this.route(shell, provider, key, previous))
+        const result = await this.probeRoute(this.route(shell, provider, key, previous))
         this.markCheck(shell, provider, result.ok, result.code)
         if (!result.ok) return this.publicStatus(previous)
       }
@@ -646,7 +711,7 @@ export class AiAccessService {
       await this.beforeHermesRouteMutation(shell)
       if (!this.gateway) throw new Error('AI_ACCESS_PROVIDER_UNSUPPORTED')
       const previous = await this.read()
-      const result = await this.gateway.probe(this.route(shell, provider, key, previous))
+      const result = await this.probeRoute(this.route(shell, provider, key, previous))
       this.recordUsage(shell, 'probe', result.ok ? 'success' : 'failure', result.ok ? undefined : result.code ?? 'unknown')
       const suggestedProvider = result.ok ? undefined : await this.suggestedProviderForKey(shell, provider, key, previous, result.code)
       const code = suggestedProvider === undefined ? result.code : 'key_product_mismatch'
@@ -690,7 +755,7 @@ export class AiAccessService {
       }
       const previousEntry = previous.codexMultiModelPool?.find(entry => entry.provider === provider)
       const route = this.route('codex', provider, key, previous, requestedModel || previousEntry?.model)
-      const result = await this.gateway.probe(route)
+      const result = await this.probeRoute(route)
       this.recordUsage('codex', 'probe', result.ok ? 'success' : 'failure', result.ok ? undefined : result.code ?? 'unknown')
       const suggestedProvider = result.ok ? undefined : await this.suggestedProviderForKey('codex', provider, key, previous, result.code)
       const code = suggestedProvider === undefined ? result.code : 'key_product_mismatch'
@@ -744,11 +809,12 @@ export class AiAccessService {
         this.updateRoutes(next)
         return this.publicStatus(next)
       }
-      if (!(await this.stopMultiRouter(previous))) {
+      const next: AiAccessState = { ...previous, codexMode: 'single' }
+      const preserveSingle = this.extras.independentRouting && activeSingleRouterRoutes(next).length > 0
+      if (!preserveSingle && !(await this.stopMultiRouter(previous))) {
         await this.refreshMultiRouter(previous)
         throw new Error('AI_ROUTER_STOP_FAILED')
       }
-      const next: AiAccessState = { ...previous, codexMode: 'single' }
       try { await this.commitCodexMultiDeactivation(next) } catch (error) {
         await this.refreshMultiRouter(previous)
         throw error
@@ -782,7 +848,8 @@ export class AiAccessService {
       const remaining = previous.codexMultiModelPool?.filter(entry => entry.provider !== provider) ?? []
       const next: AiAccessState = { ...previous, codexMultiModelPool: remaining,
         codexMode: remaining.length ? 'multi' : 'single' }
-      if (remaining.length === 0 && this.multiRouter && !(await this.stopMultiRouter(previous))) {
+      const preserveSingle = this.extras.independentRouting && activeSingleRouterRoutes(next).length > 0
+      if (remaining.length === 0 && this.multiRouter && !preserveSingle && !(await this.stopMultiRouter(previous))) {
         await this.refreshMultiRouter(previous)
         throw new Error('AI_ROUTER_STOP_FAILED')
       }
@@ -850,7 +917,7 @@ export class AiAccessService {
           this.markCheck(shell, provider, false, code)
           return this.publicStatus(previous)
         }
-        const result = await this.gateway.probe(route)
+        const result = await this.probeRoute(route)
         this.recordUsage(shell, 'probe', result.ok ? 'success' : 'failure', result.ok ? undefined : result.code ?? 'unknown')
         const suggestedProvider = result.ok ? undefined : await this.suggestedProviderForKey(shell, provider, key, previous, result.code)
         const code = suggestedProvider === undefined ? result.code : 'key_product_mismatch'
@@ -930,7 +997,8 @@ export class AiAccessService {
       const next: AiAccessState = { ...previous, selected: { ...previous.selected, [shell]: 'official' }, relayShells: previous.relayShells?.filter(item => item !== shell), pendingShells: previous.pendingShells?.filter(item => item !== shell),
         ...(shell === 'codex' && this.multiRouter ? { codexMode: 'single' as const } : {}),
         shellFingerprints: withoutShell(previous.shellFingerprints, shell) }
-      const stopMultiRouter = shell === 'codex' && this.multiRouter && previous.codexMode === 'multi'
+      const stopMultiRouter = shell === 'codex' && this.multiRouter && previous.codexMode === 'multi' &&
+        !(this.extras.independentRouting && activeSingleRouterRoutes(next).length > 0)
       if (stopMultiRouter) {
         try { if (!(await this.multiRouter!.stop(previous))) throw new Error('AI_ROUTER_STOP_FAILED') } catch {
           if (this.gateway) await this.rollbackChange(previous, rollback!)
@@ -938,7 +1006,11 @@ export class AiAccessService {
           throw new Error('AI_ROUTER_STOP_FAILED')
         }
       }
-      try { await (shell === 'codex' ? this.commitCodexMultiDeactivation(next) : this.writeState(next)) } catch {
+      try {
+        await (shell === 'codex' ? this.commitCodexMultiDeactivation(next) : this.writeState(next))
+        if (this.extras.independentRouting && activeSingleRouterRoutes(next).length === 0 &&
+          !activeRouterRoute(next) && !stopMultiRouter && !(await this.multiRouter?.stop(next))) throw new Error('AI_ROUTER_STOP_FAILED')
+      } catch {
         if (this.gateway) await this.rollbackChange(previous, rollback!)
         else if (rollback) await rollback()
         if (stopMultiRouter) await this.multiRouter!.refresh(previous).catch(() => undefined)
@@ -1004,6 +1076,7 @@ export class AiAccessService {
   /** Only restarts previously configured toolbox routes; never rewrites a shell on startup. */
   async initialize(): Promise<void> {
     await this.serialize(async () => {
+      await this.extras.prepareRouting?.()
       let state: AiAccessState
       try {
         state = await this.migrateApi15rDState()
@@ -1014,7 +1087,9 @@ export class AiAccessService {
         return
       }
       try {
-        if (state.relay || (!this.multiRouter && state.codexMultiModelPool?.length)) {
+        const singleRuntimeNeeded = !this.extras.independentRouting || aiAccessShells.some(shell =>
+          isProvider(state.selected[shell]) && (state.relayShells?.includes(shell) || state.pendingShells?.includes(shell)))
+        if (state.relay && singleRuntimeNeeded || (!this.multiRouter && state.codexMultiModelPool?.length)) {
           try { await this.ensureGateway(state) } catch (error) { this.startupError = gatewayFailureCode(error) }
         } else this.updateRoutes(state)
         if (this.multiRouter && state.codexMode === 'multi' && state.codexMultiModelPool?.length) {
@@ -1033,13 +1108,23 @@ export class AiAccessService {
   async probeDiagnosticPath(shell: AiAccessShell, revision: string) {
     await this.pending
     if (this.gateway === undefined) return { failure: 'path-unavailable' as const, durationMs: 0 }
+    if (this.extras.independentRouting) {
+      try {
+        const result = await this.multiRouter!.isolation(await this.read(), { shell, action: 'diagnostic', revision })
+        return result as Awaited<ReturnType<AiGateway['probeDiagnosticPath']>>
+      } catch { return { failure: 'unavailable' as const, durationMs: 0 } }
+    }
     return this.gateway.probeDiagnosticPath(shell, revision)
   }
 
   async serviceStatus(): Promise<ApiServiceSnapshot> {
     await this.pending
     const state = await this.read().catch(() => undefined)
-    const base = this.gateway?.snapshot() ?? { running: false, baseUrl: null, startedAt: null, requests: [], routes: [] }
+    if (this.extras.independentRouting && state) await this.readRouterSnapshot(state)
+    const local = this.gateway?.snapshot()
+    const base = this.extras.independentRouting
+      ? this.routerSnapshot?.service ?? { running: false, baseUrl: null, startedAt: null, requests: [], routes: [] }
+      : local ?? { running: false, baseUrl: null, startedAt: null, requests: [], routes: [] }
     // 配置已经指向本机服务，服务却没在跑：这是本机故障，⛔ 混进「服务商异常」。
     const liveRelayShells = state === undefined ? [] : aiAccessShells.filter(shell => activeRelayKey(state, shell) !== undefined)
     const down = this.gateway !== undefined && !base.running && liveRelayShells.length > 0
@@ -1053,13 +1138,16 @@ export class AiAccessService {
     const retainedStartupError = this.startupError
     const startupError = retainedStartupError ?? (down ? 'local_service_down'
       : pendingBlocksAllRoutes ? 'configuration_interrupted' : undefined)
-    return { ...base, ...(startupError ? { startupError } : {}), checks: [...this.checks], usage: this.usageStages(state) }
+    return { ...base, ...(this.extras.independentRouting ? {
+      requests: [...base.requests, ...(local?.requests ?? [])].sort((a, b) => Date.parse(b.at) - Date.parse(a.at)).slice(0, 200)
+    } : {}),
+      ...(startupError ? { startupError } : {}), checks: [...this.checks], usage: this.usageStages(state) }
   }
 
   /** 「测过 / 写了 / 真的在用」三件分开报；判不出就是 null，⛔ 用「配置写了」冒充「在用」。 */
   private usageStages(state?: AiAccessState): readonly ApiUsageStage[] {
-    const observed = this.gateway?.clientAcceptances() ?? {}
-    const attempts = this.gateway?.clientAttempts() ?? {}
+    const observed = this.extras.independentRouting ? this.routerSnapshot?.acceptances ?? {} : this.gateway?.clientAcceptances() ?? {}
+    const attempts = this.extras.independentRouting ? this.routerSnapshot?.attempts ?? {} : this.gateway?.clientAttempts() ?? {}
     return aiAccessShells.map(shell => {
       const selected = state?.selected[shell]
       // 还没切换过的壳，按客户刚测过的那一家报进度；已切到官方就没有第三方进度可报。
@@ -1072,7 +1160,8 @@ export class AiAccessService {
         : state?.relayShells?.includes(shell) && provider ? this.configurations.get(shell) ?? 'unknown' : 'not-managed'
       const currentConfiguration = configuration === 'ok'
       const codexDesktopRoute = shell === 'codex' && provider !== null && currentConfiguration
-        ? this.gateway?.codexDesktopRouteAcceptance() ?? { status: 'unverified' as const, at: null, reason: 'socket_binding_unavailable' as const }
+        ? (this.extras.independentRouting ? this.routerSnapshot?.desktop : this.gateway?.codexDesktopRouteAcceptance()) ??
+          { status: 'unverified' as const, at: null, reason: 'socket_binding_unavailable' as const }
         : undefined
       return {
         shell,
@@ -1109,7 +1198,7 @@ export class AiAccessService {
         this.recordUsage(shell, 'probe', 'unverified', code)
         this.markCheck(shell, provider, false, code); return
       }
-      const result = await this.gateway.probe(this.route(shell, provider, key, state))
+      const result = await this.probeRoute(this.route(shell, provider, key, state))
       this.recordUsage(shell, 'probe', result.ok ? 'success' : 'failure', result.ok ? undefined : result.code ?? 'unknown')
       const suggestedProvider = result.ok ? undefined : await this.suggestedProviderForKey(shell, provider, key, state, result.code)
       const code = suggestedProvider === undefined ? result.code : 'key_product_mismatch'
@@ -1221,7 +1310,7 @@ export class AiAccessService {
         // 先报「正在测哪一格」：48 格串行跑下来，运维要看得见进度而不是干等。
         report(entries.length, { provider, shell, model })
         let result: { ok: boolean; code?: ApiFailure; firstTextMs?: number }
-        try { result = await this.gateway.probe(this.route(shell, provider, key, state, model)) } catch { result = { ok: false, code: 'unknown' } }
+        try { result = await this.probeRoute(this.route(shell, provider, key, state, model)) } catch { result = { ok: false, code: 'unknown' } }
         note({ provider, shell, model, state: result.ok ? 'passed' : 'failed',
           ...(result.ok ? {} : { code: result.code ?? 'unknown' }),
           ...(result.firstTextMs === undefined ? {} : { firstTextMs: result.firstTextMs }), at: at() })
@@ -1316,6 +1405,7 @@ export class AiAccessService {
       if (!this.gateway || !initial.relay || (routed.length === 0 && suspended.length === 0)) {
         return this.recovery(reason, at, 'not-managed', undefined, '当前没有 AI 在使用工具箱的模型 API，无需恢复。', this.inspectStates(initial))
       }
+      if (this.extras.independentRouting) return this.recoverIndependentAccess(initial, reason, at, routed)
       let state = initial
       let relay = initial.relay
       let rebound = false
@@ -1448,7 +1538,9 @@ export class AiAccessService {
     return result
   }
 
-  private gatewayRunning(): boolean { return this.gateway?.snapshot().running === true }
+  private gatewayRunning(): boolean {
+    return this.extras.independentRouting ? this.routerSnapshot?.service.running === true : this.gateway?.snapshot().running === true
+  }
 
   /** 读当前托管段指纹；读不出就让该壳报「不能判断」，⛔ 猜成没被改。 */
   private async captureFingerprints(previous: AiAccessState['shellFingerprints'], shells: readonly AiAccessShell[]): Promise<AiAccessState['shellFingerprints']> {
@@ -1625,6 +1717,12 @@ export class AiAccessService {
       const state = await this.read().catch(() => undefined)
       if (!state) return 'configuration_failed'
       if (!state.relay) return 'not_configured'
+      if (this.extras.independentRouting) {
+        if (!(await this.multiRouter?.stop(state))) return 'local_service_down'
+        this.routerSnapshot = undefined
+        try { await this.ensureGateway(state) } catch (error) { return gatewayFailureCode(error) }
+        return undefined
+      }
       // 同端口同令牌重启：给在飞的客户流式回答一个短沉降窗（复审收尾），界内收尾的不掐断；
       // 换端口/令牌轮换路径仍走 stop() 的立即中止。
       await this.gateway!.stop(5_000)
@@ -1646,7 +1744,12 @@ export class AiAccessService {
       ...(next && next !== action ? { next } : {}) }
   }
 
-  async stop(): Promise<void> { await this.gateway?.stop() }
+  async stop(): Promise<void> {
+    // The GUI owns probes, timers and its observations. Client listeners belong to the router.
+    if (this.extras.independentRouting) this.gateway?.cancelTests()
+    await this.gateway?.stop()
+    this.routerSnapshot = undefined
+  }
 
   /**
    * API-10：中止在飞的测速请求（服务面板「取消检查」/关闭面板）。不进 serialize 队列——
@@ -1680,13 +1783,26 @@ export class AiAccessService {
     return createHash('sha256').update(JSON.stringify([route.provider, route.key, route.model, route.endpoint])).digest('hex')
   }
 
+  private async probeRoute(route: GatewayRoute): Promise<Awaited<ReturnType<AiGateway['probe']>>> {
+    const result = await this.gateway!.probe(route)
+    if (result.ok) await this.clearIndependentRetryBlock(route)
+    return result
+  }
+
+  private async clearIndependentRetryBlock(route: GatewayRoute): Promise<void> {
+    if (!this.extras.independentRouting) return
+    try {
+      await this.multiRouter!.isolation(await this.read(), { shell: route.shell, action: 'probe-accepted', targetIdentity: this.routeTargetIdentity(route) })
+    } catch { /* A provider probe remains a provider fact when the local client listener is unavailable. */ }
+  }
+
   private async suggestedProviderForKey(shell: AiAccessShell, provider: AiAccessProvider, key: string, state: AiAccessState, code?: ApiFailure): Promise<AiAccessProvider | undefined> {
     // `invalid_token` and `product_mismatch` are shared by an actually invalid Kimi Key and a
     // Key issued by its sister product. Only a successful sister probe proves the latter.
     if (code !== 'key_rejected' || !this.gateway) return undefined
     const candidate = provider === 'kimi' ? 'moonshot' : provider === 'moonshot' ? 'kimi' : undefined
     if (candidate === undefined || !isProviderShellSupported(candidate, shell)) return undefined
-    try { return (await this.gateway.probe(this.route(shell, candidate, key, state))).ok ? candidate : undefined } catch { return undefined }
+    try { return (await this.probeRoute(this.route(shell, candidate, key, state))).ok ? candidate : undefined } catch { return undefined }
   }
 
   private suggestedProviderNotice(provider: AiAccessProvider, suggested: AiAccessProvider): string {
@@ -1797,6 +1913,20 @@ export class AiAccessService {
 
   private async ensureGateway(state: AiAccessState): Promise<AiAccessState> {
     if (!this.gateway) return state
+    if (this.extras.independentRouting) {
+      if (!this.multiRouter) throw new Error('AI_ROUTER_UNAVAILABLE')
+      const relay = state.relay ?? { port: await chooseAiRouterPort(), token: randomBytes(32).toString('hex') }
+      const next: AiAccessState = { ...state, relay, codexMultiRelay: state.codexMultiRelay ?? {
+        port: relay.port, identitySecret: randomBytes(32).toString('hex')
+      } }
+      if (!state.relay || !state.codexMultiRelay) await this.store.write(next)
+      if (!(await this.multiRouter.refresh(next))) throw new Error('AI_ROUTER_UNAVAILABLE')
+      this.gateway.baseUrl = `http://127.0.0.1:${relay.port}`
+      await this.readRouterSnapshot(next)
+      this.startupError = undefined
+      this.updateRoutes(next)
+      return next
+    }
     const token = state.relay?.token ?? randomBytes(32).toString('hex')
     const port = await this.gateway.start(state.relay?.port ?? 0, token)
     const next = state.relay ? state : { ...state, relay: { token, port } }
@@ -1817,7 +1947,7 @@ export class AiAccessService {
 
   private async writeState(next: AiAccessState): Promise<void> {
     if (!this.api15rDMigrationFailed) {
-      await this.store.write(next)
+      await this.persistRouterState(next)
       return
     }
     const migrated = await this.migrateApi15rDState()
@@ -1831,7 +1961,122 @@ export class AiAccessService {
       codexMultiModelPool: next.codexMultiModelPool ?? migrated.codexMultiModelPool,
       migrations: migrated.migrations
     }
-    await this.store.write(durable)
+    await this.persistRouterState(durable)
+  }
+
+  private async persistRouterState(next: AiAccessState): Promise<void> {
+    const previous = this.extras.independentRouting ? await this.store.read() : undefined
+    await this.store.write(next)
+    try { await this.refreshIndependentRouter(next) } catch (error) {
+      try {
+        await this.store.write(previous!)
+        if (routerConfigured(previous!)) await this.refreshIndependentRouter(previous!)
+        else if (!(await this.multiRouter?.stop(next))) throw new Error('AI_ROUTER_STOP_FAILED', { cause: error })
+      } catch {
+        this.startupError = 'configuration_rollback_failed'
+        await this.multiRouter?.stop(next).catch(() => false)
+      }
+      throw error
+    }
+  }
+
+  private async refreshIndependentRouter(state: AiAccessState): Promise<void> {
+    if (!this.extras.independentRouting || !routerConfigured(state)) return
+    if (!activeSingleRouterRoutes(state).length && !activeRouterRoute(state) && !(await this.multiRouter?.probe(state))) {
+      this.routerSnapshot = undefined
+      return
+    }
+    if (!(await this.multiRouter?.refresh(state))) throw new Error('AI_ROUTER_REFRESH_FAILED')
+    await this.readRouterSnapshot(state)
+  }
+
+  private async readRouterSnapshot(state: AiAccessState): Promise<void> {
+    this.routerSnapshot = await this.multiRouter?.gatewaySnapshot(state).catch(() => undefined)
+    const snapshot = this.routerSnapshot
+    if (!snapshot) return
+    const record = (event: UsageReceiptEvent) => {
+      if (event.at === undefined) return
+      const identity = `${event.shell}:${event.stage}:${event.outcome}`
+      if (this.routerReceiptFacts.get(identity) === event.at) return
+      this.routerReceiptFacts.set(identity, event.at)
+      this.extras.recordUsageEvent?.(event)
+    }
+    for (const shell of aiAccessShells) {
+      const accepted = snapshot.acceptances[shell]
+      if (accepted) record({ shell, stage: 'client-call', outcome: 'success', at: accepted.at })
+      const attempt = snapshot.attempts[shell]
+      if (attempt && !attempt.ok) record({ shell, stage: 'client-call', outcome: 'failure', at: attempt.at, code: attempt.code ?? 'unknown' })
+    }
+    if (snapshot.desktop.at) record({ shell: 'codex', stage: 'codex-desktop', outcome: snapshot.desktop.status === 'verified' ? 'success' : 'unverified',
+      at: snapshot.desktop.at, ...(snapshot.desktop.status === 'verified' ? {} : { code: snapshot.desktop.reason }) })
+  }
+
+  private async recoverIndependentAccess(state: AiAccessState, reason: AccessRecovery['reason'], at: string,
+    routed: readonly AiAccessShell[]): Promise<AccessRecovery> {
+    try { state = await this.ensureGateway(state) } catch (error) {
+      const current = await this.multiRouter?.gatewaySnapshot(state).catch(() => undefined)
+      if (!current?.service.running && state.relay && await (this.extras.isPortListening ?? isPortListening)(state.relay.port)) {
+        return this.rebindIndependentAccess(state, reason, at, routed)
+      }
+      const code = gatewayFailureCode(error)
+      this.startupError = code
+      return this.recovery(reason, at, 'still_failing', code, apiFailureMessage(code), await this.inspectConfigurations(state), [], 'recovery_service_down')
+    }
+    const configurations = await this.inspectConfigurations(state)
+    const broken = routed.filter(shell => configurations[shell] === 'modified-externally' || configurations[shell] === 'missing')
+    if (broken.length) return this.recovery(reason, at, 'still_failing', 'configuration_failed',
+      `${broken.map(shell => shellLabel(shell)).join('、')} 的配置已不是工具箱写的那份，请重新写入配置。`, configurations, [], 'recovery_config_broken')
+    const live = new Set(this.routerSnapshot?.service.routes.map(route => route.shell))
+    if (!this.gatewayRunning()) return this.recovery(reason, at, 'still_failing', 'local_service_down', apiFailureMessage('local_service_down'), configurations, [], 'recovery_service_down')
+    if (routed.some(shell => configurations[shell] !== 'ok' || !live.has(shell))) return this.recovery(reason, at, 'still_failing',
+      'configuration_interrupted', '对应接入尚未核验完成，请重新写入配置。', configurations, [], 'recovery_config_broken')
+    return this.recovery(reason, at, 'ok', undefined, '模型 API 配置与独立路由正常。', configurations)
+  }
+
+  private async rebindIndependentAccess(original: AiAccessState, reason: AccessRecovery['reason'], at: string,
+    routed: readonly AiAccessShell[]): Promise<AccessRecovery> {
+    let state = original
+    const rewrote: AiAccessShell[] = []
+    try {
+      if (routed.includes('hermes')) await this.beforeHermesRouteMutation('hermes')
+      const before = await this.inspectConfigurations(original)
+      await this.extras.beforeRecoveryRewrite?.(routed.filter(shell => before[shell] === 'ok'))
+      const configurations = await this.inspectConfigurations(original)
+      const relay = { port: await chooseAiRouterPort(), token: randomBytes(32).toString('hex') }
+      const binding = original.codexMultiRelay!
+      // A historical single listener may also be the control listener. A separate multi-model
+      // address remains fixed so Desktop's catalogue and credential command need no migration.
+      state = { ...original, relay, codexMultiRelay: binding.port === original.relay!.port ? { ...binding, port: relay.port } : binding,
+        pendingShells: [...new Set([...(original.pendingShells ?? []), ...routed])] }
+      await this.writeState(state)
+      state = await this.ensureGateway(state)
+      for (const shell of routed.filter(shell => configurations[shell] === 'ok')) {
+        const provider = state.selected[shell]
+        if (!isProvider(provider)) continue
+        try {
+          const adapter = this.adapter(shell)
+          if (!adapter.applyConnection) throw new Error('AI_ACCESS_PROVIDER_UNSUPPORTED')
+          await adapter.applyConnection(provider, { baseUrl: this.connectionUrl(shell, provider), apiKey: relay.token,
+            model: this.route(shell, provider, '', state).model })
+          rewrote.push(shell)
+          this.configuredAt.set(shell, { at, provider })
+        } catch { /* A shell whose write failed remains durably paused. */ }
+      }
+      state = { ...state, pendingShells: state.pendingShells?.filter(shell => !rewrote.includes(shell)),
+        shellFingerprints: await this.captureFingerprints(state.shellFingerprints, rewrote) }
+      await this.writeState(state)
+      this.updateRoutes(state)
+      const after = await this.inspectConfigurations(state)
+      if (rewrote.length !== routed.length) return this.recovery(reason, at, 'still_failing', 'configuration_interrupted',
+        '独立路由已换用新端口；未能核验或写入的接入保持暂停，请重新写入配置。', after, rewrote, 'recovery_config_broken')
+      this.startupError = undefined
+      return this.recovery(reason, at, 'repaired', undefined, '本机 API 原端口被占用，已换用新端口并保留所选模型。', after, rewrote,
+        'recovery_port_changed', [String(relay.port)])
+    } catch {
+      this.startupError = 'configuration_failed'
+      return this.recovery(reason, at, 'still_failing', 'configuration_failed', '未能安全恢复独立模型路由，请重新写入配置。',
+        await this.inspectConfigurations(state), rewrote, 'recovery_state_unavailable')
+    }
   }
 
   private async read(): Promise<AiAccessState> {

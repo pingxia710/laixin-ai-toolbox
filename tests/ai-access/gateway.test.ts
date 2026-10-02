@@ -1,10 +1,12 @@
 import { EventEmitter } from 'node:events'
+import { createHash } from 'node:crypto'
 import { request as httpRequest } from 'node:http'
 import { afterEach, describe, expect, it } from 'vitest'
 import { AiGateway, type GatewayFetch, type GatewayRoute } from '../../app/main/ai-access/gateway'
 
 const token = 'laixin-fixture-client-token-0123456789'
 const key = 'sk-fixture-upstream-key-0123456789'
+const fingerprint = (value: string) => ({ bytes: Buffer.byteLength(value), sha256: createHash('sha256').update(value).digest('hex') })
 type Json = Record<string, unknown>
 const routes: GatewayRoute[] = ['codex', 'claude', 'hermes'].map(shell => ({ shell: shell as GatewayRoute['shell'], provider: 'deepseek', model: 'fixture-model', endpoint: 'https://api.deepseek.com/fixture', key }))
 const gateways: AiGateway[] = []
@@ -366,24 +368,6 @@ describe('本机 API 服务', () => {
     expect(response.status).toBe(200)
     expect(await response.text()).toBe(sse)
     expect(g.snapshot().requests[0]).toMatchObject({ ok: true, source: 'client' })
-  })
-
-  it('没有 SSE 事件边界的超长上游回复会在本机受限丢弃，不积累内存或透传原文', async () => {
-    const chunk = new Uint8Array(1024 * 1024).fill('x'.charCodeAt(0))
-    const g = await start(async () => new Response(new ReadableStream<Uint8Array>({
-      start(controller) {
-        for (let index = 0; index < 33; index += 1) controller.enqueue(chunk)
-        controller.close()
-      }
-    }), { headers: { 'content-type': 'text/event-stream' } }), 10_000)
-    const response = await fetch(`${g.baseUrl}/codex/deepseek/v1/responses`, {
-      method: 'POST', headers: { authorization: `Bearer ${token}` }, body: '{}'
-    })
-    expect(response.status).toBe(413)
-    const body = await response.text()
-    expect(body).toContain('转发上限')
-    expect(body).not.toContain('xxxxx')
-    expect(g.snapshot().requests[0]).toMatchObject({ ok: false, code: 'payload_too_large' })
   })
 
   it('客户端认证失败后的自动重试在同一路由版本内不再直打上游，换 Key 后立即解除短路', async () => {
@@ -861,7 +845,7 @@ describe('本机 API 服务', () => {
     }
   })
 
-  it('16 条慢上传尚未读完 body 时，第 17 条声明超大 body 也会立即被本机拒绝，完全不触上游', async () => {
+  it('16 条慢上传尚未读完 body 时，第 17 条会立即被并发调度拒绝，完全不触上游', async () => {
     let upstreamCalls = 0
     const g = await start(async () => { upstreamCalls += 1; return Response.json({ status: 'completed', output: [] }) }, 10_000)
     const held = Array.from({ length: 16 }, () => {
@@ -880,7 +864,7 @@ describe('本机 API 服务', () => {
       const rejected = await new Promise<{ status: number; body: string }>((resolve, reject) => {
         const request = httpRequest(`${g.baseUrl}/codex/deepseek/v1/responses`, {
           method: 'POST', headers: {
-            authorization: `Bearer ${token}`, 'content-type': 'application/json', 'content-length': String(32 * 1024 * 1024 + 1)
+            authorization: `Bearer ${token}`, 'content-type': 'application/json', 'content-length': '4096'
           }
         }, response => {
           const chunks: Buffer[] = []
@@ -978,44 +962,48 @@ describe('本机 API 服务', () => {
     await expect(nonStreaming.probe(routes.find(route => route.shell === 'codex')!))
       .resolves.toMatchObject({ ok: false, code: 'response_truncated' })
 
-    // 客户的请求同样要拿到「回答过长」，而不是「服务商返回异常」。
+    // 客户的请求保留部分答案与原截断原因，内部探测仍不冒充完整通过。
     const client = await start(async () => new Response(incompleteJson, { headers: { 'content-type': 'application/json' } }))
     const response = await fetch(`${client.baseUrl}/codex/deepseek/v1/responses`, { method: 'POST', headers: { authorization: `Bearer ${token}` }, body: '{}' })
     const body = await response.text()
-    expect(body).toContain('回答太长')
+    expect(response.status).toBe(200)
+    expect(JSON.parse(body)).toEqual(JSON.parse(incompleteJson))
     expect(body).not.toContain('服务商返回异常')
-    expect(client.snapshot().requests[0]).toMatchObject({ ok: false, code: 'response_truncated' })
+    expect(client.snapshot().requests[0]).toMatchObject({ ok: true })
+    expect(client.clientAcceptances()).toEqual({})
   })
 
-  it('请求超过本机 32MB 转发上限：如实说超出上限并留记录，⛔ 说成「无有效回复」（API-07）', async () => {
-    const g = await start(async () => { throw new Error('must not reach upstream') })
+  it('单模型请求整体超过旧 32MB 阈值仍完整转发，由上游决定是否接受', async () => {
+    const input = 'x'.repeat(32 * 1024 * 1024)
+    let upstreamInput: ReturnType<typeof fingerprint> | undefined
+    const g = await start(async (_url, init) => {
+      upstreamInput = fingerprint((JSON.parse(String(init?.body)) as { input: string }).input)
+      return Response.json({ status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: 'OK' }] }] })
+    })
     const response = await fetch(`${g.baseUrl}/codex/deepseek/v1/responses`, {
       method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-      body: 'x'.repeat(32 * 1024 * 1024 + 1)
+      body: JSON.stringify({ input })
     })
-    expect(response.status).toBe(413)
-    const body = await response.text()
-    expect(body).toContain('转发上限')
-    expect(body).not.toContain('没有返回有效模型回复')
-    expect(g.snapshot().requests[0]).toMatchObject({ ok: false, code: 'payload_too_large', source: 'client' })
+    expect(response.status).toBe(200)
+    expect(upstreamInput).toEqual(fingerprint(input))
+    expect(g.snapshot().requests[0]).toMatchObject({ ok: true, source: 'client' })
   })
 
-  it('上游回复超过本机 32MB 转发上限：如实说超出上限，⛔ 说成网络未连接或无有效回复（API-07）', async () => {
-    const oversized = 'x'.repeat(32 * 1024 * 1024 + 1)
+  it('上游回复整体超过旧 32MB 阈值仍完整转发给客户端', async () => {
+    const output = 'x'.repeat(32 * 1024 * 1024)
+    const oversized = JSON.stringify({ status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: output }] }] })
     const nonStreaming = await start(async () => new Response(oversized, { headers: { 'content-type': 'application/json' } }))
     const response = await fetch(`${nonStreaming.baseUrl}/codex/deepseek/v1/responses`, { method: 'POST', headers: { authorization: `Bearer ${token}` }, body: '{}' })
-    expect(response.status).toBe(413)
-    const body = await response.text()
-    expect(body).toContain('转发上限')
-    expect(body).not.toContain('未连接到服务商')
-    expect(nonStreaming.snapshot().requests[0]).toMatchObject({ ok: false, code: 'payload_too_large' })
+    expect(response.status).toBe(200)
+    expect(fingerprint((JSON.parse(await response.text()) as { output: Array<{ content: Array<{ text: string }> }> }).output[0].content[0].text)).toEqual(fingerprint(output))
+    expect(nonStreaming.snapshot().requests[0]).toMatchObject({ ok: true })
 
-    const oneEvent = `data: {"type":"response.output_text.delta","delta":"${'x'.repeat(32 * 1024 * 1024)}"}\n\n`
+    const oneEvent = `data: {"type":"response.output_text.delta","delta":"${output}"}\n\ndata: {"type":"response.completed","response":{"status":"completed"}}\n\n`
     const streaming = await start(async () => new Response(oneEvent, { headers: { 'content-type': 'text/event-stream' } }))
     const sseResponse = await fetch(`${streaming.baseUrl}/codex/deepseek/v1/responses`, { method: 'POST', headers: { authorization: `Bearer ${token}` }, body: '{}' })
-    expect(sseResponse.status).toBe(413)
-    expect(await sseResponse.text()).toContain('转发上限')
-    expect(streaming.snapshot().requests[0]).toMatchObject({ ok: false, code: 'payload_too_large' })
+    expect(sseResponse.status).toBe(200)
+    expect(fingerprint(await sseResponse.text())).toEqual(fingerprint(oneEvent))
+    expect(streaming.snapshot().requests[0]).toMatchObject({ ok: true })
   })
 
   // ── API-08：转发路径空闲超时 ──
@@ -1113,24 +1101,24 @@ describe('本机 API 服务', () => {
     }
   }, 15_000)
 
-  it('已开始流式转发后再遇超上限事件：原流内追加 payload_too_large 错误事件收尾，HTTP 状态不再改变（API-07 复核）', async () => {
+  it('已开始流式转发后遇到超过旧 32MB 阈值的完整事件仍继续透明转发', async () => {
     const encoder = new TextEncoder()
+    const output = 'x'.repeat(32 * 1024 * 1024 + 16)
     const g = await start(async () => new Response(new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(encoder.encode('data: {"type":"response.output_text.delta","delta":"部分回答"}\n\n'))
-        controller.enqueue(encoder.encode(`data: {"type":"response.output_text.delta","delta":"${'x'.repeat(32 * 1024 * 1024 + 16)}"}\n\n`))
+        controller.enqueue(encoder.encode(`data: {"type":"response.output_text.delta","delta":"${output}"}\n\n`))
+        controller.enqueue(encoder.encode('data: {"type":"response.completed","response":{"status":"completed"}}\n\n'))
         controller.close()
       }
     }), { headers: { 'content-type': 'text/event-stream' } }))
     const response = await fetch(`${g.baseUrl}/codex/deepseek/v1/responses`, { method: 'POST', headers: { authorization: `Bearer ${token}` }, body: '{}' })
-    // 部分内容已按 200 开始转发，HTTP 状态收不回来；超上限只能在原流里以错误事件收尾。
     expect(response.status).toBe(200)
     const text = await response.text()
-    expect(text).toContain('部分回答')
-    expect(text).toContain('event: error')
-    expect(text).toContain('payload_too_large')
-    expect(text).toContain('转发上限')
-    expect(g.snapshot().requests[0]).toMatchObject({ ok: false, code: 'payload_too_large' })
+    const expected = `data: {"type":"response.output_text.delta","delta":"部分回答"}\n\ndata: {"type":"response.output_text.delta","delta":"${output}"}\n\ndata: {"type":"response.completed","response":{"status":"completed"}}\n\n`
+    expect(fingerprint(text)).toEqual(fingerprint(expected))
+    expect(text).not.toContain('event: error')
+    expect(g.snapshot().requests[0]).toMatchObject({ ok: true })
   })
 
   // ── API-10：点测试/启用要么快点有结果、要么能取消 ──

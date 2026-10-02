@@ -11,47 +11,60 @@ export function socks5Connect({ host, port, targetHost, targetPort, timeoutMs = 
       return
     }
     const socket = connect({ host, port })
+    let settled = false
+    let phase = 'greeting'
+    let needed = 2
+    const cleanup = () => {
+      clearTimeout(timer)
+      socket.off('readable', onReadable)
+      socket.off('error', onError)
+      socket.off('end', onEnd)
+      socket.off('close', onEnd)
+    }
     const fail = (reason) => {
+      if (settled) return
+      settled = true
+      cleanup()
       socket.destroy()
       rejectPromise(new Error(reason))
     }
     const timer = setTimeout(() => fail('SOCKS5 握手超时'), timeoutMs)
-    socket.once('error', (error) => {
-      clearTimeout(timer)
-      fail(`SOCKS5 连接失败:${error.message}`)
-    })
-
-    let phase = 'greeting'
-    let buffer = Buffer.alloc(0)
-
-    socket.on('data', (chunk) => {
-      buffer = Buffer.concat([buffer, chunk])
-      if (phase === 'greeting') {
-        if (buffer.length < 2) {
-          return
+    const onError = (error) => fail(`SOCKS5 连接失败:${error.message}`)
+    const onEnd = () => fail('SOCKS5 握手提前结束')
+    const onReadable = () => {
+      // 只取当前握手字段。其后的业务数据保留在 socket 缓冲区，交给 HTTP/TLS 调用者。
+      while (!settled) {
+        const field = socket.read(needed)
+        if (field === null) return
+        // EOF 时 read(n) 可能交出不足 n 字节的尾段，不能当完整回复。
+        if (field.length !== needed) { onEnd(); return }
+        if (phase === 'greeting') {
+          if (field[0] !== 0x05 || field[1] !== 0x00) { fail('SOCKS5 无认证方式被拒'); return }
+          phase = 'header'
+          needed = 4
+          socket.write(encodeConnect(targetHost, targetPort))
+        } else if (phase === 'header') {
+          if (field[0] !== 0x05 || field[2] !== 0x00 || ![0x01, 0x03, 0x04].includes(field[3])) {
+            fail('SOCKS5 CONNECT 回复格式无效'); return
+          }
+          if (field[1] !== 0x00) { fail(`SOCKS5 CONNECT 被拒:rep=${field[1]}`); return }
+          phase = field[3] === 0x03 ? 'domain-length' : 'address'
+          needed = field[3] === 0x03 ? 1 : field[3] === 0x01 ? 6 : 18
+        } else if (phase === 'domain-length') {
+          if (field[0] === 0) { fail('SOCKS5 CONNECT 回复域名为空'); return }
+          phase = 'address'
+          needed = field[0] + 2
+        } else {
+          settled = true
+          cleanup()
+          resolvePromise(socket)
         }
-        if (buffer[0] !== 0x05 || buffer[1] !== 0x00) {
-          clearTimeout(timer)
-          fail('SOCKS5 无认证方式被拒')
-          return
-        }
-        phase = 'connect'
-        socket.write(encodeConnect(targetHost, targetPort))
-        buffer = buffer.subarray(2)
-        return
       }
-      if (buffer.length < 10) {
-        return
-      }
-      if (buffer[1] !== 0x00) {
-        clearTimeout(timer)
-        fail(`SOCKS5 CONNECT 被拒:rep=${buffer[1]}`)
-        return
-      }
-      clearTimeout(timer)
-      socket.removeAllListeners('data')
-      resolvePromise(socket)
-    })
+    }
+    socket.on('readable', onReadable)
+    socket.once('error', onError)
+    socket.once('end', onEnd)
+    socket.once('close', onEnd)
 
     socket.write(Buffer.from([0x05, 0x01, 0x00]))
   })

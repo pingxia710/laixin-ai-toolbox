@@ -130,7 +130,7 @@ export class DesktopRuntime {
         showCloseToTrayHintOnce(this.store, () => {
           dialog.showMessageBoxSync(window, { type: 'info', title: '来信 AI 工具箱',
             message: '窗口会收起到托盘，工具箱继续在后台运行',
-            detail: `如需完全退出并断开 AI 网络，请在${process.platform === 'win32' ? '任务栏右下角' : '屏幕顶部菜单栏'}打开来信图标菜单，选择“退出工具箱（断开 AI网络）”。`,
+            detail: `如需退出，请在${process.platform === 'win32' ? '任务栏右下角' : '屏幕顶部菜单栏'}打开来信图标菜单，选择“退出工具箱”。退出后仅保留 API 所需通道，并按原套餐计量；如需全部停止，请先断开 AI网络。`,
             buttons: ['知道了'], noLink: true })
         })
       } catch { console.error('[toolbox-desktop] CLOSE_TO_TRAY_HINT_UNAVAILABLE') }
@@ -323,7 +323,7 @@ export class DesktopRuntime {
       ...(update.state === 'ready' ? [{ label: `更新到新版 ${displayReleaseVersion(update.version)} 并重启`, click: () => { void this.updater.install().then((view) => { if (view.state === 'error') this.show('settings') }) } }] : []),
       { label: update.state === 'available' ? `新版 ${displayReleaseVersion(update.version)}` : '设置与更新', click: () => this.show('settings') },
       { type: 'separator' },
-      { label: '退出工具箱（断开 AI网络）', click: () => app.quit() }
+      { label: '退出工具箱', click: () => app.quit() }
     ]))
   }
 

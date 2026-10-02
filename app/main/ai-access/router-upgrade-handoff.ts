@@ -2,7 +2,7 @@ import type { AiRouterResidentSpec } from './router-resident'
 import { join } from 'node:path'
 import { AiRouterController, type RouterReady } from './router-controller'
 import { readAiRouterSeat } from './router-runtime'
-import { activeRouterRoute } from './router-state'
+import { routerConfigured } from './router-state'
 import { createAiAccessStore } from './store'
 import type { AiAccessStateStore } from './service'
 
@@ -38,7 +38,7 @@ export async function restoreAiRouterAfterUpdate(
   try {
     const store = deps.store ?? createAiAccessStore(join(userData, 'ai-access'))
     const state = await store.read()
-    if (!activeRouterRoute(state)) return 'not_configured'
+    if (!routerConfigured(state)) return 'not_configured'
     const controller = deps.controller ?? new AiRouterController(userData, spec)
     const ready = await controller.ensureReady(state, true)
     if (!ready) return 'failed'
@@ -59,7 +59,7 @@ export async function prepareAiRouterUpdate(
   const store = deps.store ?? createAiAccessStore(join(userData, 'ai-access'))
   const controller = deps.controller ?? new AiRouterController(userData, spec)
   const state = await store.read()
-  if (!activeRouterRoute(state)) return undefined
+  if (!routerConfigured(state)) return undefined
   try {
     if (!(await controller.stop(state))) throw new Error('AI_ROUTER_UPDATE_HANDOFF_FAILED')
   } catch (error) {

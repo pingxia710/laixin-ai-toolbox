@@ -8,11 +8,12 @@ import { parseProxyServer } from '../../../sidecar/win/wininet-values.mjs'
 import { unrestoredEntriesCached } from '../../../sidecar/mac/restore.mjs'
 import { readInstanceLockCached } from '../../../sidecar/shared/instance-lock.mjs'
 import { importAccountConfig, commitPickedConfig, readPackageEntries, type ImportOutcome } from './import-service'
-import { PackageReject, composeRoutes, packageDigest, sha256Hex, validatePackage, type RejectCode, type RouteOverlay } from './package-format'
+import { PackageReject, REJECT_REASONS, composeRoutes, packageDigest, sha256Hex, validatePackage, type RejectCode, type RouteOverlay } from './package-format'
 import { readCurrentInfo, readPendingInfo, type CurrentInfo } from './import-meta'
 import { parseTarEntries } from './tar'
 import { NetworkAccountError, type AccountConfiguration, type ConfigurationCache, type NetworkAccountAccess } from './account-client'
 import { CONNECTION_LEASE_MS, verifyConnectionLease, type ConnectionLease } from './connection-lease'
+import type { ApiNetworkBinding } from '../../../sidecar/shared/api-network-continuation.mjs'
 import { DiagnosisReporter, type DiagnosisPayload, type DiagnosisStage } from './diagnosis-reporter'
 import { DiagnosticEventQueue, diagnosticEventBelongsToAuthorization, type DiagnosticEvent, type EncryptedQueueCodec } from './diagnostic-event-queue'
 import { platformForRuntime } from './sidecar-path'
@@ -138,6 +139,7 @@ export interface ImportResult extends ActionResult {
 }
 
 export interface TunnelServiceDeps {
+  readonly apiNetworkContinuation?: (bridgePort: number) => Promise<ApiNetworkBinding | undefined>
   /** 仅 GUI 显式操作调用；后台守护不弹密码框，只返回受控的本地权限故障。 */
   readonly ensureProxyAuthorization?: () => Promise<{ code: string; message: string } | undefined>
   readonly dataDir: string
@@ -238,14 +240,16 @@ export class TunnelService {
   private accountRequest?: AbortController
   private accountRequestDone?: Promise<void>
   private accountDenied = false
+  private accountLoginExpired = false
   // 用户明确退出了账号(⛔ 登录过期/后台问不到):只有这时本地那份账号配置才不许再用。
   private signedOutExplicitly: boolean
   private pausedAccount?: string
+  private configRefreshResume?: { access: NetworkAccountAccess; stopToken: string; stopSequence: number }
   private configCache?: { accountId: string; batchId: string; digest: string; id: string; expiresAt: number; etag: string }
   // Negative cache is never an authorization/cacheConfiguration entry. Its ETag only
   // avoids downloading the same rejected bytes; every refresh still checks the server.
   private rejectedConfiguration?: { access: NetworkAccountAccess; code: RejectCode; digest: string;
-    retryAt: number; candidate?: ConfigurationCache }
+    retryAt: number; retryDeadline: number; candidate?: ConfigurationCache; archive?: Buffer }
   private connectionLease?: { value: ConnectionLease; token: string; sessionToken: string; monotonicDeadline: number }
   private leaseTimer?: ReturnType<typeof setTimeout>
   // 本地续期(accountTemporary)的自查周期:后台问不到时「按本地有效期继续」是主进程的承诺,
@@ -335,7 +339,12 @@ export class TunnelService {
       // 「下次接着连」标记)且配置未到期 → 重写连接意图、直接拉起守护(守护自己先按账本恢复残留、再连)。
       // 账号模块随后若发现是别的账号或用户已退出,现有逻辑会断开。
       try {
-        if (this.intentSnapshot()?.desired !== 'connected') {
+        const previous = this.readFullIntent()
+        if (previous?.desired === 'connected' && previous.apiOnly) {
+          const normal = { ...previous }
+          delete normal.apiOnly
+          writeFileAtomic(layout.intent(deps.dataDir), `${JSON.stringify({ ...normal, updatedAt: deps.now() })}\n`)
+        } else if (this.intentSnapshot()?.desired !== 'connected') {
           writeFileAtomic(layout.intent(deps.dataDir), `${JSON.stringify(this.composeConnectIntent(current))}\n`)
         }
         this.markResumeOnLaunch(false)
@@ -440,6 +449,8 @@ export class TunnelService {
 
   async setAccountAccess(access: NetworkAccountAccess | undefined, reason?: AccountAccessReason): Promise<ActionResult> {
     const active = this.accountAccess
+    if (access || reason === undefined) this.accountLoginExpired = false
+    else if (reason === 'login-expired') this.accountLoginExpired = true
     if (access && active && access.session.accountId === active.session.accountId &&
         access.session.accessToken === active.session.accessToken && access.session.deviceId === active.session.deviceId && active.client.sameEndpoint(access.client)) {
       // Periodic account checks must not abort a manual sync of the same authenticated session.
@@ -465,6 +476,7 @@ export class TunnelService {
     this.acknowledgementPending = false
     this.acknowledgedConfiguration = ''
     const next = access ? { client: access.client, session: { ...access.session } } : undefined
+    this.configRefreshResume = undefined
     this.accountAccess = next
     this.rejectedConfiguration = undefined
     this.accountDenied = false
@@ -549,17 +561,19 @@ export class TunnelService {
       if (this.accountAccess !== access || controller.signal.aborted) throw new NetworkAccountError('NETWORK_SESSION_CHANGED')
     }
     let config: AccountConfiguration | undefined
+    let configWasUnchanged = false
     try {
       const cached = this.validConfigCache(access)
       const rejected = this.rejectedConfiguration
       const now = this.deps.now()
       const retryCache = !forConnectionAttempt && cached && this.intentSnapshot()?.desired === 'connected' &&
-        rejected?.access === access && now < rejected.retryAt && now >= rejected.retryAt - REJECTED_CONFIG_RETRY_MS
+        rejected?.access === access && performance.now() < rejected.retryDeadline && now < rejected.retryAt && now >= rejected.retryAt - REJECTED_CONFIG_RETRY_MS
         ? rejected.candidate : undefined
       // 网络往返在锁外:后台再慢,互斥锁也只盖住「拿到结果写本地状态」的短窗口。
       // ⛔ 整个往返攥着锁——后台一慢,应用配置/导入配置全吃「另一个通道正在进行」,点什么都没反应;
       // 断开靠中止在途请求自救,其余动作没有这条退路(0.4.x 线上:后台一慢界面像卡死)。
       config = await access.client.claim(access.session, controller.signal, retryCache ?? cached)
+      configWasUnchanged = config.unchanged === true
       assertSession()
       if (this.rawStatus().state === DISPLAY_STATES.disconnecting) return rejectedBusy()
       if (this.stopConfirmationPending()) return unconfirmedStop()
@@ -569,6 +583,9 @@ export class TunnelService {
       const releaseHeld = () => { if (held) { held = false; release?.() } }
       try {
         const current = readCurrentInfo(this.deps.dataDir)
+        // Context-dependent failures must pass the normal validator again. Keep
+        // only this session's bounded response bytes; 304 itself grants nothing.
+        if (config.unchanged && retryCache && rejected?.archive) config = { ...config, unchanged: false, archive: rejected.archive }
         if (config.unchanged) {
           // A 304 for rejected bytes is not a successful validation, lease or receipt.
           if (retryCache) throw new PackageReject(rejected!.code)
@@ -610,16 +627,22 @@ export class TunnelService {
           sourceLineOf: (v) => TRUST_LINES[v.trust.tier] }, config.archive,
         { id: access.session.accountId, authorizationId: config.id, expiresAt: config.expiresAt }, assertSession)
         assertSession()
-        if (imported.outcome === 'rejected') return { outcome: 'rejected', code: imported.code, message: imported.message }
-        let resume = false
+        if (imported.outcome === 'rejected') {
+          // The importer validates again after staging begins; package failures
+          // share the same continuation/logging path, but disk failures do not.
+          if (Object.hasOwn(REJECT_REASONS, imported.code)) throw new PackageReject(imported.code as RejectCode)
+          return { outcome: 'rejected', code: imported.code, message: imported.message }
+        }
+        let resume = this.configRefreshRequested(access)
         if (current?.accountId === access.session.accountId) {
           const pendingBeforeWait = pendingBatchId(this.deps.dataDir)
           const intentPath = layout.intent(this.deps.dataDir)
           if (existsSync(intentPath)) {
-            try { resume = JSON.parse(readFileSync(intentPath, 'utf8')).desired === 'connected' } catch { /* A malformed intent never requests reconnection. */ }
+            try { resume ||= JSON.parse(readFileSync(intentPath, 'utf8')).desired === 'connected' } catch { /* A malformed intent never requests reconnection. */ }
           }
           this.disconnect('config-refresh')
           const stopToken = this.intentSnapshot()?.sessionToken
+          if (resume && stopToken) this.configRefreshResume = { access, stopToken, stopSequence: this.userStopSequence }
           releaseHeld()
           // N-25:同上——单次求值 + 200ms 等待节奏;assertSession 的会话闸保持每轮一查。
           const deadline = Date.now() + 5000
@@ -651,6 +674,7 @@ export class TunnelService {
           const intent = this.composeConnectIntent(readCurrentInfo(this.deps.dataDir)!)
           writeFileAtomic(layout.intent(this.deps.dataDir), `${JSON.stringify(intent)}\n`)
           this.ensureRunningForConnection()
+          this.configRefreshResume = undefined
         }
         const intentToken = this.intentSnapshot()?.sessionToken
         const acknowledgement = this.acknowledgeConfiguration(access, controller.signal)
@@ -690,10 +714,16 @@ export class TunnelService {
         return accountFailure(localCode)
       }
       if (this.accountAccess === access && !(error instanceof NetworkAccountError && error.message === 'NETWORK_SESSION_CHANGED')) {
+        if (error instanceof NetworkAccountError && error.message === 'NETWORK_LOGIN_REQUIRED') this.accountLoginExpired = true
         if (error instanceof PackageReject && config && !config.unchanged) {
           const digest = sha256Hex(config.archive)
           const previous = this.rejectedConfiguration
-          this.rejectedConfiguration = { access, code: error.code, digest, retryAt: this.deps.now() + REJECTED_CONFIG_RETRY_MS,
+          const contextual = ['PACKAGE_MALFORMED', 'PACKAGE_EXPIRED', 'PACKAGE_VERSION_REGRESSION', 'PACKAGE_VERSION_CONFLICT',
+            'PACKAGE_AUTH_ID_MISMATCH', 'PACKAGE_SIGNATURE_NO_KEY', 'PACKAGE_UNSIGNED_UNTRUSTED', 'PACKAGE_OVERLAY_NOT_ALLOWED'].includes(error.code)
+          this.rejectedConfiguration = { access, code: error.code, digest,
+            retryDeadline: configWasUnchanged && previous?.access === access && previous.digest === digest ? previous.retryDeadline : performance.now() + REJECTED_CONFIG_RETRY_MS,
+            retryAt: configWasUnchanged && previous?.access === access && previous.digest === digest ? previous.retryAt : this.deps.now() + REJECTED_CONFIG_RETRY_MS,
+            ...(contextual ? { archive: config.archive } : {}),
             ...(config.etag === `"${digest}"` ? { candidate: { id: config.id, expiresAt: config.expiresAt, etag: config.etag } } : {}) }
           if (previous?.access !== access || previous.code !== error.code || previous.digest !== digest) {
             try { this.deps.logFailure?.('account-config-rejected', error.code) } catch { /* Logging cannot stop a valid old connection. */ }
@@ -763,6 +793,7 @@ export class TunnelService {
           message: outcome.code === 'TUNNEL_NO_PENDING' ? '没有待用配置' : '待用配置已损坏,请重新导入'
         }
       }
+      this.configRefreshResume = undefined
       return { outcome: 'applied', code: '', message: `已应用配置版本 ${this.status().configVersion}，点击「连接」验证线路` }
     } finally {
       release()
@@ -910,6 +941,7 @@ export class TunnelService {
     // FB-3 件二:这里是客户断开的唯一入口(界面断开按钮 → actions/tunnel stop)。
     // 递增计数供 start() 识别「连接过程中客户主动断开」;内部流程的 disconnect() 不经过这里。
     this.userStopSequence += 1
+    this.configRefreshResume = undefined
     const repairing = this.repairController !== undefined
     this.repairController?.abort()
     if (!repairing && this.stopConfirmationPending() && this.intentSnapshot()?.reason === 'user-stop') {
@@ -1144,9 +1176,12 @@ export class TunnelService {
         if (daemon.state === 'error') throw Object.assign(new Error('repair-connect-failed'), { repairCode: daemon.code })
         return false
       })
-      finish('recovered', '', this.rawStatus().pathSource === 'reused'
+      const recoveredStatus = this.rawStatus()
+      finish('recovered', '', recoveredStatus.pathSource === 'reused'
         ? '网络已可用：正在使用本机原有的外网，未改动系统设置。请重新打开目标 AI，再登录或发一条消息确认。'
-        : '已修复并通过本机代理和通道出口复验。请重新打开目标 AI，再登录或发一条消息确认。')
+        : recoveredStatus.exitIp === ''
+          ? '已修复并通过本机代理和通道可达性复验，出口地址暂未取得。请重新打开目标 AI，再登录或发一条消息确认。'
+          : '已修复并通过本机代理和通道出口复验。请重新打开目标 AI，再登录或发一条消息确认。')
     } catch (error) {
       if (timedOut) {
         // 超时只说明复验没在限期内通过；断开意图刚写下、守护正逐项恢复原设置——⛔ 拿恢复中的账本当「未恢复」下结论
@@ -1267,11 +1302,14 @@ export class TunnelService {
       return { ...status, state: DISPLAY_STATES.resuming, message: '正在接续上次的连接，请稍候' }
     }
     if (this.accountTemporary && !status.unrestored && status.state !== DISPLAY_STATES.disconnecting && !this.stopConfirmationPending()) {
+      if (this.accountLoginExpired) return { ...status,
+        message: '登录已过期，按本地套餐有效期继续提供网络；请打开「我的账号」重新登录',
+        backend: '登录已过期，请重新登录', authorization: '本地配置有效期内，等待重新登录' }
       const rejected = this.rejectedConfiguration?.access === this.accountAccess ? this.rejectedConfiguration : undefined
       return { ...status,
         message: rejected ? rejectedConfigContinuation(rejected.code).message
           : '账号后台暂时问不到，按本地套餐有效期继续提供网络；恢复后自动核验',
-        backend: rejected ? `新配置校验失败：${rejected.code}` : '后台暂不可达，按本地有效期继续',
+        backend: rejected ? '新配置校验失败，等待有效配置' : '后台暂不可达，按本地有效期继续',
         authorization: '本地配置有效期内，等待重新核验' }
     }
     if (this.pausedAccount && !status.unrestored && (status.state !== DISPLAY_STATES.error || !this.stopConfirmationPending())) return { ...status,
@@ -1279,7 +1317,7 @@ export class TunnelService {
       message: status.state === DISPLAY_STATES.disconnecting
         ? '账号状态暂时无法确认，正在暂停通道并恢复原网络设置；恢复完成且权益有效后会接续连接'
         : '账号状态暂时无法确认，通道已暂停；有效权益恢复后会接续连接。可点击断开取消自动恢复',
-      authorization: '等待重新确认账号权益', backend: '账号校验暂不可用', exitIp: '', lastVerifiedAt: '' }
+      authorization: '等待重新确认账号权益', backend: '账号校验暂不可用', exitIp: '', pathVerified: false, lastVerifiedAt: '' }
     const privateToAnotherSession = [currentInfo, pendingInfo]
       .some((info) => info?.accountId && this.configForeignToSession(info.accountId))
     if (!privateToAnotherSession) {
@@ -1300,7 +1338,7 @@ export class TunnelService {
         ? recoveryActive ? '账号已退出或切换，正在恢复原设置；请等待完成。若长时间不变，请点击「重试恢复原设置」'
           : '原设置仍未恢复，请点击「重试恢复原设置」；仍不行请导出诊断给客服'
         : this.accountAccess ? '旧账号已断开，请点击「同步配置」领取当前账号的网络配置' : '请登录并领取当前账号的网络配置'), source: '', authorization: '',
-      backend: '', nodeLabel: '', exitIp: '', lastVerifiedAt: '', configVersion: '', expiresAt: '', pendingAvailable: false,
+      backend: '', nodeLabel: '', exitIp: '', pathVerified: false, lastVerifiedAt: '', configVersion: '', expiresAt: '', pendingAvailable: false,
       currentConfig: '', pendingConfig: '', canApplyPending: false, traffic: '' }
   }
 
@@ -1318,7 +1356,7 @@ export class TunnelService {
     const restoring = this.supervisor.isRunning() || this.supervisor.isRestoring()
     return { ...status, state: settled ? DISPLAY_STATES.stoppedRestored
       : restoring ? DISPLAY_STATES.disconnecting : DISPLAY_STATES.userDisconnected,
-      exitIp: '', pathSource: '', lastVerifiedAt: '', traffic: '', pauseReason: 'entitlement-denied', message: settled
+      exitIp: '', pathVerified: false, pathSource: '', lastVerifiedAt: '', traffic: '', pauseReason: 'entitlement-denied', message: settled
         ? '后台权益校验未通过，网络已暂停，原网络设置已恢复。请到「我的账号」核对套餐、流量和有效期。'
         : restoring ? '后台权益校验未通过，正在暂停网络；本次原网络设置恢复尚未确认。请到「我的账号」核对套餐、流量和有效期。'
           : '后台权益校验未通过，网络已暂停；守护未在运行，账本无待恢复项，但本次恢复完成状态尚未确认。可重新核验权益。' }
@@ -1515,15 +1553,27 @@ export class TunnelService {
     await access.client.reportDiagnosticEvent(access.session, new AbortController().signal, event)
   }
 
-  // 明确退出时停止:退出意图经受限桥退出钩子登记;守护自行恢复并退出。
+  // GUI 退出交接：已验证的 API 依赖保留必要通道；其余情况由守护恢复并退出。
   async requestShutdown(): Promise<void> {
+    const previous = this.readFullIntent()
+    const wasRunning = this.supervisor.isRunning()
+    this.supervisor.prepareForShutdown()
+    this.configRefreshResume = undefined
     this.repairController?.abort()
     this.pausedAccount = undefined
     this.clearConnectionLease()
     this.accountAccess = undefined
     this.accountRequest?.abort()
-    this.supervisor.prepareForShutdown()
-    if (this.supervisor.isRunning()) {
+    const continuation = previous?.desired === 'connected' && wasRunning && !this.reusedProxy() && this.deps.apiNetworkContinuation
+      ? await this.deps.apiNetworkContinuation(this.activeBridgePort()).catch(() => undefined) : undefined
+    const current = this.readFullIntent()
+    if (continuation && this.supervisor.isRunning() && current?.desired === 'connected' && current.sessionToken === previous?.sessionToken &&
+        current.updatedAt === previous?.updatedAt) {
+      this.markResumeOnLaunch(true)
+      writeFileAtomic(layout.intent(this.deps.dataDir), `${JSON.stringify({ ...current, apiOnly: continuation, updatedAt: this.deps.now() })}\n`)
+      return
+    }
+    if (wasRunning || this.supervisor.isRunning()) {
       if (this.intentSnapshot()?.desired === 'connected') this.markResumeOnLaunch(true)
       writeFileAtomic(layout.intent(this.deps.dataDir), `${JSON.stringify({ desired: 'shutdown', updatedAt: this.deps.now() })}\n`)
     } else {
@@ -1540,6 +1590,13 @@ export class TunnelService {
     }
   }
 
+  private readFullIntent(): Record<string, unknown> | undefined {
+    try {
+      const value: unknown = JSON.parse(readFileSync(layout.intent(this.deps.dataDir), 'utf8'))
+      return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined
+    } catch { return undefined }
+  }
+
   private rememberAccountPause(): void {
     const current = readCurrentInfo(this.deps.dataDir)
     if (!current?.accountId) return
@@ -1548,8 +1605,16 @@ export class TunnelService {
     } catch { /* Missing or invalid intent never authorizes automatic reconnection. */ }
   }
 
+  private configRefreshRequested(access: NetworkAccountAccess): boolean {
+    const pending = this.configRefreshResume
+    const intent = this.intentSnapshot()
+    return pending?.access === access && pending.stopSequence === this.userStopSequence &&
+      intent?.desired === 'user-disconnected' && intent.reason === 'config-refresh' && intent.sessionToken === pending.stopToken
+  }
+
   private async resumeAccountConnection(access: NetworkAccountAccess, assertSession: () => void): Promise<void> {
-    if (this.pausedAccount !== access.session.accountId) return
+    const requested = () => this.pausedAccount === access.session.accountId || this.configRefreshRequested(access)
+    if (!requested()) return
     const deadline = Date.now() + 5_000
     const restorationPending = () => {
       const status = this.rawStatus()
@@ -1557,15 +1622,16 @@ export class TunnelService {
     }
     while (restorationPending() && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 200)); assertSession() // N-25:等待类轮询放宽到 200ms
-      if (this.pausedAccount !== access.session.accountId) return
+      if (!requested()) return
     }
     assertSession()
-    if (restorationPending() || this.pausedAccount !== access.session.accountId) return
+    if (restorationPending() || !requested()) return
     const current = readCurrentInfo(this.deps.dataDir)
     if (!current || this.validateStored(current.batchId, false)) return
     writeFileAtomic(layout.intent(this.deps.dataDir), `${JSON.stringify(this.composeConnectIntent(current))}\n`)
     this.ensureRunningForConnection()
     this.pausedAccount = undefined
+    this.configRefreshResume = undefined
   }
 
   /** 更新回执只把客户明确停用视为放弃；权益拒绝等自主暂停仍交给更新验证。 */
@@ -1751,6 +1817,7 @@ export class TunnelService {
   }
 
   private disconnect(reason: DisconnectReason, autoPauseCode?: string): void {
+    if (reason !== 'config-refresh') this.configRefreshResume = undefined
     // 等待位不在这里清:内部流程(账号切换等)也会走 disconnect,清掉会让「并进同一轮」失效。
     // 客户意愿由意图文件表达,completeResidentTakeover 落定时看它;界面映射另有意图闸。
     this.markResumeOnLaunch(false)

@@ -16,6 +16,7 @@ export interface DaemonStateView {
   readonly code?: string
   readonly message?: string
   readonly exitIp?: string
+  readonly pathVerified?: boolean
   readonly lastVerifiedAt?: number
   readonly bridgePort?: number
   /** 复用了电脑上现有的外网代理(未改系统设置)。 */
@@ -42,6 +43,8 @@ export interface TunnelStatus {
   readonly backend: string
   readonly nodeLabel: string
   readonly exitIp: string
+  /** 本轮通道已通过复验；后备探测成功也能成立，不要求取得出口 IP。 */
+  readonly pathVerified?: boolean
   /** 这一刻客户的外网走的是哪条路:来信自己的通道 / 复用电脑上已有的外网 / 没有连接。
    * 界面、修复流程、诊断都按它判断,⛔ 各自从中文说明串里猜(GPT-6 网络加强研究 §六)。 */
   readonly pathSource: '' | 'laixin' | 'reused'
@@ -86,7 +89,8 @@ export function isReusedPath(daemon: DaemonStateView | undefined): boolean {
  * ⛔ 拿「出口 IP 非空」当唯一完成条件:那会让复用成功的客户永远修不完(GPT-6 网络加强研究 §六)。 */
 export function networkPathReady(status: TunnelStatus): boolean {
   if (status.state !== DISPLAY_STATES.connected || status.unrestored || !status.lastVerifiedAt) return false
-  return status.pathSource === 'reused' || status.exitIp !== ''
+  return status.pathSource === 'reused' || status.exitIp !== '' ||
+    status.pathSource === 'laixin' && status.pathVerified === true
 }
 
 export const STATUS_LINES = {
@@ -210,6 +214,7 @@ export function computeStatus(input: StatusInput): TunnelStatus {
     backend: info === undefined ? '' : STATUS_LINES.backend,
     nodeLabel: info === undefined ? '' : `${info.node.host}:${String(info.node.port)}`,
     exitIp: state === DISPLAY_STATES.connected ? (daemon?.exitIp ?? '') : '',
+    pathVerified: state === DISPLAY_STATES.connected && daemon?.pathVerified === true,
     pathSource: state === DISPLAY_STATES.connected ? (isReusedPath(daemon) ? 'reused' : 'laixin') : '',
     lastVerifiedAt:
       state === DISPLAY_STATES.connected && daemon?.lastVerifiedAt !== undefined

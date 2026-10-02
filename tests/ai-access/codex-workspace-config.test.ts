@@ -3,7 +3,8 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createManagedTextFile } from '../../app/main/ai-access/file'
-import { deactivateCodexWorkspaceProviders, installCodexWorkspaceProviders, type CodexWorkspaceOfficialModel } from '../../app/main/ai-access/codex-workspace-config'
+import { deactivateCodexWorkspaceProviders, installCodexWorkspaceProviders, readCodexWorkspaceCatalogStatus, type CodexWorkspaceOfficialModel } from '../../app/main/ai-access/codex-workspace-config'
+import { modelProviders, providerModelWindow } from '../../app/shared/model-providers'
 import { createCodexModelApiConfig, type ManagedTextFile } from '../../app/main/ai-access/deepseek-config'
 
 let root = ''
@@ -16,6 +17,40 @@ const officialModels = [officialModel('gpt-6-astra', 'GPT-6-Astra', 'low'), offi
 afterEach(async () => { if (root) await rm(root, { recursive: true, force: true }); root = '' })
 
 describe('Codex 来信多模型 provider 配置', () => {
+  it('真实目录按精确模型沿用接入资料，窗口不统一缩成 64K，图片能力保留', async () => {
+    root = await mkdtemp(join(tmpdir(), 'codex-catalog-capabilities-'))
+    const models = ['laixin.deepseek.deepseek-v4-pro', 'laixin.kimi.k3-256k', 'laixin.moonshot.kimi-k3']
+    const options = { codexHome: root, toolboxExecutable: '/toolbox', multiModel: { ...multiModel, model: models[0], models }, officialModels, file: createManagedTextFile() }
+    await installCodexWorkspaceProviders(options)
+    const path = join(root, 'laixin-multi-models.json')
+    const catalog = JSON.parse(await readFile(path, 'utf8')) as { models: Array<Record<string, unknown>> }
+    for (const [slug, provider, model] of [
+      [models[0], 'deepseek', 'deepseek-v4-pro'], [models[1], 'kimi', 'k3-256k'], [models[2], 'moonshot', 'kimi-k3']
+    ] as const) {
+      expect(catalog.models.find(entry => entry.slug === slug)).toMatchObject({
+        context_window: providerModelWindow(provider, model), max_context_window: providerModelWindow(provider, model),
+        input_modalities: modelProviders[provider].codex.inputModalities
+      })
+    }
+    expect(catalog.models.slice(0, officialModels.length)).toEqual(officialModels.map(model => model.catalog))
+    expect((await readCodexWorkspaceCatalogStatus(options)).state).toBe('written')
+    const stale = catalog.models.find(entry => entry.slug === models[0])!
+    stale.context_window = 65536
+    stale.max_context_window = 65536
+    await writeFile(path, JSON.stringify(catalog))
+    expect((await readCodexWorkspaceCatalogStatus(options)).state).toBe('modified')
+  })
+
+  it('未知内部模型不能伪造通用能力并写入目录', async () => {
+    root = await mkdtemp(join(tmpdir(), 'codex-catalog-unknown-'))
+    const original = '# customer\nmodel = "gpt-fixture"\n'
+    await writeFile(join(root, 'config.toml'), original)
+    const models = ['laixin.deepseek.unknown-model']
+    await expect(installCodexWorkspaceProviders({ codexHome: root, toolboxExecutable: '/toolbox',
+      multiModel: { ...multiModel, model: models[0], models }, officialModels, file: createManagedTextFile() })).rejects.toThrow('CODEX_MULTI_MODEL_CONNECTION_INVALID')
+    expect(await readFile(join(root, 'config.toml'), 'utf8')).toBe(original)
+  })
+
   it('只登记一个 laixin-multi provider，且只把本机网关地址与客户端令牌命令写入 Codex', async () => {
     root = await mkdtemp(join(tmpdir(), 'codex-workspaces-'))
     await installCodexWorkspaceProviders({ codexHome: root, toolboxExecutable: '/Applications/Toolbox.app/Contents/MacOS/Toolbox', multiModel, officialModels, file: createManagedTextFile() })

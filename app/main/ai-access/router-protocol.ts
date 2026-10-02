@@ -1,8 +1,11 @@
-import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 
 export const routerReadyPath = '/_laixin/router/ready'
 export const routerRefreshPath = '/_laixin/router/refresh'
 export const routerStopPath = '/_laixin/router/stop'
+export const routerSnapshotPath = '/_laixin/router/snapshot'
+export const routerIsolationPath = '/_laixin/router/isolation'
+export function routerBodyHash(body: string): string { return createHash('sha256').update(body).digest('hex') }
 export const routerControlProtocolVersion = 1
 export const routerControlTimeoutMs = 800
 export const routerStartupTimeoutMs = 6_000

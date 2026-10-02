@@ -70,7 +70,7 @@ it('零参数修复：真实守护和本机回环复验后才成功，复制摘�
 it('旧成功快照不算本次修复；守护未回应时限时退出为尚不能确认', async () => {
   const f = await setup(350, false)
   writeFileSync(layout.state(f.dataDir), JSON.stringify({ state: 'connected', sessionToken: 'old-attempt',
-    exitIp: '203.0.113.8', lastVerifiedAt: Date.now() }))
+    exitIp: '', pathVerified: true, lastVerifiedAt: Date.now() }))
   f.service.repair()
   expect(await f.finish()).toMatchObject({ outcome: 'unknown', code: 'TUNNEL_REPAIR_TIMEOUT' })
   expect(f.intent().desired).toBe('user-disconnected')
