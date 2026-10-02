@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type * as Crypto from 'node:crypto'
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   DIAGNOSTIC_EVENT_QUEUE_LIMIT,
@@ -11,6 +11,7 @@ import {
   type EncryptedQueueCodec
 } from '../../app/main/tunnel/diagnostic-event-queue'
 import { makeTempDir, removeTempDir } from './helpers'
+import { diagnosticAuthorizationHashAt } from '../../app/diagnostic-event-types'
 
 vi.mock('node:crypto', async (importOriginal) => {
   const actual = await importOriginal<typeof Crypto>()
@@ -165,6 +166,44 @@ describe('N-53 加密离线事件队列', () => {
     const rotated = readEvents(f.queuePath, f.codec)
     expect(rotated[2].authorizationHash).not.toBe(rotated[1].authorizationHash)
     expect(f.codec.decrypt(readFileSync(f.queuePath))).not.toContain(failure.authorizationId)
+  })
+
+  it('unchanged queued events do not repeatedly decrypt on connected observations', async () => {
+    const codec = testCodec(), decrypt = vi.spyOn(codec, 'decrypt')
+    const f = fixture({ codec })
+    await f.queue.recordFailure(failure)
+    const other = `lx-${'b'.repeat(32)}`
+    await f.queue.recordRecovery({ authorizationId: other, verified: true, pathType: 'laixin' })
+    decrypt.mockClear()
+    for (let index = 0; index < 20; index++) {
+      await f.queue.recordRecovery({ authorizationId: other, verified: true, pathType: 'laixin' })
+      expect(f.queue.state()).toEqual({ pending: 1, ready: 0 })
+    }
+    expect(decrypt).not.toHaveBeenCalled()
+    expect(f.sent).toEqual([])
+  })
+
+  it('atomic replacement with the same size and mtime invalidates the decrypted snapshot', async () => {
+    const f = fixture()
+    await f.queue.recordFailure(failure); f.queue.state()
+    const before = statSync(f.queuePath), events = readEvents(f.queuePath, f.codec)
+    const other = `lx-${'b'.repeat(32)}`
+    events[0] = { ...events[0], authorizationHash: diagnosticAuthorizationHashAt(other, 1_000_000) }
+    const replacement = f.queuePath + '.replacement'
+    writeFileSync(replacement, f.codec.encrypt(`${JSON.stringify(events)}\n`), { mode: 0o600 })
+    utimesSync(replacement, before.atime, before.mtime); renameSync(replacement, f.queuePath)
+    expect(statSync(f.queuePath).size).toBe(before.size)
+    expect(await f.queue.markRepairStarted(other)).toBe(events[0].eventId)
+    expect(readEvents(f.queuePath, f.codec)[0].repairResult).toBe('running')
+  })
+
+  it.skipIf(process.platform === 'win32')('queue permission changes invalidate a previously decrypted snapshot', async () => {
+    const f = fixture(); await f.queue.recordFailure(failure)
+    expect(f.queue.state().pending).toBe(1)
+    chmodSync(f.queuePath, 0o644)
+    expect(f.queue.state()).toEqual({ pending: 0, ready: 0 })
+    chmodSync(f.queuePath, 0o600)
+    expect(f.queue.state().pending).toBe(1)
   })
 
   it('超龄事件在读写时被清除:换号后旧授权 failed 不再永久留队空转', async () => {

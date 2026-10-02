@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto'
-import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import {
   diagnosticDurationBucket,
@@ -90,6 +90,7 @@ export class DiagnosticEventQueue {
   private flushing = false
   private rerunFlush = false
   private hasQueued: boolean
+  private cachedQueue?: { signature: string; queue: StoredDiagnosticEvent[] }
   private retryFailures = 0
   private nextRetryAt = 0
   private readonly openedAt = new Map<string, number>()
@@ -310,25 +311,37 @@ export class DiagnosticEventQueue {
   }
 
   private readQueue(): StoredDiagnosticEvent[] {
-    if (!existsSync(this.deps.queuePath)) return []
     try {
-      const info = lstatSync(this.deps.queuePath)
-      if (!info.isFile() || info.isSymbolicLink() || info.size <= 0 || info.size > MAX_ENCRYPTED_QUEUE_BYTES ||
-          process.platform !== 'win32' && (info.mode & 0o077) !== 0) return []
-      const parsed: unknown = JSON.parse(this.deps.codec.decrypt(readFileSync(this.deps.queuePath)))
-      if (!Array.isArray(parsed) || parsed.length > DIAGNOSTIC_EVENT_QUEUE_LIMIT) return []
-      const queue = parsed.map((entry) => parseStoredEvent(entry, info.mtimeMs))
-      if (queue.some((stored) => stored === undefined)) return []
+      const info = lstatSync(this.deps.queuePath, { bigint: true })
+      if (!info.isFile() || info.isSymbolicLink() || info.size <= 0n || info.size > BigInt(MAX_ENCRYPTED_QUEUE_BYTES) ||
+          process.platform !== 'win32' && (info.mode & 0o077n) !== 0n) {
+        this.cachedQueue = undefined
+        return []
+      }
+      // Atomic replacement, in-place writes and permission/owner changes all
+      // invalidate this instance's snapshot. Send eligibility is never cached.
+      const signature = [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs, info.mode, info.uid, info.gid].join(':')
+      let queue = this.cachedQueue?.signature === signature ? this.cachedQueue.queue : undefined
+      if (!queue) {
+        this.cachedQueue = undefined
+        const parsed: unknown = JSON.parse(this.deps.codec.decrypt(readFileSync(this.deps.queuePath)))
+        if (!Array.isArray(parsed) || parsed.length > DIAGNOSTIC_EVENT_QUEUE_LIMIT) return []
+        const decoded = parsed.map((entry) => parseStoredEvent(entry, Number(info.mtimeMs)))
+        if (decoded.some((stored) => stored === undefined)) return []
+        queue = decoded as StoredDiagnosticEvent[]
+        this.cachedQueue = { signature, queue }
+      }
       // 超龄剪枝(diagnosis-reporter.flushPending 同一形状/同一 7 天窗):换号后旧授权的 failed
       // 事件再也没有补传时机,永久留队会让连接期状态轮询每轮整文件解密空转。读侧清、盘上剪。
       const now = this.deps.now()
-      const retained = (queue as StoredDiagnosticEvent[]).filter((stored) => now - stored.recordedAt <= DIAGNOSIS_MAX_AGE_MS)
+      const retained = queue.filter((stored) => now - stored.recordedAt <= DIAGNOSIS_MAX_AGE_MS)
       if (retained.length !== queue.length) {
         this.hasQueued = retained.length > 0
         try { this.writeQueue(retained) } catch { /* 剪枝落盘失败:本轮仍按剪枝后结果返回 */ }
       }
       return retained
     } catch {
+      this.cachedQueue = undefined
       return []
     }
   }
@@ -353,6 +366,7 @@ export class DiagnosticEventQueue {
         try { unlinkSync(temporary) } catch { /* 写入前失败或已被清理。 */ }
       }
     }
+    this.cachedQueue = undefined
     this.hasQueued = queue.length > 0
   }
 }

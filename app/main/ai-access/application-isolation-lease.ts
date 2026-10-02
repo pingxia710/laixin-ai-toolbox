@@ -90,6 +90,8 @@ export interface ApplicationIsolationAdapter {
   verifyTarget(): Promise<boolean>
   /** Startup recovery of a persisted lease; it never recreates an entry. */
   recoverLease?(): Promise<'none' | ApplicationIsolationRestoreResult>
+  /** Adopt an already verified independent route without rewriting the client or creating a new lease. */
+  resumeLease?(): Promise<{ leaseId: string; restoreIfOwned: () => Promise<ApplicationIsolationRestoreResult> } | undefined>
   /** Discards a settled lease record after restoration or third-party preservation. */
   clearLease?(leaseId: string): Promise<void>
 }
@@ -105,7 +107,7 @@ export interface ApplicationIsolationSystemGuard {
 
 interface ActiveIsolation {
   readonly intent: AvailabilityIntent
-  readonly operation: AvailabilityOperation
+  readonly operation?: AvailabilityOperation
   readonly restore: () => Promise<ApplicationIsolationRestoreResult>
   readonly leaseId: string
   /** Captured-target settlement takes precedence over the legacy current-target fallback. */
@@ -177,17 +179,30 @@ export class ApplicationIsolationLeaseController {
   }
 
   /** Startup/crash recovery is deliberately idempotent and never recreates a route by itself. */
-  recover(): Promise<ApplicationIsolationLeaseStatus> {
+  recover(options: { preserveIndependent?: boolean } = {}): Promise<ApplicationIsolationLeaseStatus> {
     this.desired = false
-    this.beginIntent('recover')
+    const intent = this.beginIntent('recover')
     return this.serialize(async () => {
+      if (options.preserveIndependent) {
+        const resumed = await this.options.adapter.resumeLease?.().catch(() => undefined)
+        if (resumed) {
+          this.active = { intent, leaseId: resumed.leaseId,
+            restore: this.active?.restore ?? resumed.restoreIfOwned, clearLease: this.active?.clearLease }
+          // Retain the restoration handle for a queued disable, without overriding its newer intent.
+          if (intent.generation !== this.intentGeneration) return this.value
+          this.desired = true
+          this.value = this.state('application-only', 'available', true, 'AVAILABLE')
+          return this.value
+        }
+      }
+      if (intent.generation !== this.intentGeneration) return this.value
       if (this.active === undefined) {
         const retryingFailure = this.value.code === 'RESTORE_FAILED'
         if (retryingFailure && this.options.adapter.recoverLease === undefined) return this.value
         const recovered = await this.options.adapter.recoverLease?.().catch(() => 'failed')
         if (recovered === 'failed') return this.limit('RESTORE_FAILED')
         // The former lease may be settled while private-entry cleanup is still failing.
-        if (retryingFailure) {
+        if (retryingFailure || options.preserveIndependent && recovered !== undefined && recovered !== 'none') {
           try { await this.options.adapter.deactivateEntry() } catch { return this.limit('RESTORE_FAILED') }
         }
         this.value = this.disabled('restored', recovered === 'preserved-external' ? 'EXTERNAL_VALUE_PRESERVED' : 'RESTORED')
@@ -296,7 +311,7 @@ export class ApplicationIsolationLeaseController {
     const restored = await this.restore(active)
     const currentAfterRestore = this.isCurrent(active)
     if (this.active === active) this.active = undefined
-    this.availability.fail(active.operation, code)
+    if (active.operation) this.availability.fail(active.operation, code)
     if (!currentAfterRestore) return this.staleResult(restored)
     this.value = restored === 'failed' ? this.limit('RESTORE_FAILED')
       : restored === 'preserved-external' ? this.disabled('restored', 'EXTERNAL_VALUE_PRESERVED') : this.limit(code)
@@ -309,7 +324,7 @@ export class ApplicationIsolationLeaseController {
     const currentAfterRestore = this.isCurrent(active)
     if (currentBeforeRestore && currentAfterRestore) {
       if (this.active === active) this.active = undefined
-      this.availability.fail(active.operation, 'STALE_OPERATION')
+      if (active.operation) this.availability.fail(active.operation, 'STALE_OPERATION')
       this.value = restored === 'failed' ? this.limit('RESTORE_FAILED')
         : restored === 'preserved-external' ? this.disabled('restored', 'EXTERNAL_VALUE_PRESERVED') : this.limit('STALE_OPERATION')
       return this.value
@@ -341,7 +356,9 @@ export class ApplicationIsolationLeaseController {
     return this.limit(code)
   }
 
-  private isCurrent(active: ActiveIsolation): boolean { return this.active === active && this.availability.isCurrent(active.operation) }
+  private isCurrent(active: ActiveIsolation): boolean {
+    return this.active === active && (active.operation ? this.availability.isCurrent(active.operation) : active.intent.generation === this.intentGeneration)
+  }
   private staleResult(restored: ApplicationIsolationRestoreResult | 'failed'): ApplicationIsolationLeaseStatus {
     // A newer intent may have left `value` configuring/verifying. Returning a stale result with
     // that phase plus STALE_OPERATION would violate the public status contract and make IPC fail

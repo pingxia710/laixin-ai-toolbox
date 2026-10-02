@@ -76,6 +76,9 @@ describe('headless 路由脱敏状态', () => {
       res.setHeader('content-type', 'application/json')
       const port = req.socket.localPort
       if (!port) throw new Error('fixture address missing')
+      if (req.headers['x-laixin-proof'] !== routerProof('b'.repeat(64), 'ready', nonce, bootId, port)) {
+        res.writeHead(403); res.end(); return
+      }
       res.end(JSON.stringify({ protocol: 1, pid: process.pid, bootId,
         proof: routerProof('b'.repeat(64), 'ready-ack', nonce, bootId, port), models: 1,
         lastDesktopUse: { provider: 'deepseek', model: 'deepseek-flash', internalModelId: 'laixin.deepseek.deepseek-flash', at: '2026-09-27T00:00:00.000Z' } }))

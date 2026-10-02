@@ -1,6 +1,6 @@
 {
   "name": "laixin-ai-toolbox",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "productName": "来信AI工具箱统一版",
   "private": false,
   "description": "来信AI工具箱桌面客户端骨架",
@@ -18,7 +18,6 @@
     "prepare:koffi": "node scripts/prepare-koffi.mjs",
     "build": "npm run build:mac",
     "build:mac": "npm run prepare:sidecar && npm run prepare:mac-write-lock && npm run lint && npm run typecheck && node scripts/prepare-xray.mjs mac-arm64 && electron-vite build && electron-builder --mac --arm64 --publish never",
-    "build:mac-intel": "npm run prepare:sidecar && npm run prepare:mac-write-lock && npm run lint && npm run typecheck && node scripts/prepare-xray.mjs mac-x64 && electron-vite build && electron-builder --mac --x64 --config.electronVersion=43.7.1 --publish never",
     "build:pilot": "npm run prepare:sidecar && npm run prepare:mac-write-lock && npm run lint && npm run typecheck && node scripts/prepare-xray.mjs mac-arm64 win-x64 && npm run prepare:koffi && electron-vite build && electron-builder --mac --arm64 --publish never && electron-builder --win --x64 --publish never",
     "verify:release-account-origin": "node scripts/verify-release-account-origin.mjs",
     "postinstall": "node node_modules/electron/install.js"

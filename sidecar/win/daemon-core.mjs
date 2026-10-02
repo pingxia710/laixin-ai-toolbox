@@ -12,6 +12,7 @@ import { markNotifyOwed, rebroadcastSettings, restoreLedger, unrestoredEntries, 
 import { AI_SERVICE_PROBE_URLS, probeDirectReachability, probeExistingProxy } from './vless-connector.mjs'
 import { CONNECTION_FLAGS, hexToBlob, readConnectionSettings } from './connection-settings.mjs'
 import { NetworkAvailabilityController } from './network-availability-controller.mjs'
+import { probeApiNetwork } from './api-network-continuation.mjs'
 
 // 退出时恢复系统代理写失败(注册表被杀软短暂锁住等)⛔ 直接退出留下指向死端口的代理(发布审查 R1):
 // 按这个节奏重试；停止入口仍有未还账目时继续留守，直到还原或明确交给新守护。
@@ -363,6 +364,10 @@ class DaemonCore {
     this.connectorFactory = connectorFactory
     this.bridgeFactory = bridgeFactory
     this.parentAlive = parentAlive
+    this.probeApiNetwork = options.probeApiNetwork ?? probeApiNetwork
+    this.apiNetworkChecking = false
+    this.apiNetworkCheckedAt = -Infinity
+    this.apiNetworkTargets = undefined
     this.onExit = onExit
     this.intentPollMs = intentPollMs
     this.parentPollMs = parentPollMs
@@ -1023,10 +1028,44 @@ class DaemonCore {
   }
 
   async applyIntent(next) {
+    const previous = this.intent
     if (next.desired === 'user-disconnected' && this.intent?.desired === 'connected') this.disconnectingAuthorizationIntent = this.intent
     this.intent = next
     this.availabilityIntentFor(next)
     if (!await this.recordIntent(next.desired) || this.intent !== next) return
+    if (next.desired === 'connected' && (next.apiOnly || previous?.apiOnly) && next.sessionToken === previous?.sessionToken &&
+        this.connector !== undefined && this.bridge !== undefined) {
+      if (next.apiOnly) {
+        if (!await this.refreshApiNetwork(next)) { if (this.intent === next) this.requestShutdown(); return }
+        const restored = await this.restoreWithRetryLadder('退出后原网络设置恢复未完成', {
+          checkHandover: true, stayUntilRestored: true,
+          shouldContinue: () => !this.exited && this.intent === next && !this.shutdownTask
+        })
+        if (!restored || this.intent !== next || this.exited) return
+        this.settingsApplied = false
+        this.appliedItems = []
+        this.settingsReleased = true
+        this.repairedItems = undefined
+      } else {
+        this.apiNetworkTargets = undefined
+        this.bridge.restrict?.(undefined)
+        this.state = 'connecting'
+        this.beginAvailabilityAction('inspect')
+        this.applySettings()
+        this.verifySettings()
+        const verified = await this.verifyConnection(this.connector)
+        if (this.intent !== next || this.exited) return
+        this.verifyAvailabilityReadback(this.availabilityOperation)
+        this.completeAvailabilityAction(this.availabilityOperation, { readbackMatches: true, targetReachable: true })
+        this.lastVerification = { exitIp: verified.exitIp, pathVerified: true, lastVerifiedAt: this.clock.now() }
+        this.settingsReleased = false
+      }
+      if (this.intent === next) {
+        this.writeStateNow('connected', this.lastVerification)
+        this.scheduleVerify()
+      }
+      return
+    }
     if (next.desired === 'connected') {
       await this.connect()
       return
@@ -1059,8 +1098,22 @@ class DaemonCore {
     if (this.exited) {
       return
     }
+    // Exit can happen between the intent and parent polling ticks. Consume the written
+    // handoff before interpreting a missing GUI as an ordinary shutdown.
+    if (!this.residentIntegrity && !this.parentAlive()) this.tickIntent()
     // 常驻模式下没有父进程可看,这个节拍改成看「我自己的程序还在不在」:客户把应用拖进废纸篓了,
     // 我们得自己发现、把他的系统代理还回去、再把常驻项撤掉,⛔ 留一个指向死端口的代理和一个拉不起来的常驻项。
+    if (this.intent?.apiOnly && this.intent.desired === 'connected') {
+      if (this.residentIntegrity?.check().missing) { void this.runResidentSelfHeal(); return }
+      if (!this.apiNetworkChecking && this.clock.now() - this.apiNetworkCheckedAt >= 2_000) {
+        const intent = this.intent
+        this.apiNetworkChecking = true
+        void this.refreshApiNetwork(intent).then(valid => {
+          if (!valid && this.intent === intent && !this.exited) this.requestShutdown()
+        }).finally(() => { this.apiNetworkChecking = false })
+      }
+      return
+    }
     if (this.residentIntegrity !== undefined) {
       if (this.residentIntegrity.check().missing) void this.runResidentSelfHeal()
       return
@@ -1069,6 +1122,18 @@ class DaemonCore {
       return
     }
     this.requestShutdown()
+  }
+
+  async refreshApiNetwork(intent) {
+    let use
+    try { use = await this.probeApiNetwork(intent.apiOnly) } catch { /* An unverifiable owner cannot retain a channel. */ }
+    if (this.intent !== intent || this.exited) return false
+    this.apiNetworkCheckedAt = this.clock.now()
+    if (!use?.targets?.length || intent.apiOnly.bridgePort !== this.activeBridgePort()) return false
+    this.apiNetworkTargets = use.targets
+    if (this.bridge && !this.bridge.restrict) return false
+    this.bridge?.restrict(use.targets)
+    return true
   }
 
   // 程序被删了:停连接与还原同时开始,有界确认停止后再卸常驻。还没还干净就**留在原地下一轮再试**,⛔ 退出——
@@ -1213,6 +1278,7 @@ class DaemonCore {
   // 「已有可用外网就复用、不抢」(创始人 09-13 晚):电脑上别的代理正开着且经它能出外网 → 不改任何系统设置,
   // 状态记为已连(复用),每个复验周期再探一次;探不通了才改建来信连接。PAC 没法求值 → 按不可判定处理,走来信连接。
   async tryReuseExistingProxy(allowDirectProbe = true) {
+    if (this.intent?.apiOnly) return false
     let existing
     try { existing = this.adapter.existingProxy?.({ host: '127.0.0.1', port: this.activeBridgePort(), knownPorts: this.knownBridgePorts() }) } catch { return false }
     // 电脑上没有设代理,不等于客户没有外网(他可能装着 VPN 走全局、人在墙外、公司有专线)。
@@ -1509,8 +1575,11 @@ class DaemonCore {
     if (spec === undefined) {
       throw Object.assign(new Error('意图缺连接器'), { code: CONTROL_CODES.upstreamUnreachable })
     }
+    if (request?.apiOnly && !await this.refreshApiNetwork(request)) {
+      this.requestShutdown(); return
+    }
     try {
-      this.adapter.preflight?.({ host: '127.0.0.1', port: this.activeBridgePort() })
+      if (!request?.apiOnly) this.adapter.preflight?.({ host: '127.0.0.1', port: this.activeBridgePort() })
     } catch (error) {
       if (error?.code === CONTROL_CODES.managedPolicy) {
         try { this.beginAvailabilityAction('takeover', { restriction: 'POLICY_LOCKED' }) } catch (availabilityError) { throw availabilityError }
@@ -1570,7 +1639,7 @@ class DaemonCore {
     this.settingsReleaseFailed = false
     this.repairedItems = undefined
     this.state = 'connected'
-    this.lastVerification = { exitIp: postWriteVerification.exitIp || exitIp, lastVerifiedAt: this.clock.now() }
+    this.lastVerification = { exitIp: postWriteVerification.exitIp || exitIp, pathVerified: true, lastVerifiedAt: this.clock.now() }
     this.writeStateNow('connected', this.lastVerification)
     this.scheduleTraffic()
     this.scheduleVerify()
@@ -1681,6 +1750,10 @@ class DaemonCore {
         dataDir: this.dataDir
       })
       this.bridge = bridge
+      if (this.intent?.apiOnly) {
+        if (!bridge.restrict || !this.apiNetworkTargets) throw new Error('API_NETWORK_RESTRICTION_UNAVAILABLE')
+        bridge.restrict(this.apiNetworkTargets)
+      }
       bridge.onLost?.((error) => this.onConnectionLost(error))
       bridge.onDegraded?.(() => this.onTrafficDegraded())
       try {
@@ -1758,17 +1831,22 @@ class DaemonCore {
 
   async verifyConnection(connector, allowFallback = true) {
     const bridge = this.bridge
-    try {
-      return await (bridge?.verify ? bridge.verify() : connector.verify())
-    } catch (error) {
-      // 回显地址(配置里指定的那台服务器)打不通 ≠ 通道死了。再用通用探测点从通道里出去问一句:
-      // 有回应就是通道活着,按已连处理(出口 IP 沿用上次或留空);⛔ 因为自家回显服务抖一下就把客户的网拆了。
-      const probe = bridge?.probeReachability
-      if (!allowFallback || typeof probe !== 'function' || error?.code === 'TUNNEL_CONNECTION_CANCELLED') throw error
-      try { await probe() } catch { throw error }
-      this.log('回显探测未通过,但通用探测点经通道可达:按已连处理(出口 IP 未知)')
-      return { exitIp: this.lastVerification?.exitIp ?? '' }
+    const verifyGeneral = async () => {
+      try {
+        return await (bridge?.verify ? bridge.verify() : connector.verify())
+      } catch (error) {
+        // 回显地址(配置里指定的那台服务器)打不通 ≠ 通道死了。再用通用探测点从通道里出去问一句:
+        // 有回应就是通道活着,按已连处理(出口 IP 沿用上次或留空);⛔ 因为自家回显服务抖一下就把客户的网拆了。
+        const probe = bridge?.probeReachability
+        if (!allowFallback || typeof probe !== 'function' || error?.code === 'TUNNEL_CONNECTION_CANCELLED') throw error
+        try { await probe() } catch { throw error }
+        this.log('回显探测未通过,但通用探测点经通道可达:按已连处理(出口 IP 未知)')
+        return { exitIp: this.lastVerification?.exitIp ?? '' }
+      }
     }
+    // 两组同时核对、都成功才确认；串行会把回显超时叠加两遍，耗尽原本够用的修复预算。
+    const [verification] = await Promise.all([verifyGeneral(), bridge?.verifyDedicated?.()])
+    return verification
   }
 
   // ---- 系统代理写入权(创始人 2026-09-15 三条硬线) ----
@@ -1891,6 +1969,7 @@ class DaemonCore {
   }
 
   applySettings(options = {}) {
+    if (this.intent?.apiOnly) return
     const right = this.ensureWriteRight()
     if (!right.ok) throw this.writeRightConflict(right)
     withSettingsLock(this.dataDir, () => this.applySettingsLocked(), { owner: `apply:${this.runId}`, ...options })
@@ -1986,6 +2065,7 @@ class DaemonCore {
   }
 
   verifySettings(repair = false, options = {}) {
+    if (this.intent?.apiOnly) return
     withSettingsLock(this.dataDir, () => this.verifySettingsLocked(repair), { owner: `verify:${this.runId}`, ...options })
   }
 
@@ -2305,7 +2385,7 @@ class DaemonCore {
       if (stillCurrent()) {
         this.completeAvailabilityAction(this.availabilityReclaimOperation, { readbackMatches: true, targetReachable: true })
         this.availabilityReclaimOperation = undefined
-        this.lastVerification = { exitIp, lastVerifiedAt: this.clock.now() }
+        this.lastVerification = { exitIp, pathVerified: true, lastVerifiedAt: this.clock.now() }
         const contested = this.lastSettingsRepairAt !== undefined && this.clock.now() - this.lastSettingsRepairAt <= SETTINGS_CONTEST_NOTE_MS
         this.writeStateNow('connected', contested
           ? { ...this.lastVerification, code: 'TUNNEL_SETTINGS_CONTESTED', message: `另一款代理软件在反复修改系统代理（已改回 ${String(this.settingsRepairs)} 次）；正在确认它能否自己上外网，能就让给它` }
@@ -3130,7 +3210,8 @@ class DaemonCore {
         this.state = state
         // 持权期间写出的每一份 state 都盖上本轮令牌:后启动者据此确认「这份状态确实是当前持权者写的」。
         writeState(this.dataDir, { state, runId: this.runId, sessionToken: this.sessionToken,
-          intentToken: this.intent?.sessionToken ?? '', bridgePort: this.activeBridgePort(), note: this.optionalNote, code: '', message: '',
+          intentToken: this.intent?.sessionToken ?? '', bridgePort: this.activeBridgePort(), apiOnly: !!this.intent?.apiOnly,
+          note: this.optionalNote, code: '', message: '',
           ...(typeof this.writeRightToken === 'string' ? { writeRightToken: this.writeRightToken } : {}), ...extra,
           availability: this.availabilityView(),
           // 恢复事件随后续状态存续到桌面消费、下一段故障或停止为止。

@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { readFileSync, writeFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { createDaemon } from '../../sidecar/win/daemon-core.mjs'
 import { formatDaemonLogLine, probeProxyFaces, summarizeProxyFaces } from '../../sidecar/win/continuity-evidence.mjs'
-import { FakeClock, flushMicrotasks, makeTempDir, removeTempDir } from './helpers'
+import { FakeClock, fileExists, flushMicrotasks, makeTempDir, reapDaemons, removeTempDir, waitFor } from './helpers'
 
 const roots: string[] = []
 afterEach(() => roots.splice(0).forEach(removeTempDir))
@@ -45,14 +47,17 @@ describe('网络连续性留证', () => {
     const ledger = join(root, 'ledger.json')
     const adapter = join(root, 'adapter.mjs')
     const source = JSON.stringify([entry('WinINET', 'ProxyServer', null, 'hidden-proxy-value')])
+    const exitListeners = process.listenerCount('exit')
     writeFileSync(ledger, source)
     writeFileSync(adapter, 'export function createAdapter() { return { read: () => "hidden-proxy-value" } }\n')
     const faces = await probeProxyFaces(root, adapter)
     expect(faces?.wininet.written).toBe(1)
     expect(JSON.stringify(faces)).not.toContain('hidden-proxy-value')
+    expect(process.listenerCount('exit')).toBe(exitListeners)
     writeFileSync(ledger, '{broken')
     expect(await probeProxyFaces(root, adapter)).toBeUndefined()
     expect(readFileSync(ledger, 'utf8')).toBe('{broken')
+    expect(process.listenerCount('exit')).toBe(exitListeners)
   })
 
   it('慢采样与异常不阻塞状态写入，状态变化和守护代次仍可追溯', async () => {
@@ -82,5 +87,45 @@ describe('网络连续性留证', () => {
     expect(first).toContain('1970-01-01T00:00:01.000Z pid=1 run=generation-a')
     expect(next).toContain('1970-01-01T00:00:02.000Z pid=2 run=generation-b')
     expect(formatDaemonLogLine('state', { now: 2_000, pid: 2, runId: 'bad\nsecret' })).toContain('run=-')
+  })
+
+  it('守护正常退出时同步回收尚未完成的采样子进程', async () => {
+    const root = temp()
+    const pidPath = join(root, 'probe.pid')
+    const adapter = join(root, 'adapter.mjs')
+    writeFileSync(join(root, 'ledger.json'), '[]')
+    writeFileSync(adapter, `import { writeFileSync } from 'node:fs'
+export async function createAdapter() {
+  writeFileSync(${JSON.stringify(pidPath)}, String(process.pid))
+  await new Promise(resolve => setTimeout(resolve, 60_000))
+  return { read: () => null }
+}\n`)
+    const moduleUrl = pathToFileURL(join(process.cwd(), 'sidecar/win/continuity-evidence.mjs')).href
+    const parent = spawn(process.execPath, ['--input-type=module', '-e', `
+import { probeProxyFaces } from ${JSON.stringify(moduleUrl)}
+void probeProxyFaces(${JSON.stringify(root)}, ${JSON.stringify(adapter)})
+process.stdin.once('data', () => process.exit(0))
+`])
+    let probePid: number | undefined
+    const probeAlive = () => {
+      if (probePid === undefined) return false
+      try { process.kill(probePid, 0); return true } catch { return false }
+    }
+    try {
+      await waitFor(() => fileExists(pidPath), 3_000)
+      probePid = Number(readFileSync(pidPath, 'utf8'))
+      expect(probeAlive()).toBe(true)
+      parent.stdin?.end('exit')
+      await waitFor(() => parent.exitCode !== null, 3_000)
+      expect(parent.exitCode).toBe(0)
+      await expect.poll(probeAlive, { timeout: 2_000 }).toBe(false)
+    } finally {
+      const unreaped = await reapDaemons([parent])
+      if (probeAlive()) {
+        try { process.kill(probePid!, 'SIGKILL') } catch { /* Already exited. */ }
+      }
+      await waitFor(() => !probeAlive(), 3_000)
+      expect(unreaped).toEqual([])
+    }
   })
 })

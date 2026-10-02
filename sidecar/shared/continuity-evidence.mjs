@@ -55,6 +55,9 @@ export function probeProxyFaces(dataDir, adapterPath) {
         env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore']
       })
     } catch { resolve(undefined); return }
+    // A final state sample can still be reading when the daemon exits. It must not outlive its owner.
+    const stopOnExit = () => { try { child.kill('SIGKILL') } catch { /* Already exited. */ } }
+    process.once('exit', stopOnExit)
     let output = ''
     let oversized = false
     child.stdout.on('data', (chunk) => {
@@ -65,8 +68,9 @@ export function probeProxyFaces(dataDir, adapterPath) {
       try { child.kill() } catch { /* Already exited. */ }
       resolve(undefined)
     }, PROBE_TIMEOUT_MS)
-    child.once('error', () => { clearTimeout(timeout); resolve(undefined) })
+    child.once('error', () => { process.removeListener('exit', stopOnExit); clearTimeout(timeout); resolve(undefined) })
     child.once('close', (code) => {
+      process.removeListener('exit', stopOnExit)
       clearTimeout(timeout)
       if (code !== 0 || oversized) { resolve(undefined); return }
       try { resolve(safeFaceCounts(JSON.parse(output))) } catch { resolve(undefined) }

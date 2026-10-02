@@ -7,7 +7,7 @@ export type ApiFailure =
   | 'membership_model_unavailable' | 'membership_benefits_unavailable' | 'membership_quota_exhausted'
   | 'membership_concurrency_limited' | 'membership_rate_limited'
   | 'coding_plan_expired' | 'coding_plan_quota_exhausted' | 'coding_plan_model_unavailable' | 'coding_plan_key_product_mismatch'
-  | 'request_invalid' | 'content_too_long' | 'payload_too_large' | 'provider_outage' | 'upstream_error' | 'network_error'
+  | 'request_invalid' | 'content_too_long' | 'provider_outage' | 'upstream_error' | 'network_error'
   | 'client_aborted' | 'timeout' | 'invalid_reply' | 'tool_call_failed' | 'response_truncated' | 'configuration_failed'
   | 'configuration_rollback_failed' | 'configuration_interrupted' | 'port_unavailable' | 'local_service_down' | 'local_service_start_failed' | 'local_service_busy'
   | 'not_configured' | 'key_missing' | 'shell_version_incompatible' | 'unknown'
@@ -23,11 +23,9 @@ export interface ApiCheck {
   readonly suggestedProvider?: ModelProviderId
 }
 export type ApiLatency = { readonly ok: true; readonly latencyMs: number } | { readonly ok: false; readonly latencyMs: null; readonly code: ApiFailure }
-export interface ApiRequestRecord {
+interface ApiRequestRecordFields {
   readonly at: string
   readonly shell: ApiShell
-  readonly provider: ModelProviderId
-  readonly model: string
   readonly source: 'test' | 'client'
   readonly ok: boolean
   readonly code?: ApiFailure
@@ -35,6 +33,10 @@ export interface ApiRequestRecord {
   readonly durationMs: number
   readonly inputTokens: number | null
   readonly outputTokens: number | null
+}
+export interface ApiRequestRecord extends ApiRequestRecordFields {
+  readonly provider: ModelProviderId
+  readonly model: string
 }
 /**
  * 这个壳的配置此刻是不是还是工具箱写的那份。
@@ -133,7 +135,6 @@ export const apiFailureMessages: Record<ApiFailure, string> = {
   coding_plan_key_product_mismatch: '这个 Key 仅限企业编程套餐场景，不能用于当前产品。请在智谱官方页面确认并更换对应产品的 Key。',
   request_invalid: '服务商不接受这次请求的格式或参数，多半是这个 AI 的版本与当前接口不匹配，可先重新写入配置，再考虑更新软件。',
   content_too_long: '这次发送的内容超过了模型能接收的长度，请新开一个对话或减少内容后重试。',
-  payload_too_large: '本次发送或接收的数据超过了工具箱本机服务的转发上限（32MB），已在本地停下。请新开一个对话或缩小本次任务后重试。',
   provider_outage: '服务商一侧连续返回异常或长时间没有回复，多半是对方暂时故障，请稍后重试。',
   upstream_error: '服务商返回异常，请稍后重试。',
   network_error: '未连接到服务商，请检查网络后重试。',
@@ -183,7 +184,7 @@ const maximumRecoveryDateMs = 366 * 24 * 60 * 60 * 1_000
  */
 export function providerRecoveryNotice(status: number, body: string, code: ApiFailure, provider?: ModelProviderId, retryAfter?: string | null, now = Date.now()): string | undefined {
   if (!mayHaveRecoveryNotice(status, code)) return undefined
-  const resetAt = recoveryResetAt(body, retryAfter, now)
+  const resetAt = providerRecoveryResetAt(status, body, code, retryAfter, now)
   if (resetAt !== undefined) return `服务商预计于 ${formatChinaTime(resetAt)}恢复`
   const fields = failureFields(body)
   const window = namedRecoveryWindow(code, provider, fields)
@@ -214,7 +215,18 @@ function recoveryEnvelopes(body: string): readonly Record<string, unknown>[] {
   } catch { return [] }
 }
 
-function recoveryResetAt(body: string, retryAfter: string | null | undefined, now: number): number | undefined {
+/** The same bounded, scalar-only upstream time drives notices and the local retry cache. */
+export function providerRecoveryResetAt(status: number, body: string, code: ApiFailure, retryAfter?: string | null, now = Date.now()): number | undefined {
+  if (!mayHaveRecoveryNotice(status, code)) return undefined
+  const header = retryAfter?.trim()
+  if (header !== undefined && /^\d{1,8}$/.test(header)) {
+    const delay = Number(header) * 1000
+    if (delay <= maximumRecoveryDelayMs) return now + delay
+  }
+  if (header !== undefined && /^(?:[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT|[A-Za-z]+, \d{2}-[A-Za-z]{3}-\d{2} \d{2}:\d{2}:\d{2} GMT|[A-Za-z]{3} [A-Za-z]{3} {1,2}\d{1,2} \d{2}:\d{2}:\d{2} \d{4})$/.test(header)) {
+    const at = Date.parse(header)
+    if (Number.isFinite(at) && at >= now - 60_000 && at <= now + maximumRecoveryDelayMs) return at
+  }
   const envelopes = recoveryEnvelopes(body)
   for (const envelope of envelopes) {
     for (const field of recoveryAbsoluteFields) {
@@ -230,7 +242,7 @@ function recoveryResetAt(body: string, retryAfter: string | null | undefined, no
       if (at !== undefined) return at
     }
   }
-  return relativeRecoveryTime(retryAfter, 1_000, now)
+  return undefined
 }
 
 function absoluteRecoveryTime(value: unknown, now: number): number | undefined {
@@ -309,7 +321,6 @@ export const apiFailureRemedy: Readonly<Record<ApiFailure, ApiRemedyAction | nul
   coding_plan_key_product_mismatch: 'openConsole',
   request_invalid: 'reapply',
   content_too_long: null,
-  payload_too_large: null,
   provider_outage: 'retest',
   upstream_error: 'retest',
   network_error: null,

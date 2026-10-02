@@ -8,7 +8,7 @@ import { isAlipayCheckoutUrl } from '../account/payment-url'
 import { setNetworkAccountAccess } from '../tunnel/runtime'
 import { registerSubscriptionActions } from '../account/subscription-actions'
 import { registerSharingActions } from '../account/sharing-actions'
-import { setInstallationReporter, setDownloadReporter } from '../account/installation-report'
+import { setInstallationReporter } from '../account/installation-report'
 import { collectDeviceFacts } from '../account/device-report'
 import { createFailureLog, daemonLogPath } from '../tunnel/failure-log'
 
@@ -127,6 +127,5 @@ export function registerActions(registry: BridgeRegistry): void {
     return result
   }, () => collectDeviceFacts(app.getVersion(), app.getPath('userData')), (url) => shell.openExternal(url), undefined, accountLog)
   setInstallationReporter((confirmed) => client.captureInstallationReport(confirmed))
-  setDownloadReporter((passive) => client.captureDownloadReport(passive))
   registerAccountActions(registry, client)
 }

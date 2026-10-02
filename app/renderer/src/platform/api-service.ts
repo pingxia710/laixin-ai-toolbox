@@ -78,7 +78,7 @@ function openApiService(api: AiAccessApi, shell: ApiShell, provider: ModelProvid
   const test = node('button', '测试接口与工具调用', 'primary-action'); test.type = 'button'
   test.onclick = () => { if (busy && probeInFlight) cancelProbe(); else void load(true) }
   actions.append(refresh, test)
-  dialog.append(header, tabs, notice, content, actions, node('p', '测试会发送两次小型请求，按服务商规则计费，不操作你的文件。使用 API 时须保持工具箱运行；检查等待中可点「取消检查」或关闭此面板中止，已发出的请求可能仍按服务商规则计费，面板本身的服务不受影响。', 'platform-muted'))
+  dialog.append(header, tabs, notice, content, actions, node('p', '测试会发送两次小型请求，按服务商规则计费，不操作你的文件。检查等待中可点「取消检查」或关闭此面板中止，已发出的请求可能仍按服务商规则计费。关闭面板不会停止已启用的 API 服务。', 'platform-muted'))
   let tab = initial
   let snapshot: ApiServiceSnapshot | null = null
   let configuration: { endpoint: string; model: string } | null = null
@@ -140,7 +140,7 @@ function openApiService(api: AiAccessApi, shell: ApiShell, provider: ModelProvid
       const list = node('ol', '', 'api-service-records')
       for (const row of rows.slice(0, 12)) {
         const item = node('li')
-        const outcome = row.code === 'client_aborted' ? '已取消，未计入服务故障' : row.ok ? `成功 · ${row.durationMs} ms` : apiFailureMessage(row.code ?? 'upstream_error', row.provider)
+        const outcome = row.code === 'client_aborted' ? '已取消，未计入服务故障' : row.ok ? `成功 · ${row.durationMs} ms` : apiFailureMessage(row.code ?? 'upstream_error', row.provider ?? undefined)
         item.append(node('span', `${row.source === 'test' ? '接口自测' : '客户端调用'} · ${new Date(row.at).toLocaleTimeString()}`), node('span', outcome))
         list.append(item)
       }
@@ -195,7 +195,7 @@ export function readServiceSnapshot(raw: string): ApiServiceSnapshot {
   if (value.startupError && !Object.hasOwn(apiFailureMessages, value.startupError)) throw new Error('API_SERVICE_INVALID')
   for (const route of value.routes) if (!modelProviderIds.includes(route.provider) || !['codex','claude','hermes'].includes(route.shell) || typeof route.baseUrl !== 'string') throw new Error('API_SERVICE_INVALID')
   for (const request of value.requests) {
-    if (!modelProviderIds.includes(request.provider) || !['codex','claude','hermes'].includes(request.shell) || !['test','client'].includes(request.source) || typeof request.ok !== 'boolean' || !Number.isFinite(Date.parse(request.at)) || !Number.isFinite(request.durationMs)) throw new Error('API_SERVICE_INVALID')
+    if (!modelProviderIds.includes(request.provider) || typeof request.model !== 'string' || !['codex','claude','hermes'].includes(request.shell) || !['test','client'].includes(request.source) || typeof request.ok !== 'boolean' || !Number.isFinite(Date.parse(request.at)) || !Number.isFinite(request.durationMs)) throw new Error('API_SERVICE_INVALID')
     if (request.code && !Object.hasOwn(apiFailureMessages, request.code)) throw new Error('API_SERVICE_INVALID')
     if ([request.inputTokens,request.outputTokens].some(n => n !== null && (!Number.isSafeInteger(n) || n < 0))) throw new Error('API_SERVICE_INVALID')
   }

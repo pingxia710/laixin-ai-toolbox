@@ -26,6 +26,7 @@ import { PackageReject } from '../tunnel/package-format'
 import type { SpawnedDaemon } from '../tunnel/supervisor'
 import type { Platform } from '../precheck/software-platform'
 import type { EncryptedQueueCodec } from '../tunnel/diagnostic-event-queue'
+import { readApiNetworkContinuation } from '../ai-access/network-continuation'
 
 function diagnosticQueueCodec(): EncryptedQueueCodec {
   const available = () => {
@@ -97,6 +98,7 @@ export const statusResultSchema = schema.object({
   backend: schema.string({ maxLength: 40 }),
   nodeLabel: schema.string({ maxLength: 300 }),
   exitIp: schema.string({ maxLength: 60 }),
+  pathVerified: schema.boolean(),
   pathSource: schema.string({ maxLength: 10 }),
   lastVerifiedAt: schema.string({ maxLength: 40 }),
   configVersion: schema.string({ maxLength: 20 }),
@@ -310,6 +312,7 @@ function productionDeps(deps: TunnelActionDeps) {
           })
           return attachStderrSink(child, supervisorLog, 'restore-stderr')
         }),
-    routesFile: join(sidecarDir, 'routes.default.json')
+    routesFile: join(sidecarDir, 'routes.default.json'),
+    apiNetworkContinuation: (bridgePort: number) => readApiNetworkContinuation(app.getPath('userData'), bridgePort)
   }
 }

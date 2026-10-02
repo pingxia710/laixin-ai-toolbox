@@ -2,6 +2,7 @@ import { dirname, join } from 'node:path'
 import { parseCodexTomlDocument } from './codex-toml-document'
 import type { ManagedTextFile } from './deepseek-config'
 import { replaceConfigurationTransaction, withConfigWriteLock } from './config-write-guard'
+import { isProviderModelAllowed, modelProviderIds, modelProviders, providerModelWindow } from '../../shared/model-providers'
 
 const legacyManagedBegin = '# >>> Laixin AI Toolbox managed Codex workspaces >>>'
 const legacyManagedEnd = '# <<< Laixin AI Toolbox managed Codex workspaces <<<'
@@ -277,13 +278,15 @@ function renderModels(officialModels: readonly CodexWorkspaceOfficialModel[], pi
 }
 
 function renderPickerModel(slug: string, priority: number): Record<string, unknown> {
+  const capabilities = pickerModelCapabilities(slug)
+  if (!capabilities) throw new Error('CODEX_MULTI_MODEL_CONNECTION_INVALID')
   return {
     slug, prefer_websockets: false, support_verbosity: false, default_verbosity: 'low',
-    apply_patch_tool_type: 'freeform', web_search_tool_type: 'text', input_modalities: ['text'],
+    apply_patch_tool_type: 'freeform', web_search_tool_type: 'text', input_modalities: capabilities.inputModalities,
     supports_image_detail_original: false, truncation_policy: { mode: 'tokens', limit: 10_000 },
     supports_parallel_tool_calls: true, experimental_supported_tools: [], base_instructions: '', tool_mode: null,
     multi_agent_version: 'v2', use_responses_lite: false, include_skills_usage_instructions: false,
-    auto_review_model_override: null, context_window: 65_536, max_context_window: 65_536,
+    auto_review_model_override: null, context_window: capabilities.contextWindow, max_context_window: capabilities.contextWindow,
     effective_context_window_percent: 95, auto_compact_token_limit: null, comp_hash: '3000',
     reasoning_summary_format: 'experimental', default_reasoning_summary: 'none', display_name: slug,
     description: slug.startsWith('laixin.') ? 'Laixin multi-model picker entry' : 'Official Codex model',
@@ -308,7 +311,17 @@ function validateModelsJson(value: string | undefined): void {
 }
 
 function validPickerModels(models: readonly string[]): boolean {
-  return models.length > 0 && models.every(model => validModelId(model) && model.startsWith('laixin.')) && new Set(models).size === models.length
+  return models.length > 0 && models.every(model => validModelId(model) && pickerModelCapabilities(model) !== undefined) && new Set(models).size === models.length
+}
+
+/** Use the same product and exact model facts as single-model configuration; never guess a generic cap. */
+function pickerModelCapabilities(slug: string) {
+  const provider = modelProviderIds.find(provider => slug.startsWith(`laixin.${provider}.`))
+  if (!provider) return undefined
+  const model = slug.slice(`laixin.${provider}.`.length)
+  const contextWindow = providerModelWindow(provider, model)
+  if (!isProviderModelAllowed(provider, 'codex', model) || contextWindow === undefined) return undefined
+  return { contextWindow, inputModalities: modelProviders[provider].codex.inputModalities }
 }
 
 function validOfficialModels(models: readonly CodexWorkspaceOfficialModel[]): boolean {

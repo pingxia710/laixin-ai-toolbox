@@ -63,7 +63,19 @@ describe('复用本机已有外网时的状态', () => {
     expect(networkPathReady(statusOf(laixinDaemon))).toBe(true)
   })
 
-  it('不能因此放水：来信通道自己没验出出口 IP、或原设置未恢复，都不算可用', () => {
+  it('来信通道的本轮可达证据允许没有出口 IP，失败、旧状态及未恢复项仍不通过', () => {
+    const reachable = statusOf({ ...laixinDaemon, exitIp: '', pathVerified: true })
+    expect(networkPathReady(reachable)).toBe(true)
+    expect(networkPathReady({ ...reachable, unrestored: 'Wi-Fi/socks-proxy' })).toBe(false)
+    expect(networkPathReady({ ...reachable, lastVerifiedAt: '' })).toBe(false)
+    for (const state of ['degraded', 'connecting', 'error', 'stopped-restored']) {
+      const status = statusOf({ ...laixinDaemon, state, pathVerified: true })
+      expect(status.pathVerified).toBe(false)
+      expect(networkPathReady(status)).toBe(false)
+    }
+  })
+
+  it('没有可达证据、也没有出口 IP 或原设置未恢复，都不算可用', () => {
     expect(networkPathReady(statusOf({ ...laixinDaemon, exitIp: '' }))).toBe(false)
     expect(networkPathReady(statusOf({ ...laixinDaemon, lastVerifiedAt: undefined }))).toBe(false)
     expect(networkPathReady({ ...statusOf(laixinDaemon), unrestored: 'Wi-Fi/socks-proxy' })).toBe(false)
@@ -85,6 +97,9 @@ describe('复用本机已有外网时的状态', () => {
     expect(reused.primaryLabel).not.toBe('断开通道') // ⛔ 让客户以为点一下会关掉别人的软件
     const laixin = buildTunnelPresentation(view({ pathSource: 'laixin', exitIp: '203.0.113.42' }))
     expect(laixin.description).toContain('通道出口已完成校验')
+    const noIp = buildTunnelPresentation(view({ pathSource: 'laixin', pathVerified: true }))
+    expect(noIp.description).toContain('出口地址暂未取得')
+    expect(noIp.description).not.toContain('通道出口已完成校验')
   })
 
   it('N-55 只有执行中的当前动作才优先展示阶段：被动 examining 不覆盖断开或真实错误', () => {

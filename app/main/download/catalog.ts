@@ -1,8 +1,6 @@
 import rawCatalog from '../../../resources/catalog.json'
 import { isPlatform, isSoftwareId } from '../precheck/software-platform'
-import type { DownloadArchitecture, DownloadCatalog, DownloadFormat, DownloadResource, DownloadResourceType, DownloadSource, ExpectedIdentity, ResourceApproval } from './types'
-
-const supportedFormats = new Set<DownloadFormat>(['dmg', 'zip', 'pkg', 'exe', 'msix'])
+import type { DownloadArchitecture, DownloadCatalog, DownloadResource, ResourceApproval } from './types'
 
 // 静态目录整包 parse+validate 只做一次,⛔ 每次访问重复解析校验。
 let cachedCatalog: DownloadCatalog | undefined
@@ -23,6 +21,7 @@ export function parseCatalog(value: unknown): DownloadCatalog {
   return { catalogVersion: value.catalogVersion, resources }
 }
 
+// RETIRE03:下载引擎已退役,目录只承载 external-entry(到官方下载页);⛔ download 型条目回流。
 function parseResource(value: unknown): DownloadResource {
   if (!isRecord(value)) {
     throw new Error('CATALOG_RESOURCE_INVALID')
@@ -31,58 +30,19 @@ function parseResource(value: unknown): DownloadResource {
   const software = stringField(value, 'software')
   const platform = stringField(value, 'platform')
   const architecture = stringField(value, 'architecture')
-  const type = stringField(value, 'type')
   const officialPageUrl = stringField(value, 'officialPageUrl')
   const allowedHosts = stringArrayField(value, 'allowedHosts')
-  const version = stringField(value, 'version')
-  const officialVersionLabel = stringField(value, 'officialVersionLabel')
   const approval = parseApproval(value.approval)
 
   if (
+    value.type !== 'external-entry' ||
     !/^[a-z][a-z0-9-]{1,99}$/.test(id) ||
     !isCatalogSoftwareId(software) ||
     !isPlatform(platform) ||
     !isDownloadArchitecture(architecture) ||
-    !isResourceType(type) ||
-    !isHttpsUrl(officialPageUrl) ||
-    allowedHosts.length === 0
+    !isApprovedExternalPage(officialPageUrl, allowedHosts)
   ) {
     throw new Error('CATALOG_RESOURCE_INVALID')
-  }
-
-  if (type === 'external-entry') {
-    if (!isApprovedExternalPage(officialPageUrl, allowedHosts)) {
-      throw new Error('CATALOG_RESOURCE_INVALID')
-    }
-    return {
-      id,
-      software,
-      platform,
-      architecture,
-      type,
-      officialPageUrl,
-      allowedHosts,
-      version,
-      officialVersionLabel,
-      approval
-    }
-  }
-
-  const assetUrl = stringField(value, 'assetUrl')
-  const format = stringField(value, 'format')
-  const expectedBytes = stringField(value, 'expectedBytes')
-  const officialSha256 = nullableSha256(value.officialSha256)
-  const recordedSha256 = sha256Field(value, 'recordedSha256')
-  const identity = parseIdentity(value.identity, architecture)
-  const sources = value.sources === undefined ? undefined : parseSources(value.sources)
-  const assetHost = new URL(assetUrl).hostname
-  if (
-    !isHttpUrl(assetUrl) ||
-    !supportedFormats.has(format as DownloadFormat) ||
-    !/^[1-9][0-9]*$/.test(expectedBytes) ||
-    !allowedHosts.includes(assetHost)
-  ) {
-    throw new Error(assetHost !== '' && !allowedHosts.includes(assetHost) ? 'CATALOG_ASSET_HOST_NOT_ALLOWED' : 'CATALOG_RESOURCE_INVALID')
   }
 
   return {
@@ -90,40 +50,13 @@ function parseResource(value: unknown): DownloadResource {
     software,
     platform,
     architecture,
-    type,
+    type: 'external-entry',
     officialPageUrl,
-    assetUrl,
-    ...(sources === undefined ? {} : { sources }),
     allowedHosts,
-    version,
-    officialVersionLabel,
-    format: format as DownloadFormat,
-    expectedBytes,
-    officialSha256,
-    recordedSha256,
-    identity,
+    version: stringField(value, 'version'),
+    officialVersionLabel: stringField(value, 'officialVersionLabel'),
     approval
   }
-}
-
-function parseSources(value: unknown): readonly DownloadSource[] {
-  if (!Array.isArray(value) || value.length === 0) throw new Error('CATALOG_SOURCES_INVALID')
-  const sources = value.map((item): DownloadSource => {
-    if (!isRecord(item)) throw new Error('CATALOG_SOURCES_INVALID')
-    const id = stringField(item, 'id')
-    const assetUrl = stringField(item, 'assetUrl')
-    const allowedHosts = stringArrayField(item, 'allowedHosts')
-    let url: URL
-    try { url = new URL(assetUrl) } catch { throw new Error('CATALOG_SOURCES_INVALID') }
-    if (!/^[a-z][a-z0-9-]{0,99}$/.test(id) || !['direct', 'tunnel'].includes(String(item.network)) ||
-        url.username || url.password || url.hash || !allowedHosts.includes(url.hostname) ||
-        !(url.protocol === 'https:' || (url.protocol === 'http:' && ['127.0.0.1', '[::1]'].includes(url.hostname)))) {
-      throw new Error('CATALOG_SOURCES_INVALID')
-    }
-    return { id, assetUrl, allowedHosts, network: item.network as DownloadSource['network'] }
-  })
-  if (new Set(sources.map((source) => source.id)).size !== sources.length) throw new Error('CATALOG_SOURCES_INVALID')
-  return sources
 }
 
 function parseApproval(value: unknown): ResourceApproval {
@@ -137,31 +70,6 @@ function parseApproval(value: unknown): ResourceApproval {
     throw new Error('CATALOG_RESOURCE_INVALID')
   }
   return { approvedAt: value.approvedAt, approvedBy: value.approvedBy, sourceBuild: value.sourceBuild, scope: value.scope }
-}
-
-function parseIdentity(value: unknown, architecture: DownloadArchitecture): ExpectedIdentity | null {
-  if (value === null) {
-    return null
-  }
-  if (
-    !isRecord(value) ||
-    !isNonEmptyString(value.installerBundleIdentifier) ||
-    !('installedBundleIdentifier' in value) ||
-    !(value.installedBundleIdentifier === null || isNonEmptyString(value.installedBundleIdentifier)) ||
-    !isNonEmptyString(value.signingSubject) ||
-    !isDownloadArchitecture(value.architecture) ||
-    value.architecture !== architecture ||
-    (value.maintenanceNote !== undefined && !isNonEmptyString(value.maintenanceNote))
-  ) {
-    throw new Error('CATALOG_RESOURCE_INVALID')
-  }
-  return {
-    installerBundleIdentifier: value.installerBundleIdentifier,
-    installedBundleIdentifier: value.installedBundleIdentifier,
-    signingSubject: value.signingSubject,
-    architecture: value.architecture,
-    ...(value.maintenanceNote === undefined ? {} : { maintenanceNote: value.maintenanceNote })
-  }
 }
 
 function isCatalogSoftwareId(value: string): boolean {
@@ -186,45 +94,6 @@ function stringArrayField(value: Record<string, unknown>, field: string): readon
     throw new Error('CATALOG_RESOURCE_INVALID')
   }
   return candidate
-}
-
-function nullableSha256(value: unknown): string | null {
-  if (value === null) {
-    return null
-  }
-  return sha256Value(value)
-}
-
-function sha256Field(value: Record<string, unknown>, field: string): string {
-  return sha256Value(value[field])
-}
-
-function sha256Value(value: unknown): string {
-  if (typeof value !== 'string' || !/^[a-f0-9]{64}$/.test(value)) {
-    throw new Error('CATALOG_RESOURCE_INVALID')
-  }
-  return value
-}
-
-function isResourceType(value: string): value is DownloadResourceType {
-  return value === 'download' || value === 'external-entry'
-}
-
-function isHttpUrl(value: string): boolean {
-  try {
-    const url = new URL(value)
-    return url.protocol === 'https:' || url.protocol === 'http:'
-  } catch {
-    return false
-  }
-}
-
-function isHttpsUrl(value: string): boolean {
-  try {
-    return new URL(value).protocol === 'https:'
-  } catch {
-    return false
-  }
 }
 
 function isApprovedExternalPage(value: string, allowedHosts: readonly string[]): boolean {

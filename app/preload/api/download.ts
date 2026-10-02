@@ -13,17 +13,14 @@ export interface DownloadTaskResult {
   readonly installerPath: string
 }
 
+// RETIRE01:下载引擎退役后仅保留「到官方下载页」;latest/status 只服务于从未接线的引擎,一并移除。
 export interface DownloadApi {
-  latest(resourceId: string): Promise<DownloadTaskResult>
-  status(taskId: string): Promise<DownloadTaskResult>
   openExternal(resourceId: string): Promise<DownloadTaskResult>
 }
 
 export const namespace = 'download'
 
 export const api: DownloadApi = {
-  latest: (resourceId) => invoke('download.latest', { resourceId }),
-  status: (taskId) => invoke('download.status', { taskId }),
   openExternal: (resourceId) => invoke('download.openExternal', { resourceId })
 }
 

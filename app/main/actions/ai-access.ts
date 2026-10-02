@@ -2,9 +2,7 @@ import { app, dialog, shell, session } from 'electron'
 import { join } from 'node:path'
 import type { BridgeRegistry } from '../bridge/bridge-registry'
 import { schema } from '../bridge/schema'
-import { createDeepSeekAdapters, observedConfigurationExecution } from '../ai-access/adapters'
-import { createProjectConfigurationTargetStore } from '../ai-access/configuration-target'
-import { createConfigurationExecutionObserver, configurationObservationTtlMs } from '../ai-access/configuration-execution-observer'
+import { createProductionAiAccessAdapters } from '../ai-access/production-adapters'
 import { createManagedTextFile } from '../ai-access/file'
 import { createRestartGuidanceReader, restartMessage, type ShellRestartGuidance } from '../ai-access/restart-guidance'
 import { environmentChecklist, type EnvironmentChecklistItem } from '../ai-access/environment-checklist'
@@ -350,15 +348,15 @@ export function registerAiAccessActions(
       handler: () => respond(runGatewayRecoveryMutation(() => resolvedAccess.recoverAccess('manual'))) })
     if (codexIsolation !== undefined) registry.registerShutdownHook('aiaccess.codex-isolation', () => {
       codexIsolationHealth?.stop()
-      return codexIsolation.recover().then(() => undefined)
+      return codexIsolation.recover({ preserveIndependent: true }).then(() => undefined)
     })
     if (claudeIsolation !== undefined) registry.registerShutdownHook('aiaccess.claude-isolation', () => {
       claudeIsolationHealth?.stop()
-      return claudeIsolation.recover().then(() => undefined)
+      return claudeIsolation.recover({ preserveIndependent: true }).then(() => undefined)
     })
     if (hermesIsolation !== undefined) registry.registerShutdownHook('aiaccess.hermes-isolation', () => {
       hermesIsolationHealth?.stop()
-      return hermesIsolation.recover().then(() => undefined)
+      return hermesIsolation.recover({ preserveIndependent: true }).then(() => undefined)
     })
     registry.registerShutdownHook('aiaccess.gateway', () => resolvedAccess.stop())
     // No requests to providers and no shell writes occur during restoration.
@@ -367,9 +365,9 @@ export function registerAiAccessActions(
     // 生产合成才起后台核对：重开后先对一次，之后每 10 分钟一次，顺带覆盖唤醒与断网恢复。
     if (access === undefined) {
       void restored.then(async () => {
-        await codexIsolation?.recover()
-        await claudeIsolation?.recover()
-        await hermesIsolation?.recover()
+        if (codexIsolation) codexIsolationHealth?.observe(await codexIsolation.recover({ preserveIndependent: true }))
+        if (claudeIsolation) claudeIsolationHealth?.observe(await claudeIsolation.recover({ preserveIndependent: true }))
+        if (hermesIsolation) hermesIsolationHealth?.observe(await hermesIsolation.recover({ preserveIndependent: true }))
         await runGatewayRecoveryMutation(() => resolvedAccess.recoverAccess('startup'))
       }).catch(() => undefined)
       const timer = setInterval(() => {
@@ -504,13 +502,9 @@ export function productionAiAccessService(): AiAccessService {
   if (productionAccess) return productionAccess
   const home = app.getPath('home')
   const environment = shellInventory().environment()
-  const file = createManagedTextFile()
   // The generated Codex catalogue retains trusted Desktop model metadata and can exceed the
   // normal config-file cap. This read-only status adapter uses the same bounded cap as writing.
   const catalogFile = createManagedTextFile({ maxBytes: 4 * 1024 * 1024 })
-  // API-11：观察器结果带 10 秒时间窗——登录等待等高频 status 读取不再每轮 spawn profiles＋ps；
-  // 窗口过期或观察失败即重查，写路径判定的失效语义见 configuration-execution-observer。
-  const observeConfigurationExecution = createConfigurationExecutionObserver({ platform: process.platform, home, ttlMs: configurationObservationTtlMs })
   // Mac 使用回执（API-04）：主进程侧五个固定阶段的白名单记录；⛔ 因记录失败影响主流程。
   const usageReceipt = productionUsageReceiptRecorder()
   const codexIsolationTransport = productionCodexIsolationTransport ??= new CodexIsolationTransport({
@@ -525,25 +519,7 @@ export function productionAiAccessService(): AiAccessService {
     // Hermes has a dedicated, non-persistent session and never shares Codex cookies/cache.
     create: () => session.fromPartition('toolbox-hermes-isolation', { cache: false })
   })
-  const adapters = createDeepSeekAdapters({
-      home,
-      platform: process.platform,
-      localAppData: environment.LOCALAPPDATA,
-      hermesHome: environment.HERMES_HOME,
-      // The locator contains only a main-process HERMES_HOME needed to settle an unfinished
-      // lease after the environment selects a different target; it never enters state or IPC.
-      hermesIsolationRegistryPath: join(app.getPath('userData'), 'ai-access', 'hermes-isolation-targets.json'),
-      // No process.cwd(): it is the Toolbox process, not evidence of a customer's project.
-      configurationExecution: observedConfigurationExecution(home, process.platform, environment),
-      observeConfigurationExecution,
-      // The selected project root is retained only in this 0600 main-process file. Status and
-      // renderer messages receive target scope/reason evidence, never the customer path.
-      projectTargetStore: createProjectConfigurationTargetStore(file, join(app.getPath('userData'), 'ai-access', 'private-project-targets.json'), process.platform),
-      // One opaque lease pointer lets restart recovery reject a changed Claude target without
-      // inspecting a recorded path or writing the newly selected settings file.
-      claudeIsolationLeaseRegistryPath: join(app.getPath('userData'), 'ai-access', 'laixin-claude-isolation-target.json'),
-      file
-  })
+  const adapters = createProductionAiAccessAdapters(app.getPath('userData'), home, process.platform, environment)
   const codexAdapter = adapters.find(adapter => adapter.shell === 'codex')
   productionAccess = new AiAccessService(
     createAiAccessStore(join(app.getPath('userData'), 'ai-access')),
@@ -562,6 +538,8 @@ export function productionAiAccessService(): AiAccessService {
       onUsageEvent: event => usageReceipt.record(gatewayUsageEventToReceipt(event))
     }),
     {
+      independentRouting: true,
+      prepareRouting: async () => { await recipeStore().load() },
       // Do not block a customer on a CLI version. Stable provider differences are normalized by
       // the gateway capability table; actual trusted-install validation stays in shellInstalled.
       resolveRoute: (shell, provider) => resolveProviderRoute(recipeStore().current(), shell, provider,

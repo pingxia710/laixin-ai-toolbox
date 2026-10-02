@@ -6,8 +6,6 @@ import { NetworkAccountClient } from '../tunnel/account-client'
 import { subscriptionMessages, type SubscriptionOperation } from '../../subscription-types'
 import { sharingMessages, type SharingOperation } from '../../sharing-types'
 import { validDeviceReceipt, type DeviceFacts } from '../../customer-ops-types'
-import type { DownloadTaskSnapshot } from '../download/types'
-import { loadCatalog } from '../download/catalog'
 
 type AccountRequestStage = 'prepare' | 'fetch' | 'response' | 'body' | 'http' | 'schema' | 'local'
 
@@ -108,6 +106,7 @@ export class AccountClient {
   private wechatStarting = false
   private statusRequest?: Promise<AccountView>
   private statusController?: AbortController
+  private networkRefresh?: { token: string; pending: Promise<void> }
   private boundDevice?: { token: string; id: string }
   private deviceBinding?: { token: string; id: string; pending: Promise<void> }
   private controller = new AbortController()
@@ -115,7 +114,6 @@ export class AccountClient {
   private view: AccountView = signedOut()
   private readonly installationStates = new Map<string, { token: string; state: 'syncing' | 'synced' | 'failed'; version: number }>()
   private installationWrites: Promise<void> = Promise.resolve()
-  private readonly downloadReports = new Map<string, { token: string; signature: string }>()
   private deviceReport: { token: string; state: 'syncing' | 'synced' | 'failed'; at: number; receipt?: string } | undefined
   private terms?: CommercialTerms
   private termsFailedAt = 0
@@ -351,15 +349,11 @@ export class AccountClient {
       current()
       // 商业参数串行预取:⛔ 与通道同步请求并发,避免扰动后台按客户的用量串行化。
       await this.ensureTerms(signal)
-      const [network, overview] = await Promise.allSettled([
-        this.setNetwork({ client: new NetworkAccountClient(new URL('v1/network/', this.base).href),
-          session: { accountId: this.session.account.id, accessToken: this.session.accessToken, deviceId } }),
-        this.overview(signal)
-      ])
+      this.refreshNetwork({ client: new NetworkAccountClient(new URL('v1/network/', this.base).href),
+        session: { accountId: this.session.account.id, accessToken: this.session.accessToken, deviceId } })
+      const overview = await this.overview(signal)
       current()
-      if (network.status === 'rejected') throw network.reason
-      if (overview.status === 'rejected') throw overview.reason
-      return overview.value
+      return overview
     } catch (error) {
       if (signal.aborted || this.controller.signal.aborted) return this.view
       const loginExpired = error instanceof AccountClientError && error.message === 'ACCOUNT_LOGIN_REQUIRED'
@@ -373,6 +367,22 @@ export class AccountClient {
       this.view = { state: 'unavailable', account: null, code: 'ACCOUNT_SERVICE_UNAVAILABLE', message: '暂时无法确认登录状态，网络页会显示连接是否仍在授权期限内。', overview: null }
       throw error
     }
+  }
+
+  private refreshNetwork(access: NetworkAccountAccess): void {
+    const token = access.session.accessToken
+    if (this.networkRefresh?.token === token) return
+    // TunnelService owns connection state and cancels obsolete sessions. A slow
+    // network refresh must not hold confirmed account facts or queue duplicates.
+    const pending = (async () => {
+      try { await this.setNetwork(access) }
+      catch (error) {
+        if (this.session?.accessToken !== token || this.controller.signal.aborted) return
+        try { this.logFailure?.('account-network-sync-failed', safeExceptionName(error)) }
+        catch { /* Logging cannot replace the confirmed account view. */ }
+      }
+    })().finally(() => { if (this.networkRefresh?.pending === pending) this.networkRefresh = undefined })
+    this.networkRefresh = { token, pending }
   }
 
   authenticate(mode: 'register' | 'login', username: string, password: string, onRecovery: (code: string) => void = () => undefined,
@@ -694,27 +704,6 @@ export class AccountClient {
     }
   }
 
-  captureDownloadReport(passive = false): (task: DownloadTaskSnapshot | undefined) => void {
-    const session = this.view.state === 'signed-in' ? this.session : null
-    return (task) => {
-      if (!task || !session || this.session?.accessToken !== session.accessToken || this.view.state !== 'signed-in') return
-      const previous = this.downloadReports.get(task.taskId)
-      // Merely viewing an old local download must not attribute it to the next customer.
-      if (passive && previous?.token !== session.accessToken) return
-      const resource = loadCatalog().resources.find((r) => r.id === task.resourceId)
-      const software = resource?.software.toLowerCase()
-      if (!resource || (software !== 'hermes' && software !== 'codex' && software !== 'claude') || !['macos', 'windows'].includes(resource.platform)) return
-      const signature = `${task.state}:${task.reason}`
-      if (passive && previous?.signature === signature) return
-      this.downloadReports.set(task.taskId, { token: session.accessToken, signature })
-      if (this.downloadReports.size > 100) this.downloadReports.delete(this.downloadReports.keys().next().value!)
-      const failed = !['', 'cancelled', 'existing-installation'].includes(task.reason)
-      const errorCode = failed && /^[a-z][a-z0-9-]{0,79}$/.test(task.reason) ? task.reason : null
-      this.reportInstallation(session, { software, platform: resource.platform === 'macos' ? 'mac' : 'windows',
-        stage: `download-${task.state}`, evidence: 'unknown', errorCode })
-    }
-  }
-
   private reportInstallation(session: AccountSession, report: Pick<InstallationRecord, 'software' | 'platform' | 'stage' | 'evidence' | 'errorCode'>): void {
     const version = (this.installationStates.get(report.software)?.version ?? 0) + 1
     this.installationStates.set(report.software, { token: session.accessToken, state: 'syncing', version })
@@ -931,7 +920,8 @@ export class AccountClient {
         : retryable || ['pending', 'queued', 'provisioning'].includes(usage.state) ? '体验领取记录已保存，开通中，可稍后重试。'
           : usage.state === 'expired' ? '已领取的体验已到期。'
             : usage.state === 'exhausted' ? '已领取的体验流量已用完。'
-              : '已查到体验记录，但暂时无法确认是否可用，请刷新权益后查看。'
+              : usage.state === 'disabled' ? '已领取的体验已停用，请联系客服。'
+                : '已查到体验记录，但暂时无法确认是否可用，请刷新权益后查看。'
     return { ...view, message }
   }) }
 

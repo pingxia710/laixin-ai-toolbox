@@ -26,6 +26,37 @@ const entry = (tag: string, port: number) => ({ tag, protocol: 'socks', settings
 type EntryOutbound = { tag: string; settings?: { servers?: Array<{ port?: number }> } }
 const asEntry = (outbound: { tag: string }): EntryOutbound => outbound as EntryOutbound
 
+it('专用复验仅走内部回环入口，不改客户入口的回显和分流规则', () => {
+  const options = { listenPort: 18080, upstream: undefined, outbounds: [entry('a', 7001), entry('b', 7002)], routes,
+    verifyUrl: 'http://echo.example/ip' }
+  const baseline = buildXrayConfig(options)
+  const config = buildXrayConfig({ ...options, dedicatedProbePort: 18081 })
+  expect(config.inbounds[1]).toMatchObject({ tag: 'dedicated-probe', listen: '127.0.0.1', port: 18081 })
+  expect(config.routing.rules[0]).toEqual({ type: 'field', inboundTag: ['dedicated-probe'], balancerTag: 'dedicated' })
+  expect(config.routing.rules.slice(1)).toEqual(baseline.routing.rules)
+  expect(config.outbounds).toEqual(baseline.outbounds)
+  expect(config.observatory).toEqual(baseline.observatory)
+  const single = buildXrayConfig({ ...options, outbounds: [entry('a', 7001)], dedicatedProbePort: 18081 })
+  expect(single.inbounds).toHaveLength(1)
+})
+
+it('专用组回显没有 IP，但真实后备 HTTP 可达时仍通过复验', async () => {
+  const dataDir = makeTempDir('dedicated-probe-fallback-')
+  const target = await startFakeHttpMarker('reachable-without-ip')
+  const upstream = await startFakeSocks5Server({ 'echo.invalid:80': ['127.0.0.1', target.port],
+    'probe.invalid:80': ['127.0.0.1', target.port] })
+  const bridge = createLocalBridge({ listenPort: 0, dataDir, routes, upstream: undefined,
+    outbounds: [entry('a', upstream.port), entry('b', upstream.port)],
+    verifyUrl: 'http://echo.invalid/ip', probeUrls: ['http://probe.invalid/'], verifyTimeoutMs: 500 })
+  try {
+    await bridge.listen()
+    expect(bridge.verifyDedicated).toBeTypeOf('function')
+    await expect(bridge.verifyDedicated!()).resolves.toBeUndefined()
+    expect(upstream.hits().some((hit) => hit.host === 'echo.invalid')).toBe(true)
+    expect(upstream.hits().some((hit) => hit.host === 'probe.invalid')).toBe(true)
+  } finally { await bridge.close(); await upstream.close(); await target.close(); removeTempDir(dataDir) }
+})
+
 describe('CH-1 · 三类域名在内核规则表里指向专用出站', () => {
   it('单节点配置:专用域名规则指向 dedicated 出站,先于 geosite:cn 与显式直连', () => {
     expect(dedicatedSuffixes.length, '基础分流表必须带有专用后缀').toBeGreaterThan(0)

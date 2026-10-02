@@ -73,6 +73,7 @@ export interface DaemonState {
   readonly code: string
   readonly message: string
   readonly exitIp?: string
+  readonly pathVerified?: boolean
   readonly lastVerifiedAt?: number
   /** 本次实际监听的入口端口(系统代理指向它)。 */
   readonly bridgePort?: number
@@ -121,9 +122,11 @@ export interface ManagedAdapter extends SettingsAdapter {
 }
 
 export interface LocalBridge {
+  restrict?(targets: readonly string[] | undefined): void
   verify?(): Promise<{ exitIp: string }>
   /** 回显失败后的第二意见:通用探测点经通道可达即 resolve。 */
   probeReachability?(): Promise<unknown>
+  verifyDedicated?(): Promise<void>
   listen(): Promise<void> | void
   close(): Promise<void> | void
   isAlive?(): boolean
@@ -134,6 +137,7 @@ export interface LocalBridge {
 }
 
 export interface DaemonOptions {
+  readonly probeApiNetwork?: typeof import('./api-network-continuation.mjs').probeApiNetwork
   readonly dataDir: string
   readonly runId?: string
   readonly clock: DaemonClock

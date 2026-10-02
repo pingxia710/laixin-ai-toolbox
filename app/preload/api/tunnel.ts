@@ -29,6 +29,7 @@ export interface TunnelStatusView {
   readonly backend: string
   readonly nodeLabel: string
   readonly exitIp: string
+  readonly pathVerified?: boolean
   /** 这一刻走的哪条路:来信通道 / 复用电脑上已有外网 / 未连接。界面按它说话,⛔ 猜。 */
   readonly pathSource: '' | 'laixin' | 'reused'
   readonly lastVerifiedAt: string

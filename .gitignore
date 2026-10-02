@@ -107,3 +107,11 @@ sidecar/win/xray-runner.d.mts
 # 本地运行状态与演示数据
 evidence/
 sidecar/mac/bin/
+sidecar/mac/api-destination-gate.mjs
+sidecar/mac/api-destination-gate.d.mts
+sidecar/mac/api-network-continuation.mjs
+sidecar/mac/api-network-continuation.d.mts
+sidecar/win/api-destination-gate.mjs
+sidecar/win/api-destination-gate.d.mts
+sidecar/win/api-network-continuation.mjs
+sidecar/win/api-network-continuation.d.mts

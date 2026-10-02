@@ -184,20 +184,39 @@ function httpConnectTunnel(proxyHost, proxyPort, targetHost, targetPort, timeout
   return new Promise((resolve, reject) => {
     const socket = netConnect({ host: proxyHost, port: proxyPort })
     let buffer = ''
-    const fail = (message) => { socket.destroy(); reject(new ConnectorError(CONTROL_CODES.upstreamUnreachable, message)) }
+    let settled = false
+    const cleanup = () => {
+      clearTimeout(timer)
+      socket.off('error', onError)
+      socket.off('connect', onConnect)
+      socket.off('data', onData)
+      socket.off('end', onEnd)
+      socket.off('close', onEnd)
+    }
+    const fail = (message) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      socket.destroy()
+      reject(new ConnectorError(CONTROL_CODES.upstreamUnreachable, message))
+    }
     const timer = setTimeout(() => fail('现有代理 CONNECT 超时'), timeoutMs)
-    socket.once('error', () => { clearTimeout(timer); fail('现有代理连接失败') })
-    socket.once('connect', () => { socket.write(`CONNECT ${targetHost}:${String(targetPort)} HTTP/1.1\r\nHost: ${targetHost}:${String(targetPort)}\r\n\r\n`) })
-    socket.on('data', (chunk) => {
+    const onError = () => fail('现有代理连接失败')
+    const onEnd = () => fail('现有代理 CONNECT 提前结束')
+    const onConnect = () => { socket.write(`CONNECT ${targetHost}:${String(targetPort)} HTTP/1.1\r\nHost: ${targetHost}:${String(targetPort)}\r\n\r\n`) }
+    const onData = (chunk) => {
       buffer += chunk.toString('latin1')
       const end = buffer.indexOf('\r\n\r\n')
       if (end < 0) { if (buffer.length > 8192) fail('现有代理应答异常'); return }
-      clearTimeout(timer)
-      socket.removeAllListeners('data')
       const status = Number.parseInt(buffer.split(' ')[1] ?? '', 10)
-      if (status >= 200 && status < 300) resolve(socket)
+      if (status >= 200 && status < 300) { settled = true; cleanup(); resolve(socket) }
       else fail(`现有代理拒绝 CONNECT(${String(status)})`)
-    })
+    }
+    socket.once('error', onError)
+    socket.once('connect', onConnect)
+    socket.on('data', onData)
+    socket.once('end', onEnd)
+    socket.once('close', onEnd)
   })
 }
 
@@ -231,7 +250,7 @@ async function httpResponseOverSocket(transport, target, timeoutMs, isAcceptable
       })
       const timer = setTimeout(() => req.destroy(new Error('PROBE_TIMEOUT')), timeoutMs)
       req.on('error', fail)
-      req.on('close', () => clearTimeout(timer))
+      req.on('close', () => { clearTimeout(timer); fail() })
       req.end()
     })
   } finally {
@@ -267,7 +286,7 @@ export async function verifyThroughProxy(port, verifyUrl, timeoutMs = 10_000) {
       })
       const timer = setTimeout(() => req.destroy(new Error('VERIFY_TIMEOUT')), Math.max(1, deadline - Date.now()))
       req.on('error', fail)
-      req.on('close', () => clearTimeout(timer))
+      req.on('close', () => { clearTimeout(timer); fail() })
       req.end()
     })
   } finally {

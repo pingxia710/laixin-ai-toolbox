@@ -35,7 +35,7 @@ async function control(state, action) {
   const nonce = randomBytes(16).toString('hex')
   const response = await fetch(`http://127.0.0.1:${runtime.port}/_laixin/router/${action}${action === 'ready' ? `?nonce=${nonce}` : ''}`, {
     method: action === 'ready' ? 'GET' : 'POST',
-    headers: action === 'ready' ? undefined : {
+    headers: {
       'x-laixin-nonce': nonce,
       'x-laixin-proof': proof(state.codexMultiRelay.identitySecret, action, nonce, runtime.bootId, runtime.port)
     }, signal: AbortSignal.timeout(2000)

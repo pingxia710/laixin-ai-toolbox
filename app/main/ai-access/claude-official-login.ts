@@ -77,12 +77,26 @@ export function startClaudeLogin(command: ClaudeLoginCommand, options: StartClau
   const completed = new Promise<boolean>((done) => { resolveCompletion = done })
   const timer = setTimeout(() => finish(false), options.timeoutMs ?? 10 * 60_000)
 
+  function openAuthorization(candidates: readonly string[]): void {
+    if (finished || cancelled || url !== undefined) return
+    const found = candidates.find((candidate) => validClaudeAuthUrl(candidate))
+    if (!found) return
+    url = found
+    clearTimeout(fallbackTimer)
+    void options.openExternal(found).catch(() => finish(false))
+  }
+
   /** 兜底必须在会话还活着的时候开：开晚了客户授权完拿到码，已经没有地方粘。 */
   function openFallback(): void {
     if (finished || cancelled || url !== undefined || fallbackCandidate === undefined) return
-    url = fallbackCandidate
+    const opening = fallbackCandidate
+    url = opening
     clearTimeout(fallbackTimer)
-    void options.openExternal(fallbackCandidate).catch(() => undefined)
+    void options.openExternal(opening).catch(() => {
+      if (finished || cancelled || url !== opening) return
+      url = undefined
+      openAuthorization(buffer.match(URL_PATTERN) ?? [])
+    })
   }
   // 保险计时：CLI 万一一直不问码，几秒内兜底；每出现一条新的域名命中就重新计时——
   // 真正的授权链接可能还在后面（docs-first 就是这个顺序）。
@@ -109,14 +123,7 @@ export function startClaudeLogin(command: ClaudeLoginCommand, options: StartClau
     if (bytes > 1_048_576) { finish(false); return }
     buffer = (buffer + chunk.toString('utf8').replace(ANSI, '')).slice(-8_000)
     const candidates = buffer.match(URL_PATTERN) ?? []
-    if (url === undefined) {
-      const found = candidates.find((candidate) => validClaudeAuthUrl(candidate))
-      if (found) {
-        url = found
-        clearTimeout(fallbackTimer)
-        void options.openExternal(found).catch(() => finish(false))
-      }
-    }
+    openAuthorization(candidates)
     for (const candidate of candidates) {
       if (!validClaudeDomainUrl(candidate)) continue
       // 只在候选真的变了的时候重设计时。真实 CLI 挂在伪终端上持续刷新（转圈、“等待授权中…”），

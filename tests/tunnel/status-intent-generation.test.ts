@@ -37,7 +37,7 @@ it('同 runId 新连接/断开意图未落盘时不沿用旧状态，并保留�
 
   // 同一常驻进程上一轮的意图与已连状态匹配，不能误压成“连接中”。
   const connected = { state: 'connected', runId: 'same-run',
-    intentToken: 'previous', exitIp: '203.0.113.1', lastVerifiedAt: Date.parse('2026-10-01T00:00:00Z') }
+    intentToken: 'previous', exitIp: '203.0.113.1', pathVerified: true, lastVerifiedAt: Date.parse('2026-10-01T00:00:00Z') }
   writeFileAtomic(layout.state(dataDir), `${JSON.stringify(connected)}\n`)
   writeFileAtomic(layout.intent(dataDir), `${JSON.stringify({ desired: 'connected', sessionToken: 'previous' })}\n`)
   expect(service.status().state).toBe('已连')
@@ -48,6 +48,7 @@ it('同 runId 新连接/断开意图未落盘时不沿用旧状态，并保留�
   expect(nextToken).not.toBe('previous')
   expect(service.status().state).toBe('连接中')
   expect(service.status().exitIp).toBe('')
+  expect(service.status().pathVerified).toBe(false)
 
   // 守护后来把本轮状态落盘后，应恢复显示真实“已连”。
   writeFileAtomic(layout.state(dataDir), `${JSON.stringify({ ...connected, intentToken: nextToken })}\n`)
@@ -63,6 +64,7 @@ it('同 runId 新连接/断开意图未落盘时不沿用旧状态，并保留�
   expect(service.status().state).toBe('断开中')
   expect(service.status().exitIp).toBe('')
   expect(service.status().unrestored).toBe('')
+  expect(service.status().pathVerified).toBe(false)
   expect(reports).toHaveLength(0)
   const internal = service as unknown as { pausedAccount?: string }
   internal.pausedAccount = 'temporarily-unavailable'

@@ -1,11 +1,48 @@
 import { safeStorage } from 'electron'
 import { readFile, lstat } from 'node:fs/promises'
 import { join } from 'node:path'
-import { isProviderModelAllowed, modelProviderIds, providerShellContract } from '../../shared/model-providers'
+import { isProviderModelAllowed, isProviderShellSupported, modelProviderIds, normalizeProviderModel, providerShellContract } from '../../shared/model-providers'
 import type { AiAccessState, CodexMultiModelPoolEntry } from './service'
-import type { MultiModelGatewayRoute } from './gateway'
+import type { GatewayRoute, MultiModelGatewayRoute } from './gateway'
 
 export interface AiRouterBinding { readonly port: number; readonly identitySecret: string }
+
+export function routerBinding(state: AiAccessState): AiRouterBinding | undefined {
+  const binding = state.codexMultiRelay
+  return binding && Number.isInteger(binding.port) && binding.port >= 1024 && binding.port <= 65535 &&
+    /^[a-f0-9]{64}$/.test(binding.identitySecret) ? binding : undefined
+}
+
+/** An empty keyed listener is needed while the GUI commits a first connection transaction. */
+export function routerConfigured(state: AiAccessState): boolean {
+  const relay = state.relay
+  return routerBinding(state) !== undefined && (activeRouterRoute(state) !== undefined ||
+    relay !== undefined && Number.isInteger(relay.port) && relay.port >= 1024 && relay.port <= 65535 && /^[a-f0-9]{64}$/.test(relay.token))
+}
+
+export type RouterRouteResolver = (shell: GatewayRoute['shell'], provider: GatewayRoute['provider']) => { endpoint: string; model: string }
+
+export function activeSingleRouterRoutes(state: AiAccessState, resolve?: RouterRouteResolver): readonly GatewayRoute[] {
+  if (!state.relay || !/^[a-f0-9]{64}$/.test(state.relay.token)) return []
+  return (['codex', 'claude', 'hermes'] as const).flatMap(shell => {
+    const provider = state.selected?.[shell]
+    if (!modelProviderIds.includes(provider as GatewayRoute['provider']) ||
+      !state.relayShells?.includes(shell) || state.pendingShells?.includes(shell) ||
+      shell === 'codex' && state.codexMode === 'multi') return []
+    const id = provider as GatewayRoute['provider']
+    if (!isProviderShellSupported(id, shell)) return []
+    const key = state.shellKeys?.[shell]?.[id]
+    if (!key || !/^[A-Za-z0-9._-]{16,512}$/.test(key)) return []
+    const contract = providerShellContract(id, shell)
+    if (contract.status !== 'supported') return []
+    const resolved = resolve?.(shell, id)
+    const stored = state.shellModels?.[shell]?.[id]
+    const model = (stored === undefined ? undefined : normalizeProviderModel(id, shell, stored)) ??
+      (resolved === undefined ? undefined : normalizeProviderModel(id, shell, resolved.model)) ?? contract.defaultModel
+    if (!isProviderModelAllowed(id, shell, model)) return []
+    return [{ shell, provider: id, model, key, endpoint: resolved?.endpoint ?? contract.endpoint }]
+  })
+}
 
 /** The router reads the encrypted business state directly and fails closed without rewriting it. */
 export async function readRouterBusinessState(root: string): Promise<AiAccessState> {
