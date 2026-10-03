@@ -5,7 +5,8 @@ import { join } from 'node:path'
 
 const command = vi.hoisted(() => ({
   calls: [] as { file: string; args: string[]; timeout: number }[], loaded: false, xml: '', bootoutError: false, powershellError: false,
-  taskState: 'missing' as 'missing' | 'present', queryError: false, deleteMissing: false
+  taskState: 'missing' as 'missing' | 'present', queryError: false, deleteMissing: false, registerAccessDenied: false,
+  existingAction: undefined as { execute: string; arguments: string; workingDirectory: string; runLevel: string } | undefined
 }))
 vi.mock('node:child_process', () => ({
   execFile: (file: string, args: string[], options: { timeout: number }, callback: (error: Error | null, stdout?: string, stderr?: string) => void) => {
@@ -17,9 +18,14 @@ vi.mock('node:child_process', () => ({
     if (file === 'powershell.exe') {
       if (args.join(' ').includes('Get-ScheduledTask')) {
         if (command.queryError) { callback(new Error('fixture task query failure')); return }
+        if (args.join(' ').includes('ConvertTo-Json')) {
+          callback(null, command.existingAction ? JSON.stringify(command.existingAction) : '', '')
+          return
+        }
         callback(null, JSON.stringify({ exists: command.taskState === 'present' }), '')
         return
       }
+      if (command.registerAccessDenied) { callback(new Error('Access is denied. 0x80070005')); return }
       if (command.powershellError) { callback(new Error('sharing violation')); return }
       const path = join(command.xml, 'ai-router-task.xml')
       void readFile(path).then(bytes => { command.xml = bytes.toString('utf16le'); callback(null, '', '') }, error => callback(error as Error))
@@ -36,7 +42,8 @@ import { RESIDENT_LABEL, RESIDENT_TASK } from '../../app/main/tunnel/platform/re
 let root = ''
 afterEach(async () => {
   command.calls.length = 0; command.loaded = false; command.xml = ''; command.bootoutError = false; command.powershellError = false
-  command.taskState = 'missing'; command.queryError = false; command.deleteMissing = false
+  command.taskState = 'missing'; command.queryError = false; command.deleteMissing = false; command.registerAccessDenied = false
+  command.existingAction = undefined
   if (root) await rm(root, { recursive: true, force: true }); root = ''
 })
 const managedDefinitionMaxBytes = 128 * 1024
@@ -57,11 +64,13 @@ describe('独立 AI router 常驻安装和停止命令', () => {
     expect(command.calls.every(call => call.timeout === 8000)).toBe(true)
   })
 
-  it('Windows 只注册当前用户独立任务，XML 为 UTF-16LE 并逐次有界', async () => {
+  it('Windows 只注册当前用户独立任务，不使用普通权限会被拒绝的登录触发器', async () => {
     root = await mkdtemp(join(tmpdir(), 'laixin-router-task-'))
     command.xml = root
     await installAiRouterResident({ executable: 'C:\\Program Files\\Laixin\\Laixin.exe', logDir: root }, 'win32')
-    expect(command.xml).toContain('<LogonTrigger>')
+    expect(command.xml).toContain('<TimeTrigger>')
+    expect(command.xml).toContain('<Interval>PT1M</Interval>')
+    expect(command.xml).not.toContain('<LogonTrigger>')
     expect(command.xml).toContain('<RestartOnFailure>')
     expect(command.xml).toContain('&quot;--laixin-ai-router&quot;')
     await wakeAiRouterResident('win32')
@@ -70,6 +79,52 @@ describe('独立 AI router 常驻安装和停止命令', () => {
     expect(command.calls.some(call => call.file === 'schtasks.exe' && call.args.join(' ').includes(AI_ROUTER_TASK))).toBe(true)
     expect(command.calls.map(call => call.args.join(' ')).join('\n')).not.toContain(RESIDENT_TASK)
     expect(command.calls.every(call => call.timeout === 8000)).toBe(true)
+  })
+
+  it('Windows 普通权限无法覆盖管理员已建任务时，只接管完全相同的启动动作', async () => {
+    root = await mkdtemp(join(tmpdir(), 'laixin-router-task-adopt-'))
+    command.xml = root
+    command.registerAccessDenied = true
+    command.existingAction = {
+      execute: 'C:\\Program Files\\Laixin\\Laixin.exe',
+      arguments: '"--laixin-ai-router"',
+      workingDirectory: root,
+      runLevel: 'LeastPrivilege'
+    }
+
+    await expect(installAiRouterResident({ executable: command.existingAction.execute, logDir: root }, 'win32'))
+      .resolves.toBeUndefined()
+    expect(command.calls.some(call => call.args.join(' ').includes('ConvertTo-Json'))).toBe(true)
+  })
+
+  it('Windows 普通权限不能覆盖且存量任务不同时，返回可识别的权限错误', async () => {
+    root = await mkdtemp(join(tmpdir(), 'laixin-router-task-denied-'))
+    command.xml = root
+    command.registerAccessDenied = true
+    command.existingAction = {
+      execute: 'C:\\Old\\Laixin.exe',
+      arguments: '"--laixin-ai-router"',
+      workingDirectory: root,
+      runLevel: 'LeastPrivilege'
+    }
+
+    await expect(installAiRouterResident({ executable: 'C:\\Program Files\\Laixin\\Laixin.exe', logDir: root }, 'win32'))
+      .rejects.toThrow('AI_ROUTER_RESIDENT_TASK_PERMISSION_DENIED')
+  })
+
+  it('Windows 受保护任务即使启动动作相同，也不接管高权限定义', async () => {
+    root = await mkdtemp(join(tmpdir(), 'laixin-router-task-elevated-'))
+    command.xml = root
+    command.registerAccessDenied = true
+    command.existingAction = {
+      execute: 'C:\\Program Files\\Laixin\\Laixin.exe',
+      arguments: '"--laixin-ai-router"',
+      workingDirectory: root,
+      runLevel: 'Highest'
+    }
+
+    await expect(installAiRouterResident({ executable: command.existingAction.execute, logDir: root }, 'win32'))
+      .rejects.toThrow('AI_ROUTER_RESIDENT_TASK_PERMISSION_DENIED')
   })
 
   it('Windows 计划任务替换失败时报错并删除临时 XML，不触碰网络任务', async () => {

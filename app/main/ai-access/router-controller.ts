@@ -106,7 +106,10 @@ export class AiRouterController {
       try {
         this.residentInstallation ??= installAiRouterResident(this.spec).finally(() => { this.residentInstallation = undefined })
         await this.residentInstallation
-      } catch { return undefined }
+      } catch (error) {
+        if (error instanceof Error && error.message === 'AI_ROUTER_RESIDENT_TASK_PERMISSION_DENIED') throw error
+        return undefined
+      }
       // Updating a resident definition may replace its process; never reuse the pre-install proof.
       current = await this.probe(state)
     }

@@ -9,7 +9,7 @@ export type ApiFailure =
   | 'coding_plan_expired' | 'coding_plan_quota_exhausted' | 'coding_plan_model_unavailable' | 'coding_plan_key_product_mismatch'
   | 'request_invalid' | 'content_too_long' | 'provider_outage' | 'upstream_error' | 'network_error'
   | 'client_aborted' | 'timeout' | 'invalid_reply' | 'tool_call_failed' | 'response_truncated' | 'configuration_failed'
-  | 'configuration_rollback_failed' | 'configuration_interrupted' | 'port_unavailable' | 'local_service_down' | 'local_service_start_failed' | 'local_service_busy'
+  | 'configuration_rollback_failed' | 'configuration_interrupted' | 'port_unavailable' | 'local_service_down' | 'local_service_start_failed' | 'local_service_permission_denied' | 'local_service_busy'
   | 'not_configured' | 'key_missing' | 'shell_version_incompatible' | 'unknown'
 export interface ApiCheck {
   readonly shell: ApiShell
@@ -149,6 +149,7 @@ export const apiFailureMessages: Record<ApiFailure, string> = {
   port_unavailable: '本机 API 服务端口被占用，请关闭占用程序后重试。',
   local_service_down: '工具箱的本机 API 服务没有在运行，AI 现在连不上，请重启本机 API 服务。',
   local_service_start_failed: '工具箱的本机 API 服务启动失败，请重启工具箱；仍失败请把诊断结果复制给客服。',
+  local_service_permission_denied: 'Windows 中已有一个当前用户无法接管的模型 API 后台任务。请以管理员身份运行一次工具箱完成更新；仍失败请把诊断结果复制给客服。',
   local_service_busy: '工具箱本机同时处理的请求较多，请稍候重试',
   not_configured: '尚未启用本机 API 路由，请先在模型 API 中启用。',
   key_missing: '请先添加这个入口对应的 Key。',
@@ -336,6 +337,7 @@ export const apiFailureRemedy: Readonly<Record<ApiFailure, ApiRemedyAction | nul
   port_unavailable: 'restartGateway',
   local_service_down: 'restartGateway',
   local_service_start_failed: null,
+  local_service_permission_denied: null,
   local_service_busy: 'retest',
   not_configured: 'reapply',
   key_missing: 'openConsole',
