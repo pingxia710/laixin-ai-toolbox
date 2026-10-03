@@ -70,6 +70,33 @@ describe('路由刷新复用已校准常驻定义', () => {
     expect(ensureReady).toHaveBeenCalledTimes(1)
   })
 
+  it('Windows 后台任务被系统拒绝时保留明确故障码，不压成笼统的本机服务失败', async () => {
+    const f = await fixture()
+    const state: AiAccessState = { ...f.state, migrations: { api15rD: 1 }, selected: { codex: 'deepseek' },
+      relayShells: ['codex'], shellKeys: { codex: { deepseek: 'sk-fixture-0123456789012345' } } }
+    vi.mocked(installAiRouterResident).mockRejectedValueOnce(new Error('AI_ROUTER_RESIDENT_TASK_PERMISSION_DENIED'))
+    const service = new AiAccessService({ read: async () => state, write: async () => undefined },
+      aiAccessShells.map(shell => ({ shell, applyDeepSeek: async () => undefined })), new AiGateway(), { independentRouting: true }, f.controller)
+
+    await service.initialize()
+
+    expect(await service.serviceStatus()).toMatchObject({ running: false, startupError: 'local_service_permission_denied' })
+  })
+
+  it('Windows 多模型路由在同一任务权限失败时也保留明确故障码', async () => {
+    const f = await fixture()
+    const state: AiAccessState = { ...f.state, migrations: { api15rD: 1 }, codexMode: 'multi',
+      codexMultiModelPool: [{ provider: 'deepseek', model: 'deepseek-flash', internalModelId: 'laixin.deepseek.deepseek-flash' }],
+      shellKeys: { codex: { deepseek: 'sk-fixture-0123456789012345' } } }
+    vi.mocked(installAiRouterResident).mockRejectedValueOnce(new Error('AI_ROUTER_RESIDENT_TASK_PERMISSION_DENIED'))
+    const service = new AiAccessService({ read: async () => state, write: async () => undefined },
+      aiAccessShells.map(shell => ({ shell, applyDeepSeek: async () => undefined })), new AiGateway(), { independentRouting: true }, f.controller)
+
+    await service.initialize()
+
+    expect(await service.serviceStatus()).toMatchObject({ running: false, startupError: 'local_service_permission_denied' })
+  })
+
   it('同一可信路由重复刷新只安装一次，仍逐次发送签名刷新', async () => {
     const f = await fixture()
     for (let index = 0; index < 3; index++) expect(await f.controller.refresh(f.state)).toBe(true)

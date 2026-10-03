@@ -173,6 +173,7 @@ export interface AiAccessStatus {
 const keyPattern = /^[A-Za-z0-9._-]{16,512}$/
 function gatewayFailureCode(error: unknown): ApiFailure {
   if (error instanceof Error && error.message === 'AI_ACCESS_STATE_WRITE_FAILED') return 'configuration_failed'
+  if (error instanceof Error && error.message === 'AI_ROUTER_RESIDENT_TASK_PERMISSION_DENIED') return 'local_service_permission_denied'
   return error instanceof Error && (error as NodeJS.ErrnoException).code === 'EADDRINUSE'
     ? 'port_unavailable' : 'local_service_start_failed'
 }
@@ -1093,7 +1094,9 @@ export class AiAccessService {
           try { await this.ensureGateway(state) } catch (error) { this.startupError = gatewayFailureCode(error) }
         } else this.updateRoutes(state)
         if (this.multiRouter && state.codexMode === 'multi' && state.codexMultiModelPool?.length) {
-          if (!(await this.multiRouter.ensureReady(state, true))) this.startupError = 'local_service_down'
+          try {
+            if (!(await this.multiRouter.ensureReady(state, true))) this.startupError = 'local_service_down'
+          } catch (error) { this.startupError = gatewayFailureCode(error) }
         }
       } catch { this.startupError = 'configuration_failed' }
     })
