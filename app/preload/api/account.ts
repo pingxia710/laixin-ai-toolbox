@@ -1,10 +1,14 @@
 import { ipcRenderer } from 'electron'
 import { IPC_CHANNEL } from '../../bridge-protocol'
+import type { WechatPanelMode } from '../../account-types'
 
 export interface AccountApi {
   status(): Promise<{ snapshot: string }>
   login(input: { username: string; password: string; inviteCode: string }): Promise<{ snapshot: string; recoveryCode: string }>
   wechatLogin(input: { mode: 'login' | 'bind' }): Promise<{ snapshot: string; recoveryCode: string }>
+  wechatInlineLogin(): Promise<{ snapshot: string; recoveryCode: string }>
+  wechatPanelBounds(input: { bounds: string }): Promise<void>
+  wechatPanelMode(): Promise<{ mode: WechatPanelMode }>
   cancelWechatLogin(): Promise<{ cancelled: boolean }>
   register(input: { username: string; password: string; inviteCode: string }): Promise<{ snapshot: string; recoveryCode: string }>
   recover(input: { username: string; password: string; recoveryCode: string }): Promise<{ snapshot: string; recoveryCode: string }>
@@ -32,6 +36,9 @@ export const api: AccountApi = {
   status: () => ipcRenderer.invoke(IPC_CHANNEL, 'account.status', undefined),
   login: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'account.login', input),
   wechatLogin: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'account.wechatLogin', input),
+  wechatInlineLogin: () => ipcRenderer.invoke(IPC_CHANNEL, 'account.wechatInlineLogin', undefined),
+  wechatPanelBounds: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'account.wechatPanelBounds', input),
+  wechatPanelMode: () => ipcRenderer.invoke(IPC_CHANNEL, 'account.wechatPanelMode', undefined),
   cancelWechatLogin: () => ipcRenderer.invoke(IPC_CHANNEL, 'account.cancelWechatLogin', undefined),
   register: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'account.register', input),
   recover: (input) => ipcRenderer.invoke(IPC_CHANNEL, 'account.recover', input),

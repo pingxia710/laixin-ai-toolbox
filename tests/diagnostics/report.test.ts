@@ -12,11 +12,16 @@ it('网络修复进入客服摘要，只选取展示字段，不输出连接令�
 })
 
 describe('一键诊断文本', () => {
+  it('复制诊断带恢复检查次数、已证实原因与最终读回结果', () => {
+    const detail = '已重试 2 次；原设置已读回确认；上次原因：端口查询超时'
+    expect(buildDiagnosticsText({ collectedAt: 'now', errors: [], tunnel: { recoveryDetail: detail } }))
+      .toContain(`最近设置恢复：${detail}`)
+  })
   it('汇总软件、网络、已装 AI、模型接入、余额与更新；从不包含 Key', () => {
     const text = buildDiagnosticsText({
       collectedAt: '2026-09-11 23:00',
       app: { version: '0.4.6', platform: 'darwin', architecture: 'arm64', packaged: true },
-      tunnel: { state: '已连', message: '出口已复验', currentConfig: '版本 3', nodeLabel: 'node-a', exitIp: '203.0.113.8', expiresAt: '2026-10-01', lastVerifiedAt: '23:00', authorization: '已核验', backend: '已接入', unrestored: '', componentMissing: '' },
+      tunnel: { state: '已连', message: '出口已复验', currentConfig: '版本 3', nodeLabel: 'node-a', observedNodeLabel: 'node-b', exitIp: '203.0.113.8', expiresAt: '2026-10-01', lastVerifiedAt: '23:00', authorization: '已核验', backend: '已接入', traffic: '上传 12 KB/秒 · 下载 1.4 MB/秒 · 累计 870 MB', unrestored: '', componentMissing: '' },
       network: { layers: [{ label: '基础网络', state: 'ok', detail: '120ms' }, { label: '通道出口', state: 'fail', detail: '超时' }] },
       shells: [{ id: 'codex', label: 'Codex', installed: true, version: '0.153.4', latest: '0.160.0', updatable: true, location: '/opt/homebrew/bin/codex' }, { id: 'zcode', label: '智谱 ZCode', installed: null, version: '', latest: '' }],
       access: { shells: { codex: { selected: 'deepseek', providerKeys: { deepseek: true, kimi: false } } }, attempt: { shell: 'codex', provider: 'deepseek', ok: false, code: 'shell_version_incompatible', notice: '请安装 2.1.153', at: '2026-09-11T15:00:00Z' } },
@@ -29,7 +34,7 @@ describe('一键诊断文本', () => {
         { at: '2026-09-11T15:05:00Z', version: '0.4.9', network: 'AI_DIAG_TUNNEL_REQUIRED' }
       ]
     })
-    for (const expected of ['0.4.6', '已连', '203.0.113.8', '通道出口：fail 超时', 'Codex：已装 0.153.4 · 最新 0.160.0 · 可更新', '智谱 ZCode：无法判断', 'codex：当前 deepseek · 已存 Key：deepseek', 'shell_version_incompatible 请安装 2.1.153', '运行中 http://127.0.0.1:47000', '812ms', '12.35 CNY', '半价', '最近安装任务：claude-code failed command-failed', '自动更新：开', 'networkdiagnostics.run: timeout', '【最近故障与已试过的处理】', '试过「重新测试」', '仍有问题', 'AI_DIAG_TUNNEL_REQUIRED', 'codex 接入进度：接口测试 2026-09-11T15:00:00Z · 配置已写 2026-09-11T15:00:05Z · 观察到软件调用 尚未观察到']) expect(text).toContain(expected)
+    for (const expected of ['0.4.6', '已连', '配置首节点：node-a', '最近实测节点：node-b', '203.0.113.8', '当前通道流量：上传 12 KB/秒 · 下载 1.4 MB/秒 · 累计 870 MB', '通道出口：fail 超时', 'Codex：已装 0.153.4 · 最新 0.160.0 · 可更新', '智谱 ZCode：无法判断', 'codex：当前 deepseek · 已存 Key：deepseek', 'shell_version_incompatible 请安装 2.1.153', '运行中 http://127.0.0.1:47000', '812ms', '12.35 CNY', '半价', '最近安装任务：claude-code failed command-failed', '自动更新：开', 'networkdiagnostics.run: timeout', '【最近故障与已试过的处理】', '试过「重新测试」', '仍有问题', 'AI_DIAG_TUNNEL_REQUIRED', 'codex 接入进度：接口测试 2026-09-11T15:00:00Z · 配置已写 2026-09-11T15:00:05Z · 观察到软件调用 尚未观察到']) expect(text).toContain(expected)
     expect(text).not.toMatch(/sk-[A-Za-z0-9]/)
   })
   it('什么都没读到也能出一页，不崩', () => {

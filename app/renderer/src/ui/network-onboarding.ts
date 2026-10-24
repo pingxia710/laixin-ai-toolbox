@@ -108,6 +108,7 @@ export function renderNetworkOnboarding(element: HTMLElement, view: NetworkOnboa
     item.dataset.selected = String(step === selectedStep)
     const tab = actionButton('', () => selectStep(step)); tab.className = 'onboarding-step'
     tab.dataset.onboardingStep = String(step)
+    tab.setAttribute('aria-label', `查看第 ${step} 步：${descriptions[step].title}`)
     tab.setAttribute('aria-pressed', String(step === selectedStep))
     tab.setAttribute('aria-controls', 'network-onboarding-content')
     tab.append(textNode('span', String(step), 'onboarding-number'), textNode('span', descriptions[step].label))

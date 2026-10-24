@@ -27,7 +27,8 @@ class Element {
   parent: Element | undefined
   selectionStart: number | null = null; selectionEnd: number | null = null
   private handlers: Record<string, () => void> = {}
-  setAttribute() {}
+  attributes: Record<string, string> = {}
+  setAttribute(name: string, value: string) { this.attributes[name] = value }
   append(...children: Element[]) { for (const child of children) { child.parent = this; this.children.push(child) } }
   remove() { if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this); this.parent = undefined }
   replaceChildren(...children: Element[]) {
@@ -38,6 +39,7 @@ class Element {
     this.append(...children)
   }
   addEventListener(event: string, call: () => void) { this.handlers[event] = call }
+  removeEventListener(event: string) { delete this.handlers[event] }
   contains(node: Element | null): boolean { return node === this || this.children.some((child) => child.contains(node)) }
   focus() { doc().activeElement = this }
   setSelectionRange(start: number, end: number) { this.selectionStart = start; this.selectionEnd = end }
@@ -84,12 +86,140 @@ async function setup(
     const { rememberDiagnosticSession } = await import('../../app/renderer/src/diagnostic-session')
     rememberDiagnosticSession({ id: 'DG-ABCDEF-123456', software: 'codex', checkedAt: Date.now() })
   }
-  const { page } = await import('../../app/renderer/src/pages/tunnel')
+  const tunnel = await import('../../app/renderer/src/pages/tunnel')
+  let stopDetails = () => {}; let stopRepair = () => {}
+  const page: typeof tunnel.page = {
+    ...tunnel.page,
+    mount(host, context) {
+      const main = document.createElement('div'); const advanced = document.createElement('div')
+      const help = document.createElement('details'); help.className = 'network-diagnostics'
+      const software = document.createElement('select'); software.dataset.networkAction = 'repair-report-software'
+      software.value = context.diagnosticSoftware ?? ''
+      const repair = document.createElement('div'); help.append(software, repair)
+      host.replaceChildren(main, help, advanced)
+      tunnel.page.mount(main, context)
+      stopDetails = tunnel.mountTunnelDetails(advanced)
+      stopRepair = tunnel.mountNetworkRepair(repair, help, software)
+    },
+    unmount() { stopRepair(); stopDetails(); tunnel.page.unmount() }
+  }
   const root = new Element(); page.mount(root as unknown as HTMLElement, { tab: 'tunnel' }); cleanup = page.unmount
   await flush()
   return { page, root, status, start, explainRoute, repairStatus, repair, stop, run, runForReport, copy, report, reportIncomplete,
     text: () => root.all().map((node) => node.textContent) }
 }
+
+it('恢复项合并同一原因并默认折叠，轮询保留展开且不吞原始字段', async () => {
+  const reason = '未恢复:失败:代理端口归属暂未确认'
+  const unrestored = `WinINET/ProxyServer:${reason};WinINET/ProxyEnable:${reason}`
+  const status = vi.fn<() => Promise<TunnelStatusView>>().mockResolvedValue({ ...connected, state: '异常', recoveryState: 'required', unrestored })
+  const x = await setup(status)
+  const details = x.root.querySelector('.network-recovery-details')!
+  expect(details).toBeDefined()
+  expect(details.open).toBe(false)
+  const text = details.all().map((node) => node.textContent).join('\n')
+  expect(text.match(/代理端口归属暂未确认/g)).toHaveLength(1)
+  expect(text).toContain('WinINET/ProxyServer')
+  expect(text).toContain('WinINET/ProxyEnable')
+  details.open = true
+  status.mockResolvedValue({ ...connected, state: '异常', recoveryState: 'required', unrestored, lastVerifiedAt: 'new' })
+  await vi.advanceTimersByTimeAsync(2000)
+  expect(x.root.querySelector('.network-recovery-details')!.open).toBe(true)
+})
+
+it('正常时收起帮助；新故障展开；手动收起后轮询不强行展开', async () => {
+  const x = await setup()
+  const help = x.root.querySelector('.network-diagnostics')!
+  expect(help.open).toBe(false)
+  x.status.mockResolvedValue({ ...connected, state: '异常', message: '测试故障' })
+  await vi.advanceTimersByTimeAsync(2000)
+  expect(help.open).toBe(true)
+  expect(x.text().filter(text => text === '测试故障')).toHaveLength(1)
+  help.open = false
+  await vi.advanceTimersByTimeAsync(2000)
+  expect(help.open).toBe(false)
+})
+
+it('设置网络点击时检查权益，领取后不换成账号引导文案', async () => {
+  const x = await setup(vi.fn<() => Promise<TunnelStatusView>>().mockResolvedValue({ ...connected, state: '未配置', currentConfig: '' }))
+  const { accountAction } = await import('../../app/renderer/src/account-state')
+  const account = { state: 'signed-in', account: { id: 'local', username: 'local' }, code: '', message: '', overview: {
+    networkAvailable: true, trial: { available: true, usage: null as unknown }, subscription: null, plans: [], paymentChannels: [], recoveryReady: true
+  } }
+  await accountAction(async () => ({ snapshot: JSON.stringify(account) }))
+  const claimTrial = vi.fn(async () => ({ snapshot: JSON.stringify({ ...account, overview: { ...account.overview,
+    trial: { available: false, usage: { state: 'active' } } } }) }))
+  Object.assign(window.toolbox, { account: { claimTrial } })
+  x.root.querySelector('[data-network-action="primary"]')!.click()
+  await flush()
+  expect(claimTrial).toHaveBeenCalledTimes(1)
+  expect(x.text()).toContain('网络尚未配置')
+  expect(x.text()).toContain('设置网络')
+  expect(x.start).not.toHaveBeenCalled()
+})
+
+it('未配置仍显示圆形电源按钮，不因账号登录或读取失败改变主卡内容和操作', async () => {
+  const x = await setup(vi.fn<() => Promise<TunnelStatusView>>().mockResolvedValue({ ...connected, state: '未配置', currentConfig: '' }))
+  const { accountAction } = await import('../../app/renderer/src/account-state')
+  const cards: string[][] = []
+  for (const state of ['signed-out', 'signed-in', 'unavailable']) {
+    await accountAction(async () => ({ snapshot: JSON.stringify({ state, account: null, overview: null, code: '', message: '' }) }))
+    cards.push(x.root.querySelector('.connection-card')!.all().map(node => node.textContent))
+    const primary = x.root.querySelector('[data-network-action="primary"]')!
+    expect(primary.disabled).toBe(false)
+    expect(primary.className.split(' ')).toContain('power-button')
+    expect(primary.querySelector('.icon')?.textContent).toBe('◉')
+    expect(primary.attributes['aria-label']).toBe('设置网络')
+    expect(x.root.querySelector('.connection-actions')!.querySelector('small')?.textContent).toBe('设置网络')
+  }
+  expect(cards[0]).toEqual(cards[1])
+  expect(cards[2]).toEqual(cards[1])
+  const status = vi.fn().mockResolvedValue({ snapshot: JSON.stringify({ state: 'unavailable', account: null, overview: null, code: 'UNAVAILABLE', message: '暂时无法读取账号状态' }) })
+  Object.assign(window.toolbox, { account: { status } })
+  x.root.querySelector('[data-network-action="primary"]')!.click()
+  await flush()
+  expect(status).toHaveBeenCalledTimes(1)
+  expect(x.text()).toContain('暂时无法读取账号状态')
+  expect(x.start).not.toHaveBeenCalled()
+})
+
+it('断开完成后清除本次尚未确认提示，不以未知或仍待恢复冒充成功', async () => {
+  const x = await setup()
+  const notice = '断开指令已提交，原网络设置是否恢复尚未确认'
+  x.stop.mockResolvedValue({ outcome: 'stopped', message: notice, code: '' })
+  x.status.mockResolvedValue({ ...connected, state: '异常', recoveryState: 'required', unrestored: 'pending' })
+  x.root.querySelector('[data-network-action="primary"]')!.click()
+  await flush()
+  expect(x.text()).toContain(notice)
+  x.status.mockResolvedValue({ ...disconnected, recoveryState: 'required', unrestored: 'pending' })
+  await vi.advanceTimersByTimeAsync(2000)
+  expect(x.text()).toContain(notice)
+  x.status.mockResolvedValue({ ...disconnected, recoveryState: 'idle' })
+  await vi.advanceTimersByTimeAsync(2000)
+  expect(x.text()).not.toContain(notice)
+})
+
+it('恢复完成不会清除后来生成的诊断复制结果或客服回执', async () => {
+  const x = await setup()
+  x.root.querySelector('[data-network-action="primary"]')!.click()
+  await flush()
+  x.root.querySelector('[data-network-action="repair-report"]')!.click()
+  await flush()
+  x.status.mockResolvedValue(disconnected)
+  await vi.advanceTimersByTimeAsync(2000)
+  expect(x.text()).toContain('已上报，回执号 LX-7K3M-9QZP。把它告诉客服即可。')
+})
+
+it('自动恢复等待不重复诱导点击，恢复摘要留在详情', async () => {
+  const x = await setup(vi.fn<() => Promise<TunnelStatusView>>().mockResolvedValue({ ...connected, state: '异常',
+    recoveryState: 'running', message: '原设置尚未恢复，请重试恢复', unrestored: 'WinINET/ProxyServer:未恢复:失败',
+    recoveryDetail: '检查 2 次，已重试 1 次；正在等待自动重试' }))
+  expect(x.text()).toContain('正在恢复原设置')
+  expect(x.text()).not.toContain('原设置尚未恢复，请重试恢复')
+  expect(x.root.querySelector('[data-network-action="primary"]')!.disabled).toBe(true)
+  expect(x.root.querySelector('.network-recovery-details')!.all().map((node) => node.textContent))
+    .toContain('检查 2 次，已重试 1 次；正在等待自动重试')
+})
 
 it('修复中禁止重复触发，取消始终可用；重进页面按主进程状态恢复', async () => {
   const x = await setup()
@@ -288,17 +418,45 @@ it('分流查询迟到的结果不渲染到重新挂载后的页面', async () =
   cleanup = x.page.unmount
 })
 
-it('分流说明与出口 IP 默认展开，出口 IP 直接显示在连接详情里', async () => {
+it('高级详情默认收起，出口 IP 保留一份且不占主连接卡', async () => {
   const x = await setup(vi.fn<() => Promise<TunnelStatusView>>().mockResolvedValue({ ...connected, exitIp: '203.0.113.7' }))
 
   const extra = x.root.querySelectorAll('.network-extra')[0]
   expect(extra).toBeDefined()
-  expect(extra.open).toBe(true)
+  expect(extra.open).toBe(false)
   expect(extra.all().some((node) => node.dataset.networkRouteInput === 'true')).toBe(true)
 
   const details = x.root.querySelectorAll('.network-details')[0]
   expect(details.all().map((node) => node.textContent)).toContain('203.0.113.7')
   expect(x.text()).not.toContain('已隐藏，可在更多连接信息中查看')
+  expect(x.text().filter(text => text === '203.0.113.7')).toHaveLength(1)
+  expect(x.root.querySelectorAll('.network-shortcuts')).toHaveLength(0)
+})
+
+it('未登录的主按钮直接进入账号并返回网络页，不再绕回仪表盘', async () => {
+  const x = await setup(vi.fn<() => Promise<TunnelStatusView>>().mockResolvedValue({ ...connected, state: '未配置', currentConfig: '' }))
+  const account = await import('../../app/renderer/src/account-state')
+  const entry = vi.spyOn(account, 'requireAccount').mockImplementation(() => undefined)
+  await account.accountAction(async () => ({ snapshot: JSON.stringify({ state: 'signed-out', code: '', message: '', account: null, overview: null }) }))
+  expect(x.text()).toContain('网络尚未配置')
+  expect(x.text()).toContain('设置网络')
+  expect(x.text()).not.toContain('先注册或登录')
+  x.root.querySelector('[data-network-action="primary"]')!.click()
+  expect(entry).toHaveBeenCalledWith('tunnel')
+  entry.mockRestore()
+})
+
+it('上报完成后从其他软件进入，明确指定的软件优先于旧回执的选择', async () => {
+  const x = await setup()
+  x.root.querySelector('[data-network-action="repair-report"]')!.click()
+  await flush()
+  x.page.unmount()
+  x.page.mount(x.root as unknown as HTMLElement, { tab: 'tunnel', diagnosticSoftware: 'hermes' })
+  await flush()
+  expect(x.root.querySelector('[data-network-action="repair-report-software"]')!.value).toBe('hermes')
+  x.root.querySelector('[data-network-action="repair-report"]')!.click()
+  await flush()
+  expect(x.runForReport).toHaveBeenLastCalledWith({ software: 'hermes' })
 })
 
 it('一键上报：⛔ 自动发，只有点了按钮才发；发出去就把回执号摆在客户眼前', async () => {

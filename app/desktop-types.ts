@@ -5,7 +5,7 @@ export interface AiApplicationView {
   version: string
 }
 export interface DesktopPreferences { zoom: number; quotaNotifications: boolean; autoUpdate: boolean }
-export interface DesktopAlert { id: string; kind: 'ai' | 'network'; message: string }
+export interface DesktopAlert { id: string; kind: 'ai' | 'network' | 'resident'; message: string }
 export interface UpdateView {
   state: 'idle' | 'checking' | 'current' | 'available' | 'downloading' | 'ready' | 'installing' | 'error'
   version: string

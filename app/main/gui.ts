@@ -13,6 +13,7 @@ import { registerDesktopActions } from './desktop/bridge'
 import { createMainCrashLog, createRendererRecovery } from './desktop/renderer-recovery'
 import { actionLocalFault } from './bridge/local-fault'
 import { recordFault } from './diagnostics/context'
+import { wechatLoginPanel } from './account/wechat-panel'
 
 // 主进程顶层异常落盘(收敛包3·件3):⛔ 静默丢失。
 const logMainCrash = createMainCrashLog((line) => {
@@ -46,6 +47,7 @@ async function createWindow(): Promise<void> {
     }
   })
   desktop.attach(mainWindow)
+  wechatLoginPanel.attach(mainWindow)
 
   mainWindow.once('ready-to-show', () => mainWindow?.show())
 

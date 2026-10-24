@@ -14,7 +14,7 @@ import {
   RESIDENT_DEFAULT_ENABLED, applyResidentChoice, residentToggleStatus, systemResidentController,
   type ResidentController, type ResidentPreference, type ResidentToggleStatus
 } from './resident-preference'
-import { calibrateResident } from '../tunnel/resident-owner'
+import { calibrateResident, residentCalibrationError } from '../tunnel/resident-owner'
 import { updateConnectOutcome } from '../tunnel/runtime-owner'
 import { resolveTunnelDataDir } from '../tunnel/paths'
 import { readDaemonState } from '../tunnel/status-service'
@@ -190,7 +190,11 @@ export class DesktopRuntime {
   async status(): Promise<DesktopView> {
     await this.readAlerts()
     const preferences = this.store.preferences()
-    return { preferences, backgroundAvailable: !!this.tray, alerts: preferences.quotaNotifications ? this.alerts : [], update: this.updater.status() }
+    const alerts = preferences.quotaNotifications ? [...this.alerts] : []
+    const residentError = app.isPackaged && (this.store.residentChoice() ?? RESIDENT_DEFAULT_ENABLED) ? residentCalibrationError() : ''
+    if (residentError) alerts.push({ id: `resident:${residentError}`, kind: 'resident',
+      message: `网络常驻未生效，无法保障开机或意外退出后的自动接续。当前仍可手动连接，请保持工具箱开启。错误码：${residentError}。点击查看设置或联系客服。` })
+    return { preferences, backgroundAvailable: !!this.tray, alerts, update: this.updater.status() }
   }
 
   configure(zoom: string, quotaNotifications: boolean, autoUpdate: boolean): Promise<DesktopView> {

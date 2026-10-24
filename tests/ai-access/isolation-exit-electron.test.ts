@@ -17,7 +17,7 @@ import type { AiAccessState } from '../../app/main/ai-access/service'
 
 const require = createRequire(import.meta.url)
 const electron = require('electron') as string
-const run = process.platform === 'darwin' ? describe : describe.skip
+const run = process.platform === 'darwin' || process.platform === 'win32' ? describe : describe.skip
 const cleanup: Array<() => void | Promise<void>> = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
 const alive = (pid: number) => { try { process.kill(pid, 0); return true } catch { return false } }

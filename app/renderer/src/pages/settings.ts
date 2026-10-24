@@ -164,8 +164,14 @@ export const page: PageModule = {
     const updates = group('更新')
     const autoLabel = document.createElement('label'); autoLabel.className = 'setting-row'
     const auto = document.createElement('input'); auto.type = 'checkbox'; auto.disabled = true; auto.id = 'auto-update'
+    autoLabel.htmlFor = auto.id
     autoLabel.append(Object.assign(document.createElement('span'), { textContent: '自动下载新版并提醒我' }), auto)
-    updates.append(autoLabel, Object.assign(document.createElement('p'), { className: 'account-note', textContent: '工具箱会定期检查新版本，有新版时自动下载，下载完成后提醒。更新并重启由你点击确认，不会自动断开 AI网络。' }))
+    const updateStatus = document.createElement('p'); updateStatus.setAttribute('role', 'status')
+    const check = button('检查更新', { onClick: () => { void update('checkUpdate') } })
+    const updateActions = document.createElement('div'); updateActions.className = 'action-row'; updateActions.append(check)
+    updates.append(autoLabel,
+      Object.assign(document.createElement('p'), { className: 'account-note', textContent: '工具箱会定期检查新版本，有新版时自动下载，下载完成后提醒。更新并重启由你点击确认，不会自动断开 AI网络。' }),
+      updateStatus, updateActions)
     // 保存进行中:此时三项是被本函数禁用的,⛔ 让轮询把它们提前解禁(客户会在保存途中又改一次)。
     let saving = false
     const configure = async () => {
@@ -265,10 +271,7 @@ export const page: PageModule = {
 
     const about = group('关于')
     const version = document.createElement('p'); version.className = 'settings-version'; version.textContent = '正在读取客户端版本…'
-    const updateStatus = document.createElement('p'); updateStatus.setAttribute('role', 'status')
-    const check = button('检查更新', { onClick: () => { void update('checkUpdate') } })
-    const actions = document.createElement('div'); actions.className = 'action-row'; actions.append(check)
-    about.append(version, updateStatus, actions)
+    about.append(version)
     let clientVersion = ''
     let latestUpdate: UpdateView | undefined
     let updateDialog: HTMLDialogElement | undefined

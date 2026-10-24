@@ -3,7 +3,7 @@
 // ③复用中现有代理失效 → 自动改建来信连接、写入系统设置;④原本直连(没有代理)→ 正常建来信连接。PAC 按不可判定 → 接管。
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { existsSync, readFileSync } from 'node:fs'
-import { createDaemon } from '../../sidecar/win/daemon-core.mjs'
+import { createDaemon, REUSE_PATH_PROBE_TIMEOUT_MS } from '../../sidecar/win/daemon-core.mjs'
 import { createAdapter } from './fixtures/fake-wininet-adapter.mjs'
 import { FakeClock, flushMicrotasks, makeTempDir, removeTempDir, writeIntentFile } from './helpers'
 
@@ -27,7 +27,7 @@ describe('已有可用外网优先复用', () => {
         onLost: () => undefined, verify: async () => ({ exitIp: '203.0.113.6' }) }),
       bridgeFactory: () => ({ listen: async () => undefined, close: async () => undefined, isAlive: () => true, onLost: () => undefined })
     })
-    const view = () => JSON.parse(readFileSync(`${dataDir}/state.json`, 'utf8')) as { state: string; code: string; message: string; reusedProxy?: { host: string; port: number } }
+    const view = () => JSON.parse(readFileSync(`${dataDir}/state.json`, 'utf8')) as { state: string; code: string; message: string; connectStage?: string; reusedProxy?: { host: string; port: number } }
     const registry = () => (existsSync(store) ? JSON.parse(readFileSync(store, 'utf8')) : {}) as Record<string, { data: string }>
     return { daemon, counters, view, registry }
   }
@@ -62,6 +62,21 @@ describe('已有可用外网优先复用', () => {
     expect(h.registry().ProxyServer?.data).toBe('127.0.0.1:18080')
     h.daemon.requestShutdown(); await flushMicrotasks()
     expect(h.registry()).toEqual({})
+  })
+
+  it('②-b 现有代理探测卡住:到首连预算即放弃复用,继续建立来信连接', async () => {
+    const h = harness({ kind: 'http', host: '127.0.0.1', port: 7890 }, () => true)
+    ;(h.daemon as unknown as { probeProxy: () => Promise<never> }).probeProxy = () => new Promise(() => undefined)
+    const run = h.daemon.run()
+    await flushMicrotasks(); await flushMicrotasks()
+    expect(h.view().connectStage).toBe('existing-proxy-probe')
+    clock.advance(REUSE_PATH_PROBE_TIMEOUT_MS)
+    await run
+    expect(h.view().state).toBe('connected')
+    expect(h.view().code).toBe('')
+    expect(h.counters.connectorStarts).toBe(1)
+    expect(h.registry().ProxyServer?.data).toBe('127.0.0.1:18080')
+    h.daemon.requestShutdown(); await flushMicrotasks()
   })
 
   it('③复用中现有代理失效:先待确认,1 秒后确认失效 → 自动改建来信连接、写入系统设置', async () => {

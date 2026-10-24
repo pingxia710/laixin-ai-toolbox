@@ -69,13 +69,13 @@ export function mountAccountOverview(element: HTMLElement, view: AccountView, fr
   trialCard.append(textNode('h4', trialCardTitle(view.terms)))
   paidCard.append(textNode('h4', '付费套餐'))
   if (view.state !== 'signed-in' || !view.overview) {
-    const hint = view.state === 'signed-out' ? '登录后查看' : '暂时无法获取'
+    const hint = from === 'tunnel' ? '暂无数据' : view.state === 'signed-out' ? '登录后查看' : '暂时无法获取'
     renderEmptyUsage(trialCard, hint); renderEmptyUsage(paidCard, hint)
   } else {
     const trial = view.overview.trial
     if (trial.usage) renderUsage(trialCard, trial.usage, view.terms?.plans)
     else renderEmptyUsage(trialCard, trialCardHint(view.terms))
-    if (trial.available || trial.retryable) {
+    if (from !== 'tunnel' && (trial.available || trial.retryable)) {
       const claim = actionButton(trial.usage?.state === 'expired' ? '补发未开通的体验' : trial.usage ? '重试领取配置' : trialClaimLabel(view.terms), () => {
         claim.disabled = true; claim.textContent = '正在开通，请稍候…'; void accountAction(() => window.toolbox.account.claimTrial())
       }, true)
@@ -98,10 +98,29 @@ export function mountAccountOverview(element: HTMLElement, view: AccountView, fr
       }
     }
   }
+  if (from === 'tunnel') {
+    const trial = view.state === 'signed-in' ? view.overview?.trial : undefined
+    const feedback = textNode('p', '', 'account-note'); feedback.setAttribute('role', 'status')
+    const claim = actionButton(trialClaimLabel(view.terms), () => {
+      if (view.state === 'signed-out') { requireAccount(from); return }
+      if (view.state !== 'signed-in' || !view.overview?.networkAvailable) { feedback.textContent = '暂时无法确认体验资格，请刷新流量后重试。'; return }
+      claim.disabled = true; claim.textContent = '正在开通，请稍候…'
+      void accountAction(() => window.toolbox.account.claimTrial())
+    }, true)
+    claim.disabled = Boolean(trial && !trial.available && !trial.retryable)
+    trialCard.append(claim, feedback)
+  }
   const invite = view.state === 'signed-in' ? view.overview?.invite : undefined
-  if (invite) cards.append(renderInviteCard(invite, view))
-  cards.append(trialCard, paidCard); element.append(cards)
-  element.append(textNode('p', '优先使用有效的体验流量；其后是邀请奖励流量，最后自动使用已有的可用付费套餐。各份额度和期限独立计算。', 'account-note'))
+  cards.append(paidCard, trialCard)
+  if (from !== 'tunnel' && invite) cards.append(renderInviteCard(invite, view))
+  element.append(cards)
+  element.append(textNode('p', from === 'tunnel' ? '各份流量的额度和期限独立计算。'
+    : '优先使用有效的体验流量；其后是邀请奖励流量，最后自动使用已有的可用付费套餐。各份额度和期限独立计算。', 'account-note'))
+  mountNetworkPlans(element, view, from)
+}
+
+/** Network controls stay visible; authentication and channel checks run on the chosen action. */
+export function mountNetworkPlans(element: HTMLElement, view: AccountView, from: TabId): void {
   const plans = document.createElement('div'); plans.className = 'account-plans'
   const payChannels: readonly PaymentChannelName[] = view.state === 'signed-in' ? (view.overview?.paymentChannels ?? []) : []
   const canPay = payChannels.length > 0 && view.overview?.networkAvailable === true
@@ -110,7 +129,19 @@ export function mountAccountOverview(element: HTMLElement, view: AccountView, fr
     const row = document.createElement('div'); row.className = 'account-plan'
     const info = document.createElement('div'); info.append(textNode('strong', plan.label), textNode('span', `¥${(plan.priceCents / 100).toFixed(1)} / 月`))
     row.append(info)
-    if (view.state === 'signed-out') row.append(actionButton('购买', () => requireAccount(from, plan.id), true))
+    if (from === 'tunnel') {
+      const feedback = textNode('p', '', 'account-note'); feedback.setAttribute('role', 'status')
+      const payGroup = document.createElement('div'); payGroup.className = 'account-pay-group'
+      const purchase = actionButton('购买', () => {
+        if (view.state === 'signed-out') { requireAccount(from, plan.id); return }
+        if (view.state !== 'signed-in') { feedback.textContent = '暂时无法确认账号状态，请刷新流量后重试。'; return }
+        if (!canPay) { feedback.textContent = '付款暂时不可用，请刷新流量后重试。'; return }
+        if (payChannels.length === 1) { openPaymentDialog(plan, payChannels[0]); return }
+        feedback.textContent = '选择付款方式'
+        payGroup.replaceChildren(...payChannels.map(channel => actionButton(channel === 'alipay' ? '支付宝付款' : '微信付款', () => { openPaymentDialog(plan, channel) }, true)))
+      }, true)
+      row.append(purchase, payGroup, feedback)
+    } else if (view.state === 'signed-out') row.append(actionButton('购买', () => requireAccount(from, plan.id), true))
     else if (canPay) {
       const payGroup = document.createElement('div'); payGroup.className = 'account-pay-group'
       for (const channel of payChannels) {
@@ -125,7 +156,9 @@ export function mountAccountOverview(element: HTMLElement, view: AccountView, fr
     }
     plans.append(row)
   }
-  const planNote = textNode('p', view.state === 'signed-out'
+  const planNote = textNode('p', from === 'tunnel'
+    ? '套餐可重复购买，每笔付款增加一份独立套餐，有效期从付款成功时开始计算。'
+    : view.state === 'signed-out'
     ? '登录后即可购买。每笔付款成功后立即增加一份套餐，有效期从实际付款时间开始计算。'
     : canPay ? '同档和不同档套餐都可重复购买。每笔购买创建新订单；付款成功后套餐立即可用，并从实际付款时间开始计算有效期。'
       : '在线购买暂时无法使用，请稍后刷新或联系来信客服。', 'account-note')

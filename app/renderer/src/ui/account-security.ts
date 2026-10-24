@@ -2,7 +2,7 @@ import type { AccountLogin } from '../../../account-types'
 import { accountAction } from '../account-state'
 import { actionButton, textNode } from './account-overview'
 
-export function mountAccountSecurity(element: HTMLElement): void {
+export function mountAccountSecurity(element: HTMLElement, passwordReady = true): void {
   const security = document.createElement('details'); security.className = 'account-security'
   security.append(textNode('summary', '修改密码与登录设备'))
   const passwordForm = document.createElement('form'); passwordForm.className = 'account-form'
@@ -44,7 +44,8 @@ export function mountAccountSecurity(element: HTMLElement): void {
     finally { loading = false; refresh.disabled = false }
   }
   devices.append(textNode('h3', '登录设备'), refresh, state, list)
-  security.append(passwordForm, devices)
+  if (passwordReady) security.append(passwordForm)
+  security.append(devices)
 
   const close = document.createElement('details'); close.className = 'account-security account-close'
   close.append(textNode('summary', '注销账号'))
@@ -61,7 +62,9 @@ export function mountAccountSecurity(element: HTMLElement): void {
     const input = { password: password.value, confirmed: confirmed.checked }; password.value = ''
     void accountAction(() => window.toolbox.account.closeAccount(input)).finally(() => { remove.disabled = false })
   })
-  close.append(closeForm); element.append(security, close)
+  if (passwordReady) close.append(closeForm)
+  else close.append(textNode('p', '注销需要验证账号归属。请先退出登录，用保存的恢复码在「忘记密码」中设置密码，再登录注销。', 'account-note'))
+  element.append(security, close)
 }
 
 function passwordField(form: HTMLFormElement, label: string, autocomplete: 'current-password' | 'new-password'): HTMLInputElement {

@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import type { CodexCommand } from '../codex-usage/runtime'
 import type { CodexWorkspaceOfficialModel } from './codex-workspace-config'
 import type { CodexWorkspaceSource } from './codex-workspace-sources'
+import { toolboxClientVersion } from '../../shared/client-identity'
 
 export interface CodexWorkspaceLaunchOptions {
   readonly cwd: string
@@ -75,6 +76,7 @@ export async function readCodexWorkspaceOfficialModels(command: CodexCommand, op
 
 /** Test-only callers may provide a temporary CODEX_HOME to verify app-server parsing of a generated catalogue. */
 export async function readCodexWorkspaceModels(command: CodexCommand, options: CodexWorkspaceModelListOptions & { readonly codexHome: string }): Promise<readonly CodexWorkspaceModel[]> {
+  const clientVersion = await toolboxClientVersion()
   const child = spawn(command.executable, [...command.args], {
     cwd: options.cwd,
     env: { ...(options.env ?? process.env), CODEX_HOME: options.codexHome },
@@ -145,7 +147,7 @@ export async function readCodexWorkspaceModels(command: CodexCommand, options: C
       return
     }
   })
-  send({ id: 1, method: 'initialize', params: { clientInfo: { name: 'laixin_codex_workspace', title: '来信 AI 工作窗口', version: '0.5.19' }, capabilities: null } })
+  send({ id: 1, method: 'initialize', params: { clientInfo: { name: 'laixin_codex_workspace', title: '来信 AI 工作窗口', version: clientVersion }, capabilities: null } })
   try {
     return await result
   } finally {
@@ -318,6 +320,7 @@ function nullishString(value: unknown): string | null {
 
 /** Creates and materializes one native Codex thread, then always stops its temporary app-server. */
 export async function launchCodexWorkspaceThread(command: CodexCommand, options: CodexWorkspaceLaunchOptions): Promise<CodexWorkspaceLaunchResult> {
+  const clientVersion = await toolboxClientVersion()
   const child = spawn(command.executable, [...command.args], {
     cwd: options.cwd,
     env: { ...(options.env ?? process.env), CODEX_HOME: options.codexHome },
@@ -388,7 +391,7 @@ export async function launchCodexWorkspaceThread(command: CodexCommand, options:
   }
 
   try {
-    await request('initialize', { clientInfo: { name: 'laixin_codex_workspace', title: '来信 AI 工作窗口', version: '0.5.19' }, capabilities: null })
+    await request('initialize', { clientInfo: { name: 'laixin_codex_workspace', title: '来信 AI 工作窗口', version: clientVersion }, capabilities: null })
     notify('initialized')
     const startParams: Record<string, unknown> = { cwd: options.cwd, modelProvider: options.source.provider, ephemeral: false }
     if (options.source.model !== undefined) startParams.model = options.source.model

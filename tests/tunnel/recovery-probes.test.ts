@@ -4,7 +4,7 @@ import { createDaemon as winDaemon } from '../../sidecar/win/daemon-core.mjs'
 import { CONTROL_CODES, ConnectorError } from '../../sidecar/mac/connectors.mjs'
 import { SettingsBusyError as MacSettingsBusyError } from '../../sidecar/mac/ledger.mjs'
 import { SettingsBusyError as WinSettingsBusyError } from '../../sidecar/win/ledger.mjs'
-import { verifyWithFallback, verifyThroughProxy } from '../../sidecar/mac/vless-connector.mjs'
+import { probeTargetReachability, verifyWithFallback, verifyThroughProxy } from '../../sidecar/mac/vless-connector.mjs'
 import { buildXrayConfig } from '../../sidecar/mac/local-bridge.mjs'
 import { validVerifyFallbackUrl } from '../../sidecar/mac/vless-settings.mjs'
 import { FakeClock, flushMicrotasks, makeTempDir, readJsonFile, removeTempDir, startFakeHttpMarker, startFakeSocks5Server, writeIntentFile } from './helpers'
@@ -14,7 +14,7 @@ afterEach(() => { dirs.splice(0).forEach(removeTempDir) })
 
 describe.each([['macOS', macDaemon], ['Windows', winDaemon]] as const)('%s bounded recovery', (_platform, createDaemon) => {
   const SettingsBusy = _platform === 'macOS' ? MacSettingsBusyError : WinSettingsBusyError
-  function harness(random = 0, reachability?: () => Promise<{ url: string }>, verifyDedicated?: () => Promise<void>) {
+  function harness(random = 0, reachability?: () => Promise<{ url: string }>, verifyDedicated?: () => Promise<void>, targetReachability?: () => Promise<{ url: string }>) {
     const dir = makeTempDir('bounded-recovery-'); dirs.push(dir)
     const clock = new FakeClock()
     const intent = { desired: 'connected', sessionToken: 'one', bridgePort: 18080,
@@ -32,7 +32,9 @@ describe.each([['macOS', macDaemon], ['Windows', winDaemon]] as const)('%s bound
       adapter: { managedItems: () => [{ ref: { service: 'test', item: 'proxy' }, value: true }], read: () => value,
         write, reapplyOnChange: () => true, currentPathIdentity: () => ({ id: pathId, kind: 'fake-network-path' }) },
       connectorFactory: () => ({ kind: 'loopback-probe', start, stop, verify, onLost: () => {}, localProxyPort: () => 1 }),
-      bridgeFactory: () => ({ listen: () => {}, close: () => {}, verifyDedicated, ...(reachability ? { probeReachability: reachability } : {}) }) })
+      bridgeFactory: () => ({ listen: () => {}, close: () => {}, verifyDedicated,
+        ...(reachability ? { probeReachability: reachability } : {}),
+        ...(targetReachability ? { probeTargetReachability: targetReachability } : {}) }) })
     const advance = async (ms: number) => { clock.advance(ms); await flushMicrotasks() }
     return { dir, clock, daemon, start, stop, verify, write, intent, advance, value: () => value,
       offline: () => { offline = true }, online: () => { offline = false },
@@ -88,7 +90,8 @@ describe.each([['macOS', macDaemon], ['Windows', winDaemon]] as const)('%s bound
 
   it('echo endpoint stays unavailable but the tunnel is reachable: repeated checks do not flash unconfirmed', async () => {
     const reachability = vi.fn(async () => ({ url: 'https://probe.example/generate_204' }))
-    const h = harness(0, reachability)
+    const targetReachability = vi.fn(async () => ({ url: 'https://chatgpt.com/' }))
+    const h = harness(0, reachability, undefined, targetReachability)
     await h.daemon.run()
     h.verify.mockRejectedValue(new ConnectorError(CONTROL_CODES.probeUnavailable))
     for (let index = 0; index < 4; index += 1) {
@@ -96,8 +99,41 @@ describe.each([['macOS', macDaemon], ['Windows', winDaemon]] as const)('%s bound
       expect(h.state()).toMatchObject({ state: 'connected', code: '', pathVerified: true })
     }
     expect(reachability).toHaveBeenCalledTimes(4)
+    expect(targetReachability).toHaveBeenCalledTimes(4)
     expect(h.start).toHaveBeenCalledTimes(1)
     expect(h.stop).not.toHaveBeenCalled()
+    h.daemon.requestShutdown(); await flushMicrotasks()
+  })
+
+  it('通用探测点可达但 AI 目标不可达时，首连仍完成网络连接并把目标状态单独提示', async () => {
+    const reachability = vi.fn(async () => ({ url: 'https://probe.example/generate_204' }))
+    const targetReachability = vi.fn(async () => { throw new ConnectorError(CONTROL_CODES.upstreamUnreachable, 'AI 目标被拦截') })
+    const h = harness(0, reachability, undefined, targetReachability)
+    h.verify.mockRejectedValueOnce(new ConnectorError(CONTROL_CODES.probeUnavailable))
+    await h.daemon.run()
+    expect(h.state()).toMatchObject({ state: 'connected', code: '', pathVerified: true })
+    expect(targetReachability).not.toHaveBeenCalled()
+    expect(reachability).toHaveBeenCalledTimes(1)
+    await h.advance(30_000)
+    expect(h.state()).toMatchObject({ state: 'connected', code: 'TUNNEL_TARGET_UNCONFIRMED', pathVerified: true })
+    expect(targetReachability).toHaveBeenCalledTimes(1)
+    expect(h.stop).not.toHaveBeenCalled()
+    h.daemon.requestShutdown(); await flushMicrotasks()
+  })
+
+  it('已连接后目标 AI 暂不可达，保留网络连接并明确目标待确认', async () => {
+    const reachability = vi.fn(async () => ({ url: 'https://probe.example/generate_204' }))
+    const targetReachability = vi.fn(async () => ({ url: 'https://chatgpt.com/' }))
+    const h = harness(0, reachability, undefined, targetReachability)
+    await h.daemon.run()
+    h.verify.mockRejectedValue(new ConnectorError(CONTROL_CODES.probeUnavailable))
+    targetReachability.mockRejectedValue(new ConnectorError(CONTROL_CODES.upstreamUnreachable, 'AI 目标被拦截'))
+    await h.advance(30_000)
+    expect(h.state()).toMatchObject({ state: 'connected', code: 'TUNNEL_TARGET_UNCONFIRMED', pathVerified: true })
+    expect(h.stop).not.toHaveBeenCalled()
+    targetReachability.mockResolvedValue({ url: 'https://chatgpt.com/' })
+    await h.advance(30_000)
+    expect(h.state()).toMatchObject({ state: 'connected', code: '', pathVerified: true })
     h.daemon.requestShutdown(); await flushMicrotasks()
   })
 
@@ -313,6 +349,28 @@ it('real SOCKS/HTTP distinguishes an invalid echo body from a transport failure'
     await expect(verifyThroughProxy(socks.port, `http://echo.test:${target.port}/ip`, 500)).rejects.toMatchObject({ code: CONTROL_CODES.probeUnavailable })
     await expect(verifyThroughProxy(socks.port, 'http://missing.test:80/ip', 500)).rejects.not.toMatchObject({ code: CONTROL_CODES.probeUnavailable })
   } finally { await socks.close(); await target.close() }
+})
+
+it('target probe uses the AI-specific response predicate instead of generic HTTP success', async () => {
+  const probe = vi.fn(async (_port: number, url: string, _timeoutMs: number, acceptable: (target: URL, response: { statusCode: number; headers: Record<string, string> }) => boolean) => {
+    const target = new URL(url)
+    if (!acceptable(target, { statusCode: 403, headers: { 'cf-mitigated': 'challenge' } })) throw new Error('target rejected')
+  })
+  await expect(probeTargetReachability(1, ['https://chatgpt.com/'], 10, probe)).resolves.toEqual({ url: 'https://chatgpt.com/' })
+  expect(probe).toHaveBeenCalledTimes(1)
+})
+
+it('target probe requires both AI hosts; one reachable host cannot mask the other', async () => {
+  const probe = vi.fn(async (_port: number, url: string, _timeoutMs: number, acceptable: (target: URL, response: { statusCode: number; headers: Record<string, string> }) => boolean) => {
+    const target = new URL(url)
+    if (target.hostname === 'chatgpt.com') {
+      if (!acceptable(target, { statusCode: 403, headers: { 'cf-mitigated': 'challenge' } })) throw new Error('chatgpt rejected')
+      return
+    }
+    throw new ConnectorError(CONTROL_CODES.upstreamUnreachable, 'anthropic blocked')
+  })
+  await expect(probeTargetReachability(1, ['https://chatgpt.com/', 'https://api.anthropic.com/'], 10, probe)).rejects.toMatchObject({ code: CONTROL_CODES.upstreamUnreachable })
+  expect(probe).toHaveBeenCalledTimes(2)
 })
 
 

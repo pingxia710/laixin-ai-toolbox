@@ -1,5 +1,6 @@
 import readline from 'node:readline'
 import process from 'node:process'
+import { appendFileSync } from 'node:fs'
 
 const mode = process.argv[2] || 'ready'
 const expectedCodexHome = process.argv[3]
@@ -9,6 +10,7 @@ const notify = (method, params) => process.stdout.write(JSON.stringify({ method,
 
 readline.createInterface({ input: process.stdin }).on('line', (line) => {
   const request = JSON.parse(line)
+  if (process.env.LOGIN_FIXTURE_REQUESTS) appendFileSync(process.env.LOGIN_FIXTURE_REQUESTS, `${JSON.stringify(request)}\n`)
   if (request.method === 'initialize') return reply(request.id, {})
   if (request.method === 'initialized') { initialized = true; return }
   if (!initialized) throw new Error('initialize handshake missing')

@@ -2,11 +2,11 @@
 // 超过则停止重启、派发系统代理恢复,并让状态显示「网络守护已停止,点连接重试」。
 import { describe, expect, it } from 'vitest'
 import { spawn, type ChildProcess } from 'node:child_process'
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { DaemonSupervisor, DAEMON_RESTART_BACKOFF_MS } from '../../app/main/tunnel/supervisor'
+import { DaemonSupervisor, DAEMON_RESTART_BACKOFF_MS, DAEMON_STARTUP_WATCHDOG_MS } from '../../app/main/tunnel/supervisor'
 import { computeStatus } from '../../app/main/tunnel/status-service'
 import { fakeAdapterEnv, makeTempDir, readJsonFile, startFakeUpstream, waitFor, writeIntentFile, type FakeUpstream } from './helpers'
 
@@ -115,6 +115,86 @@ describe('守护退避重启与放弃恢复(收敛包3·件1)', () => {
     expect(h.scheduled.length).toBe(0)
     expect(h.supervisor.surrendered).toBe(false)
     h.cleanup()
+  })
+
+  it('启动看门狗只处理没有 state 的坏启动，并按既有退避重启', () => {
+    const root = mkdtempSync(join(tmpdir(), 'supervisor-startup-watchdog-'))
+    let fire: (() => void) | undefined
+    let exit: ((code: number | null, signal: string | null) => void) | undefined
+    let killed = 0
+    let runId = ''
+    const child = {
+      kill: () => { killed += 1; return true },
+      on: (event: string, callback: (code: number | null, signal: string | null) => void) => { if (event === 'exit') exit = callback },
+      once: () => undefined
+    } as unknown as FakeChild & { kill: () => boolean }
+    const scheduled: Array<{ delayMs: number; fire: () => void }> = []
+    const supervisor = new DaemonSupervisor({
+      dataDir: root,
+      spawnDaemon: (nextRunId) => { runId = nextRunId; return child },
+      spawnRestore: () => undefined,
+      scheduleStartupWatchdog: (callback, delayMs) => { fire = callback; expect(delayMs).toBe(DAEMON_STARTUP_WATCHDOG_MS); return 1 },
+      cancelStartupWatchdog: () => undefined,
+      scheduleRestart: (callback, delayMs) => { scheduled.push({ fire: callback, delayMs }); return 1 }
+    })
+    supervisor.ensureRunning()
+    expect(fire).toBeTypeOf('function')
+    fire?.()
+    expect(killed).toBe(1)
+    // kill() 只代表信号已发出；没有真实 exit 前绝不能拉起第二代。
+    expect(scheduled).toEqual([])
+    exit?.(null, 'SIGKILL')
+    expect(scheduled).toEqual([{ delayMs: 2_000, fire: expect.any(Function) }])
+    expect(runId).toBeTruthy()
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  it('启动看门狗看到本轮 connecting state 后不误杀慢机连接', () => {
+    const root = mkdtempSync(join(tmpdir(), 'supervisor-startup-slow-'))
+    let fire: (() => void) | undefined
+    let killed = 0
+    const child = {
+      kill: () => { killed += 1; return true },
+      on: () => undefined,
+      once: () => undefined
+    } as unknown as FakeChild & { kill: () => boolean }
+    let runId = ''
+    const supervisor = new DaemonSupervisor({
+      dataDir: root,
+      spawnDaemon: (nextRunId) => { runId = nextRunId; return child },
+      spawnRestore: () => undefined,
+      scheduleStartupWatchdog: (callback) => { fire = callback; return 1 },
+      cancelStartupWatchdog: () => undefined
+    })
+    supervisor.ensureRunning()
+    writeFileSync(join(root, 'state.json'), JSON.stringify({ state: 'connecting', runId, updatedAt: Date.now() }))
+    fire?.()
+    expect(killed).toBe(0)
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  it('启动恢复已发布本轮 recovery-owner 时主进程看门狗也不误杀', () => {
+    const root = mkdtempSync(join(tmpdir(), 'supervisor-startup-recovery-'))
+    let fire: (() => void) | undefined
+    let killed = 0
+    let runId = ''
+    const child = {
+      kill: () => { killed += 1; return true },
+      on: () => undefined,
+      once: () => undefined
+    } as unknown as FakeChild & { kill: () => boolean }
+    const supervisor = new DaemonSupervisor({
+      dataDir: root,
+      spawnDaemon: (nextRunId) => { runId = nextRunId; return child },
+      spawnRestore: () => undefined,
+      scheduleStartupWatchdog: (callback) => { fire = callback; return 1 },
+      cancelStartupWatchdog: () => undefined
+    })
+    supervisor.ensureRunning()
+    writeFileSync(join(root, 'recovery-owner.json'), JSON.stringify({ runId, generation: 2 }))
+    fire?.()
+    expect(killed).toBe(0)
+    rmSync(root, { recursive: true, force: true })
   })
 
   it('真实守护被 kill -9:supervisor 在退避时限内拉起并重连一次(全链路)', async () => {

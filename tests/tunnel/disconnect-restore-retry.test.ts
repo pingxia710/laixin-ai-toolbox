@@ -116,6 +116,37 @@ it('断开后恢复写失败:按梯子重试,故障解除后原设置实际还�
   expect(pendingSettingEntries(root)).toEqual([])
 })
 
+it('Windows 断开还原耗尽快速梯子后只收一次通道，慢速恢复继续并最终落定', async () => {
+  vi.useFakeTimers()
+  const root = directory()
+  const base = createAdapter({ FAKE_WININET_STORE: join(root, 'registry.json') })
+  let restoreBlocked = false
+  const adapter = { ...base, write: (ref: Parameters<typeof base.write>[0], value: Parameters<typeof base.write>[1]) => {
+    if (restoreBlocked && ref.item === 'ProxyServer') throw Error('temporary registry lock')
+    base.write(ref, value)
+  } }
+  let bridgeCloseCalls = 0
+  writeIntentFile(root, connectedIntent)
+  const daemon = createDaemon({ dataDir: root, platform: 'win32', adapter, clock: fakeWallClock(), parentAlive: () => true,
+    onExit: () => {}, connectorFactory: connector,
+    bridgeFactory: () => ({ listen: async () => {}, close: async () => { bridgeCloseCalls += 1 }, isAlive: () => true, onLost: () => {} }),
+    intentPollMs: 100 })
+  await daemon.run()
+  restoreBlocked = true
+  writeIntentFile(root, { desired: 'user-disconnected' as const, sessionToken: 'grace-stop-1' })
+
+  await vi.advanceTimersByTimeAsync(69_000)
+  expect(bridgeCloseCalls).toBe(1)
+  expect(proxyServer(base)).toBe('127.0.0.1:18080')
+  expect(readState(root).code).toBe('TUNNEL_RESTORE_INCOMPLETE')
+
+  restoreBlocked = false
+  await vi.advanceTimersByTimeAsync(31_000)
+  expect(bridgeCloseCalls).toBe(1)
+  expect(readState(root).state).toBe('stopped-restored')
+  expect(proxyServer(base) ?? null).toBeNull()
+})
+
 it('桥接收尾停住后重复断开:先还原代理并有界结束异常守护', async () => {
   vi.useFakeTimers()
   const root = directory()

@@ -31,23 +31,32 @@ const reward = (overrides: Partial<NonNullable<NonNullable<AccountView['overview
 })
 
 function render(invite: NonNullable<AccountView['overview']>['invite'],
-  overrides: Partial<NonNullable<AccountView['overview']>> = {}, plans: CommercialTerms['plans'] = []) {
+  overrides: Partial<NonNullable<AccountView['overview']>> = {}, plans: CommercialTerms['plans'] = [], from: 'account' | 'tunnel' = 'account') {
   vi.stubGlobal('document', { createElement: (tag: string) => new Element(tag) })
   const root = new Element('main')
   const view: AccountView = { state: 'signed-in', code: '', message: '', terms: { ...terms, plans },
     account: { id: 'acct-' + '1'.repeat(32), username: 'local-host' },
     overview: { trial: { available: false, usage: null }, recoveryReady: true, subscription: null,
       plans, networkAvailable: true, paymentChannels: [], ...(invite ? { invite } : {}), ...overrides } }
-  mountAccountOverview(root as unknown as HTMLElement, view, 'account')
+  mountAccountOverview(root as unknown as HTMLElement, view, from)
   return root.all()
 }
 
 afterEach(() => { vi.unstubAllGlobals(); vi.clearAllMocks() })
 
+it('网络页即使有邀请码和待开通奖励，也不展示邀请活动或邀请操作', () => {
+  const nodes = render({ code: 'AB12CD34', invitedBy: 'old-friend', rewards: [reward({ state: 'pending' })] }, {}, [], 'tunnel')
+  const text = nodes.map(node => node.textContent).join(' ')
+  expect(text).not.toMatch(/邀请|AB12CD34|old-friend|开通奖励流量/)
+  expect(nodes.filter(node => node.tag === 'h4').map(node => node.textContent)).toEqual(['付费套餐', '体验流量 · 5 GB / 48 小时'])
+  expect(accountAction).not.toHaveBeenCalled()
+})
+
 it('有邀请数据时展示邀请卡：邀请码、来源、奖励剩余与到期、规则边界，不展示未接入落地页的伪链接', () => {
   const nodes = render({ code: 'AB12CD34', invitedBy: null,
     link: 'https://laixin.test/AI-tools/?inv=AB12CD34', rewards: [reward()] } as unknown as NonNullable<AccountView['overview']>['invite'])
   expect(nodes.filter((node) => node.className === 'account-usage-card')).toHaveLength(3)
+  expect(nodes.filter(node => node.tag === 'h4').map(node => node.textContent)).toEqual(['付费套餐', '体验流量 · 5 GB / 48 小时', '邀请有礼'])
   expect(nodes.some((node) => node.textContent.includes('邀请有礼'))).toBe(true)
   expect(nodes.some((node) => node.textContent.includes('AB12CD34'))).toBe(true)
   expect(nodes.some((node) => node.textContent.includes('双方各得 5 GB'))).toBe(true)

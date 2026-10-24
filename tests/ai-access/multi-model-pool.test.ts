@@ -76,6 +76,23 @@ describe('Codex 来信多模型池', () => {
     expect(calls).toBe(0)
   })
 
+  it('所选来源失败时返回失败，不使用其他来源、模型或 Key', async () => {
+    const calls: { url: string; init: RequestInit }[] = []
+    const gateway = await start(async (url, init) => {
+      calls.push({ url: String(url), init: init! })
+      return String(url) === routes[0].endpoint ? new Response('fixture upstream unavailable', { status: 503 }) : response()
+    })
+    const result = await fetch(`${gateway.baseUrl}/codex/multi/v1/responses`, {
+      method: 'POST', headers: { authorization: `Bearer ${clientToken}` },
+      body: JSON.stringify({ model: routes[0].internalModelId, input: 'fixture request' })
+    })
+    expect(result.status).toBeGreaterThanOrEqual(400)
+    expect(calls.length).toBeGreaterThan(0)
+    expect(calls.every(call => call.url === routes[0].endpoint)).toBe(true)
+    expect(calls.every(call => new Headers(call.init.headers).get('authorization') === `Bearer ${routes[0].key}`)).toBe(true)
+    expect(calls.every(call => JSON.parse(String(call.init.body)).model === routes[0].model)).toBe(true)
+  })
+
   it('请求开始后固定精确路由快照；更新只影响下一次请求', async () => {
     const calls: RequestInit[] = []
     let release!: () => void

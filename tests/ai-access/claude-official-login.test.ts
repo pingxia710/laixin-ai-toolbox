@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import { resolve } from 'node:path'
+import { join } from 'node:path'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { ClaudeOfficialLoginController, readClaudeAuthStatus, startClaudeLogin, validClaudeAuthUrl } from '../../app/main/ai-access/claude-official-login'
 
 const fixture = resolve('tests/ai-access/fixtures/claude-login-cli.mjs')
@@ -112,6 +115,15 @@ describe('Claude 官方登录', () => {
     expect(await readClaudeAuthStatus({ executable: 'claude', args: [] }, {}, no)).toBe(false)
     const boom = (async () => { throw new Error('not installed') }) as never
     expect(await readClaudeAuthStatus({ executable: 'claude', args: [] }, {}, boom)).toBe(false)
+  })
+
+  it.skipIf(process.platform === 'win32')('APBUF-01：auth status --json 输出超过 256KiB 也不丢登录态（读取上限 4MiB）', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'claude-status-cap-'))
+    try {
+      const script = join(directory, 'claude-status.sh')
+      await writeFile(script, "#!/bin/sh\nprintf '{\"loggedIn\":true,\"pad\":\"%s\"}\\n' \"$(head -c 300000 /dev/zero | tr '\\0' 'x')\"\n", { mode: 0o700 })
+      expect(await readClaudeAuthStatus({ executable: script, args: [] })).toBe(true)
+    } finally { await rm(directory, { recursive: true, force: true }) }
   })
 
   it.each(['You are not logged in.\n', 'Not logged in. Run /login.\n', 'You are not currently logged in.\n', 'You are no longer logged in.\n'])('否定句不触发成功核实：%s', async text => {

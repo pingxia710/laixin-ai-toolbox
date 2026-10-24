@@ -31,25 +31,27 @@ export function createAdapter({ writeProxy = (ref, value, options) => proxyReque
     // 原值记进账本、退出还回去。这里只保留「读不到系统代理」这类真正的前置失败。
     preflight() { proxyRequest({ op: 'status' }) },
     // N-55:接管动作取证和目标实测结束后都读取默认路由与唯一映射服务；切到另一条网络服务即作废旧路径证据。
-    currentPathIdentity() {
-      const active = activeNetworkPath()
-      assertActiveNetworkPath(active)
+    currentPathIdentity(options) {
+      const deadline = deadlineFrom(options)
+      const active = activeNetworkPath(deadline)
+      assertActiveNetworkPath(active, deadline)
       return { id: `service:${active.service}:device:${active.device}`, kind: 'mac-network-service' }
     },
     // 只报告系统当前默认路由实际使用的网络服务。目标是 HTTPS AI 服务，所以只读该服务的
     // Secure Web Proxy；普通 Web Proxy、SOCKS、清单第一项或其他网卡都不能替它拿绿灯。
     // 返回普通候选 DTO；异步探测完成后由守护显式调用 validateExistingProxy 二次核验。
     // 快照只放 WeakMap，绝不把会长期抛错的 getter 存进 reusedProxy。
-    existingProxy(ours) {
+    existingProxy(ours, options) {
+      const deadline = deadlineFrom(options)
       const isOurs = (value) => isOurProxy(value, ours)
-      const active = activeNetworkPath()
-      const pac = readAutoProxyUrl(active.service)
+      const active = activeNetworkPath(deadline)
+      const pac = readAutoProxyUrl(active.service, deadline)
       if (pac.enabled && pac.url !== '') {
-        assertActiveNetworkPath(active)
+        assertActiveNetworkPath(active, deadline)
         return { kind: 'pac', url: pac.url, source: active.service }
       }
-      const current = this.read({ service: active.service, item: 'secure-web-proxy' })
-      assertActiveNetworkPath(active)
+      const current = this.read({ service: active.service, item: 'secure-web-proxy' }, deadline)
+      assertActiveNetworkPath(active, deadline)
       if (current?.enabled === true && !isOurs(current)) {
         const candidate = Object.freeze({
           kind: 'http', host: current.host, port: current.port, source: active.service + '/secure-web-proxy'
@@ -59,10 +61,10 @@ export function createAdapter({ writeProxy = (ref, value, options) => proxyReque
       }
       return undefined
     },
-    validateExistingProxy(candidate) {
+    validateExistingProxy(candidate, options) {
       const expected = proxySnapshots.get(candidate)
       if (expected === undefined) throw activeProxyChangedError()
-      assertActiveProxySnapshot(expected.active, expected.snapshot)
+      assertActiveProxySnapshot(expected.active, expected.snapshot, deadlineFrom(options))
     },
     materializeExistingProxy(candidate) {
       return Object.freeze({ kind: candidate.kind, host: candidate.host, port: candidate.port, source: candidate.source })
@@ -110,10 +112,18 @@ export function createAdapter({ writeProxy = (ref, value, options) => proxyReque
       return (current.host === '' && current.port === 0) ||
         (writtenValue?.enabled === true && current.host === writtenValue.host && current.port === writtenValue.port)
     },
-    read(itemRef) {
-      if (itemRef?.item === AUTO_PROXY_ITEM) { assertService(itemRef); return readAutoProxyUrl(itemRef.service) }
+    // 恢复后的残留检查使用 Mac 网络服务，不能读取 WinINET 注册表字段。
+    readProxyEndpoints() {
+      return listNetworkServices().flatMap((service) => PROXY_ITEMS.flatMap(({ item }) => {
+        const value = this.read({ service, item })
+        return value?.enabled === true ? [{ host: value.host, port: value.port }] : []
+      }))
+    },
+    read(itemRef, options) {
+      const deadline = deadlineFrom(options)
+      if (itemRef?.item === AUTO_PROXY_ITEM) { assertService(itemRef); return readAutoProxyUrl(itemRef.service, deadline) }
       const item = proxyItem(itemRef)
-      const output = run('networksetup', [item.read, itemRef.service])
+      const output = run('networksetup', [item.read, itemRef.service], deadline)
       return parseProxy(output)
     },
     write(itemRef, value, options) {
@@ -168,28 +178,28 @@ function listNetworkServices() {
 // networksetup 的“服务顺序”只给配置对象与设备名的映射；当前真正承载缺省流量的设备
 // 必须以 route 的默认路由为准。两次读取默认路由夹住映射读取，避免切网窗口里拼出一条
 // 从未同时成立过的“活动服务”。匹配不到或同一设备对应多个服务时宁可未知，也不猜第一项。
-function activeNetworkPath() {
-  const resolution = resolveActiveNetworkPath(run)
+function activeNetworkPath(deadline) {
+  const resolution = resolveActiveNetworkPath((executable, args) => run(executable, args, deadline))
   if (resolution.status === 'resolved') return resolution.path
   if (resolution.status === 'changed') throw activeNetworkChangedError()
   throw activeNetworkUnknownError()
 }
 
-function assertActiveNetworkPath(expected) {
-  const current = activeNetworkPath()
+function assertActiveNetworkPath(expected, deadline) {
+  const current = activeNetworkPath(deadline)
   if (current.device !== expected.device || current.service !== expected.service) throw activeNetworkChangedError()
 }
 
-function assertActiveProxySnapshot(active, expected) {
+function assertActiveProxySnapshot(active, expected, deadline) {
   try {
-    assertActiveNetworkPath(active)
-    const pac = readAutoProxyUrl(active.service)
+    assertActiveNetworkPath(active, deadline)
+    const pac = readAutoProxyUrl(active.service, deadline)
     if (pac.enabled !== expected.pac.enabled || pac.url !== expected.pac.url) throw activeProxyChangedError()
-    const proxy = parseProxy(run('networksetup', ['-getsecurewebproxy', active.service]))
+    const proxy = parseProxy(run('networksetup', ['-getsecurewebproxy', active.service], deadline))
     if (proxy.enabled !== expected.proxy.enabled || proxy.host !== expected.proxy.host || proxy.port !== expected.proxy.port) {
       throw activeProxyChangedError()
     }
-    assertActiveNetworkPath(active)
+    assertActiveNetworkPath(active, deadline)
   } catch (error) {
     if (error?.code === 'TUNNEL_ACTIVE_NETWORK_CHANGED' || error?.code === 'TUNNEL_ACTIVE_NETWORK_UNKNOWN' ||
         error?.code === 'TUNNEL_ACTIVE_PROXY_CHANGED') throw error
@@ -221,8 +231,8 @@ function parseFields(output) {
 }
 
 // networksetup -getautoproxyurl 的读数:「URL: …」+「Enabled: Yes/No」;没设过时 URL 是 (null)。
-function readAutoProxyUrl(service) {
-  const fields = parseFields(run('networksetup', ['-getautoproxyurl', service]))
+function readAutoProxyUrl(service, deadline) {
+  const fields = parseFields(run('networksetup', ['-getautoproxyurl', service], deadline))
   const url = fields.URL
   if (!['Yes', 'No'].includes(fields.Enabled) || typeof url !== 'string') {
     throw settingsError('无法核对系统自动代理读数')
@@ -268,15 +278,15 @@ const ABSENT_SERVICE_PATTERNS = [
 // 清单也查不动就当没消失——宁可报「恢复未完成」,⛔ 悄悄放过一条该还原的设置。
 const AMBIGUOUS_ABSENT_PATTERN = /the parameters? (?:were|was) not valid/i
 
-function isAbsentService(text, service) {
+function isAbsentService(text, service, deadline) {
   if (ABSENT_SERVICE_PATTERNS.some((pattern) => pattern.test(text))) return true
   if (!AMBIGUOUS_ABSENT_PATTERN.test(text) || typeof service !== 'string' || service === '') return false
-  try { return !networkServiceExists(service) } catch { return false }
+  try { return !networkServiceExists(service, deadline) } catch { return false }
 }
 
 // 存在性按原始清单判:停用的服务前面带 *,它仍然存在,⛔ 跟着 listNetworkServices() 一起被滤掉。
-function networkServiceExists(service) {
-  return run('networksetup', ['-listallnetworkservices']).split('\n')
+function networkServiceExists(service, deadline) {
+  return run('networksetup', ['-listallnetworkservices'], deadline).split('\n')
     .map((line) => line.trim().replace(/^\*/, ''))
     .some((name) => name !== '' && !name.startsWith('An asterisk') && name === service)
 }
@@ -292,17 +302,30 @@ function absentTargetError(service) {
 // 正常数据,不是失败(候选甲-3)。失败判定回到退出码(catch 路径)与结构化解析(parseProxy 等)。
 const KNOWN_ERROR_LINE = /^\*\* Error:/m
 
-function run(executable, args) {
+function run(executable, args, deadline) {
   const service = args[1]
   try {
-    const output = execFileSync(executable, args, { encoding: 'utf8', timeout: 4_000, env: { ...process.env, LC_ALL: 'C' } })
-    if (isAbsentService(output, service)) throw absentTargetError(service)
+    const output = execFileSync(executable, args, { encoding: 'utf8', timeout: remainingTimeout(deadline, 4_000), env: { ...process.env, LC_ALL: 'C' } })
+    if (isAbsentService(output, service, deadline)) throw absentTargetError(service)
     if (KNOWN_ERROR_LINE.test(output)) throw settingsError('系统代理设置被拒绝')
     return output
   } catch (error) {
     if (error?.code === 'TUNNEL_SETTINGS_NOT_APPLIED' || error?.code === 'TUNNEL_SETTING_TARGET_ABSENT') throw error
     const text = `${String(error?.stdout ?? '')}\n${String(error?.stderr ?? '')}`
-    if (isAbsentService(text, service)) throw absentTargetError(service)
+    if (isAbsentService(text, service, deadline)) throw absentTargetError(service)
     throw settingsError('无法读取或修改系统代理，请检查系统权限后重试')
   }
+}
+
+function deadlineFrom(options) {
+  if (typeof options === 'number' && Number.isFinite(options)) return options
+  const timeoutMs = Number(options?.timeoutMs)
+  return Number.isFinite(timeoutMs) && timeoutMs > 0 ? Date.now() + timeoutMs : undefined
+}
+
+function remainingTimeout(deadline, fallback) {
+  if (deadline === undefined) return fallback
+  const remaining = Math.floor(deadline - Date.now())
+  if (remaining <= 0) throw settingsError('读取系统代理超过首连预算')
+  return Math.max(1, Math.min(fallback, remaining))
 }

@@ -90,6 +90,24 @@ describe('低额度只基于当前真实读数，按账号周期去重', () => {
     value.overview!.subscription = { ...value.overview!.subscription, state: 'pending', measurement: 'not-requested', remainingBytes: null }
     expect(quotaAlerts(undefined, value, now)).toHaveLength(1)
   })
+  it('ENT-15：多订阅按全部套餐合计，头牌耗尽而其他套餐充足不误报；全部低水位仍提醒；出现 unknown 继续抑制', () => {
+    const subscription = (id: string, state: 'active' | 'exhausted' | 'unknown', remainingGiB: number, totalGiB: number) => ({
+      authorizationId: id, kind: 'subscription' as const, planId: 'plan', state, measurement: 'current' as const,
+      totalBytes: Math.round(totalGiB * 1024 ** 3), usedBytes: Math.round((totalGiB - remainingGiB) * 1024 ** 3),
+      remainingBytes: Math.round(remainingGiB * 1024 ** 3), expiresAt: now + 3600_000, observedAt: now, reasonCode: '' })
+    const multi = (list: unknown[]): AccountView => ({ ...network(100), overview: { ...network(100).overview!, trial: { available: false, usage: null }, subscription: list[0] as never, subscriptions: list as never[] } })
+    // 头牌 5GB 套餐耗尽、次套餐 50GB 充足：合计余量九成，不应低流量告警。
+    expect(quotaAlerts(undefined, multi([subscription('sub-a', 'exhausted', 0.05, 5), subscription('sub-b', 'active', 50, 50)]), now)
+      .filter((alert) => alert.kind === 'network')).toEqual([])
+    // 所有套餐都在低水位：仍要提醒，且按合计余量算，不能只看头牌。
+    const low = quotaAlerts(undefined, multi([subscription('sub-a', 'exhausted', 0.05, 5), subscription('sub-b', 'active', 0.1, 10)]), now)
+      .filter((alert) => alert.kind === 'network')
+    expect(low).toHaveLength(1)
+    expect(low[0].message).toContain('0.15 GB')
+    // 任一套餐读数 unknown：读不清不当作零，继续抑制。
+    expect(quotaAlerts(undefined, multi([subscription('sub-a', 'exhausted', 0.05, 5), subscription('sub-b', 'unknown', 0.1, 10)]), now)
+      .filter((alert) => alert.kind === 'network')).toEqual([])
+  })
 })
 
 it('Windows Codex 只打开已安装官方包中的应用 ID；输入不能执行任意程序', async () => {

@@ -89,6 +89,7 @@ class TestElement {
   append(...children: TestElement[]) { this.children.push(...children) }
   replaceChildren(...children: TestElement[]) { this.children.splice(0, this.children.length, ...children) }
   setAttribute() {}
+  contains(node: TestElement | null): boolean { return node === this || this.children.some(child => child.contains(node)) }
   addEventListener(event: string, handler: () => void) { this.handlers.set(event, handler) }
   removeEventListener(event: string) { this.handlers.delete(event) }
   click() { if (!this.disabled) this.handlers.get('click')?.() }

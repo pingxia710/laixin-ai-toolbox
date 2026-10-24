@@ -18,6 +18,7 @@ import type { AiAccessState } from './service'
 import { removeAiRouterResident } from './router-resident'
 import { recordFault } from '../diagnostics/context'
 import { detachAiRouterConnections } from './router-cleanup'
+import { electronSystemFetch } from './electron-fetch'
 import { API_NETWORK_PATH } from '../../../sidecar/shared/api-network-continuation.mjs'
 
 declare const __TOOLBOX_UPDATE_PUBLIC_KEY__: string
@@ -189,7 +190,7 @@ export async function runHeadlessRouter(userData = app.getPath('userData')): Pro
     isolation: (command, state) => gatewayHolder.current!.isolation(command, state),
     onStop: () => { void stop() } })
   const recentFaults = new Map<string, number>()
-  const gateway = new AiRouterGateway({ desktopAttestor: createDesktopRouteAttestor(), routerControl: control,
+  const gateway = new AiRouterGateway({ fetch: electronSystemFetch, desktopAttestor: createDesktopRouteAttestor(), routerControl: control,
     onClientFailure: record => {
       const code = record.code ?? 'unknown'
       const now = Date.now()

@@ -11,6 +11,7 @@ import { registerSharingActions } from '../account/sharing-actions'
 import { setInstallationReporter } from '../account/installation-report'
 import { collectDeviceFacts } from '../account/device-report'
 import { createFailureLog, daemonLogPath } from '../tunnel/failure-log'
+import { wechatLoginPanel } from '../account/wechat-panel'
 
 declare const __TOOLBOX_ACCOUNT_ORIGIN__: string
 
@@ -75,7 +76,23 @@ export function registerAccountActions(registry: BridgeRegistry, client: Account
       return { snapshot: JSON.stringify(view), recoveryCode }
     } })
   registry.registerAction({ name: 'account.cancelWechatLogin', paramsSchema: schema.undefined(),
-    resultSchema: schema.object({ cancelled: schema.boolean() }), handler: () => client.cancelWechatLogin().then((cancelled) => ({ cancelled })) })
+    resultSchema: schema.object({ cancelled: schema.boolean() }), handler: () => client.cancelWechatLogin().then((cancelled) => {
+      if (cancelled) wechatLoginPanel.close()
+      return { cancelled }
+    }) })
+  registry.registerAction({ name: 'account.wechatInlineLogin', paramsSchema: schema.undefined(), resultSchema: recoverySchema,
+    handler: async () => {
+      let recoveryCode = ''
+      try {
+        const view = await client.wechatLogin('login', (code) => { recoveryCode = code },
+          (url) => wechatLoginPanel.open(url, () => { void client.cancelWechatLogin() }))
+        return { snapshot: JSON.stringify(view), recoveryCode }
+      } finally { wechatLoginPanel.close() }
+    } })
+  registry.registerAction({ name: 'account.wechatPanelBounds', paramsSchema: schema.object({ bounds: schema.string({ maxLength: 256 }) }),
+    resultSchema: schema.undefined(), handler: (params) => wechatLoginPanel.updateBounds(JSON.parse((params as { bounds: string }).bounds)) })
+  registry.registerAction({ name: 'account.wechatPanelMode', paramsSchema: schema.undefined(),
+    resultSchema: schema.object({ mode: schema.string({ maxLength: 16 }) }), handler: () => wechatLoginPanel.mode() })
   registry.registerAction({ name: 'account.recover', paramsSchema: schema.object({ username: schema.string(),
     recoveryCode: schema.string({ maxLength: 80 }), password: schema.string() }), resultSchema: recoverySchema,
     handler: async (params) => {
@@ -116,7 +133,7 @@ export function registerAccountActions(registry: BridgeRegistry, client: Account
       const order = await client.pollPayment((params as { orderId: string }).orderId)
       return { order: JSON.stringify(order) }
     } })
-  registry.registerShutdownHook('account', () => client.dispose())
+  registry.registerShutdownHook('account', () => { wechatLoginPanel.close(); return client.dispose() })
 }
 
 export function registerActions(registry: BridgeRegistry): void {

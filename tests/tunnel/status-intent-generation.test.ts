@@ -37,16 +37,20 @@ it('同 runId 新连接/断开意图未落盘时不沿用旧状态，并保留�
 
   // 同一常驻进程上一轮的意图与已连状态匹配，不能误压成“连接中”。
   const connected = { state: 'connected', runId: 'same-run',
+    restoration: { phase: 'complete', result: 'restored', attempts: 3, startedAt: 1000, updatedAt: 2000,
+      nextRetryAt: 0, lastFailureCode: 'PORT_QUERY_TIMEOUT' },
     intentToken: 'previous', exitIp: '203.0.113.1', pathVerified: true, lastVerifiedAt: Date.parse('2026-10-01T00:00:00Z') }
   writeFileAtomic(layout.state(dataDir), `${JSON.stringify(connected)}\n`)
   writeFileAtomic(layout.intent(dataDir), `${JSON.stringify({ desired: 'connected', sessionToken: 'previous' })}\n`)
   expect(service.status().state).toBe('已连')
+  expect(service.status().recoveryDetail).toContain('已重试 2 次')
 
   // 真实 start() 写出新 token；设置锁忙时 state.json 仍停在上一轮 connected。
   expect((await service.start()).outcome).toBe('started')
   const nextToken = (JSON.parse(readFileSync(layout.intent(dataDir), 'utf8')) as { sessionToken: string }).sessionToken
   expect(nextToken).not.toBe('previous')
   expect(service.status().state).toBe('连接中')
+  expect(service.status().recoveryDetail).toBe('')
   expect(service.status().exitIp).toBe('')
   expect(service.status().pathVerified).toBe(false)
 

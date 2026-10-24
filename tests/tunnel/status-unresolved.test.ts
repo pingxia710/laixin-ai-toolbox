@@ -22,6 +22,26 @@ function dataDirWithUnresolved(count: number): string {
 }
 
 describe('未恢复项汇总不再撑爆 tunnel.status 的结果限长', () => {
+  it('同轮自动恢复只展示白名单证据；过期等待记录不冒充仍在重试', () => {
+    const input = { dataDir: dataDirWithUnresolved(1), daemonUnexpectedExitAt: undefined, componentMissing: [], sshBinary: '',
+      daemonState: { state: 'error', code: 'TUNNEL_RESTORE_INCOMPLETE', restoration: {
+        phase: 'waiting', attempts: 3, startedAt: Date.now() - 3000, updatedAt: Date.now(), nextRetryAt: Date.now() + 5000,
+        result: 'unconfirmed', lastFailureCode: 'PORT_QUERY_TIMEOUT', secret: 'DO_NOT_COPY_TOKEN'
+      } } }
+    const status = computeStatus(input)
+    expect(status.recoveryState).toBe('running')
+    expect(status).toMatchObject({ recoveryDetail: expect.stringContaining('已重试 2 次') })
+    expect(status).toMatchObject({ recoveryDetail: expect.stringContaining('端口查询超时') })
+    expect(JSON.stringify(status)).not.toContain('DO_NOT_COPY')
+    expect(matchesSchema(status, statusResultSchema)).toBe(true)
+    const crashed = computeStatus({ ...input, daemonUnexpectedExitAt: Date.now() })
+    expect(crashed.recoveryState).toBe('required')
+    expect(crashed.recoveryDetail).not.toContain('正在等待自动重试')
+    input.daemonState.restoration.updatedAt -= 120_000
+    expect(computeStatus(input).recoveryState).toBe('required')
+    input.daemonState.restoration.lastFailureCode = 'DO_NOT_COPY_TOKEN'
+    expect(JSON.stringify(computeStatus(input))).not.toContain('DO_NOT_COPY')
+  })
   it('恢复进程启动前崩溃且账本为空，仍明确要求重试恢复', () => {
     const status = computeStatus({ dataDir: dataDirWithUnresolved(0),
       daemonState: { state: 'error', code: 'TUNNEL_RESTORE_PROCESS_FAILED', message: '恢复程序意外退出' },

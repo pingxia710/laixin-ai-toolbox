@@ -4,7 +4,7 @@ import { AiGateway } from '../../app/main/ai-access/gateway'
 const gateways: AiGateway[] = []
 afterEach(async () => { await Promise.all(gateways.splice(0).map(gateway => gateway.stop())) })
 const token = 'fixture-sse-compatibility-token'
-const answer = { status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: 'OK' }] }] }
+const answer = { status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: '中文回答🙂' }] }] }
 const route = { shell: 'codex' as const, provider: 'deepseek' as const, model: 'fixture-model', endpoint: 'https://api.deepseek.com/fixture', key: 'sk-fixture-0123456789012345' }
 
 async function fixture(payload: string, chunked = false) {

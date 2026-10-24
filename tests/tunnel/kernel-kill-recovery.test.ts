@@ -11,7 +11,7 @@ import { expect, it } from 'vitest'
 import { readDaemonState } from '../../app/main/tunnel/status-service'
 import { layout, writeFileAtomic } from '../../app/main/tunnel/paths'
 import { freePort, startRealityNode } from './fixtures/reality-node'
-import { fakeAdapterEnv, makeTempDir, readFakeStore, removeTempDir, waitFor } from './helpers'
+import { fakeAdapterEnv, httpGetViaProxy, makeTempDir, readFakeStore, removeTempDir, waitFor } from './helpers'
 
 it('内核被外部杀掉:先还系统代理、再自己拉起内核重新接上;断开还原;退出干净', async () => {
   const root = makeTempDir('laixin-kernel-kill-')
@@ -33,6 +33,7 @@ it('内核被外部杀掉:先还系统代理、再自己拉起内核重新接上
     child.stderr?.on('data', (chunk) => { logs += chunk })
     await waitFor(() => readDaemonState(dataDir)?.state === 'connected', 8000)
     expect(Object.keys(readFakeStore(storePath)).length).toBeGreaterThan(0)
+    expect(await httpGetViaProxy(port, node.verifyUrl)).toContain('203.0.113.42')
 
     // 从外面杀内核(SIGKILL,清理钩子不跑),pid 在桥的记档里
     const pidRecords = () => readdirSync(dataDir).filter((name) => /^xray-bridge\.json\.[0-9a-f-]+\.pid$/.test(name))
@@ -48,15 +49,21 @@ it('内核被外部杀掉:先还系统代理、再自己拉起内核重新接上
     expect(pidRecords()).toHaveLength(1)
     const again = JSON.parse(readFileSync(join(dataDir, pidRecords()[0]), 'utf8')) as { pid: number }
     expect(again.pid).not.toBe(record.pid)
+    expect(await httpGetViaProxy(port, node.verifyUrl)).toContain('203.0.113.42')
     // ③ 断开还原、退出干净
     writeFileAtomic(layout.intent(dataDir), JSON.stringify({ desired: 'user-disconnected' }))
     await waitFor(() => readDaemonState(dataDir)?.state === 'stopped-restored', 4000)
     expect(readFakeStore(storePath)).toEqual({})
+    await expect(httpGetViaProxy(port, node.verifyUrl)).rejects.toThrow()
     writeFileAtomic(layout.intent(dataDir), JSON.stringify({ desired: 'shutdown' }))
     await waitFor(() => child?.exitCode !== null, 4000)
     expect(child.exitCode).toBe(0)
     expect(logs).toContain('本机中继不在监听:已先把系统代理还给客户')
     expect(logs).not.toContain(node.credential.uuid)
+    const evidence = process.env.TOOLBOX_NETWORK_EVIDENCE
+    if (evidence) writeFileSync(evidence, JSON.stringify({ kernelKilled: true, proxyRestoredBeforeReconnect: true,
+      kernelPidChanged: true, requestBeforeAndAfterRecovery: true, stoppedListenerClosed: true,
+      daemonExited: true, fakeSystemAdapter: true, localNodeRequests: node.requests() }, null, 2))
   } finally {
     if (child && child.exitCode === null && child.signalCode === null) {
       child.kill('SIGTERM')

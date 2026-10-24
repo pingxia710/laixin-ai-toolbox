@@ -81,16 +81,16 @@ export class AiRouterGateway {
     if (this.stopping) throw new Error('AI_ROUTER_STOPPING')
     if (relay && relay.port !== primaryPort && !this.secondary) {
       const secondary = new AiGateway({ ...this.gatewayOptions, routerControl: undefined })
-      try { await secondary.start(relay.port, relay.token) } catch (error) {
+      try {
+        await secondary.start(relay.port, relay.token)
+        this.secondary = secondary
+      } catch (error) {
         await secondary.stop().catch(() => undefined)
-        // 单模型端口被外部占用时降级:控制面与多模型监听不受连坐,进程不退出
-        //(退出会被常驻 KeepAlive 无限拉起成重启循环);端口释放后下次 refresh 在此重试补起。
-        if ((error as NodeJS.ErrnoException).code === 'EADDRINUSE') { this.secondaryMissing = true; this.relay = relay; return }
-        throw error
+        // 端口冲突仅降级单模型监听；继续安装/刷新多模型，释放后下次 refresh 补起。
+        if ((error as NodeJS.ErrnoException).code !== 'EADDRINUSE') throw error
       }
-      this.secondaryMissing = false
-      this.secondary = secondary
     }
+    this.secondaryMissing = relay !== undefined && relay.port !== primaryPort && this.secondary === undefined
     if (relay?.port === primaryPort && this.relay && relay.token !== this.relay.token) throw new Error('AI_ROUTER_BINDING_CHANGED')
     this.relay = relay
     const routes = activeSingleRouterRoutes(state, this.resolve).map(route => {

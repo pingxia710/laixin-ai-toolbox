@@ -9,6 +9,7 @@ import { BridgeRegistry } from '../../app/main/bridge/bridge-registry'
 import { registerActions } from '../../app/main/actions/tunnel'
 import { layout } from '../../app/main/tunnel/paths'
 import { buildPackageEntries, writePackageDir } from './fixtures/package-builder'
+import { macServiceSidecar } from './fixtures/mac-service-sidecar'
 import { fakeAdapterEnv, forceTunnelPathForTest, makeTempDir, readFakeOps, readFakeStore, removeTempDir, startFakeUpstream, waitFor } from './helpers'
 
 const cleanups: (() => Promise<unknown> | void)[] = []
@@ -20,7 +21,7 @@ async function setup(timeoutMs = 10_000, launchDaemon = true) {
   const upstream = await startFakeUpstream()
   cleanups.push(() => upstream.killAll())
   const dataDir = join(root, 'device'); const storePath = join(root, 'fake-system.json')
-  const sidecarDir = fileURLToPath(new URL('../../sidecar/mac', import.meta.url))
+  const sidecarDir = macServiceSidecar(root)
   const adapter = fileURLToPath(new URL('./fixtures/fake-adapter.mjs', import.meta.url))
   const built = buildPackageEntries({ configVersion: 1 })
   const packageDir = writePackageDir(join(root, 'package'), built)
@@ -31,7 +32,8 @@ async function setup(timeoutMs = 10_000, launchDaemon = true) {
     { env: { ...process.env, ...fakeAdapterEnv(storePath) }, stdio: 'ignore' })
     children.push(child); return child
   }
-  const service = new TunnelService({ dataDir, sidecarDir, picker: async () => packageDir,
+  // 固定模拟 Mac 设置；宿主可为 Windows，不把模拟适配器当真实系统验收。
+  const service = new TunnelService({ dataDir, sidecarDir, platform: 'macos', picker: async () => packageDir,
     trust: { whitelistDigests: [built.digest], signingPublicKeys: [] }, now: () => Date.parse('2026-10-01T00:00:00Z'),
     spawnDaemon: (dir, runId) => {
       forceTunnelPathForTest(dir)
@@ -48,7 +50,8 @@ async function setup(timeoutMs = 10_000, launchDaemon = true) {
     }
   })
   const registry = new BridgeRegistry(); registerActions(registry, { service })
-  await service.importConfig(); await service.applyPending()
+  expect((await service.importConfig()).outcome).toBe('imported')
+  expect((await service.applyPending()).outcome).toBe('applied')
   const intent = () => JSON.parse(readFileSync(layout.intent(dataDir), 'utf8'))
   const finish = async () => { await waitFor(() => !service.repairStatus().running, 15_000); return service.repairStatus() }
   return { service, registry, root, dataDir, storePath, children, intent, finish }

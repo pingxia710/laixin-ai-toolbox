@@ -1,6 +1,7 @@
 import type { NetworkUsageView } from './shared/network-usage-types'
 
 export interface AccountIdentity { id: string; username: string }
+export type WechatPanelMode = 'loading' | 'quick' | 'qr' | 'confirm'
 export type AccountDevice = 'macos' | 'windows' | 'linux' | 'web' | 'unknown'
 export interface AccountLogin { id: string; device: AccountDevice; deviceId?: string; createdAt: number | null; expiresAt: number; current: boolean }
 export interface InstallationRecord {
@@ -76,6 +77,8 @@ export interface AccountOverview {
   wechatBound?: boolean
   trial: { available: boolean; usage: NetworkUsageView | null; retryable?: boolean; compensated?: boolean }
   recoveryReady: boolean
+  /** False for a WeChat-only account; legacy servers omit this field. */
+  passwordReady?: boolean
   subscription: NetworkUsageView | null
   /** 本账号每一份已付款网络套餐；各自从付款时间计期，可同时有效。 */
   subscriptions?: NetworkUsageView[]

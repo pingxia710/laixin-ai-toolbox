@@ -26,6 +26,8 @@ export interface LocalBridgeHandle {
   restrict(targets: readonly string[] | undefined): void
   verify?: (() => Promise<{ exitIp: string }>) | undefined
   probeReachability?: (() => Promise<{ url: string }>) | undefined
+  /** 通用探测通过后，进一步确认真实 AI 目标可达。 */
+  probeTargetReachability?: (() => Promise<{ url: string }>) | undefined
   /** 多入口专用组独立复验,不以普通组结果代替。 */
   verifyDedicated?: (() => Promise<void>) | undefined
   /** activeStreams:此刻正在往回吐回答的连接数(D3 在途流)。起算点是**正文**第一个字节

@@ -100,7 +100,10 @@ describe('Windows 换文件前置闸入口合同', () => {
 
   it('新旧两个任务逐一变更并 XML 回读，未知状态不得冒充不存在', () => {
     expect(preflightHelper).toContain("[`\\\\Laixin\\\\${options.residentLabel}`, options.residentLabel]")
-    expect(preflightHelper).toContain("['/query', '/tn', task, '/xml', 'ONE']")
+    expect(preflightHelper).toContain('LAIXIN_TASK_XML_QUERY')
+    expect(preflightHelper).toContain('Export-ScheduledTask')
+    expect(preflightHelper).toContain('[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($xml))')
+    expect(preflightHelper).toContain('taskConfirmedMissing')
     expect(preflightHelper).toContain('function taskDisabled(xml)')
     expect(preflightHelper).toContain('const settings = /<Settings')
     expect(preflightHelper).toContain('test(settings[1])')

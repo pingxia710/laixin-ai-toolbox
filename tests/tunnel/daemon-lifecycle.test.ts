@@ -1,7 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { mkdirSync, rmSync } from 'node:fs'
 import { ConnectorError, createLoopbackProbeConnector, type Connector } from '../../sidecar/mac/connectors.mjs'
-import { createDaemon, readIntent, RECONNECT_BACKOFF_MS, type DaemonState } from '../../sidecar/mac/daemon-core.mjs'
+import {
+  BRIDGE_START_TIMEOUT_MS,
+  CONNECTION_VERIFY_TIMEOUT_MS,
+  createDaemon,
+  readIntent,
+  RECONNECT_BACKOFF_MS,
+  type DaemonState
+} from '../../sidecar/mac/daemon-core.mjs'
 import { lastIntent, loadLedger, type SettingEntry } from '../../sidecar/mac/ledger.mjs'
 import { createAdapter, type FakeAdapter } from './fixtures/fake-adapter.mjs'
 import {
@@ -146,6 +153,281 @@ describe('守护核心(判据 1/2/8,连接时指纹核验)', () => {
     expect(stateOf().state).toBe('stopped-restored')
     expect(readFakeStore(storePath)).toEqual({})
     daemon.requestShutdown()
+  })
+
+  it('首次连接阶段卡住时必须在限定时间内收敛到可重连错误，并留下卡住阶段', async () => {
+    const h = harness()
+    writeIntentFile(dataDir, connectIntent())
+    let starts = 0
+    const daemon = createDaemon({ random: () => 0, dataDir, clock, adapter,
+      connectorFactory: connectorFactory(h, (connector) => {
+        starts += 1
+        const originalStart = connector.start.bind(connector)
+        connector.start = () => {
+          if (starts === 1) {
+            h.startCalls.push(h.clock.now())
+            return new Promise(() => undefined)
+          }
+          return originalStart()
+        }
+      }),
+      bridgeFactory: fakeBridgeFactory(), parentAlive: () => true, onExit: () => undefined
+    })
+    const running = daemon.run()
+    await flushMicrotasks()
+    expect(stateOf().state).toBe('connecting')
+    expect(stateOf().connectStage).toBe('connector-start')
+
+    clock.advance(19_999)
+    await flushMicrotasks()
+    expect(stateOf().state).toBe('connecting')
+    clock.advance(1)
+    await flushMicrotasks()
+    await running
+
+    expect(stateOf().state).toBe('error')
+    expect(stateOf().code).toBe('TUNNEL_CONNECTION_TIMEOUT')
+    expect(stateOf().connectStage).toBe('connector-start')
+    clock.advance(RECONNECT_BACKOFF_MS[0])
+    await flushMicrotasks()
+    await flushMicrotasks()
+    await flushMicrotasks()
+    expect(h.startCalls).toHaveLength(2)
+    await waitFor(() => stateOf().state === 'connected')
+
+    daemon.requestShutdown()
+    await flushMicrotasks()
+  })
+
+  it('本地桥启动卡住时也必须收敛，不得把客户永远留在网络连接中', async () => {
+    const h = harness()
+    writeIntentFile(dataDir, connectIntent())
+    let finishListen: (() => void) | undefined
+    let closeCalls = 0
+    const daemon = createDaemon({ random: () => 0, dataDir, clock, adapter,
+      connectorFactory: connectorFactory(h),
+      bridgeFactory: () => ({
+        listen: () => new Promise<void>((resolve) => { finishListen = resolve }),
+        close: () => { closeCalls += 1 }
+      }),
+      parentAlive: () => true, onExit: () => undefined
+    })
+    const running = daemon.run()
+    await waitFor(() => {
+      try { return stateOf().connectStage === 'bridge-start' } catch { return false }
+    })
+    clock.advance(BRIDGE_START_TIMEOUT_MS)
+    await flushMicrotasks()
+    await flushMicrotasks()
+    await running
+    expect(stateOf()).toMatchObject({ state: 'error', code: 'TUNNEL_CONNECTION_TIMEOUT', connectStage: 'bridge-start' })
+    expect(closeCalls).toBe(1)
+    finishListen?.()
+    await flushMicrotasks()
+    expect(stateOf()).toMatchObject({ state: 'error', code: 'TUNNEL_CONNECTION_TIMEOUT', connectStage: 'bridge-start' })
+    daemon.requestShutdown()
+    await flushMicrotasks()
+  })
+
+  it('本地桥启动超时后不绕过未完成的旧桥收尾创建下一代', async () => {
+    const h = harness()
+    writeIntentFile(dataDir, connectIntent())
+    let bridgeCreates = 0
+    let finishListen: (() => void) | undefined
+    const daemon = createDaemon({ random: () => 0, dataDir, clock, adapter,
+      connectorFactory: connectorFactory(h),
+      bridgeFactory: () => {
+        bridgeCreates += 1
+        return {
+          listen: () => new Promise<void>((resolve) => { finishListen = resolve }),
+          close: () => new Promise<void>(() => undefined)
+        }
+      },
+      parentAlive: () => true, onExit: (code) => { h.exited = code }
+    })
+    const running = daemon.run()
+    await waitFor(() => {
+      try { return stateOf().connectStage === 'bridge-start' } catch { return false }
+    })
+    clock.advance(BRIDGE_START_TIMEOUT_MS)
+    await flushMicrotasks()
+    await flushMicrotasks()
+    expect(stateOf()).toMatchObject({ state: 'error', code: 'TUNNEL_CONNECTION_TIMEOUT', connectStage: 'bridge-start' })
+    expect(bridgeCreates).toBe(1)
+
+    // 快速重连醒来时，旧 bridge 仍在 teardown；必须等 30 秒收尾闸，而不是创建第二代。
+    clock.advance(RECONNECT_BACKOFF_MS[0])
+    await flushMicrotasks()
+    await flushMicrotasks()
+    expect(bridgeCreates).toBe(1)
+    clock.advance(30_000)
+    await flushMicrotasks()
+    await running
+    expect(h.exited).toBe(65)
+    finishListen?.()
+    daemon.requestShutdown()
+    await flushMicrotasks()
+  })
+
+  it('自动重连遇到本地桥启动超时时先等旧桥收尾，收尾后才允许下一代', async () => {
+    const h = harness()
+    writeIntentFile(dataDir, connectIntent())
+    let bridgeCreates = 0
+    let firstBridgeAlive = true
+    let finishListen: (() => void) | undefined
+    let finishClose: (() => void) | undefined
+    const daemon = createDaemon({ random: () => 0, dataDir, clock, adapter,
+      connectorFactory: connectorFactory(h),
+      bridgeFactory: () => {
+        const generation = ++bridgeCreates
+        if (generation === 1) {
+          return {
+            listen: async () => {},
+            close: async () => { firstBridgeAlive = false },
+            isAlive: () => firstBridgeAlive
+          }
+        }
+        if (generation === 2) {
+          return {
+            listen: () => new Promise<void>((resolve) => { finishListen = resolve }),
+            close: () => new Promise<void>((resolve) => { finishClose = resolve }),
+            isAlive: () => false
+          }
+        }
+        return { listen: async () => {}, close: async () => {}, isAlive: () => true }
+      },
+      parentAlive: () => true, onExit: (code) => { h.exited = code }
+    })
+    await daemon.run()
+    expect(stateOf().state).toBe('connected')
+    expect(bridgeCreates).toBe(1)
+
+    firstBridgeAlive = false
+    const reconnect = (daemon as unknown as { attemptReconnect(): Promise<void> }).attemptReconnect()
+    await waitFor(() => {
+      try { return stateOf().connectStage === 'bridge-start' } catch { return false }
+    })
+    expect(bridgeCreates).toBe(2)
+
+    clock.advance(BRIDGE_START_TIMEOUT_MS)
+    await flushMicrotasks()
+    await flushMicrotasks()
+    // 第二代 listen 已超时但 close 仍未结束；自动重连不能偷偷创建第三代。
+    clock.advance(10_000)
+    await flushMicrotasks()
+    expect(bridgeCreates).toBe(2)
+    expect(h.exited).toBeUndefined()
+
+    finishClose?.()
+    finishListen?.()
+    await reconnect
+    clock.advance(RECONNECT_BACKOFF_MS[1])
+    await flushMicrotasks()
+    await flushMicrotasks()
+    await waitFor(() => stateOf().state === 'connected')
+    expect(bridgeCreates).toBe(3)
+    expect(h.exited).toBeUndefined()
+
+    daemon.requestShutdown()
+    await waitFor(() => stateOf().state === 'stopped-restored')
+  })
+
+  it('旧桥迟到的断流和降级事件不得覆盖后继已连通的桥', async () => {
+    const h = harness()
+    writeIntentFile(dataDir, connectIntent())
+    let bridgeGeneration = 0
+    let firstBridgeAlive = true
+    let firstLost: ((error: Error) => void) | undefined
+    let firstDegraded: (() => void) | undefined
+    const daemon = createDaemon({ random: () => 0, dataDir, clock, adapter,
+      connectorFactory: connectorFactory(h),
+      bridgeFactory: () => {
+        const generation = ++bridgeGeneration
+        return {
+          listen: async () => {},
+          close: async () => { if (generation === 1) firstBridgeAlive = false },
+          isAlive: () => generation === 1 ? firstBridgeAlive : true,
+          onLost: (callback: (error: Error) => void) => { if (generation === 1) firstLost = callback },
+          onDegraded: (callback: () => void) => { if (generation === 1) firstDegraded = callback },
+          verify: async () => ({ exitIp: EXIT_IP })
+        }
+      },
+      parentAlive: () => true, onExit: () => undefined
+    })
+    await daemon.run()
+    firstBridgeAlive = false
+    await (daemon as unknown as { attemptReconnect(): Promise<void> }).attemptReconnect()
+    expect(bridgeGeneration).toBe(2)
+    expect(stateOf().state).toBe('connected')
+
+    firstLost?.(new Error('旧桥迟到断流'))
+    firstDegraded?.()
+    await flushMicrotasks()
+    await flushMicrotasks()
+    expect(bridgeGeneration).toBe(2)
+    expect(stateOf().state).toBe('connected')
+    daemon.requestShutdown()
+    await flushMicrotasks()
+  })
+
+  it('路径确认卡住时也必须收敛，并且不能写入系统代理账本', async () => {
+    const h = harness()
+    writeIntentFile(dataDir, connectIntent())
+    const daemon = createDaemon({ random: () => 0, dataDir, clock, adapter,
+      connectorFactory: connectorFactory(h, (connector) => {
+        connector.verify = () => new Promise(() => undefined)
+      }),
+      bridgeFactory: fakeBridgeFactory(), parentAlive: () => true, onExit: () => undefined
+    })
+    const running = daemon.run()
+    await waitFor(() => {
+      try { return stateOf().connectStage === 'path-verify-before-settings' } catch { return false }
+    })
+    clock.advance(CONNECTION_VERIFY_TIMEOUT_MS)
+    await flushMicrotasks()
+    await flushMicrotasks()
+    await running
+    expect(stateOf()).toMatchObject({ state: 'error', code: 'TUNNEL_CONNECTION_TIMEOUT', connectStage: 'path-verify-before-settings' })
+    expect(loadLedger(dataDir).filter((entry) => entry.kind === 'setting')).toHaveLength(0)
+    expect(readFakeStore(storePath)).toEqual({})
+    daemon.requestShutdown()
+    await flushMicrotasks()
+  })
+
+  it('写入系统代理后路径确认迟到时必须保持失败态，并完成原设置恢复', async () => {
+    const h = harness()
+    writeIntentFile(dataDir, connectIntent())
+    let verifyCalls = 0
+    let finishVerify: ((value: { exitIp: string }) => void) | undefined
+    const daemon = createDaemon({ random: () => 0, dataDir, clock, adapter,
+      connectorFactory: connectorFactory(h, (connector) => {
+        connector.verify = () => {
+          verifyCalls += 1
+          if (verifyCalls === 1) return Promise.resolve({ exitIp: EXIT_IP })
+          return new Promise((resolve) => { finishVerify = resolve })
+        }
+      }),
+      bridgeFactory: fakeBridgeFactory(), parentAlive: () => true, onExit: () => undefined
+    })
+    const running = daemon.run()
+    await waitFor(() => {
+      try { return stateOf().connectStage === 'path-verify-after-settings' } catch { return false }
+    })
+    expect(Object.keys(readFakeStore(storePath))).not.toHaveLength(0)
+    clock.advance(CONNECTION_VERIFY_TIMEOUT_MS)
+    await flushMicrotasks()
+    await flushMicrotasks()
+    await running
+    expect(stateOf()).toMatchObject({ state: 'error', code: 'TUNNEL_CONNECTION_TIMEOUT', connectStage: 'path-verify-after-settings' })
+    expect(loadLedger(dataDir).filter((entry) => entry.kind === 'setting' && entry.status !== 'restored')).toHaveLength(0)
+    expect(readFakeStore(storePath)).toEqual({})
+
+    // 底层探测即使迟到完成，也不能越过本轮身份栅栏把失败态改回 connected。
+    finishVerify?.({ exitIp: EXIT_IP })
+    await flushMicrotasks()
+    expect(stateOf()).toMatchObject({ state: 'error', code: 'TUNNEL_CONNECTION_TIMEOUT', connectStage: 'path-verify-after-settings' })
+    daemon.requestShutdown()
+    await flushMicrotasks()
   })
 
   it('内核首次失败或运行中退出均不能假连通，重启内核后才恢复且不重复覆盖原设置', async () => {

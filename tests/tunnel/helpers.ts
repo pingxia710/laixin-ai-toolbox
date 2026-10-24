@@ -69,6 +69,10 @@ export async function startFakeUpstream(): Promise<FakeUpstream> {
   const server: Server = createServer((socket) => {
     count += 1
     sockets.add(socket)
+    // 假上游故意挂住连接；守护停止/重建时，Windows 可把对端关闭报成 RST。
+    socket.on('error', (error: NodeJS.ErrnoException) => {
+      if (error.code !== 'ECONNRESET') throw error
+    })
     socket.on('close', () => sockets.delete(socket))
   })
   await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen))

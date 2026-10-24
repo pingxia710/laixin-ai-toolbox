@@ -737,7 +737,7 @@ describe('保存 Key 到真实路由的闭环（隔离上游）', () => {
     expect((await f.service.serviceStatus()).routes[0].provider).toBe('deepseek')
     write.mockRestore()
   })
-  it('配置写不进去时，attempt 带上目录、属主和能照做的一句话，⛔ 只回一句 configuration_failed（纪律 2）', async () => {
+  it('配置写不进去时，attempt 带上目录和对应平台能照做的修复建议', async () => {
     const f = fixture()
     await f.service.saveProviderKey('claude', 'deepseek', 'sk-fixture-deepseek-0123456789')
     const home = await mkdtemp(join(tmpdir(), 'laixin-write-fault-'))
@@ -749,8 +749,14 @@ describe('保存 Key 到真实路由的闭环（隔离上游）', () => {
       const result = await f.service.useProvider('claude', 'deepseek')
       expect(result.attempt).toMatchObject({ ok: false, code: 'configuration_failed' })
       expect(result.attempt?.notice).toContain(home)
-      expect(result.attempt?.notice).toContain('属主')
-      expect(result.attempt?.notice).toContain('chown')
+      if (process.platform === 'win32') {
+        expect(result.attempt?.notice).toContain('只读属性')
+        expect(result.attempt?.notice).toContain('安全权限')
+        expect(result.attempt?.notice).not.toContain('chown')
+      } else {
+        expect(result.attempt?.notice).toContain('属主')
+        expect(result.attempt?.notice).toContain('chown')
+      }
       expect(result.attempt?.notice).not.toContain('sk-fixture-deepseek')
     } finally {
       await rm(home, { recursive: true, force: true })

@@ -48,6 +48,12 @@ export const TUNNEL_PROBE_URLS = Object.freeze(['https://www.gstatic.com/generat
  */
 export const AI_SERVICE_PROBE_URLS = Object.freeze(['https://chatgpt.com/', 'https://api.anthropic.com/'])
 
+// 通用 204 只能证明通道里有一条路，不能证明客户真正要用的 AI 目标可达。
+// 目标未确认时由守护写成受控状态，不把它误报成「已连接」。
+export function targetUnconfirmedError() {
+  return Object.assign(new Error('目标 AI 服务暂未确认'), { code: 'TUNNEL_TARGET_UNCONFIRMED' })
+}
+
 /**
  * 甲-4 补强(2026-09-17):AI 服务按**每个探测地址的真实响应特征**判「这条路能不能用」,⛔ 一刀切。
  * 甲-4 基线是任何 <500 都算通,但两家对**不支持地区**都会在网络可达的前提下回 403 → 被判可用 →
@@ -90,15 +96,32 @@ export function aiProbeResponseAcceptable(target, statusCode, headers) {
 }
 
 /** 逐个探测,任一有 HTTP 回应(状态 < 500)即视为通道可达;全部失败抛最后一个错误。 */
-export async function probeTunnelReachability(port, urls = TUNNEL_PROBE_URLS, timeoutMs = 8_000, probe = reachThroughProxy) {
+export async function probeTunnelReachability(port, urls = TUNNEL_PROBE_URLS, timeoutMs = 8_000, probe = reachThroughProxy, isAcceptable) {
   let lastError = new ConnectorError(CONTROL_CODES.upstreamUnreachable, '通道探测无回应')
   for (const url of urls) {
-    try { await probe(port, url, timeoutMs); return { url } } catch (error) { lastError = error }
+    try { await probe(port, url, timeoutMs, isAcceptable); return { url } } catch (error) { lastError = error }
   }
   throw lastError
 }
 
-export async function reachThroughProxy(port, url, timeoutMs = 8_000) {
+/** 通道已经能访问通用地址时，再用真实 AI 目标确认“客户能用的路”确实可达。 */
+export async function probeTargetReachability(port, urls = AI_SERVICE_PROBE_URLS, timeoutMs = 8_000, probe = reachThroughProxy) {
+  const targets = urls.slice(0, 2)
+  if (targets.length === 0) throw new ConnectorError(CONTROL_CODES.upstreamUnreachable, '没有可用的目标探测点')
+  let lastError
+  for (const url of targets) {
+    try {
+      await probe(port, url, timeoutMs,
+        (target, response) => aiProbeResponseAcceptable(target, response.statusCode, response.headers))
+    } catch (error) {
+      lastError = error
+    }
+  }
+  if (lastError !== undefined) throw lastError
+  return { url: targets[0] }
+}
+
+export async function reachThroughProxy(port, url, timeoutMs = 8_000, isAcceptable) {
   const target = new URL(url)
   const targetHost = target.hostname.replace(/^\[|\]$/g, '')
   const targetPort = Number(target.port || (target.protocol === 'https:' ? 443 : 80))
@@ -107,7 +130,8 @@ export async function reachThroughProxy(port, url, timeoutMs = 8_000) {
   try {
     if (target.protocol === 'https:') transport = tlsConnect({ socket, servername: isIP(targetHost) ? undefined : targetHost, host: targetHost, rejectUnauthorized: true })
     // 判据与两个复用探测同一处:真发一次轻量请求,拿到 <500 的 HTTP 响应才算通(甲-4)。
-    await httpResponseOverSocket(transport, target, timeoutMs)
+    await httpResponseOverSocket(transport, target, timeoutMs,
+      isAcceptable === undefined ? undefined : (response) => isAcceptable(target, response))
   } finally {
     transport.destroy()
     socket.destroy()

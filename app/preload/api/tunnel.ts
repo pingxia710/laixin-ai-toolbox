@@ -27,6 +27,7 @@ export interface TunnelStatusView {
   readonly source: string
   readonly authorization: string
   readonly backend: string
+  readonly observedNodeLabel?: string
   readonly nodeLabel: string
   readonly exitIp: string
   readonly pathVerified?: boolean
@@ -38,6 +39,7 @@ export interface TunnelStatusView {
   readonly pendingAvailable: boolean
   readonly unrestored: string
   readonly recoveryState?: 'idle' | 'running' | 'required'
+  readonly recoveryDetail?: string
   readonly componentMissing: string
   readonly traffic?: string
   /** N-55 控制器阶段；为空表示当前没有受控网络设置动作。 */

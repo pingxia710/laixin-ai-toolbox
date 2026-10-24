@@ -8,13 +8,22 @@ import type { ResidentRuntime } from './resident-bridge'
 
 let runtime: ResidentRuntime | undefined
 let pendingChoice: boolean | undefined
+let calibrationError = ''
+
+/** Only a stable code crosses into the UI; command output can contain local paths. */
+export function residentCalibrationError(): string { return calibrationError }
+function failureCode(reason: unknown): string {
+  const message = reason instanceof Error ? reason.message : String(reason ?? '')
+  return /0x80070005/i.test(message) ? '0x80070005' : 'RESIDENT_SETUP_FAILED'
+}
 
 export function setResidentRuntime(value: ResidentRuntime): void {
   runtime = value
+  calibrationError = ''
   if (pendingChoice !== undefined) {
     const wanted = pendingChoice
     pendingChoice = undefined
-    void value.calibrate(wanted).catch(() => undefined)
+    void calibrateResident(wanted).catch(() => undefined)
   }
 }
 
@@ -25,11 +34,20 @@ export async function calibrateResident(enabled: boolean): Promise<ResidentOutco
     pendingChoice = enabled
     return undefined
   }
-  return runtime.calibrate(enabled)
+  const current = runtime
+  try {
+    const outcome = await current.calibrate(enabled)
+    if (runtime === current) calibrationError = enabled && !outcome.installed ? failureCode(outcome.reason) : ''
+    return outcome
+  } catch (error) {
+    if (runtime === current) calibrationError = enabled ? failureCode(error) : ''
+    throw error
+  }
 }
 
 /** 仅供测试复位。 */
 export function resetResidentRuntime(): void {
   runtime = undefined
   pendingChoice = undefined
+  calibrationError = ''
 }

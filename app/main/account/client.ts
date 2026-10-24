@@ -9,6 +9,12 @@ import { validDeviceReceipt, type DeviceFacts } from '../../customer-ops-types'
 
 type AccountRequestStage = 'prepare' | 'fetch' | 'response' | 'body' | 'http' | 'schema' | 'local'
 
+/** 登录/领取这类明确动作可以要求网络层在配置同步后立即发起首连。
+ * 后台状态刷新不传此选项，因此不会因为轮询或重开状态查询而接管用户已断开的网络。 */
+export interface NetworkAccessOptions {
+  readonly autoConnect?: boolean
+}
+
 const safeExceptionName = (error: unknown): string =>
   error instanceof Error && ['TypeError', 'AbortError', 'TimeoutError', 'SyntaxError', 'RangeError'].includes(error.name) ? error.name : 'Other'
 
@@ -61,6 +67,7 @@ export const accountMessages: Record<string, string> = {
   WECHAT_ACCOUNT_BOUND: '当前来信账号已绑定其他微信，请联系来信客服核对。',
   ACCOUNT_BUSY: '正在处理账号操作，请稍候。',
   NETWORK_NOT_CONFIGURED: '网络开通服务暂未开放。',
+  NETWORK_PROVISIONING_UNAVAILABLE: '网络开通服务暂时不可用，请稍后重试；持续失败请联系客服。',
   APPLICATION_ALREADY_EXISTS: '已有网络套餐，请刷新查看当前套餐后重试。',
   ALLOCATION_BUSY: '开通服务正在处理其他申请，请稍后重试。',
   ACCOUNT_LOGOUT_PENDING: '网络暂不可用，尚未完成退出，请恢复连接后重试。',
@@ -119,7 +126,7 @@ export class AccountClient {
   private termsFailedAt = 0
   private readonly device: AccountDevice = process.platform === 'darwin' ? 'macos' : process.platform === 'win32' ? 'windows' : process.platform === 'linux' ? 'linux' : 'unknown'
   constructor(origin: string, private readonly store: SessionStore,
-    private readonly setNetwork: (access: NetworkAccountAccess | undefined, reason?: 'temporary-unavailable' | 'login-expired') => Promise<unknown>,
+    private readonly setNetwork: (access: NetworkAccountAccess | undefined, reason?: 'temporary-unavailable' | 'login-expired', options?: NetworkAccessOptions) => Promise<unknown>,
     private readonly collectDevice?: () => Promise<DeviceFacts>,
     private readonly openExternal: (url: string) => Promise<void> = async () => { throw new AccountClientError('WECHAT_LOGIN_OPEN_FAILED') },
     private readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -420,7 +427,7 @@ export class AccountClient {
     this.view = { state: 'signed-in', account: data.account, code: '', message: '已登录', overview: null }
     await this.ensureTerms()
     await this.setNetwork({ client: new NetworkAccountClient(new URL('v1/network/', this.base!).href),
-      session: { accountId: data.account.id, accessToken: data.accessToken, deviceId: await this.store.deviceId?.() } })
+      session: { accountId: data.account.id, accessToken: data.accessToken, deviceId: await this.store.deviceId?.() } }, undefined, { autoConnect: true })
     const view = await this.overview()
     return droppedInvite ? { ...view, message: '已登录。当前账号服务版本暂不支持邀请码，本次注册未获得邀请奖励。' } : view
   }) }
@@ -438,7 +445,8 @@ export class AccountClient {
     return false
   }
 
-  wechatLogin(mode: 'login' | 'bind' = 'login', onRecovery: (code: string) => void = () => undefined): Promise<AccountView> { return this.run(async () => {
+  wechatLogin(mode: 'login' | 'bind' = 'login', onRecovery: (code: string) => void = () => undefined,
+    present: (url: string) => Promise<void> = this.openExternal): Promise<AccountView> { return this.run(async () => {
     if ((mode === 'bind') !== Boolean(this.session)) throw new AccountClientError('ACCOUNT_LOGIN_REQUIRED')
     this.wechatCancelled = false
     this.wechatStarting = true
@@ -470,7 +478,7 @@ export class AccountClient {
     let result: Record<string, unknown> | undefined
     try {
       if (this.wechatCancelled) throw new AccountClientError('WECHAT_LOGIN_CANCELLED')
-      try { await this.openExternal(authorize.href) } catch { throw new AccountClientError('WECHAT_LOGIN_OPEN_FAILED') }
+      try { await present(authorize.href) } catch { throw new AccountClientError('WECHAT_LOGIN_OPEN_FAILED') }
       while (Date.now() < Number(started.expiresAt)) {
         if (this.wechatCancelled) throw new AccountClientError('WECHAT_LOGIN_CANCELLED')
         try {
@@ -512,7 +520,7 @@ export class AccountClient {
     this.view = { state: 'signed-in', account: data.account, code: '', message: '已登录', overview: null }
     await this.ensureTerms()
     await this.setNetwork({ client: new NetworkAccountClient(new URL('v1/network/', this.base!).href),
-      session: { accountId: data.account.id, accessToken: data.accessToken, deviceId } })
+      session: { accountId: data.account.id, accessToken: data.accessToken, deviceId } }, undefined, { autoConnect: true })
     return this.overview()
   }) }
 
@@ -539,6 +547,7 @@ export class AccountClient {
       if (!data || !Array.isArray(data.plans) || typeof data.networkAvailable !== 'boolean' || !data.trial ||
           typeof data.recoveryReady !== 'boolean' || typeof data.trial.available !== 'boolean' ||
           (data.wechatBound !== undefined && typeof data.wechatBound !== 'boolean') ||
+          (data.passwordReady !== undefined && typeof data.passwordReady !== 'boolean') ||
           (data.trial.usage !== null && (!validUsage(data.trial.usage) || data.trial.usage.kind !== 'trial')) ||
           (data.subscription !== null && (!validUsage(data.subscription) || data.subscription.kind !== 'subscription')) ||
           (data.subscriptions !== undefined && (!Array.isArray(data.subscriptions) || data.subscriptions.some((item) =>
@@ -905,16 +914,20 @@ export class AccountClient {
 
   claimTrial(): Promise<AccountView> { return this.run(async () => {
     if (!this.session) return signedOut('ACCOUNT_LOGIN_REQUIRED', accountMessages.ACCOUNT_LOGIN_REQUIRED)
+    let claimError: AccountClientError | undefined
     try { await this.request('/v1/account/trial', {}, this.session.accessToken) }
     catch (error) {
       if (error instanceof AccountClientError && error.message === 'ACCOUNT_LOGIN_REQUIRED') throw error
       // A lost response does not prove that provisioning failed. Read back the entitlement.
+      if (error instanceof AccountClientError) claimError = error
     }
     await this.setNetwork({ client: new NetworkAccountClient(new URL('v1/network/', this.base!).href),
-      session: { accountId: this.session.account.id, accessToken: this.session.accessToken, deviceId: await this.store.deviceId?.() } })
+      session: { accountId: this.session.account.id, accessToken: this.session.accessToken, deviceId: await this.store.deviceId?.() } }, undefined, { autoConnect: true })
     const view = await this.overview()
     if (!view.overview) return { ...view, message: '领取结果暂时无法确认，请稍后刷新权益查看。' }
     const { usage, retryable } = view.overview.trial
+    if (!usage && claimError) return { ...view, code: claimError.message,
+      message: claimError.detail ?? accountMessages[claimError.message] ?? accountMessages.ACCOUNT_SERVICE_UNAVAILABLE }
     const message = !usage ? '暂未确认领取成功，请稍后重试。'
       : usage.state === 'active' ? trialClaimedCopy(this.terms)
         : retryable || ['pending', 'queued', 'provisioning'].includes(usage.state) ? '体验领取记录已保存，开通中，可稍后重试。'

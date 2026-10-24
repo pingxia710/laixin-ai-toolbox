@@ -7,6 +7,10 @@ import { readCodexUsage, readCodexUsageForAddedAccount, readCodexUsageWithFallba
 import { findCodexCommand, isCodexDesktopExecutable } from '../../app/main/codex-usage/runtime'
 import { createUsageMonitor } from '../../app/main/codex-usage/monitor'
 import { percentText, resetText, windowLabel } from '../../app/renderer/src/codex-usage/view'
+import packageInfo from '../../package.json'
+
+// 模拟带后缀工作包的运行时版本（electron-builder extraMetadata 在编译后改写成品版本）。
+vi.mock('electron', () => ({ app: { getVersion: () => '0.6.3-review.1' } }))
 
 const fixture = resolve('tests/codex-usage/fixtures/server.mjs')
 const account = { type: 'chatgpt', email: 'demo@example.test', planType: 'plus' }
@@ -54,7 +58,27 @@ describe('实际子进程协议', () => {
       const calls = (await readFile(requests, 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as { method: string; params?: { refreshToken: boolean } })
       expect(calls.map((call) => call.method)).toEqual(['initialize', 'initialized', 'account/read', 'account/rateLimits/read', 'account/read'])
       expect(calls.filter((call) => call.method === 'account/read').every((call) => call.params?.refreshToken === false)).toBe(true)
+      const initialize = calls.find((call) => call.method === 'initialize') as { params?: { clientInfo?: { version?: string } } } | undefined
+      expect(initialize?.params?.clientInfo?.version).toBe(packageInfo.version)
     } finally { await rm(directory, { recursive: true, force: true }) }
+  })
+
+  it('带后缀工作包上报实际运行版本，不用编译时源码版本', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'usage-runtime-version-'))
+    const versions = process.versions as { electron?: string }
+    const originalElectron = versions.electron
+    versions.electron = '33.0.0'
+    try {
+      const requests = join(directory, 'requests.jsonl')
+      await readCodexUsage({ executable: process.execPath, args: [fixture] }, { cwd: directory, signal: new AbortController().signal, env: { ...process.env, USAGE_FIXTURE_REQUESTS: requests } })
+      const calls = (await readFile(requests, 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as { method: string; params?: { clientInfo?: { version?: string } } })
+      const initialize = calls.find((call) => call.method === 'initialize')
+      expect(initialize?.params?.clientInfo?.version).toBe('0.6.3-review.1')
+    } finally {
+      if (originalElectron === undefined) delete versions.electron
+      else versions.electron = originalElectron
+      await rm(directory, { recursive: true, force: true })
+    }
   })
   it.each([
     ['signed-out', 'signed-out'], ['api-key', 'unsupported'], ['changed', 'account-changed'],

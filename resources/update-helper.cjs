@@ -184,13 +184,27 @@ async function taskConfirmedMissing(task, commands, schtasks, deadlineAt, now) {
 }
 
 async function queryResidentTask(task, commands, schtasks, deadlineAt, now) {
-  const query = await boundedCommand(commands, schtasks, ['/query', '/tn', task, '/xml', 'ONE'], deadlineAt, now);
-  assertNotTimedOut(query, 'UPDATE_RESIDENT_TASK_QUERY_TIMEOUT');
-  if (query.code !== 0) {
+  // schtasks can emit its XML in the active OEM code page despite the XML encoding declaration.
+  // Export the Unicode task through an ASCII-only pipe before persisting its recovery snapshot.
+  const separator = task.lastIndexOf('\\');
+  const taskPath = separator >= 0 ? task.slice(0, separator + 1) : '\\';
+  const taskName = separator >= 0 ? task.slice(separator + 1) : task;
+  const powershell = win32.join(win32.dirname(schtasks), 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const script = `# LAIXIN_TASK_XML_QUERY\n$ErrorActionPreference='Stop';` +
+    `$xml=Export-ScheduledTask -TaskPath (${decodeBase64PowerShell(taskPath)}) -TaskName (${decodeBase64PowerShell(taskName)}) -ErrorAction Stop;` +
+    `[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($xml))`;
+  const exported = await boundedCommand(commands, powershell, encodedPowerShell(script), deadlineAt, now);
+  assertNotTimedOut(exported, 'UPDATE_RESIDENT_TASK_QUERY_TIMEOUT');
+  if (exported.code !== 0) {
     if (await taskConfirmedMissing(task, commands, schtasks, deadlineAt, now)) return { task, state: 'missing', xml: '' };
     throw new Error('UPDATE_RESIDENT_TASK_STATE_UNKNOWN');
   }
-  return { task, state: taskDisabled(query.stdout) ? 'disabled' : 'enabled', xml: query.stdout };
+  const encoded = exported.stdout.trim();
+  const xml = Buffer.from(encoded, 'base64').toString('utf8');
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(encoded) || !/<Task(?:\s|>)/.test(xml)) {
+    throw new Error('UPDATE_RESIDENT_TASK_XML_INVALID');
+  }
+  return { task, state: taskDisabled(xml) ? 'disabled' : 'enabled', xml };
 }
 
 async function changeResidentTask(task, state, commands, schtasks, deadlineAt, now) {
@@ -359,7 +373,7 @@ function proxyOwnershipPowerShell() {
     if(Test-Path -LiteralPath (Join-Path $TunnelDataDir 'ledger-recovery-required') -ErrorAction Stop){throw 'UPDATE_PROXY_OWNERSHIP_UNKNOWN'}
     $raw=Get-Content -LiteralPath (Join-Path $TunnelDataDir 'ledger.json') -Raw -Encoding UTF8 -ErrorAction Stop
     if(-not $raw.TrimStart().StartsWith('[')){throw 'UPDATE_PROXY_OWNERSHIP_UNKNOWN'}
-    $ledger=@(ConvertFrom-Json -InputObject $raw -ErrorAction Stop)
+    $ledger=ConvertFrom-Json -InputObject $raw -ErrorAction Stop
     if($ledger.Count -eq 0){throw 'UPDATE_PROXY_OWNERSHIP_UNKNOWN'}
     foreach($entry in $ledger){
       if($null -eq $entry -or [string]::IsNullOrWhiteSpace([string]$entry.id) -or $null -eq $entry.time){throw 'UPDATE_PROXY_OWNERSHIP_UNKNOWN'}
@@ -696,7 +710,9 @@ function recoveryGuardReason(error) {
 
 async function recordRecoveryGuardFallback(recoveryDirectory, error) {
   const reason = recoveryGuardReason(error);
-  const line = `${new Date().toISOString()} UPDATE_RECOVERY_GUARD_BYPASSED GUARD_REASON=${reason}\n`;
+  const message = error instanceof Error ? error.message : String(error);
+  const waitedMs = /^UPDATE_RECOVERY_GUARD_TIMEOUT:WAITED_MS_(\d+)$/.exec(message)?.[1];
+  const line = `${new Date().toISOString()} UPDATE_RECOVERY_GUARD_BYPASSED GUARD_REASON=${reason}${waitedMs === undefined ? '' : ` WAITED_MS=${waitedMs}`}\n`;
   try { await fs.appendFile(join(recoveryDirectory, 'windows-preflight-last-error.log'), line, { mode: 0o600 }); }
   catch { /* The uninstall still has to prove task, process and network cleanup below. */ }
 }
@@ -732,7 +748,10 @@ async function defaultRecoveryGuardLauncher({ guardSourcePath, guardPath, guardE
         LAIXIN_RECOVERY_GUARD_POWERSHELL: powershell,
         LAIXIN_RECOVERY_GUARD_LAUNCHER: launcherPath
       }, cwd: WINDOWS_NATIVE_CWD,
-      detached: false, windowsHide: true, stdio: 'ignore', windowsVerbatimArguments: false
+      // The native guard must outlive this short preflight worker. A non-detached child belongs
+      // to libuv's Windows job and is killed when the worker exits, before NSIS verifies handoff.
+      // Unlike the former PowerShell guard, this native PE runs without an attached console.
+      detached: true, windowsHide: true, stdio: 'ignore', windowsVerbatimArguments: false
     });
   } catch {
     await writeRecoveryGuardFailure(guardErrorPath, 'UPDATE_RECOVERY_GUARD_LAUNCH_FAILED');
@@ -834,7 +853,10 @@ function sameHandleTerminationScript(processEntry) {
     `  if($wait -eq 0){$exitCode=0} elseif($wait -ne 258){$exitCode=23}\n` +
     `  elseif(-not [LaixinNativeProcess]::TerminateProcess($handle,1)){$exitCode=24}\n` +
     `  elseif([LaixinNativeProcess]::WaitForSingleObject($handle,2000) -ne 0){$exitCode=25}\n` +
-    ` } } } finally {[void][LaixinNativeProcess]::CloseHandle($handle)}; exit $exitCode;`;
+    // A parent exit may finish this child after the snapshot while another handle keeps its PID alive.
+    // QueryFullProcessImageName then fails; only a signaled same-process handle proves stop is complete.
+    ` } } } finally {if($exitCode -ne 0 -and [LaixinNativeProcess]::WaitForSingleObject($handle,0) -eq 0){$exitCode=0};` +
+    `[void][LaixinNativeProcess]::CloseHandle($handle)}; exit $exitCode;`;
 }
 
 async function stopManagedProcess(processEntry, commands, powershell, deadlineAt, now) {
@@ -1509,13 +1531,17 @@ if (require.main === module) main().catch(async error => {
   const win32Error = /^UPDATE_RECOVERY_DURABLE_RENAME_FAILED:WIN32_(\d+)$/.exec(message)?.[1];
   const guardWaitMs = /^UPDATE_RECOVERY_GUARD_TIMEOUT:WAITED_MS_(\d+)$/.exec(message)?.[1];
   const guardReason = /^UPDATE_RECOVERY_GUARD_FAILED:(UPDATE_RECOVERY_GUARD_[A-Z_]+)$/.exec(message)?.[1];
-  const line = `${new Date().toISOString()} ${code}${win32Error === undefined ? '' : ` WIN32_${win32Error}`}${guardWaitMs === undefined ? '' : ` WAITED_MS=${guardWaitMs}`}${guardReason === undefined ? '' : ` GUARD_REASON=${guardReason}`}\n`;
+  const stage = process.argv[2] === 'windows-preflight' ? 'preflight'
+    : process.argv[2] === 'windows-preflight-commit' ? 'recovery-commit' : undefined;
+  const line = `${new Date().toISOString()} ${code}${stage === undefined ? '' : ` STAGE=${stage}`}${win32Error === undefined ? '' : ` WIN32_${win32Error}`}${guardWaitMs === undefined ? '' : ` WAITED_MS=${guardWaitMs}`}${guardReason === undefined ? '' : ` GUARD_REASON=${guardReason}`}\n`;
   try { process.stderr.write(line); } catch { /* The exit code still reaches the installer. */ }
-  if (process.argv[2] === 'windows-preflight' && process.env.LAIXIN_PREFLIGHT_RECOVERY_DIRECTORY) {
+  const reportDirectory = process.argv[2] === 'windows-preflight'
+    ? process.env.LAIXIN_PREFLIGHT_RECOVERY_DIRECTORY
+    : process.argv[2] === 'windows-preflight-commit' ? process.argv[3] : undefined;
+  if (reportDirectory) {
     try {
-      const directory = process.env.LAIXIN_PREFLIGHT_RECOVERY_DIRECTORY;
-      await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-      await fs.appendFile(join(directory, 'windows-preflight-last-error.log'), line, { mode: 0o600 });
+      await fs.mkdir(reportDirectory, { recursive: true, mode: 0o700 });
+      await fs.appendFile(join(reportDirectory, 'windows-preflight-last-error.log'), line, { mode: 0o600 });
     } catch { /* Reporting failure must not mask the original preflight failure. */ }
   }
   process.exitCode = 1;

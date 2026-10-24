@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { net } from 'electron'
 import { EventEmitter } from 'node:events'
 import type { spawn as spawnType } from 'node:child_process'
 import { access, chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises'
@@ -7,6 +8,10 @@ import { dirname, join } from 'node:path'
 import { defaultRecipes, type Recipes } from '../../app/main/recipes/recipes'
 import { ShellInventory, augmentedEnvironment, parseVersion, trustedCliCommandCandidates, trustedCliExecutable, trustedCliInstalled, trustedCliVersion, trustedHermesCommandCandidates, trustedHermesEnvironment, trustedHermesExecutable } from '../../app/main/shells/inventory'
 import { ShellInstaller } from '../../app/main/shells/installer'
+
+vi.mock('electron', () => ({
+  net: { fetch: vi.fn(async () => new Response(JSON.stringify({ version: '0.160.0' }), { status: 200 })) }
+}))
 
 function inventory(options: { files?: string[]; versions?: Record<string, string>; recipes?: Recipes; fetch?: typeof fetch; platform?: string } = {}) {
   const files = new Set(options.files ?? [])
@@ -327,6 +332,25 @@ describe('六壳安装检测', () => {
     const pinned = { ...defaultRecipes, shells: { ...defaultRecipes.shells, 'deepseek-harness': { ...defaultRecipes.shells['deepseek-harness'], latest: '0.153.4' } } }
     const { inv: pinnedInv } = inventory({ files: ['/usr/bin/dsh'], versions: { dsh: '0.153.4' }, recipes: pinned, fetch: fetchImpl })
     expect(await pinnedInv.inspect('deepseek-harness')).toMatchObject({ latest: '0.153.4', updatable: false })
+  })
+
+  it('INV-01：缺省 registry 查询在 Electron 内走 net.fetch（系统代理/PAC/专线），不用全局 fetch 直连', async () => {
+    const globalFetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('', { status: 503 }))
+    const versions = process.versions as { electron?: string }
+    const originalElectron = versions.electron
+    versions.electron = '33.0.0'
+    try {
+      const inv = new ShellInventory({ platform: 'darwin', home: '/Users/t', env: { PATH: '/usr/bin' },
+        recipes: () => defaultRecipes, exec: async () => '', exists: async () => false,
+        trustedVersion: async () => undefined, validateHermesExecutable: async () => false, now: () => 1_800_000_000_000 })
+      await expect(inv.latest('deepseek-harness')).resolves.toBe('0.160.0')
+      expect(net.fetch).toHaveBeenCalledWith('https://registry.npmjs.org/@deepseek-ai/dsh/latest', expect.objectContaining({ signal: expect.any(AbortSignal) }))
+      expect(globalFetch).not.toHaveBeenCalled()
+    } finally {
+      if (originalElectron === undefined) delete versions.electron
+      else versions.electron = originalElectron
+      globalFetch.mockRestore()
+    }
   })
 })
 

@@ -1,7 +1,11 @@
 // 写入权互斥体与端口认人的直接行为覆盖(审查点名:这两个新件原先只有接入处被间接覆盖)。
 import { describe, expect, it } from 'vitest'
+import { createServer } from 'node:net'
 import { WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT, acquireWriteRight } from '../../sidecar/win/wininet-write-right.mjs'
-import { identifyPortOwner, isLaixinExePath, isLaixinInstallDir, isLaixinXrayPath, parsePortOwner } from '../../sidecar/win/port-owner.mjs'
+import {
+  identifyPortOwner, isLaixinExePath, isLaixinInstallDir, isLaixinXrayPath, loadNativePortOwner, parsePortOwner,
+  resetPortOwnerCache
+} from '../../sidecar/win/port-owner.mjs'
 
 function fakeApi(status: number, overrides: Record<string, unknown> = {}) {
   const calls = { released: 0, closed: 0 }
@@ -42,8 +46,11 @@ describe('系统代理写入权互斥体', () => {
   })
 
   it('原语不可用(koffi 缺失/等待失败):理由是 unavailable,⛔ 当成「没人持有」放行', () => {
-    expect(acquireWriteRight({ api: undefined }).acquired).toBe(false)
-    expect(acquireWriteRight({ api: undefined })).toMatchObject({ reason: 'unavailable' })
+    // 默认参数在 Windows 会加载真实内核原语；非 Windows 才应走不可用分支。
+    if (process.platform !== 'win32') {
+      expect(acquireWriteRight({ api: undefined }).acquired).toBe(false)
+      expect(acquireWriteRight({ api: undefined })).toMatchObject({ reason: 'unavailable' })
+    }
     const { api } = fakeApi(WAIT_FAILED)
     expect(acquireWriteRight({ api })).toMatchObject({ acquired: false, reason: 'unavailable' })
     const throwing = fakeApi(WAIT_OBJECT_0, { createMutex: () => { throw new Error('no dll') } })
@@ -63,6 +70,87 @@ describe('系统代理写入权互斥体', () => {
 })
 
 describe('端口认人', () => {
+  it.runIf(process.platform === 'win32')('Windows 原生监听表返回真实 PID/路径，关闭监听后立即变为 none', async () => {
+    const server = createServer()
+    await new Promise<void>((resolve, reject) => server.listen(0, '127.0.0.1', resolve).once('error', reject))
+    const address = server.address()
+    if (address === null || typeof address === 'string') throw new Error('TEST_LISTENER_ADDRESS_MISSING')
+    const native = loadNativePortOwner()
+    if (typeof native !== 'function') throw new Error('NATIVE_PORT_OWNER_UNAVAILABLE')
+    try {
+      resetPortOwnerCache()
+      const startedAt = performance.now()
+      const owner = native(address.port)
+      expect(performance.now() - startedAt).toBeLessThan(500)
+      expect(owner.pid).toBe(process.pid)
+      expect(owner.path?.toLowerCase()).toBe(process.execPath.toLowerCase())
+      resetPortOwnerCache()
+      expect(identifyPortOwner(address.port)).toEqual(owner)
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error === undefined ? resolve() : reject(error)))
+    }
+    resetPortOwnerCache()
+    expect(native(address.port)).toEqual({ kind: 'none' })
+  })
+
+  it('原生 TCP 表读取监听 PID 与 UTF-16 路径，不起 PowerShell', () => {
+    const processPath = 'C:\\Apps\\来信AI工具箱统一版.exe'
+    const koffi = {
+      load: (dll: string) => ({
+        func: (signature: string) => {
+          if (dll === 'iphlpapi.dll' && signature.includes('GetExtendedTcpTable')) {
+            return (table: Buffer | null, size: number[], _ordered: boolean, family: number) => {
+              const rowSize = family === 2 ? 24 : 56
+              size[0] = 4 + rowSize
+              if (table === null) return 122
+              table.writeUInt32LE(1, 0)
+              const row = 4
+              if (family === 2) {
+                table.writeUInt32LE(2, row + 0)
+                table.writeUInt32LE(0x0100007f, row + 4)
+                table.writeUInt32LE(0xa046, row + 8) // 18080，网络序存于 DWORD 低两字节
+                table.writeUInt32LE(4242, row + 20)
+              } else {
+                table.fill(0, row, row + 16)
+                table[row + 15] = 1 // ::1，不与 IPv4 入口冲突
+                table.writeUInt32LE(0xa046, row + 20)
+              }
+              return 0
+            }
+          }
+          throw new Error(`unexpected ${dll}:${signature}`)
+        }
+      }),
+      kernel32: undefined
+    }
+    const requireImpl = () => ({
+      ...koffi,
+      load: (dll: string) => ({
+        func: (signature: string) => {
+          if (dll === 'iphlpapi.dll') return koffi.load(dll).func(signature)
+          if (signature.includes('OpenProcess')) return () => ({ handle: 4242 })
+          if (signature.includes('QueryFullProcessImageNameW')) return (_handle: unknown, _flags: number, output: Buffer, length: number[]) => {
+            const encoded = Buffer.from(processPath, 'utf16le')
+            encoded.copy(output)
+            length[0] = processPath.length
+            return true
+          }
+          if (signature.includes('CloseHandle')) return () => true
+          throw new Error(`unexpected ${dll}:${signature}`)
+        }
+      })
+    })
+    const nativeOwner = loadNativePortOwner(requireImpl, () => false)
+    expect(nativeOwner?.(18080)).toMatchObject({ kind: 'laixin', pid: 4242, path: processPath })
+  })
+
+  it.each([
+    ['ETIMEDOUT', 'timeout'], ['ENOENT', 'command-unavailable'], ['EACCES', 'permission-denied'],
+    ['EPERM', 'permission-denied'], ['UNRECOGNIZED_SECRET', 'query-failed']
+  ])('查询失败 %s 只带受控原因，归属仍未知', (code, reason) => {
+    const owner = identifyPortOwner(18080, { exec: () => { throw Object.assign(new Error('DO_NOT_COPY_TOKEN'), { code }) } })
+    expect(owner).toEqual({ kind: 'unknown', reason })
+  })
   it('占用者是来信自己:认出来,调用方据此停手而不是换端口继续抢', () => {
     expect(parsePortOwner('4242|来信AI工具箱统一版|C:\\X\\来信AI工具箱统一版.exe'))
       .toMatchObject({ kind: 'laixin', pid: 4242 })
@@ -130,6 +218,22 @@ describe('端口认人', () => {
     expect(query).not.toContain('SilentlyContinue')
     expect(identifyPortOwner(18080, { exec: () => { throw new Error('查询失败') } }))
       .toMatchObject({ kind: 'unknown' })
+  })
+
+  it('普通探测短暂缓存；恢复用 fresh 绕过缓存，端口占用者消失后重新取证', () => {
+    resetPortOwnerCache()
+    let calls = 0
+    const first = identifyPortOwner(18080, {
+      nativeOwner: () => { calls += 1; return { kind: 'other', pid: 4242 } }
+    })
+    const second = identifyPortOwner(18080, {
+      fresh: true,
+      nativeOwner: () => { calls += 1; return { kind: 'none' } }
+    })
+    expect(first).toMatchObject({ kind: 'other', pid: 4242 })
+    expect(second).toMatchObject({ kind: 'none' })
+    expect(calls).toBe(2)
+    resetPortOwnerCache()
   })
 
   it('IPv6 专用监听不占 IPv4 入口，双栈或多 PID 仍不可猜归属', () => {

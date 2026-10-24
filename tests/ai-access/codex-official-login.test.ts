@@ -1,5 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
+import packageInfo from '../../package.json'
+
+// 模拟带后缀工作包的运行时版本（electron-builder extraMetadata 在编译后改写成品版本）。
+vi.mock('electron', () => ({ app: { getVersion: () => '0.6.3-review.1' } }))
 import { resolve } from 'node:path'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
   CodexOfficialLoginController,
   startCodexChatGptLogin,
@@ -12,6 +19,10 @@ const command: CodexLoginCommand = { executable: process.execPath, args: [fixtur
 describe('Codex 官方登录', () => {
   it('用 Codex 自己的 app-server 发起浏览器授权，成功后才切回官方模式', async () => {
     const openExternal = vi.fn(async () => undefined)
+    const captureRoot = await mkdtemp(join(tmpdir(), 'codex-login-identity-'))
+    const requests = join(captureRoot, 'requests.jsonl')
+    process.env.LOGIN_FIXTURE_REQUESTS = requests
+    try {
     const start = await startCodexChatGptLogin(command, { cwd: process.cwd(), openExternal })
     expect(openExternal).toHaveBeenCalledWith('https://chatgpt.com/authorize')
     await expect(start.completed).resolves.toBe(true)
@@ -25,6 +36,32 @@ describe('Codex 官方登录', () => {
     await expect(controller.start()).resolves.toEqual({ status: 'pending' })
     await vi.waitFor(() => expect(controller.status()).toEqual({ status: 'connected' }))
     expect(useOfficial).toHaveBeenCalledWith('codex')
+    const calls = (await readFile(requests, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as { method: string; params?: { clientInfo?: { version?: string } } })
+    const initialize = calls.find(call => call.method === 'initialize')
+    expect(initialize?.params?.clientInfo?.version).toBe(packageInfo.version)
+    } finally { delete process.env.LOGIN_FIXTURE_REQUESTS; await rm(captureRoot, { recursive: true, force: true }) }
+  })
+
+  it('带后缀工作包上报实际运行版本，不用编译时源码版本', async () => {
+    const openExternal = vi.fn(async () => undefined)
+    const captureRoot = await mkdtemp(join(tmpdir(), 'codex-login-runtime-version-'))
+    const requests = join(captureRoot, 'requests.jsonl')
+    const versions = process.versions as { electron?: string }
+    const originalElectron = versions.electron
+    versions.electron = '33.0.0'
+    try {
+      process.env.LOGIN_FIXTURE_REQUESTS = requests
+      const start = await startCodexChatGptLogin(command, { cwd: process.cwd(), openExternal })
+      await expect(start.completed).resolves.toBe(true)
+      const calls = (await readFile(requests, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as { method: string; params?: { clientInfo?: { version?: string } } })
+      const initialize = calls.find(call => call.method === 'initialize')
+      expect(initialize?.params?.clientInfo?.version).toBe('0.6.3-review.1')
+    } finally {
+      if (originalElectron === undefined) delete versions.electron
+      else versions.electron = originalElectron
+      delete process.env.LOGIN_FIXTURE_REQUESTS
+      await rm(captureRoot, { recursive: true, force: true })
+    }
   })
 
   it('终端自定义 CODEX_HOME 会传给官方登录子进程，而不是继承错误的默认根', async () => {

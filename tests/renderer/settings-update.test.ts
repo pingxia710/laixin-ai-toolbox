@@ -89,6 +89,21 @@ function diagnosticSnapshot(software: DiagnosticSoftware): string {
     attempts: [], attemptsTotal: 0, attemptsComplete: true })
 }
 
+it('自动下载开关、更新状态和检查按钮在同一个更新区块，开关有显式标签', async () => {
+  const x = await mountSettings({})
+  const section = (title: string) => x.root.all().find((node) =>
+    node.tag === 'section' && node.children.some((child) => child.tag === 'h2' && child.textContent === title))!
+  const updates = section('更新')
+  const about = section('关于')
+  const updateNodes = updates.all()
+  const auto = updateNodes.find((node) => node.id === 'auto-update')!
+  const label = updateNodes.find((node) => node.tag === 'label' && node.htmlFor === auto.id)
+
+  expect(label?.label()).toContain('自动下载新版并提醒我')
+  expect(updateNodes.some((node) => node.tag === 'button' && node.label() === '检查更新')).toBe(true)
+  expect(about.all().some((node) => node.tag === 'button' && node.label() === '检查更新')).toBe(false)
+})
+
 it('自动失败回传说明完整列出六类字段和账号关联，读开关失败时仍看得到', async () => {
   vi.useFakeTimers()
   let failing = true

@@ -148,9 +148,11 @@ export function composeManagedAdapters(networkAdapter, terminalAdapter, acquireW
     // 不具备路径读取能力与“读取失败”不同：前者让守护跳过直连复用、转入有快照/租约的接管；
     // 后者保留方法并由守护形成受控证据限制，不能被空包装器混为一谈。
     ...(typeof networkAdapter.currentPathIdentity === 'function'
-      ? { currentPathIdentity: () => networkAdapter.currentPathIdentity() } : {}),
-    existingProxy: (ours) => networkAdapter.existingProxy?.(ours),
-    validateExistingProxy: (candidate) => networkAdapter.validateExistingProxy?.(candidate),
+      ? { currentPathIdentity: (options) => networkAdapter.currentPathIdentity(options) } : {}),
+    ...(typeof networkAdapter.readProxyEndpoints === 'function'
+      ? { readProxyEndpoints: () => networkAdapter.readProxyEndpoints() } : {}),
+    existingProxy: (ours, options) => networkAdapter.existingProxy?.(ours, options),
+    validateExistingProxy: (candidate, options) => networkAdapter.validateExistingProxy?.(candidate, options),
     materializeExistingProxy: (candidate) => networkAdapter.materializeExistingProxy?.(candidate) ?? candidate,
     // 「满足接管要求」与「修回写什么」两个钩子只对系统代理项有意义;终端项按完整值。
     settingSatisfied(current, written, ref) {

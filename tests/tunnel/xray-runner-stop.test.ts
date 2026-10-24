@@ -271,6 +271,24 @@ describe('local-bridge 停止(win32 注入模拟)', () => {
     }
   }
 
+  it('关闭准备中的 bridge 会取消迟到 listen，不得在 close 返回后再启动 runner', async () => {
+    const executablePath = join(dataDir, 'xray.exe')
+    for (const name of ['xray.exe', 'geoip.dat', 'geosite.dat']) writeFileSync(join(dataDir, name), '')
+    let spawned = 0
+    const bridge = createLocalBridge({
+      listenPort: 0, dataDir, routes: undefined, upstream: { host: '127.0.0.1', port: 1 }, executablePath,
+      spawnImpl: (() => {
+        spawned += 1
+        throw new Error('启动已取消却仍调用 spawn')
+      }) as never
+    })
+    const listening = bridge.listen()
+    await bridge.close()
+    await expect(listening).rejects.toMatchObject({ code: 'TUNNEL_CONNECTION_CANCELLED' })
+    expect(spawned).toBe(0)
+    await bridge.close()
+  })
+
   it('监听关闭回调延迟时先停 runner，重叠 close 一起等待中继收尾', async () => {
     let runnerStdin: PassThrough | undefined
     let runnerChild: EventEmitter | undefined

@@ -50,7 +50,8 @@ describe('Windows ProxyServer 解析', () => {
     expect(parseProxyServer('127.0.0.1:7890')).toEqual({ kind: 'http', host: '127.0.0.1', port: 7890 })
     expect(parseProxyServer('http=proxy.corp:8080;https=proxy.corp:8443;ftp=proxy.corp:21')).toEqual({ kind: 'http', host: 'proxy.corp', port: 8443 })
     expect(parseProxyServer('socks=127.0.0.1:1080')).toEqual({ kind: 'socks', host: '127.0.0.1', port: 1080 })
-    expect(parseProxyServer('http=proxy.corp:8080')).toBeUndefined()
+    // WinINET 允许只填写 http=；是否承载 HTTPS 由后续 CONNECT 探测决定，不能在解析层误丢。
+    expect(parseProxyServer('http=proxy.corp:8080')).toEqual({ kind: 'http', host: 'proxy.corp', port: 8080 })
     expect(parseProxyServer('')).toBeUndefined()
     expect(parseProxyServer('garbage')).toBeUndefined()
   })

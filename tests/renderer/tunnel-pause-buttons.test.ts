@@ -41,6 +41,7 @@ class Element {
     this.append(...children)
   }
   addEventListener(event: string, call: () => void) { this.handlers[event] = call }
+  removeEventListener(event: string) { delete this.handlers[event] }
   contains(node: Element | null): boolean { return node === this || this.children.some((child) => child.contains(node)) }
   focus() { doc().activeElement = this }
   setSelectionRange(start: number, end: number) { this.selectionStart = start; this.selectionEnd = end }
@@ -82,8 +83,11 @@ async function setup(statusResponse: TunnelStatusView, repairResponse: NetworkRe
   const tunnelPage = await import('../../app/renderer/src/pages/tunnel')
   // 启动/暂停两颗卡在「手动配置」动作区,由 mountTunnelDetails 挂到独立宿主——两处都要挂。
   const advanced = new Element(); const unmountAdvanced = tunnelPage.mountTunnelDetails(advanced as unknown as HTMLElement)
-  const root = new Element(); tunnelPage.page.mount(root as unknown as HTMLElement, { tab: 'tunnel' })
-  cleanup = () => { tunnelPage.page.unmount(); unmountAdvanced() }
+  const root = new Element(); const main = new Element(); const help = new Element(); const software = new Element(); const repairHost = new Element()
+  root.append(main, help); help.append(software, repairHost)
+  tunnelPage.page.mount(main as unknown as HTMLElement, { tab: 'tunnel' })
+  const stopRepair = tunnelPage.mountNetworkRepair(repairHost as unknown as HTMLElement, help as unknown as HTMLDetailsElement, software as unknown as HTMLSelectElement)
+  cleanup = () => { stopRepair(); tunnelPage.page.unmount(); unmountAdvanced() }
   await flush()
   return { root, advanced, start, stop, repair, syncAccountConfig, text: () => [...root.all(), ...advanced.all()].map((node) => node.textContent) }
 }
@@ -161,9 +165,9 @@ describe('N-48 断开在途', () => {
     const x = await setup({ ...connected, state: '断开中' }, idleNetworkRepair, true)
     const shortcut = x.root.querySelector('[data-network-action="同步配置"]')
     const manual = x.advanced.querySelector('[data-network-action="同步账号配置"]')
-    expect(shortcut?.disabled).toBe(true)
+    expect(shortcut).toBeUndefined()
     expect(manual?.disabled).toBe(true)
-    shortcut!.click(); manual!.click()
+    manual!.click()
     await flush()
     expect(x.syncAccountConfig).not.toHaveBeenCalled()
   })

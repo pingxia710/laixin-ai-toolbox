@@ -283,7 +283,7 @@ p { line-height: 1.75; }
 #tab-panel { display: grid; gap: 24px; min-width: 0; font-size: 14px; line-height: 1.65; }
 #tab-panel:focus { outline: none; }
 #tab-panel > section { min-width: 0; }
-#tab-panel > section:not([data-module-id='dashboard.overview']):not([data-module-id='tunnel.main']):not([data-module-id='network.details']):not([data-module-id='codex-usage']):not([data-module-id='ai-accounts']):not([data-module-id='account.customer']) { padding: 26px; border: 1px solid var(--line); border-radius: 13px; background: var(--surface); box-shadow: var(--shadow); }
+#tab-panel > section:not([data-module-id='dashboard.overview']):not([data-module-id='tunnel.main']):not([data-module-id='network.details']):not([data-module-id='network.diagnostics']):not([data-module-id='codex-usage']):not([data-module-id='ai-accounts']):not([data-module-id='account.customer']) { padding: 26px; border: 1px solid var(--line); border-radius: 13px; background: var(--surface); box-shadow: var(--shadow); }
 #tab-panel p { color: var(--muted); }
 #tab-panel h2 + p { margin-top: 8px; }
 #tab-panel h3 { font-size: 16px; }
@@ -632,7 +632,7 @@ a { color: var(--accent); }
   .connection-card { padding-inline: 20px; }
   .connection-footer, .card-kicker, .network-details-header, .setting-row { flex-wrap: wrap; }
   .static-state-facts div { grid-template-columns: 1fr; gap: 4px; }
-  #tab-panel > section:not([data-module-id='dashboard.overview']):not([data-module-id='tunnel.main']):not([data-module-id='network.details']):not([data-module-id='codex-usage']):not([data-module-id='ai-accounts']):not([data-module-id='account.customer']) { padding: 20px 16px; }
+  #tab-panel > section:not([data-module-id='dashboard.overview']):not([data-module-id='tunnel.main']):not([data-module-id='network.details']):not([data-module-id='network.diagnostics']):not([data-module-id='codex-usage']):not([data-module-id='ai-accounts']):not([data-module-id='account.customer']) { padding: 20px 16px; }
   .dashboard-primary, .dashboard-traffic, .dashboard-card { padding: 20px; }
 }
 

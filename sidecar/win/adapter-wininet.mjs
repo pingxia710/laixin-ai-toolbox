@@ -40,11 +40,19 @@ const LOCAL_BYPASS = Object.freeze(['<local>', 'localhost', '127.*'])
 // ⛔ 再自动转发;真正的异常由代码按受控码记录。
 const REG_TRANSIENT_ATTEMPTS = 3
 const REG_TRANSIENT_RETRY_MS = 200
-// PowerShell 通道超时:5 秒在新装 Windows(Defender 首扫 + 正在下载大文件)上经常不够,冷启动本身就要 2–4 秒。
+// 保留 N-71/N-61 的读取预算：PowerShell 仅作原生路径的兜底，单次直连路径证据最多 10 秒。
 const POWERSHELL_READ_TIMEOUT_MS = 10_000
 const NOTIFY_TIMEOUT_MS = 15_000
 const NOTIFY_ATTEMPTS = 2
 const NOTIFY_RETRY_MS = 300
+const ERROR_INSUFFICIENT_BUFFER = 122
+const MIB_IPFORWARDROW_SIZE = 56
+const MIB_IFROW_SIZE = 860
+// SDK MIB_IFROW: wszName[256] WCHAR occupies 512 bytes; dwIndex/dwType follow at 512/516.
+const MIB_IFROW_DW_INDEX_OFFSET = 512
+const MIB_IFROW_DW_TYPE_OFFSET = 516
+const IF_TYPE_ETHERNET_CSMACD = 6
+const IF_TYPE_IEEE80211 = 71
 // reg.exe 的退出码 1 泛指失败,但两类失败代价不同:「键/值不存在」是稳定结论,重试 3 次
 // 纯白等 ≈0.4 秒/项(审计 A4:四项里常有两项不存在);「拒绝访问/键被短暂锁住」才值得重试。
 const REG_MISSING_PATTERNS = Object.freeze([
@@ -84,11 +92,90 @@ export function loadNativeNotifier(requireImpl = createRequire(import.meta.url))
   } catch { return undefined }
 }
 
+function readForwardTable(getIpForwardTable) {
+  const size = [0]
+  const probed = getIpForwardTable(null, size, false)
+  if (![0, ERROR_INSUFFICIENT_BUFFER].includes(probed) || !Number.isSafeInteger(size[0]) || size[0] < 4) {
+    throw new Error('IP_FORWARD_TABLE_SIZE_FAILED')
+  }
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const table = Buffer.alloc(size[0])
+    const actual = [table.length]
+    const status = getIpForwardTable(table, actual, false)
+    if (status === ERROR_INSUFFICIENT_BUFFER && Number.isSafeInteger(actual[0]) && actual[0] > table.length) {
+      size[0] = actual[0]
+      continue
+    }
+    if (status !== 0) throw new Error('IP_FORWARD_TABLE_READ_FAILED')
+    const count = table.readUInt32LE(0)
+    if (4 + count * MIB_IPFORWARDROW_SIZE > table.length) throw new Error('IP_FORWARD_TABLE_TRUNCATED')
+    return { table, count }
+  }
+  throw new Error('IP_FORWARD_TABLE_CHANGED')
+}
+
+function formatGuid(buffer) {
+  const data4 = [...buffer.subarray(8, 16)].map((value) => value.toString(16).padStart(2, '0'))
+  return `${buffer.readUInt32LE(0).toString(16).padStart(8, '0')}-${buffer.readUInt16LE(4).toString(16).padStart(4, '0')}-${buffer.readUInt16LE(6).toString(16).padStart(4, '0')}-${data4.slice(0, 2).join('')}-${data4.slice(2).join('')}`
+}
+
+/**
+ * 进程内读取唯一最低度量 IPv4 默认路由及其接口身份。并列最低度量保持未知，交给
+ * PowerShell 回落通道精算；加载失败返回 undefined，调用方继续走既有回落。
+ */
+export function loadNativePathIdentity(requireImpl = createRequire(import.meta.url)) {
+  try {
+    const koffi = requireImpl('koffi')
+    const iphlpapi = koffi.load('iphlpapi.dll')
+    const getIpForwardTable = iphlpapi.func(
+      'uint32 __stdcall GetIpForwardTable(_Out_ void *pIpForwardTable, _Inout_ uint32 *pdwSize, bool bOrder)')
+    const indexToLuid = iphlpapi.func(
+      'uint32 __stdcall ConvertInterfaceIndexToLuid(uint32 InterfaceIndex, _Out_ void *InterfaceLuid)')
+    const luidToGuid = iphlpapi.func(
+      'uint32 __stdcall ConvertInterfaceLuidToGuid(void *InterfaceLuid, _Out_ void *InterfaceGuid)')
+    const getIfEntry = iphlpapi.func('uint32 __stdcall GetIfEntry(_Inout_ void *pIfRow)')
+    return () => {
+      const { table, count } = readForwardTable(getIpForwardTable)
+      const routes = []
+      for (let index = 0; index < count; index += 1) {
+        const row = 4 + index * MIB_IPFORWARDROW_SIZE
+        if (table.readUInt32LE(row) !== 0 || table.readUInt32LE(row + 4) !== 0) continue
+        const interfaceIndex = table.readUInt32LE(row + 16)
+        const metric = table.readUInt32LE(row + 36)
+        if (interfaceIndex === 0) continue
+        routes.push({ interfaceIndex, routeMetric: metric })
+      }
+      if (routes.length === 0) return undefined
+      // On Windows Vista and later MIB_IPFORWARDROW.dwForwardMetric1 is already
+      // the complete route + interface metric.  Get-NetRoute exposes the route
+      // offset separately, so its PowerShell fallback adds InterfaceMetric; the
+      // old IP Helper table must use its combined value as-is here.
+      const candidates = routes.map(({ interfaceIndex, routeMetric }) => ({ interfaceIndex, metric: routeMetric }))
+      const lowestMetric = Math.min(...candidates.map(({ metric }) => metric))
+      const selected = candidates.filter(({ metric }) => metric === lowestMetric)
+      if (selected.length !== 1) return undefined
+      const [{ interfaceIndex }] = selected
+      const luid = Buffer.alloc(8)
+      if (indexToLuid(interfaceIndex, luid) !== 0) throw new Error('INTERFACE_LUID_FAILED')
+      const guid = Buffer.alloc(16)
+      if (luidToGuid(luid, guid) !== 0) throw new Error('INTERFACE_GUID_FAILED')
+      const ifRow = Buffer.alloc(MIB_IFROW_SIZE)
+      ifRow.writeUInt32LE(interfaceIndex, MIB_IFROW_DW_INDEX_OFFSET)
+      if (getIfEntry(ifRow) !== 0) throw new Error('INTERFACE_ROW_FAILED')
+      const interfaceType = ifRow.readUInt32LE(MIB_IFROW_DW_TYPE_OFFSET)
+      const kind = [IF_TYPE_ETHERNET_CSMACD, IF_TYPE_IEEE80211].includes(interfaceType)
+        ? 'network-interface' : 'virtual-tun'
+      return { id: `if:${String(interfaceIndex)}:guid:${formatGuid(guid)}`, kind }
+    }
+  } catch { return undefined }
+}
+
 export function createAdapter(options = {}) {
   // 注入点(仅测试):execFile 换假命令执行,sleep 换空操作,nativeNotify 换假原生通知;真实启动路径三者缺省。
   const exec = options.execFile ?? execFileSync
   const sleep = options.sleep ?? defaultSleep
   const nativeNotify = Object.hasOwn(options, 'nativeNotify') ? options.nativeNotify : loadNativeNotifier()
+  const nativePathIdentity = Object.hasOwn(options, 'nativePathIdentity') ? options.nativePathIdentity : loadNativePathIdentity()
   return {
     valuesEqual: wininetValuesEqual,
     preserveExternalChanges: (ref) => ref.service === SERVICE && ITEMS.includes(ref.item),
@@ -102,19 +189,35 @@ export function createAdapter(options = {}) {
     // WinINET 是当前用户全局设置，但复用结果还必须属于本轮实际默认路径。读取最低度量的 IPv4
     // 默认路由及其 InterfaceGuid；虚拟适配器也进入身份。查不到就抛，由守护拒绝把旧探测绿灯
     // 归给“current-user-wininet”这种常量假身份。
-    currentPathIdentity() { return registryCommand({ operation: 'path' }) },
+    currentPathIdentity(options) {
+      const deadline = deadlineFrom(options)
+      // Native koffi is the first path even during a budgeted first-connect probe:
+      // the PowerShell fallback is the known 12–14s slow path that caused direct
+      // registration to miss its 8s stage.  The call is synchronous and cannot be
+      // interrupted, so a genuinely stuck native API would still need a worker;
+      // Windows IP Helper calls are short and the elapsed deadline is honored before
+      // any fallback is attempted.
+      if (typeof nativePathIdentity === 'function') {
+        try {
+          const identity = nativePathIdentity()
+          if (identity !== undefined && (deadline === undefined || Date.now() < deadline)) return identity
+        } catch { /* 回落 PowerShell */ }
+      }
+      return registryCommand({ operation: 'path' }, deadline)
+    },
     // 电脑上别的代理(不是我们的)当前开着吗:守护据此决定「能出外网就复用」还是接管。PAC 也报,守护按不可判定处理。
-    existingProxy(ours) {
-      const pac = read({ service: SERVICE, item: 'AutoConfigURL' })
+    existingProxy(ours, options) {
+      const deadline = deadlineFrom(options)
+      const pac = read({ service: SERVICE, item: 'AutoConfigURL' }, deadline)
       if (pac !== null && pac.data !== '') return { kind: 'pac', url: pac.data, source: 'WinINET/AutoConfigURL' }
-      const connection = read({ service: SERVICE, item: CONNECTION_ITEM })
+      const connection = read({ service: SERVICE, item: CONNECTION_ITEM }, deadline)
       // A successful direct/manual probe cannot attest a path selected by WPAD. Unknown is not off.
       if (autoDetectEnabled(hexToBlob(connection?.type === 'REG_BINARY' ? connection.data : undefined)) !== false) {
         return { kind: 'pac', source: 'WinINET/DefaultConnectionSettings' }
       }
-      const enabled = read({ service: SERVICE, item: 'ProxyEnable' })
+      const enabled = read({ service: SERVICE, item: 'ProxyEnable' }, deadline)
       if (enabled?.data !== '1') return undefined
-      const server = read({ service: SERVICE, item: 'ProxyServer' })
+      const server = read({ service: SERVICE, item: 'ProxyServer' }, deadline)
       const parsed = parseProxyServer(server?.data ?? '')
       if (parsed === undefined) return undefined
       const isOurs = isOurProxy(parsed, ours)
@@ -154,7 +257,7 @@ export function createAdapter(options = {}) {
     return item === undefined ? undefined : [item]
   }
 
-  function read(ref) {
+  function read(ref, deadline) {
     if (ref.service !== SERVICE || !ITEMS.includes(ref.item)) {
       throw new Error(`WININET_ITEM_INVALID:${ref.service}/${ref.item}`)
     }
@@ -163,15 +266,17 @@ export function createAdapter(options = {}) {
     // 动辄几秒、还要过杀软,曾是 Windows 上「系统设置暂不可达」抖动的稳定来源(创始人 09-13 真机断网链之一)。
     // 值不存在是稳定结论,直接 null;只有瞬时错误、解析不出、或值含非 ASCII(reg.exe 输出走控制台代码页,
     // 非 ASCII 会被改写)才回落 .NET/ps1 通道取精确值。
-    try { output = run('reg.exe', ['query', keyFor(ref.item), '/v', ref.item], isMissingRegistryEntry) } catch (error) {
+    try {
+      output = run('reg.exe', ['query', keyFor(ref.item), '/v', ref.item], (error) => isMissingRegistryEntry(error, deadline), deadline)
+    } catch (error) {
       if (error?.permanentFailure === true) return null
-      return registryCommand({ operation: 'read', item: ref.item })
+      return registryCommand({ operation: 'read', item: ref.item }, deadline)
     }
     const match = output.match(/\s+(REG_[A-Z0-9_]+)[ \t]*(.*)$/im)
     if (match === null) throw new ConnectorError(CONTROL_CODES.settingsTransient, 'WinINET 读数暂时无法解析')
     const data = match[2].replace(/\r$/, '')
     if (match[1] === 'REG_DWORD' || match[1] === 'REG_BINARY') return registryValue(match[1], data)
-    if (!['REG_SZ', 'REG_EXPAND_SZ'].includes(match[1]) || !/^[\x20-\x7e]*$/.test(data)) return registryCommand({ operation: 'read', item: ref.item })
+    if (!['REG_SZ', 'REG_EXPAND_SZ'].includes(match[1]) || !/^[\x20-\x7e]*$/.test(data)) return registryCommand({ operation: 'read', item: ref.item }, deadline)
     return registryValue(match[1], data)
   }
 
@@ -181,7 +286,12 @@ export function createAdapter(options = {}) {
     }
     try {
       if (value === null) {
-        if (read(ref) !== null) run('reg.exe', ['delete', keyFor(ref.item), '/v', ref.item, '/f'])
+        if (read(ref) !== null) {
+          try { run('reg.exe', ['delete', keyFor(ref.item), '/v', ref.item, '/f'], isMissingRegistryEntry) } catch (error) {
+            // 读后被另一方先删掉时，目标状态已经达成。缺值是幂等成功，不应把恢复账本留成失败。
+            if (error?.permanentFailure !== true) throw error
+          }
+        }
         return
       }
       if (!isRegistryValue(value)) {
@@ -229,16 +339,17 @@ export function createAdapter(options = {}) {
     return false
   }
 
-  function run(command, args, isPermanentFailure) {
+  function run(command, args, isPermanentFailure, deadline) {
     let lastError
     for (let attempt = 1; attempt <= REG_TRANSIENT_ATTEMPTS; attempt += 1) {
       try {
-        return exec(command, args, { encoding: 'utf8', windowsHide: true, timeout: 5_000, stdio: ['ignore', 'pipe', 'pipe'] })
+        const timeout = remainingTimeout(deadline, 5_000)
+        return exec(command, args, { encoding: 'utf8', windowsHide: true, timeout, stdio: ['ignore', 'pipe', 'pipe'] })
       } catch (error) {
         lastError = error
         // 判定结果挂在错误上:调用方据此区分「值不存在」(稳定结论)与瞬时失败,⛔ 再探一次父键。
         if (isPermanentFailure?.(error) === true) { try { error.permanentFailure = true } catch { /* 非对象错误 */ } break }
-        if (attempt < REG_TRANSIENT_ATTEMPTS) sleep(REG_TRANSIENT_RETRY_MS)
+        if (attempt < REG_TRANSIENT_ATTEMPTS) sleep(Math.min(REG_TRANSIENT_RETRY_MS, remainingTimeout(deadline, REG_TRANSIENT_RETRY_MS)))
       }
     }
     throw lastError
@@ -246,23 +357,23 @@ export function createAdapter(options = {}) {
 
   // 「这个值不存在」与「这次读失败了」的区分:先看 reg.exe 的输出文本(英文/中文);
   // 文本被系统语言或编码打乱时按结构判——父键读得通,就说明只是这个值不存在。
-  function isMissingRegistryEntry(error) {
-    const text = `${textOf(error?.stderr)}\n${textOf(error?.stdout)}`
+  function isMissingRegistryEntry(error, deadline) {
+    const text = `${textOf(error?.message)}\n${textOf(error?.stderr)}\n${textOf(error?.stdout)}`
     if (REG_TRANSIENT_PATTERNS.some((pattern) => pattern.test(text))) return false
     if (REG_MISSING_PATTERNS.some((pattern) => pattern.test(text))) return true
     try {
-      exec('reg.exe', ['query', KEY], { encoding: 'utf8', windowsHide: true, timeout: 5_000, stdio: ['ignore', 'pipe', 'pipe'] })
+      exec('reg.exe', ['query', KEY], { encoding: 'utf8', windowsHide: true, timeout: remainingTimeout(deadline, 5_000), stdio: ['ignore', 'pipe', 'pipe'] })
       return true
     } catch { return false }
   }
 
-  function registryCommand(request) {
+  function registryCommand(request, deadline) {
     try {
       // 通知要过 Add-Type(首次编译慢,之后走缓存的程序集);读数走 .NET 反射;两者都给足冷启动时间。
       const output = exec('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
         '-File', fileURLToPath(new URL('./wininet-settings.ps1', import.meta.url))], {
         input: JSON.stringify(request), encoding: 'utf8', windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
-        timeout: request.operation === 'notify' ? NOTIFY_TIMEOUT_MS : POWERSHELL_READ_TIMEOUT_MS
+        timeout: remainingTimeout(deadline, request.operation === 'notify' ? NOTIFY_TIMEOUT_MS : POWERSHELL_READ_TIMEOUT_MS)
       })
       const result = JSON.parse(output.replace(/^\uFEFF/, '').trim())
       if (request.operation === 'notify' && result !== true) throw new Error('invalid notification response')
@@ -275,6 +386,18 @@ export function createAdapter(options = {}) {
       return result
     } catch { throw new ConnectorError(CONTROL_CODES.settingsTransient, '系统代理设置读取或通知暂时失败,将自动重试') }
   }
+}
+
+function deadlineFrom(options) {
+  const timeoutMs = Number(options?.timeoutMs)
+  return Number.isFinite(timeoutMs) && timeoutMs > 0 ? Date.now() + timeoutMs : undefined
+}
+
+function remainingTimeout(deadline, fallback) {
+  if (deadline === undefined) return fallback
+  const remaining = Math.floor(deadline - Date.now())
+  if (remaining <= 0) throw new ConnectorError(CONTROL_CODES.settingsTransient, '读取系统代理超过首连预算')
+  return Math.max(1, Math.min(fallback, remaining))
 }
 
 function routeIdentity(value) {

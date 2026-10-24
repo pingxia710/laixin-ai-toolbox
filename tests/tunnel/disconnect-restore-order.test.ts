@@ -77,6 +77,8 @@ it.each(['write', 'readback'] as const)('主动断开 %s 暂败：四层还原�
   expect(x.closes).toEqual([])
   expect(x.alive()).toBe(true)
   expect(x.state().code).toBe('TUNNEL_RESTORE_INCOMPLETE')
+  expect(x.state()).toMatchObject({ restoration: { phase: 'waiting', attempts: 2,
+    lastFailureCode: 'SETTINGS_WRITE_OR_READBACK_FAILED', result: 'unconfirmed' } })
   expect(x.exits).toEqual([])
   x.block(false)
   await vi.advanceTimersByTimeAsync(5_000)
@@ -84,7 +86,33 @@ it.each(['write', 'readback'] as const)('主动断开 %s 暂败：四层还原�
   expect(x.closes.sort()).toEqual(['bridge', 'connector'])
   expect(x.alive()).toBe(false)
   expect(x.state()).toMatchObject({ state: 'stopped-restored' })
+  expect(x.state()).toMatchObject({ restoration: { phase: 'complete', attempts: 3,
+    lastFailureCode: 'SETTINGS_WRITE_OR_READBACK_FAILED', result: 'restored', nextRetryAt: 0 } })
   expect(x.exits).toEqual([])
+})
+
+it('仅摘要落盘失败不妨碍原设置继续恢复，观测写入不额外等待锁', async () => {
+  const x = setup('write')
+  await x.daemon.run()
+  const internal = x.daemon as unknown as { writeStateNow(state: string, extra: object, timeout?: number): boolean }
+  const writeState = internal.writeStateNow.bind(internal)
+  const observationWrites = vi.fn()
+  const spy = vi.spyOn(internal, 'writeStateNow').mockImplementation((state, extra, timeout) => {
+    if (timeout === 0) { observationWrites(); throw new Error('fixture summary write failure') }
+    return writeState(state, extra, timeout)
+  })
+  try {
+    x.block(true)
+    writeIntentFile(x.root, { desired: 'user-disconnected', sessionToken: 'stop' })
+    await vi.advanceTimersByTimeAsync(1500)
+    expect(x.alive()).toBe(true)
+    expect(x.closes).toEqual([])
+    expect(observationWrites).toHaveBeenCalled()
+    x.block(false)
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(x.refs.map(x.adapter.read)).toEqual([null, null, null, null])
+    expect(x.state()).toMatchObject({ state: 'stopped-restored', restoration: { phase: 'complete', result: 'restored' } })
+  } finally { spy.mockRestore() }
 })
 
 it('设置已还原但旧桥停止卡死，重启守护后按原断开意图收敛而不重新连接', async () => {

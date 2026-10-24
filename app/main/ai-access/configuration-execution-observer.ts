@@ -676,7 +676,7 @@ async function defaultPolicyFilePresence(path: string): Promise<Presence> {
 }
 
 async function defaultRun(command: string, args: readonly string[], options?: { readonly timeoutMs?: number }): Promise<string> {
-  const { stdout } = await execFile(command, [...args], { encoding: 'utf8', timeout: options?.timeoutMs ?? 2_000, maxBuffer: 256 * 1024, windowsHide: true })
+  const { stdout } = await execFile(command, [...args], { encoding: 'utf8', timeout: options?.timeoutMs ?? 2_000, maxBuffer: 4 * 1024 * 1024, windowsHide: true })
   return stdout
 }
 

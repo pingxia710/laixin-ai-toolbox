@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process'
 import { codexAccountKey, record } from './normalize'
 import type { CodexCommand } from './runtime'
 import type { UsageStatus } from './types'
+import { toolboxClientVersion } from '../../shared/client-identity'
 
 export class UsageReadError extends Error {
   constructor(readonly status: UsageStatus) { super(status) }
@@ -13,7 +14,7 @@ export interface CodexReadResult {
 }
 
 // This short-lived client has no thread, execution, login, logout or token-export methods.
-export function readCodexUsage(command: CodexCommand, options: {
+export async function readCodexUsage(command: CodexCommand, options: {
   readonly cwd: string
   readonly signal: AbortSignal
   readonly timeoutMs?: number
@@ -21,6 +22,7 @@ export function readCodexUsage(command: CodexCommand, options: {
   /** Read identity without making a quota request. */
   readonly accountOnly?: boolean
 }): Promise<CodexReadResult> {
+  const clientVersion = await toolboxClientVersion()
   return new Promise((resolve, reject) => {
     if (options.signal.aborted) { reject(new UsageReadError('unavailable')); return }
     const child = spawn(command.executable, [...command.args], {
@@ -111,7 +113,7 @@ export function readCodexUsage(command: CodexCommand, options: {
         if (line.trim()) receive(line)
       }
     })
-    send('initialize', { clientInfo: { name: 'laixin_usage_monitor', title: '来信 AI 用量监测', version: '0.1.0' }, capabilities: null })
+    send('initialize', { clientInfo: { name: 'laixin_usage_monitor', title: '来信 AI 用量监测', version: clientVersion }, capabilities: null })
   })
 }
 

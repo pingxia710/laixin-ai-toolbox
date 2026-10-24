@@ -2,6 +2,8 @@
 // 判据 3②:守护突然退出 → 主进程状态进「异常」并列未恢复项;3③:再启动先处理未恢复项。
 import { pendingSettingEntries, pendingSettingEntriesCached, ledgerFailure, ledgerFailureCached } from '../../../sidecar/mac/ledger.mjs'
 import { randomUUID } from 'node:crypto'
+import { existsSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { readDaemonState, type DaemonStateView } from './status-service'
 import { layout, statSignature, writeFileAtomic } from './paths'
 import { restoreDeadlineMs } from './repair-budget'
@@ -27,6 +29,23 @@ export { RESTORE_DEADLINE_FLOOR_MS as RESTORE_DEADLINE_MS } from './repair-budge
 
 // 收敛包3·件1:守护非预期退出后按此序列有限重启;三次都失败则放弃并恢复系统代理。
 export const DAEMON_RESTART_BACKOFF_MS = Object.freeze([2_000, 10_000, 30_000])
+
+/**
+ * 启动看门狗：守护进程发出后，120 秒内至少要写出一份带本轮 runId 的 state。
+ * 这只约束「根本没有进入守护状态」的坏启动；一旦 state 已落盘，后面的慢连接仍由
+ * daemon-core 自己的连接阶段预算处理，⛔ 不拿这个值误杀合法的慢机连接。
+ */
+export const DAEMON_STARTUP_WATCHDOG_MS = 120_000
+
+function currentRecoveryOwner(dataDir: string, runId: string): boolean {
+  try {
+    if (!existsSync(join(dataDir, 'recovery-owner.json'))) return false
+    const owner = JSON.parse(readFileSync(join(dataDir, 'recovery-owner.json'), 'utf8')) as { runId?: unknown }
+    return owner.runId === runId
+  } catch {
+    return false
+  }
+}
 
 // 常驻模式下重启归系统管(LaunchAgent KeepAlive / 计划任务 RestartOnFailure),主进程 ⛔ 抢这个活;
 // 主进程只负责「客户点了连接、而守护此刻不在」时把它叫起来。叫不醒时按此序列再叫,仍无活人则放弃并还原——
@@ -78,6 +97,9 @@ export interface SupervisorDeps {
   readonly resident?: ResidentBridge
   /** 测试注入;缺省真实等待。 */
   readonly wait?: (ms: number) => Promise<void>
+  /** 测试注入;缺省真实有界定时器。 */
+  readonly scheduleStartupWatchdog?: (fire: () => void, delayMs: number) => unknown
+  readonly cancelStartupWatchdog?: (handle: unknown) => void
   /** N-23:一次性恢复子进程的 deadline;测试注入短值,生产用 RESTORE_DEADLINE_MS。 */
   readonly restoreDeadlineMs?: number
   /** Phase 1 ④:结构化失败日志(进 <userData>/logs/tunnel-daemon.log,诊断包收录)。
@@ -152,10 +174,22 @@ export class DaemonSupervisor {
    *  首轮与退避重启两处调用点原本逐字节重复——⛔ 各留一份漂移。 */
   private spawnTrackedDaemon(): void {
     this.runId = randomUUID()
+    const runId = this.runId
+    const startupWatchdog = this.deps.scheduleStartupWatchdog ?? ((fire: () => void, ms: number) => {
+      const handle = setTimeout(fire, ms)
+      // 看门狗是安全兜底，不应让主进程退出时因为一个已安排的定时器被拖住。
+      handle.unref?.()
+      return handle
+    })
+    const cancelStartupWatchdog = this.deps.cancelStartupWatchdog ?? ((handle: unknown) => {
+      clearTimeout(handle as ReturnType<typeof setTimeout>)
+    })
     const child = this.deps.spawnDaemon(this.runId)
     this.daemon = child
+    const startup = { handle: undefined as unknown }
     const exited = () => {
       if (this.daemon !== child) return
+      if (startup.handle !== undefined) cancelStartupWatchdog(startup.handle)
       this.daemon = undefined
       if (!this.expectExit) {
         this.unexpectedExit = { at: Date.now() }
@@ -163,6 +197,21 @@ export class DaemonSupervisor {
       }
       this.expectExit = false
     }
+    // conhost/cmd 或 Electron 入口在慢机上可能根本没有进入 daemon.run()，因此没有
+    // state.json 可供主进程判断。到点先请求杀掉这一代；只有收到真实 exit 才走既有
+    // 退避重启，避免旧子进程尚未退出时与下一代并存。只要本轮 state 已写出（哪怕仍是
+    // connecting/idle），就把后续等待交给守护自己的阶段预算。
+    startup.handle = child.kill === undefined ? undefined : startupWatchdog(() => {
+      if (this.daemon !== child || this.quitting) return
+      const state = readDaemonState(this.deps.dataDir) as (DaemonStateView & { updatedAt?: number }) | undefined
+      if (state?.runId === runId || currentRecoveryOwner(this.deps.dataDir, runId)) return
+      this.deps.logFailure?.('daemon-start-timeout', `runId=${runId};timeoutMs=${String(DAEMON_STARTUP_WATCHDOG_MS)}`)
+      try { child.kill?.('SIGKILL') } catch { /* 退出回调仍会兜住本轮 */ }
+      // 必须等真实 exit 事件才清掉监管位；Windows 上 kill 返回只代表信号已发出，
+      // 立刻排下一代会让旧守护与新守护同时写账本/系统代理。旧进程退出后由同一
+      // exited() 路径安排既有 2s/10s/30s 退避；若杀进程本身被系统拖住，宁可保持
+      // 这一代受监管，也不冒险并存两份网络管理者。
+    }, DAEMON_STARTUP_WATCHDOG_MS)
     child.on('exit', exited)
     child.once?.('error', exited)
   }

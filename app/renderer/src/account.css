@@ -1,10 +1,27 @@
-/* Signing in updates each card's contents, never the workspace width or card order. */
+/* Guests choose a login method first; signed-in customers see identity and entitlements side by side. */
 #tab-panel > .account-workspace { display: grid; gap: 18px; width: 100%; max-width: none; margin: 0; padding: 0; border: 0; background: transparent; box-shadow: none; }
 .account-main-grid { display: grid; grid-template-columns: minmax(280px, .85fr) minmax(0, 1.4fr); gap: 18px; align-items: stretch; }
 .account-workspace .account-panel, .account-workspace .account-service { min-width: 0; padding: 24px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
 .account-workspace .account-access h2 { margin-top: 8px; font-size: 24px; }
-.account-workspace .account-wechat-entry { margin: 20px 0; }
-.account-workspace .account-wechat-entry .account-note { margin-top: 8px; }
+.account-workspace[data-account-mode='entry'] .account-main-grid { grid-template-columns: minmax(0, 1fr); }
+.account-entry-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.account-workspace .account-entry-heading h2 { margin: 0; }
+.account-login-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 40px; margin-top: 32px; align-items: start; }
+.account-password-panel { min-width: 0; }
+.account-access { container-type: inline-size; }
+.account-workspace .account-login-columns h3 { margin: 0; font-size: 18px; }
+.account-workspace .account-login-columns .account-form { margin: 22px 0 16px; }
+.account-workspace .account-login-columns input:not([type=checkbox]) { min-height: 48px; border-radius: 10px; }
+#tab-panel .account-password-panel button[type=submit] { min-height: 48px; margin-top: 8px; border-radius: 10px; }
+.account-workspace .account-access .account-password-panel .account-actions { margin: 0; gap: 8px 24px; justify-content: space-between; }
+#tab-panel .account-password-panel .account-actions button { padding-inline: 0; border: 0; background: transparent; color: var(--accent-strong); font-size: 13px; }
+.account-wechat-panel { display: grid; align-content: start; justify-items: center; gap: 16px; min-width: 0; padding-left: 40px; border-left: 1px solid var(--line); text-align: center; }
+.account-workspace .account-wechat-panel .account-note { max-width: 28em; margin: 0; font-size: 13px; }
+.account-wechat-feedback:empty { display: none; }
+.account-wechat-frame { display: grid; place-items: center; width: 100%; max-width: 320px; height: 290px; background: #fff; border-radius: 8px; }
+.account-wechat-frame .account-note { padding: 20px; color: #676d78; }
+#tab-panel .account-text-action { min-height: 32px; padding: 4px 8px; border: 0; background: transparent; color: var(--muted); font-size: 13px; }
+@media (hover: hover) { #tab-panel .account-text-action:hover { color: var(--accent-strong); } }
 .account-workspace .account-access > .account-note { margin: 16px 0; }
 .account-workspace .account-form { max-width: none; }
 .account-workspace .account-access .account-actions { flex-wrap: wrap; gap: 8px; }
@@ -32,8 +49,14 @@
   .account-service-grid { grid-template-columns: 1fr; }
 }
 @media (max-width: 700px) {
+  .account-login-columns { grid-template-columns: minmax(0, 1fr); gap: 24px; }
+  .account-wechat-panel { padding: 24px 0 0; border-left: 0; border-top: 1px solid var(--line); }
   .account-safety-grid { grid-template-columns: 1fr; }
   .account-workspace .account-panel, .account-workspace .account-service { padding: 20px; }
   .account-workspace .account-usage-grid { grid-template-columns: 1fr; }
   .account-workspace .account-plans { grid-template-columns: 1fr; }
+}
+@container (max-width: 650px) {
+  .account-login-columns { grid-template-columns: minmax(0, 1fr); gap: 24px; }
+  .account-wechat-panel { padding: 24px 0 0; border-left: 0; border-top: 1px solid var(--line); }
 }

@@ -18,6 +18,7 @@ it('API 目标限制启用后，通用与专用线路仍能通过内部入口核
     await bridge.listen()
     bridge.restrict(['api.example:443'])
     await expect(bridge.probeReachability!()).resolves.toMatchObject({ url: 'http://probe.invalid/' })
+    await expect(bridge.probeTargetReachability!()).resolves.toMatchObject({ url: 'api-only-target-gate' })
     await expect(bridge.verifyDedicated!()).resolves.toBeUndefined()
     expect(upstream.hits().some(hit => hit.host === 'echo.invalid')).toBe(true)
     expect(upstream.hits().some(hit => hit.host === 'probe.invalid')).toBe(true)

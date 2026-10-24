@@ -6,7 +6,7 @@ import { connect, createServer, isIP } from 'node:net'
 import { uptime } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { TUNNEL_PROBE_URLS, probeTunnelReachability, verifyWithFallback } from './vless-connector.mjs'
+import { AI_SERVICE_PROBE_URLS, TUNNEL_PROBE_URLS, probeTargetReachability, probeTunnelReachability, verifyWithFallback } from './vless-connector.mjs'
 import { CONTROL_CODES, ConnectorError } from './connectors.mjs'
 import { validVerifyFallbackUrl } from './vless-settings.mjs'
 import { lockHolderAlive } from './ledger.mjs'
@@ -128,6 +128,8 @@ export function createLocalBridge(options) {
   let lost
   let degraded
   let runId
+  let lifecycleGeneration = 0
+  let starting = false
   let closeInFlight
   let port = options.listenPort
   let kernelPort
@@ -153,22 +155,28 @@ export function createLocalBridge(options) {
     verify: options.verifyUrl ? () => verifyWithFallback(apiOnly ? kernelPort : port, options.verifyUrl, options.verifyFallbackUrl, options.verifyTimeoutMs) : undefined,
     // 回显打不通时的第二意见:通用探测点经通道可达 = 通道活着(见 daemon-core.verifyConnection)。
     probeReachability: options.verifyUrl ? () => probeTunnelReachability(apiOnly ? kernelPort : port, options.probeUrls ?? TUNNEL_PROBE_URLS, options.verifyTimeoutMs) : undefined,
+    // 通用探测只能证明 tunnel alive；普通通道还必须有 ChatGPT/Claude 目标证据。
+    // API-only 已经由 apiDestinations 限制到调用方目标，不能拿浏览器服务探测去误伤它。
+    probeTargetReachability: options.verifyUrl && options.routes !== undefined ? () => apiOnly
+      ? Promise.resolve({ url: 'api-only-target-gate' })
+      : probeTargetReachability(port, AI_SERVICE_PROBE_URLS, options.verifyTimeoutMs) : undefined,
     verifyDedicated: probeDedicated ? async () => {
       if (stopped || dedicatedProbePort === undefined) throw fail()
-      try {
-        await verifyWithFallback(dedicatedProbePort, options.verifyUrl, options.verifyFallbackUrl, options.verifyTimeoutMs)
-      } catch (error) {
+      try { await verifyWithFallback(dedicatedProbePort, options.verifyUrl, options.verifyFallbackUrl, options.verifyTimeoutMs) }
+      catch (error) {
         // 回显站故障不等于专用通道故障;第二意见仍须走专用组。
         try { await probeTunnelReachability(dedicatedProbePort, options.probeUrls ?? TUNNEL_PROBE_URLS, options.verifyTimeoutMs) }
         catch { throw error }
       }
+      // The main local entry already routes AI targets through the dedicated
+      // balancer, so verifyConnection's target probe covers this path too.
     } : undefined,
     isAlive: () => child !== undefined && child.exitCode === null && child.signalCode === null && failure === undefined,
     onLost: (callback) => { lost = callback },
     // 被动检测(照 mihomo 的 onDialFailed):客户真实请求在通道里连续失败,就立刻通知守护复验,⛔ 干等 30 秒定时。
     onDegraded: (callback) => { degraded = callback },
     async listen() {
-      if (!stopped || child !== undefined) throw new Error('BRIDGE_ALREADY_STARTED')
+      if (starting || !stopped || child !== undefined) throw new Error('BRIDGE_ALREADY_STARTED')
       if (!options.outbound && !(options.outbounds?.length > 0) && options.upstream?.host !== '127.0.0.1') throw fail()
       const executable = options.executablePath ?? xrayExecutable()
       // 内核文件不在(装包不全,或被安全软件隔离)是缺组件 ⛔ 「上游不可达」:按上游不可达报会无限重连,
@@ -176,51 +184,71 @@ export function createLocalBridge(options) {
       if (!existsSync(executable)) throw new ConnectorError(CONTROL_CODES.componentMissing, '代理内核缺失或已被安全软件隔离，请把工具箱目录加入安全软件白名单后重新安装')
       const missingAsset = ['geoip.dat', 'geosite.dat'].find((name) => !existsSync(join(dirname(executable), name)))
       if (missingAsset) throw new ConnectorError(CONTROL_CODES.componentMissing, `分流数据缺失（${missingAsset}），请重新安装工具箱`)
-      // 入口端口由 relay 直接占用，避免检查完成到监听之间被其他本机进程抢占。
-      const requestedPort = port ?? 0
-      let xrayPort = await availablePort(0)
-      while (requestedPort > 0 && xrayPort === requestedPort) xrayPort = await availablePort(0)
-      kernelPort = xrayPort
-      if (probeDedicated) {
-        do { dedicatedProbePort = await availablePort(0) }
-        while (dedicatedProbePort === requestedPort || dedicatedProbePort === xrayPort)
-      }
-      mkdirSync(options.dataDir, { recursive: true })
-      const config = join(options.dataDir, 'xray-bridge.json')
-      runId = randomUUID()
-      // 上次 runner 被硬杀(Windows TerminateProcess)时 close 钩子不跑,pid 记档留在磁盘、
-      // 内核还活着。启动前清扫失去 runner 的旧记录；活 runner 的记录保留。
-      sweepOrphanXrays(config, platform, imageNameOf(executable), spawnImpl)
-      writeFileSync(config, JSON.stringify(buildXrayConfig({ ...options, listenPort: xrayPort, dedicatedProbePort })), { mode: 0o600 })
+      const generation = ++lifecycleGeneration
+      starting = true
       stopped = false
-      failure = undefined
-      // runner 的 stdin 是停止管道:close() 关闭它,runner 见 EOF 即停 xray(跨平台可靠)。
-      // stderr 接进守护的 stderr(甲-6:runner 把内核 stderr 转发到那里 → 守护日志 → 诊断包)。
-      child = spawnImpl(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), 'xray-runner.mjs'), executable, config, String(process.pid), runId], {
-        env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
-        stdio: ['pipe', 'ignore', 'inherit'], windowsHide: true
-      })
-      exited = new Promise((resolve) => {
-        child.once('error', () => { failure = fail() })
-        child.once('close', () => {
-          failure ??= fail()
-          void closeTrafficRelay(relay, relaySockets)
-          relay = undefined
-          resolve()
-          if (!stopped) lost?.(failure)
-        })
-      })
+      const assertActive = () => {
+        if (generation !== lifecycleGeneration || stopped) {
+          throw Object.assign(new Error('本地桥启动已取消'), { code: 'TUNNEL_CONNECTION_CANCELLED' })
+        }
+      }
       try {
+        // 入口端口由 relay 直接占用，避免检查完成到监听之间被其他本机进程抢占。
+        const requestedPort = port ?? 0
+        let xrayPort = await availablePort(0)
+        assertActive()
+        while (requestedPort > 0 && xrayPort === requestedPort) {
+          xrayPort = await availablePort(0)
+          assertActive()
+        }
+        kernelPort = xrayPort
+        if (probeDedicated) {
+          do {
+            dedicatedProbePort = await availablePort(0)
+            assertActive()
+          } while (dedicatedProbePort === requestedPort || dedicatedProbePort === xrayPort)
+        }
+        mkdirSync(options.dataDir, { recursive: true })
+        const config = join(options.dataDir, 'xray-bridge.json')
+        runId = randomUUID()
+        // 上次 runner 被硬杀(Windows TerminateProcess)时 close 钩子不跑,pid 记档留在磁盘、
+        // 内核还活着。启动前清扫失去 runner 的旧记录；活 runner 的记录保留。
+        sweepOrphanXrays(config, platform, imageNameOf(executable), spawnImpl)
+        assertActive()
+        writeFileSync(config, JSON.stringify(buildXrayConfig({ ...options, listenPort: xrayPort, dedicatedProbePort })), { mode: 0o600 })
+        failure = undefined
+        // runner 的 stdin 是停止管道:close() 关闭它,runner 见 EOF 即停 xray(跨平台可靠)。
+        // stderr 接进守护的 stderr(甲-6:runner 把内核 stderr 转发到那里 → 守护日志 → 诊断包)。
+        child = spawnImpl(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), 'xray-runner.mjs'), executable, config, String(process.pid), runId], {
+          env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+          stdio: ['pipe', 'ignore', 'inherit'], windowsHide: true
+        })
+        exited = new Promise((resolve) => {
+          child.once('error', () => { failure = fail() })
+          child.once('close', () => {
+            failure ??= fail()
+            void closeTrafficRelay(relay, relaySockets)
+            relay = undefined
+            resolve()
+            if (!stopped) lost?.(failure)
+          })
+        })
         const deadline = Date.now() + 5_000
         while (Date.now() < deadline) {
           await new Promise((resolve) => setTimeout(resolve, 100))
+          assertActive()
           if (failure !== undefined) break
           if (await probeSocks(xrayPort)) {
+            assertActive()
             const detector = createFailureDetector({ onDegraded: () => degraded?.() })
             const listener = await startTrafficRelay(requestedPort, xrayPort, traffic, relaySockets, options.idleStreamMs, detector, apiDestinations)
             relay = listener.server
+            assertActive()
             port = listener.port
-            if (await probeSocks(port)) return
+            if (await probeSocks(port)) {
+              assertActive()
+              return
+            }
             break
           }
         }
@@ -228,11 +256,14 @@ export function createLocalBridge(options) {
       } catch (error) {
         await this.close()
         throw error
+      } finally {
+        starting = false
       }
     },
     async close() {
-      if (closeInFlight !== undefined) return closeInFlight
+      lifecycleGeneration += 1
       stopped = true
+      if (closeInFlight !== undefined) return closeInFlight
       const closing = Promise.resolve().then(async () => {
         const closingChild = child
         const closingRunId = runId

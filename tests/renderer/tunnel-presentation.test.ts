@@ -12,6 +12,11 @@ function status(partial: Partial<TunnelStatusView>): TunnelStatusView {
 }
 
 describe('网络页状态呈现', () => {
+  it('恢复尚未确认时不提前声称通道已停止', () => {
+    const view = buildTunnelPresentation(status({ state: '异常', recoveryState: 'required', unrestored: 'WinINET/ProxyServer:未恢复:失败' }))
+    expect(view.description).not.toContain('通道已停止')
+    expect(view.description).toContain('尚未确认')
+  })
   it('旧账号配置已隐藏也必须按恢复阶段给动作，不诱导导入新配置', () => {
     const hidden = status({ state: '异常', currentConfig: '', unrestored: '', message: '原设置恢复待确认' })
     expect(buildTunnelPresentation({ ...hidden, recoveryState: 'running' })).toMatchObject({

@@ -1,6 +1,7 @@
 import { DISPLAY_STATES } from './status-service'
 import { type AccountAccessReason, type TunnelService } from './tunnel-service'
 import type { NetworkAccountAccess } from './account-client'
+import type { NetworkAccessOptions } from '../account/client'
 
 export interface TunnelRuntimeSnapshot {
   readonly state: 'connected' | 'stopped'
@@ -18,9 +19,10 @@ export function initializeTunnelRuntime(createService: () => TunnelService): Tun
 }
 
 // Account integration hook; call after normal authentication or with undefined on logout.
-export function setNetworkAccountAccess(access: NetworkAccountAccess | undefined, reason?: AccountAccessReason) {
+export function setNetworkAccountAccess(access: NetworkAccountAccess | undefined, reason?: AccountAccessReason,
+  options?: NetworkAccessOptions) {
   if (!tunnelService) throw new Error('TUNNEL_RUNTIME_UNINITIALIZED')
-  return tunnelService.setAccountAccess(access, reason)
+  return tunnelService.setAccountAccess(access, reason, options)
 }
 
 export function readTunnelSnapshot(): TunnelRuntimeSnapshot {

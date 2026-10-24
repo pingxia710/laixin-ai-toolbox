@@ -50,7 +50,7 @@ export function mountDesktopStatus(version: HTMLElement): void {
         previous = signature; notices.replaceChildren(); notices.hidden = !value.alerts.length
         for (const alert of value.alerts) {
           const entry = document.createElement('button'); entry.type = 'button'; entry.textContent = alert.message
-          entry.addEventListener('click', () => requestTabNavigation(alert.kind === 'ai' ? 'usage' : 'tunnel'))
+          entry.addEventListener('click', () => requestTabNavigation(alert.kind === 'ai' ? 'usage' : alert.kind === 'resident' ? 'settings' : 'tunnel'))
           notices.append(entry)
         }
       }

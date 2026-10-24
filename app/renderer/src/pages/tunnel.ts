@@ -3,8 +3,8 @@ import { icon, type IconName } from '../icons'
 import { button, statusPill } from '../page-ui'
 import type { PageModule } from './types'
 import { revealSupport } from '../support-widget'
-import { requestTabNavigation } from '../navigation'
-import { accountSnapshot, onAccountChange } from '../account-state'
+import { accountAction, accountSnapshot, onAccountChange, refreshAccount, requireAccount } from '../account-state'
+import { buildNetworkOnboarding, type OnboardingAction } from '../ui/network-onboarding'
 import { idleNetworkRepair, type NetworkRepairStatus } from '../../../shared/network-repair'
 import type { DiagnosticSoftware } from '../../../network-diagnostics-types'
 import { currentDiagnosticSession, forgetDiagnosticSession, parseDiagnosticRunSnapshot, rememberDiagnosticSession } from '../diagnostic-session'
@@ -17,6 +17,7 @@ interface TunnelPageState {
   statusReadError: string
   lastActionMessage: string
   lastActionTone: Tone
+  lastActionAwaitingRestore: boolean
   routeHost: string
   routeResult: RouteExplanationView | undefined
   routeError: string
@@ -51,15 +52,19 @@ function isHealthyLocalBackendContinuation(status: TunnelStatusView, now: number
 }
 
 const state: TunnelPageState = {
-  status: undefined, statusReadError: '', lastActionMessage: '', lastActionTone: 'neutral',
+  status: undefined, statusReadError: '', lastActionMessage: '', lastActionTone: 'neutral', lastActionAwaitingRestore: false,
   routeHost: '', routeResult: undefined, routeError: '', routeBusy: false,
   repair: { ...idleNetworkRepair }, repairReadError: false,
   reportReceipt: '', reportFile: '', reportSoftware: 'codex'
 }
-/** 分流说明与出口 IP 所在的折叠区：首次挂载就展开，⛔ 让客户多点一下才看得到（验收 P3-4）。 */
+/** UI-10: technical evidence remains available, but starts collapsed. */
 const networkExtraClass = 'technical-details network-extra'
 let activeElement: HTMLElement | undefined
 let advancedElement: HTMLElement | undefined
+let repairElement: HTMLElement | undefined
+let repairBusyChanged: ((busy: boolean) => void) | undefined
+let helpDetails: HTMLDetailsElement | undefined
+let helpReason = ''
 let pollTimer: ReturnType<typeof setInterval> | undefined
 let mountVersion = 0
 let refreshRequest = 0
@@ -82,6 +87,7 @@ export const page: PageModule = {
     if (!reportInProgress && !state.reportReceipt) {
       state.lastActionMessage = ''
       state.lastActionTone = 'neutral'
+      state.lastActionAwaitingRestore = false
     }
     state.routeHost = ''
     state.routeResult = undefined
@@ -123,10 +129,10 @@ export function buildTunnelPresentation(status: TunnelStatusView | undefined): T
   }
   if (status.recoveryState === 'running') {
     return { tone: 'warning', headline: '正在恢复原设置', description: '正在交还网络设置，完成前请不要重复连接或导入配置。',
-      hint: status.message || '恢复结束后会自动更新状态。', primaryAction: 'none', primaryLabel: '恢复中' }
+      hint: '正在自动处理，恢复结果会自动更新；其他软件修改的设置会保留。', primaryAction: 'none', primaryLabel: '恢复中' }
   }
   if (status.recoveryState === 'required' || status.unrestored) {
-    return { tone: 'danger', headline: '原设置尚未恢复', description: '通道已停止。可以重试恢复；其他软件修改的设置会保留。',
+    return { tone: 'warning', headline: '原设置尚未恢复', description: '原网络设置是否恢复尚未确认。可以重试恢复；其他软件修改的设置会保留。',
       hint: status.message || '恢复完成前无法重新连接或应用新配置。', primaryAction: 'stop', primaryLabel: '重试恢复原设置' }
   }
   if (status.state === '断开中') {
@@ -242,6 +248,11 @@ async function refresh(version: number): Promise<void> {
       Promise.resolve().then(() => window.toolbox.tunnel.repairStatus()).catch(() => undefined)])
     if (version !== mountVersion || request < lastRefreshedRequest) return
     state.status = status
+    if (state.lastActionAwaitingRestore && status.state === '已停止并恢复原设置' &&
+      !status.unrestored && !status.componentMissing && (!status.recoveryState || status.recoveryState === 'idle')) {
+      state.lastActionMessage = ''
+      state.lastActionAwaitingRestore = false
+    }
     state.statusReadError = ''
     state.repairReadError = repair === undefined
     if (repair) state.repair = repair
@@ -263,10 +274,12 @@ async function runAction(action: () => Promise<TunnelActionResult>): Promise<voi
     const result = await action()
     if (version !== mountVersion) return
     state.lastActionMessage = result.message
+    state.lastActionAwaitingRestore = result.outcome === 'stopped' && result.code === ''
     state.lastActionTone = result.outcome === 'rejected' ? 'danger' : result.outcome === 'cancelled' ? 'warning' : 'neutral'
   } catch {
     if (version !== mountVersion) return
     state.lastActionMessage = '操作未完成，请重试或重新导入来信配置包。'
+    state.lastActionAwaitingRestore = false
     state.lastActionTone = 'danger'
   }
   busy = false
@@ -290,17 +303,12 @@ async function runReportDiagnosis(software: DiagnosticSoftware): Promise<ReturnT
 
 function render(element: HTMLElement): void {
   const now = Date.now()
-  const key = JSON.stringify([state, busy, accountSnapshot().state,
+  const key = JSON.stringify([state, busy, accountSnapshot(),
     state.status !== undefined && isHealthyLocalBackendContinuation(state.status, now)])
   if (key === lastRender) return
-  const firstRender = lastRender === ''
   lastRender = key
+  const opened = new Set(Array.from(element.querySelectorAll<HTMLDetailsElement>('details[open]')).map(details => details.className))
   const focusedAction = element.contains(document.activeElement) ? (document.activeElement as HTMLElement)?.dataset.networkAction : undefined
-  const routeCaret = routeCaretOf(element)
-  // 首次挂载给默认展开的那一份；之后按客户自己开合的现状保留。
-  const opened = firstRender
-    ? new Set([networkExtraClass])
-    : new Set(Array.from(element.querySelectorAll<HTMLDetailsElement>('details[open]')).map((details) => details.className))
   for (const remove of listeners.splice(0)) remove()
   element.className = 'tunnel-page'
   element.replaceChildren()
@@ -310,16 +318,10 @@ function render(element: HTMLElement): void {
     : buildTunnelPresentation(status)
   element.append(connectionCard(presentation))
   appendFeedback(element, status, now)
-  element.append(repairCard(), detailsCard(status), networkShortcuts(status))
-  const extra = document.createElement('details'); extra.className = networkExtraClass
-  extra.open = opened.has(networkExtraClass)
-  const summary = document.createElement('summary'); summary.textContent = '更多连接信息与分流说明'
-  summary.dataset.networkAction = 'extra'
-  extra.append(summary, extraDetails(status), routeExplanationCard(status)); element.append(extra)
-  element.querySelectorAll<HTMLDetailsElement>('details').forEach((details) => { details.open = opened.has(details.className) })
+  element.querySelectorAll<HTMLDetailsElement>('details').forEach(details => { details.open = opened.has(details.className) })
   renderAdvanced()
+  renderRepair()
   if (focusedAction) element.querySelectorAll<HTMLElement>('[data-network-action]').forEach((action) => { if (action.dataset.networkAction === focusedAction) action.focus({ preventScroll: true }) })
-  restoreRouteCaret(element, routeCaret)
 }
 
 /** 轮询会整页重建；输入中的分流查询框按原位置恢复焦点与光标。 */
@@ -350,9 +352,56 @@ function renderAdvanced(): void {
   if (!element) return
   const opened = new Set(Array.from(element.querySelectorAll<HTMLDetailsElement>('details[open]')).map((details) => details.className))
   const focusedAction = element.contains(document.activeElement) ? (document.activeElement as HTMLElement)?.dataset.networkAction : undefined
-  element.replaceChildren(actionSection(state.status))
+  const caret = routeCaretOf(element)
+  const details = document.createElement('details'); details.className = networkExtraClass
+  const heading = document.createElement('summary'); heading.textContent = '高级详情与手动配置'; heading.dataset.networkAction = 'extra'
+  details.append(heading, detailsCard(state.status), routeExplanationCard(state.status), actionSection(state.status))
+  element.replaceChildren(details)
   element.querySelectorAll<HTMLDetailsElement>('details').forEach((details) => { details.open = opened.has(details.className) })
   if (focusedAction) element.querySelectorAll<HTMLElement>('[data-network-action]').forEach((action) => { if (action.dataset.networkAction === focusedAction) action.focus({ preventScroll: true }) })
+  restoreRouteCaret(element, caret)
+}
+
+/** Diagnostics and repair share one disclosure and one software selection. */
+export function mountNetworkRepair(element: HTMLElement, details: HTMLDetailsElement, software: HTMLSelectElement, onBusy?: (busy: boolean) => void): () => void {
+  repairElement = element; helpDetails = details; helpReason = ''
+  repairBusyChanged = busy => { software.disabled = busy; onBusy?.(busy) }
+  if (reportInProgress || !software.value) software.value = state.reportSoftware
+  const select = () => {
+    if (software.value === 'codex' || software.value === 'claude' || software.value === 'hermes') state.reportSoftware = software.value
+  }
+  select(); software.addEventListener('change', select)
+  renderRepair()
+  return () => { software.removeEventListener('change', select); repairElement = undefined; repairBusyChanged = undefined; helpDetails = undefined; helpReason = '' }
+}
+
+function renderRepair(): void {
+  if (!repairElement) return
+  repairBusyChanged?.(Boolean(busy || state.repair.running || reportInProgress))
+  const focused = repairElement.contains(document.activeElement) ? (document.activeElement as HTMLElement)?.dataset.networkAction : undefined
+  repairElement.replaceChildren(repairCard())
+  if (focused) repairElement.querySelectorAll<HTMLElement>('[data-network-action]').forEach(action => { if (action.dataset.networkAction === focused) action.focus({ preventScroll: true }) })
+  const fault = state.status && buildTunnelPresentation(state.status).tone === 'danger'
+  const reason = state.repair.running ? 'repair' : reportInProgress || state.reportReceipt ? 'report'
+    : state.statusReadError || state.repairReadError ? 'read-error' : fault ? state.status!.state + state.status!.message : ''
+  if (reason && reason !== helpReason && helpDetails) helpDetails.open = true
+  helpReason = reason
+}
+
+function runSetup(action: OnboardingAction): void {
+  if (action === 'account' && accountSnapshot().state === 'signed-in') {
+    const details = document.querySelector<HTMLDetailsElement>('.network-allowance-details')
+    if (details) { details.open = true; details.scrollIntoView({ block: 'nearest' }); details.querySelector('summary')?.focus() }
+    return
+  }
+  if (action === 'account' || action === 'register') { requireAccount('tunnel'); return }
+  if (action === 'support') { revealSupport(); return }
+  if (action === 'sync') { void runAction(() => window.toolbox.tunnel.syncAccountConfig()); return }
+  if (action === 'start') { void runAction(() => window.toolbox.tunnel.start()); return }
+  if (action === 'claim' || action === 'refresh' || action === 'none') void runAction(async () => {
+    const view = await (action === 'claim' ? accountAction(() => window.toolbox.account.claimTrial()) : refreshAccount())
+    return { outcome: 'unchanged', code: view.code, message: view.message }
+  })
 }
 
 function connectionCard(presentation: TunnelPresentation): HTMLElement {
@@ -365,21 +414,20 @@ function connectionCard(presentation: TunnelPresentation): HTMLElement {
   const kicker = document.createElement('div')
   kicker.className = 'card-kicker'
   const label = document.createElement('span')
-  label.append(icon('network'), document.createTextNode('AI网络配置'))
+  label.append(icon('network'), document.createTextNode('网络连接'))
   kicker.append(label)
   const body = document.createElement('div')
   body.className = 'connection-main'
   const copy = document.createElement('div')
   const unconfigured = presentation.primaryAction === 'guide'
-  const signedIn = accountSnapshot().state === 'signed-in'
-  copy.append(Object.assign(document.createElement('h2'), { textContent: unconfigured ? '尚未配置' : presentation.headline }))
+  const primaryLabel = unconfigured ? '设置网络' : presentation.primaryLabel
+  copy.append(Object.assign(document.createElement('h2'), { textContent: unconfigured ? '网络尚未配置' : presentation.headline }))
   copy.append(Object.assign(document.createElement('p'), { textContent: unconfigured
-    ? signedIn ? '账号已登录。按引导领取可用流量并准备网络配置，也可以导入已有的来信配置包。' : '登录来信账号后，领取可用流量并准备网络配置；已有来信配置包也可手动导入。'
-    : presentation.description }))
+    ? '完成配置后，即可连接来信网络。' : presentation.description }))
   const hint = document.createElement('div')
   hint.className = 'connection-hint'
   hint.append(icon(presentation.tone === 'danger' ? 'warning' : presentation.tone === 'positive' ? 'check' : 'clock'), document.createTextNode(presentation.hint))
-  copy.append(hint)
+  if (!unconfigured && state.status?.state !== '已连' && presentation.hint !== statusFeedback(state.status, Date.now())) copy.append(hint)
   const power = document.createElement('div')
   power.className = 'connection-actions'
   const action = primaryAction(presentation.primaryAction)
@@ -388,26 +436,21 @@ function connectionCard(presentation: TunnelPresentation): HTMLElement {
   const trigger = button('', {
     className: 'power-button', iconName: presentation.primaryAction === 'repair' ? 'refresh' : 'power',
     disabled: busy || (presentation.primaryAction === 'repair' && state.repairReadError) || (!guide && !support && action === undefined),
-    onClick: support ? () => revealSupport() : guide ? () => requestTabNavigation('dashboard') : action === undefined ? undefined : () => void runAction(action)
+    onClick: support ? () => revealSupport() : unconfigured ? () => runSetup(buildNetworkOnboarding(accountSnapshot(), state.status).action) : action === undefined ? undefined : () => void runAction(action)
   })
   trigger.dataset.networkAction = 'primary'
-  trigger.setAttribute('aria-label', presentation.primaryLabel)
-  power.append(trigger, Object.assign(document.createElement('small'), { textContent: presentation.primaryLabel }))
+  trigger.setAttribute('aria-label', primaryLabel)
+  power.append(trigger)
+  power.append(Object.assign(document.createElement('small'), { textContent: primaryLabel }))
   body.append(copy, power)
-  const footer = document.createElement('div')
-  footer.className = 'connection-footer'
-  for (const [name, value] of [['出口节点', state.status?.nodeLabel || '尚未配置'], ['配置版本', state.status?.configVersion || '尚未应用'], ['最近复验', state.status?.lastVerifiedAt ? formatTime(state.status.lastVerifiedAt) : '尚未复验']]) {
-    const fact = document.createElement('span'); fact.append(document.createTextNode(name), Object.assign(document.createElement('strong'), { textContent: value })); footer.append(fact)
-  }
-  card.append(kicker, body, footer)
+  card.append(kicker, body)
   return card
 }
 
 function repairCard(): HTMLElement {
-  const card = document.createElement('section'); card.className = 'panel network-repair'
+  const card = document.createElement('section'); card.className = 'network-repair'
   const repair = state.repair
-  card.append(Object.assign(document.createElement('h3'), { textContent: '连接有问题？' }))
-  card.append(Object.assign(document.createElement('p'), { textContent: '恢复来信管理的设置、同步配置，再重新连接验证。不会接管其他代理，也不会更改 AI 的模型或 API Key。' }))
+  card.append(Object.assign(document.createElement('p'), { textContent: '修复会重新建立连接，期间网络可能短暂中断；不会更改 AI 模型或 API Key。' }))
   const actions = document.createElement('div'); actions.className = 'network-repair-actions'
   const trigger = button(repair.running ? '正在修复' : '检测并修复连接', {
     iconName: 'refresh', disabled: busy || repair.running || !state.status || state.status.state === '断开中' || state.repairReadError,
@@ -425,21 +468,6 @@ function repairCard(): HTMLElement {
   copy.dataset.networkAction = 'repair-copy'
   // 一键上报：客户不会复制诊断、也不一定发得出来（创始人 09-13：「复制诊断我不发哈」）。
   // 点一下，剩下的不用他管；发不出去也给同一个回执号和一份本机文件。
-  const softwareLabel = document.createElement('label'); softwareLabel.className = 'setting-row network-report-software'
-  softwareLabel.append(document.createTextNode('本次报障检查的软件'))
-  const softwareSelect = document.createElement('select'); softwareSelect.className = 'theme-select'
-  softwareSelect.dataset.networkAction = 'repair-report-software'
-  for (const [value, title] of [['codex', 'Codex'], ['claude', 'Claude Code'], ['hermes', 'Hermes（DeepSeek）']] as const) {
-    softwareSelect.append(Object.assign(document.createElement('option'), { value, textContent: title }))
-  }
-  softwareSelect.value = state.reportSoftware
-  softwareSelect.disabled = busy || repair.running
-  softwareSelect.addEventListener('change', () => {
-    if (softwareSelect.value === 'codex' || softwareSelect.value === 'claude' || softwareSelect.value === 'hermes') {
-      state.reportSoftware = softwareSelect.value
-    }
-  })
-  softwareLabel.append(softwareSelect)
   const send = button('把情况报给来信', { disabled: busy || repair.running,
     onClick: () => {
       if (reportInProgress || busy) return
@@ -453,6 +481,7 @@ function repairCard(): HTMLElement {
       state.reportReceipt = ''
       state.reportFile = ''
       state.lastActionMessage = '正在检查本次网络情况并准备报告，请稍候。'
+      state.lastActionAwaitingRestore = false
       state.lastActionTone = 'neutral'
       if (activeElement) render(activeElement)
       void (async () => {
@@ -493,7 +522,8 @@ function repairCard(): HTMLElement {
       })()
     } })
   send.dataset.networkAction = 'repair-report'
-  actions.append(trigger, send, copy); card.append(softwareLabel, actions)
+  copy.className = 'network-text-action'
+  actions.append(trigger, send, copy); card.append(actions)
   // 客户按之前就该知道发的是什么。这句是事实陈述，⛔ 写成免责声明。
   card.append(Object.assign(document.createElement('small'), { className: 'network-report-scope',
     textContent: '只有点击上报才会发送脱敏诊断包，可能包含账号/设备编号、出口 IP、代理与设置恢复状态、近期故障和网络运行日志。日志中的地址文本会做脱敏处理，但仍可能保留部分地址；不主动采集对话内容。' }))
@@ -511,7 +541,7 @@ function repairCard(): HTMLElement {
   feedback.setAttribute('role', 'status'); feedback.setAttribute('aria-live', 'polite')
   feedback.dataset.outcome = repair.outcome
   feedback.textContent = state.repairReadError ? '修复状态暂时读不到，请稍后刷新；不要把它当作已经修好。'
-    : repair.message || '只在本机代理和通道出口复验通过后显示已修复；AI 登录和对话需在目标软件确认。'
+    : repair.message
   card.append(feedback)
   return card
 }
@@ -529,14 +559,6 @@ function detailsCard(status: TunnelStatusView | undefined): HTMLElement {
   appendDetail(details, '当前节点', status?.nodeLabel, '尚未配置节点')
   appendDetail(details, '配置版本', status?.configVersion, '尚未应用')
   appendDetail(details, '最近复验', status?.lastVerifiedAt ? formatTime(status.lastVerifiedAt) : '', '尚未复验')
-  appendDetail(details, '出口 IP', status?.exitIp, status?.pathSource === 'reused' ? '复用本机原有外网，无来信出口'
-    : status?.pathVerified === true ? '出口地址暂未取得' : '连接后校验')
-  card.append(details)
-  return card
-}
-
-function extraDetails(status: TunnelStatusView | undefined): HTMLElement {
-  const details = document.createElement('dl'); details.className = 'detail-list'
   appendDetail(details, '本机代理', status?.state === '已连' ? '设置已读回核验' : status?.unrestored ? '恢复未完成' : '', '连接后核验')
   appendDetail(details, '通道出口', status?.state === '已连' ? '出口探测已通过' : '', '尚未通过当前连接校验')
   appendDetail(details, '目标 AI 软件', '请在软件内确认登录并尝试对话', '')
@@ -548,28 +570,8 @@ function extraDetails(status: TunnelStatusView | undefined): HTMLElement {
   appendDetail(details, '出口 IP', status?.exitIp, status?.pathSource === 'reused' ? '复用本机原有外网，无来信出口'
     : status?.pathVerified === true ? '出口地址暂未取得' : '连接后校验')
   appendDetail(details, '代理入口流量', status?.traffic, '连接后显示')
-  return details
-}
-
-function networkShortcuts(status: TunnelStatusView | undefined): HTMLElement {
-  const section = document.createElement('div'); section.className = 'network-shortcuts'
-  const open = (selector: string): void => {
-    const details = activeElement?.closest('#tab-panel')?.querySelector<HTMLDetailsElement>(selector)
-    if (!details) return
-    details.open = true; details.scrollIntoView({ block: 'nearest' }); details.querySelector<HTMLElement>('summary')?.focus({ preventScroll: true })
-  }
-  for (const [title, description, iconName, action, disabled] of [
-    ['刷新状态', '读取当前连接状态与最近一次复验结果。', 'refresh', () => { void refresh(mountVersion) }, busy],
-    ['同步配置', '登录后读取账号下的网络配置，沿用现有应用流程。', 'download', () => { void runAction(() => window.toolbox.tunnel.syncAccountConfig()) }, busy || state.repair.running || status === undefined || status.state === '断开中' || accountSnapshot().state !== 'signed-in'],
-    ['网络诊断', '检查基础网络、当前通道和目标 AI 服务。', 'network', () => open('.network-diagnostics'), false],
-    ['手动配置', '导入已有的来信配置包，或应用待用配置。', 'settings', () => open('.network-manual'), false]
-  ] as const) {
-    const trigger = button('', { disabled, onClick: action }); trigger.className = 'network-shortcut'
-    trigger.dataset.networkAction = title; trigger.setAttribute('aria-label', title)
-    trigger.append(icon(iconName), Object.assign(document.createElement('strong'), { textContent: title }), Object.assign(document.createElement('span'), { textContent: description }))
-    section.append(trigger)
-  }
-  return section
+  card.append(details, button('刷新状态', { disabled: busy, onClick: () => { void refresh(mountVersion) } }))
+  return card
 }
 
 /** 一眼看懂的结论：走哪条路、是不是局域网、还是得交给内核判。 */
@@ -723,14 +725,19 @@ function primaryAction(action: PrimaryAction): (() => Promise<TunnelActionResult
   }
 }
 
+function statusFeedback(status: TunnelStatusView | undefined, now: number): string {
+  return status?.message && status.recoveryState !== 'running' && status.recoveryState !== 'required' && !isHealthyLocalBackendContinuation(status, now)
+    ? status.message : ''
+}
+
 function appendFeedback(element: HTMLElement, status: TunnelStatusView | undefined, now: number): void {
   const messages: Array<{ text: string; tone: Tone; iconName: IconName }> = []
   if (state.statusReadError !== '') messages.push({ text: state.statusReadError, tone: 'danger', iconName: 'warning' })
   if (state.lastActionMessage !== '') messages.push({ text: state.lastActionMessage, tone: state.lastActionTone, iconName: state.lastActionTone === 'danger' ? 'warning' : 'check' })
-  if (status?.message !== undefined && status.message !== '' && !isHealthyLocalBackendContinuation(status, now)) {
-    messages.push({ text: status.message, tone: status.state === '异常' ? 'danger' : 'warning', iconName: 'warning' })
+  const message = statusFeedback(status, now)
+  if (message) {
+    messages.push({ text: message, tone: status?.state === '异常' ? 'danger' : 'warning', iconName: 'warning' })
   }
-  if (status?.unrestored !== undefined && status.unrestored !== '') messages.push({ text: `未恢复项：${status.unrestored}`, tone: 'danger', iconName: 'warning' })
   if (status?.componentMissing !== undefined && status.componentMissing !== '') messages.push({ text: status.componentMissing, tone: 'danger', iconName: 'warning' })
   for (const message of messages) {
     const feedback = document.createElement('div')
@@ -738,6 +745,27 @@ function appendFeedback(element: HTMLElement, status: TunnelStatusView | undefin
     feedback.dataset.tone = message.tone
     feedback.append(icon(message.iconName), document.createTextNode(message.text))
     element.append(feedback)
+  }
+  if (status?.unrestored || status?.recoveryDetail) {
+    const details = document.createElement('details')
+    details.className = 'technical-details network-recovery-details'
+    const summary = document.createElement('summary')
+    summary.textContent = '恢复详情（可提供给客服）'
+    summary.dataset.networkAction = 'recovery-details'
+    details.append(summary)
+    if (status.recoveryDetail) details.append(Object.assign(document.createElement('p'), { textContent: status.recoveryDetail }))
+    const groups = new Map<string, string[]>()
+    for (const item of (status.unrestored ? status.unrestored.split(';') : [])) {
+      const separator = item.indexOf(':未恢复:')
+      const reason = separator < 0 ? item : item.slice(separator + 1)
+      const fields = groups.get(reason) ?? []
+      if (separator >= 0) fields.push(item.slice(0, separator))
+      groups.set(reason, fields)
+    }
+    for (const [reason, fields] of groups) {
+      details.append(Object.assign(document.createElement('p'), { textContent: fields.length ? `${fields.join('、')}：${reason}` : reason }))
+    }
+    element.append(details)
   }
 }
 

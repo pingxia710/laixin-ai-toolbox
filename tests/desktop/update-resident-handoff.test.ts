@@ -222,7 +222,7 @@ it('守护实际还原失败时，兜底成功也不能让普通卸载、静默�
   expect(deleteCache).toBeGreaterThan(abort)
 
   // 从实际 NSIS 条件读出退出码闸，再用不同入口和返回码求值；兜底只恢复 WinINET。
-  const gate = body.slice(fallback, commit).match(/\$\{If\} \$6 != "0"\s+\$\{AndIf\} \$6 != "not-run"\s+\$\{AndIf\} \$7 == "0"\s+StrCpy \$7 (\$6|"[^"]*")\s+\$\{EndIf\}/)
+  const gate = body.slice(fallback, commit).match(/\$\{If\} \$6 != "0"\s+\$\{AndIf\} \$6 != "not-run"\s+\$\{AndIf\} \$7 == "0"\s+StrCpy \$7 (\$6|"[^"]*")\s+StrCpy \$laixinUninstallFailureCode "UNINSTALL_TUNNEL_RESTORE_FAILED"\s+\$\{EndIf\}/)
   expect(gate).not.toBeNull()
   const predicates = [...gate![0].matchAll(/\$\{(?:If|AndIf)\} (\$[67]) (==|!=) "([^"]+)"/g)]
   expect(predicates).toHaveLength(3)
@@ -251,6 +251,47 @@ it('守护实际还原失败时，兜底成功也不能让普通卸载、静默�
   expect(failureGate).toBeGreaterThan(commit)
   expect(failureGate).toBeLessThan(abort)
   expect(body.slice(failureGate, abort + 'SetErrorLevel 1\n    Abort'.length)).toMatch(/\$\{If\} \$5 == "uninstall"[\s\S]*\$\{GetOptions\} \$3 "\/S" \$4[\s\S]*\$\{If\} \$\{Errors\}[\s\S]*\$\{EndIf\}\s+\$\{EndIf\}\s+SetErrorLevel 1\s+Abort/)
+})
+
+it('Windows 真卸载失败落盘五个阶段结果，弹窗显示稳定失败码', async () => {
+  const script = await readFile(join(__dirname, '..', '..', 'build', 'installer.nsh'), 'utf8')
+  const macroStart = script.indexOf('!macro writeLaixinUninstallFailure')
+  const macroEnd = script.indexOf('!macroend', macroStart)
+  expect(macroStart).toBeGreaterThan(-1)
+  const writer = script.slice(macroStart, macroEnd)
+  expect(writer).toContain('windows-preflight-last-error.log')
+  expect(writer).toContain('FAILURE_CODE=$laixinUninstallFailureCode')
+  expect(writer).toContain('PREFLIGHT=$laixinUninstallPreflight')
+  expect(writer).toContain('AI_ROUTER=$laixinAiRouterCleanup')
+  expect(writer).toContain('TUNNEL_RESTORE=$6')
+  expect(writer).toContain('PROXY_FALLBACK=$laixinUninstallProxyFallback')
+  expect(writer).toContain('RECOVERY_COMMIT=$laixinUninstallRecoveryCommit')
+  expect(writer).not.toContain('$INSTDIR')
+  expect(writer).not.toContain('$APPDATA\\${PRODUCT_NAME}\\tunnel')
+
+  const body = script.slice(script.indexOf('!macro customUnInstall'),
+    script.indexOf('!macroend', script.indexOf('!macro customUnInstall')))
+  expect(body).toContain('StrCpy $laixinAiRouterCleanup "not-run"')
+  expect(body).toMatch(/\$laixinAiRouterCleanup != "0"\s+\$\{AndIf\} \$laixinAiRouterCleanup != "not-run"\s+\$\{AndIf\} \$7 == "0"/)
+  for (const code of [
+    'UNINSTALL_PREFLIGHT_FAILED',
+    'UNINSTALL_PROXY_FALLBACK_FAILED',
+    'UNINSTALL_AI_ROUTER_CLEANUP_FAILED',
+    'UNINSTALL_TUNNEL_RESTORE_FAILED'
+  ]) expect(body).toContain(`StrCpy $laixinUninstallFailureCode "${code}"`)
+  const commitMacro = script.slice(script.indexOf('!macro commitLaixinWindowsPreflight'),
+    script.indexOf('!macroend', script.indexOf('!macro commitLaixinWindowsPreflight')))
+  expect(commitMacro).toContain('StrCpy $laixinUninstallFailureCode "UNINSTALL_RECOVERY_COMMIT_FAILED"')
+  const failureGate = body.indexOf('${If} $7 != "0"')
+  const write = body.indexOf('!insertmacro writeLaixinUninstallFailure', failureGate)
+  const message = body.indexOf('MessageBox MB_OK|MB_ICONSTOP', write)
+  const abort = body.indexOf('Abort', message)
+  expect(failureGate).toBeGreaterThan(-1)
+  expect(write).toBeGreaterThan(failureGate)
+  expect(message).toBeGreaterThan(write)
+  expect(abort).toBeGreaterThan(message)
+  expect(body.slice(message, abort)).toContain('失败码：$laixinUninstallFailureCode')
+  expect(body.slice(message, abort)).not.toContain('重新打开工具箱')
 })
 
 it('主 EXE 缺失但 sidecar 留存时不尝试启动守护，残缺安装仍可走代理兜底', async () => {

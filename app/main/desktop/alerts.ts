@@ -18,7 +18,9 @@ export function quotaAlerts(ai: UsageReport | undefined, network: AccountView | 
     }
   }
   const overview = network?.state === 'signed-in' && !network.code ? network.overview : null
-  const usages = overview ? [overview.trial.usage, overview.subscription].filter((usage) => usage !== null) : []
+  // ENT-15：多订阅可同时有效，低流量按本账号全部套餐合计；subscriptions 缺席的旧后台退回头牌，与账号页同口径。
+  const subscriptions = overview?.subscriptions ?? (overview?.subscription ? [overview.subscription] : [])
+  const usages = overview ? [overview.trial.usage, ...subscriptions].filter((usage) => usage !== null) : []
   // An unreadable allocation is not zero. Do not warn while any potentially usable allocation is unknown.
   if (usages.some((usage) => usage.state === 'unknown' || (['active', 'exhausted'].includes(usage.state) && usage.measurement !== 'current'))) return alerts
   const available = usages.filter((usage) => ['active', 'exhausted'].includes(usage.state) && usage.expiresAt !== null && usage.expiresAt > now)

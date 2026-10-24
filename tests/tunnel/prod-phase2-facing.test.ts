@@ -30,6 +30,22 @@ describe('「上游不可达」不能再以裸码或无动作的计数文案出�
     expect(text).toMatch(/请/)
     expect(text).toMatch(/网络|诊断/)
   })
+
+  it('连接阶段超时在连接页和修复页都给出网络动作', () => {
+    const shown = connectionMessage({ state: 'error', code: 'TUNNEL_CONNECTION_TIMEOUT', message: 'TUNNEL_CONNECTION_TIMEOUT' } as never)
+    expect(shown).toMatch(/限定时间|网络/)
+    expect(shown).toMatch(/重试|诊断/)
+    const repair = REPAIR_REASONS.TUNNEL_CONNECTION_TIMEOUT
+    expect(repair).toMatch(/限定时间|网络/)
+    expect(repair).toMatch(/重试|诊断/)
+  })
+
+  it('通道建立但目标 AI 未确认时，给出目标服务动作而不是裸码', () => {
+    const shown = connectionMessage({ state: 'error', code: 'TUNNEL_TARGET_UNCONFIRMED', message: 'TUNNEL_TARGET_UNCONFIRMED' } as never)
+    expect(shown).toMatch(/目标 AI|换一个网络|诊断/)
+    expect(shown).not.toBe('TUNNEL_TARGET_UNCONFIRMED')
+    expect(REPAIR_REASONS.TUNNEL_TARGET_UNCONFIRMED).toMatch(/目标 AI|换一个网络|诊断/)
+  })
 })
 
 describe('NETWORK_AUTHORIZATION_UNAVAILABLE 要告诉客户「去哪查」', () => {

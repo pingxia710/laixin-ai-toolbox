@@ -75,6 +75,24 @@ describe('复用本机已有外网时的状态', () => {
     }
   })
 
+  it('目标 AI 尚未确认时仍保持已连，并把待确认事实交给界面', () => {
+    const status = statusOf({
+      ...laixinDaemon,
+      code: 'TUNNEL_TARGET_UNCONFIRMED',
+      message: '网络通道已连接，目标 AI 待确认，正在复查；另一款代理软件也在反复修改系统代理',
+      pathVerified: true
+    })
+    expect(status).toMatchObject({ state: DISPLAY_STATES.connected, pathVerified: true, pathSource: 'laixin' })
+    expect(status.message).toContain('网络通道已连接')
+    expect(status.message).toContain('目标 AI 待确认')
+    expect(status.message).toContain('另一款代理软件')
+    expect(networkPathReady(status)).toBe(true)
+
+    const fallback = statusOf({ ...laixinDaemon, code: 'TUNNEL_TARGET_UNCONFIRMED', message: '' })
+    expect(fallback.message).toContain('网络通道已连接')
+    expect(fallback.message).toContain('目标 AI 待确认')
+  })
+
   it('没有可达证据、也没有出口 IP 或原设置未恢复，都不算可用', () => {
     expect(networkPathReady(statusOf({ ...laixinDaemon, exitIp: '' }))).toBe(false)
     expect(networkPathReady(statusOf({ ...laixinDaemon, lastVerifiedAt: undefined }))).toBe(false)

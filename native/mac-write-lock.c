@@ -3,11 +3,35 @@
 // the lock, and can never leave an unlocked transition child running behind it.
 #include <errno.h>
 #include <fcntl.h>
+#include <libproc.h>
+#include <limits.h>
+#include <locale.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+
+// Read-only identity lookup avoids executing the setuid /bin/ps. Keep its C
+// locale lstart format exactly: existing live owners must never look stale.
+static int process_start(const char *text) {
+    if (text[0] == '\0' || strspn(text, "0123456789") != strlen(text)) return 64;
+    errno = 0;
+    long parsed = strtol(text, NULL, 10);
+    if (errno != 0 || parsed <= 0 || parsed > INT_MAX) return 64;
+    struct proc_bsdinfo info = {0};
+    int count = proc_pidinfo((pid_t)parsed, PROC_PIDTBSDINFO, 0, &info, sizeof(info));
+    if (count != sizeof(info) || info.pbi_pid != (uint32_t)parsed
+        || info.pbi_uid != getuid() || info.pbi_start_tvsec == 0) return 74;
+    time_t started = (time_t)info.pbi_start_tvsec;
+    struct tm local;
+    char identity[64];
+    if (setlocale(LC_TIME, "C") == NULL || localtime_r(&started, &local) == NULL
+        || strftime(identity, sizeof(identity), "%a %b %e %H:%M:%S %Y", &local) == 0) return 74;
+    return puts(identity) == EOF ? 74 : 0;
+}
 
 static double monotonic_seconds(void) {
     struct timespec now;
@@ -16,6 +40,7 @@ static double monotonic_seconds(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 3 && strcmp(argv[1], "--process-start") == 0) return process_start(argv[2]);
     if (argc < 4 || (strcmp(argv[1], "0") != 0 && strcmp(argv[1], "1") != 0)
         || argv[2][0] != '/' || argv[3][0] != '/') return 64;
     // JS creates the stable private file first. Never create, follow a symlink,

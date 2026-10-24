@@ -202,7 +202,7 @@ function parseLeadingJsonObject(text: string, start: number): Record<string, unk
 /** 官方订阅状态不接受明确的 API Key 认证；旧版缺少 authMethod 时保留明确登录字段兼容。 */
 export async function readClaudeAuthStatus(command: ClaudeLoginCommand, env: NodeJS.ProcessEnv = process.env, exec = execFile): Promise<boolean> {
   try {
-    const { stdout } = await exec(command.executable, ['auth', 'status', '--json'], { encoding: 'utf8', timeout: 15_000, maxBuffer: 256 * 1024, env, windowsHide: true })
+    const { stdout } = await exec(command.executable, ['auth', 'status', '--json'], { encoding: 'utf8', timeout: 15_000, maxBuffer: 4 * 1024 * 1024, env, windowsHide: true })
     const text = String(stdout)
     const start = text.indexOf('{')
     if (start >= 0) {

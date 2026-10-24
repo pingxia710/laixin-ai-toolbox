@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { toolboxClientVersion } from '../../shared/client-identity'
 
 export interface CodexLoginCommand {
   readonly executable: string
@@ -23,6 +24,7 @@ export interface StartCodexLoginOptions {
 }
 
 export async function startCodexChatGptLogin(command: CodexLoginCommand, options: StartCodexLoginOptions): Promise<CodexChatGptLogin> {
+  const clientVersion = await toolboxClientVersion()
   return new Promise((resolve, reject) => {
     const child = spawn(command.executable, [...command.args], {
       cwd: options.cwd, env: command.environment ?? options.env ?? process.env, shell: false, windowsHide: true,
@@ -133,7 +135,7 @@ export async function startCodexChatGptLogin(command: CodexLoginCommand, options
         if (line.trim()) void received(line)
       }
     })
-    send(1, 'initialize', { clientInfo: { name: 'laixin_ai_toolbox', title: '来信 AI 工具箱', version: '0.4.6' }, capabilities: null })
+    send(1, 'initialize', { clientInfo: { name: 'laixin_ai_toolbox', title: '来信 AI 工具箱', version: clientVersion }, capabilities: null })
   })
 }
 

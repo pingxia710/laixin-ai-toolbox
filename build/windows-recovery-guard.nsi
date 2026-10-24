@@ -87,7 +87,7 @@ Section
   ${If} $R3 == 0
     !insertmacro GuardFailure "UPDATE_RECOVERY_GUARD_PROCESS_PATH_FAILED"
   ${EndIf}
-  System::Call 'kernel32::lstrcmpiW(w R4, w $OwnerPath) i .R3'
+  System::Call 'kernel32::lstrcmpiW(w R4, w "$OwnerPath") i .R3'
   ${If} $R3 != 0
     !insertmacro GuardFailure "UPDATE_RECOVERY_GUARD_PROCESS_PATH_MISMATCH"
   ${EndIf}
@@ -116,7 +116,7 @@ owner_valid:
   ${If} $R3 == 0
     !insertmacro GuardFailure "UPDATE_RECOVERY_GUARD_PROCESS_PATH_FAILED"
   ${EndIf}
-  System::Call 'kernel32::lstrcmpiW(w R4, w $WorkerPath) i .R3'
+  System::Call 'kernel32::lstrcmpiW(w R4, w "$WorkerPath") i .R3'
   ${If} $R3 != 0
     !insertmacro GuardFailure "UPDATE_RECOVERY_GUARD_PROCESS_PATH_MISMATCH"
   ${EndIf}

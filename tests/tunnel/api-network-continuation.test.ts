@@ -35,7 +35,7 @@ function fixture(apiOnly = false, parentPollMs = 50, exitIp = '203.0.113.1') {
     parentExit: () => { parentAlive = false; clock.advance(50) },
     parentExitFirst: () => { parentAlive = false; clock.advance(1) },
     reopen: () => { parentAlive = true; writeIntentFile(dataDir, { ...base, updatedAt: 3 }); clock.advance(50) },
-    disconnect: () => { writeIntentFile(dataDir, { desired: 'user-disconnected', updatedAt: 4 }); clock.advance(50) } }
+    disconnect: (reason = 'user-stop') => { writeIntentFile(dataDir, { desired: 'user-disconnected', reason, updatedAt: 4 }); clock.advance(50) } }
 }
 
 describe('退出后仅 API 需要的通道延续', () => {
@@ -60,14 +60,17 @@ describe('退出后仅 API 需要的通道延续', () => {
     await waitFor(() => f.state().state === 'stopped-restored')
   })
 
-  it('交接核验晚到不能覆盖用户较新的断开意图', async () => {
+  it.each([
+    ['交接核验晚到不能覆盖用户较新的断开意图', 'user-stop'],
+    ['交接核验晚到不能覆盖退出账号的断开意图', 'account-logout']
+  ])('%s', async (_title, reason) => {
     const f = fixture()
     await f.daemon.run()
     let release!: (value: { proxyUrl: string; targets: string[] }) => void
     f.probe.mockImplementationOnce(() => new Promise(resolve => { release = resolve }))
     f.detach()
     await waitFor(() => release !== undefined)
-    f.disconnect()
+    f.disconnect(reason)
     release({ proxyUrl: 'http://127.0.0.1:18080', targets: ['api.deepseek.com:443'] })
     await waitFor(() => f.state().state === 'stopped-restored')
     expect(f.state().apiOnly).toBe(false)

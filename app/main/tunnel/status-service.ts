@@ -1,14 +1,17 @@
 // 状态合并与脱敏(定稿第 2 轮 2 / 第 3 轮 2a):界面与日志只出白名单字段,
 // ⛔ 凭据路径与内容 ⛔「已授权 / 可信 / 已认证」语义。
 import { existsSync, readFileSync } from 'node:fs'
+import { isIP } from 'node:net'
 import { join } from 'node:path'
 import { lastIntentCached, ledgerFailureCached } from '../../../sidecar/mac/ledger.mjs'
 import { unrestoredEntriesCached } from '../../../sidecar/mac/restore.mjs'
+import { restoreObservationActive, restoreObservationText } from '../../../sidecar/mac/restore-observation.mjs'
 import { readCurrentInfo, readPendingInfo } from './import-meta'
 import { hasInvalidPointers } from './transactions'
 import { layout, statSignature } from './paths'
 
 export interface DaemonStateView {
+  readonly restoration?: unknown
   readonly state: string
   readonly runId?: string
   readonly sessionToken?: string
@@ -18,6 +21,8 @@ export interface DaemonStateView {
   readonly exitIp?: string
   readonly pathVerified?: boolean
   readonly lastVerifiedAt?: number
+  /** 首次连接失败时最后一个受控阶段；用于诊断，不代表已建立隧道。 */
+  readonly connectStage?: string
   readonly bridgePort?: number
   /** 复用了电脑上现有的外网代理(未改系统设置)。 */
   // direct = 客户这台电脑本来就能到 AI 服务（VPN 走全局、人在墙外、公司专线），没有 host/port。
@@ -41,6 +46,8 @@ export interface TunnelStatus {
   readonly source: string
   readonly authorization: string
   readonly backend: string
+  /** 最近一次复验能明确归属的来信入口；多入口无法证明时留空。 */
+  readonly observedNodeLabel: string
   readonly nodeLabel: string
   readonly exitIp: string
   /** 本轮通道已通过复验；后备探测成功也能成立，不要求取得出口 IP。 */
@@ -58,6 +65,7 @@ export interface TunnelStatus {
   readonly unrestored: string
   /** 与配置可见性独立；退出账号后隐藏旧配置不等于无需恢复。 */
   readonly recoveryState?: 'idle' | 'running' | 'required'
+  readonly recoveryDetail?: string
   readonly componentMissing: string
   // 随包 OpenSSH(Windows)有无的如实读数:有/无;非 Windows 为空串不展示。
   readonly sshBinary: string
@@ -91,6 +99,18 @@ export function networkPathReady(status: TunnelStatus): boolean {
   if (status.state !== DISPLAY_STATES.connected || status.unrestored || !status.lastVerifiedAt) return false
   return status.pathSource === 'reused' || status.exitIp !== '' ||
     status.pathSource === 'laixin' && status.pathVerified === true
+}
+
+function observedNodeLabel(info: ReturnType<typeof readCurrentInfo>, daemon: DaemonStateView | undefined, state: string): string {
+  if (info === undefined || state !== DISPLAY_STATES.connected || daemon?.pathVerified !== true || isReusedPath(daemon)) return ''
+  if (info.nodes.length === 1) return `${info.nodes[0].host}:${String(info.nodes[0].port)}`
+  const exitIp = daemon.exitIp?.replace(/^\[|\]$/g, '') ?? ''
+  if (isIP(exitIp) === 0) return ''
+  const matches = info.nodes.filter((node) => {
+    const host = node.host.replace(/^\[|\]$/g, '')
+    return isIP(host) !== 0 && host === exitIp
+  })
+  return matches.length === 1 ? `${matches[0].host}:${String(matches[0].port)}` : ''
 }
 
 export const STATUS_LINES = {
@@ -153,14 +173,27 @@ export function computeStatus(input: StatusInput): TunnelStatus {
       message = '来信遇到一个未预期的问题，连接已停止。请点击重新连接；若反复出现，请复制诊断给客服'
     } else if (daemon?.state === 'connected') {
       state = DISPLAY_STATES.connected
-      // 已连状态下要带给客户的话:复用了本机现有外网 / 另一款代理软件在反复改系统代理 / 可选项(终端接入)没启用
+      // 已连状态下要带给客户的话:目标 AI 尚未确认 / 复用了本机现有外网 /
+      // 另一款代理软件在反复改系统代理 / 可选项(终端接入)没启用。
+      // 目标探测是「已连」之后的独立就绪信号，不能把它降级成「通道待确认」；
+      // 但必须把待确认事实带到界面，避免客户把传输已建立误解成目标服务已就绪。
       const lines = []
-      if (daemon.code === 'TUNNEL_SETTINGS_CONTESTED' || daemon.code === 'TUNNEL_REUSED_EXISTING') lines.push(daemon.message ?? '')
+      if (daemon.code === 'TUNNEL_TARGET_UNCONFIRMED') {
+        const targetMessage = daemon.message?.trim()
+        lines.push(targetMessage !== undefined && targetMessage !== '' && targetMessage !== daemon.code
+          ? targetMessage : '网络通道已连接，目标 AI 待确认，正在复查')
+      } else if (daemon.code === 'TUNNEL_SETTINGS_CONTESTED' || daemon.code === 'TUNNEL_REUSED_EXISTING') {
+        lines.push(daemon.message ?? '')
+      }
       if (daemon.note) lines.push(daemon.note)
       message = lines.filter(Boolean).join('；')
     } else if (daemon?.state === 'degraded') {
       state = DISPLAY_STATES.degraded
-      message = daemon.code === 'TUNNEL_PROBE_UNAVAILABLE' ? '检测服务暂不可用，正在保留原通道并重新检查' : '通道暂未确认，正在重新检查'
+      message = daemon.code === 'TUNNEL_PROBE_UNAVAILABLE'
+        ? '检测服务暂不可用，正在保留原通道并重新检查'
+        : daemon.code === 'TUNNEL_TARGET_UNCONFIRMED'
+          ? '通道已建立，但目标 AI 服务暂未确认，正在重新检查'
+          : '通道暂未确认，正在重新检查'
     } else if (daemon?.state === 'connecting') {
       state = DISPLAY_STATES.connecting
     } else if (daemon?.state === 'error') {
@@ -208,10 +241,13 @@ export function computeStatus(input: StatusInput): TunnelStatus {
     state,
     message,
     pauseReason: '',
-    recoveryState: failedRecovery ? 'required' : 'idle',
+    recoveryState: failedRecovery ? input.daemonUnexpectedExitAt === undefined && !input.daemonSurrendered && restoreObservationActive(daemon?.restoration)
+      ? 'running' : 'required' : 'idle',
+    recoveryDetail: restoreObservationText(daemon?.restoration, Date.now(), input.daemonUnexpectedExitAt === undefined && !input.daemonSurrendered),
     source: info?.sourceLine ?? '',
     authorization: info === undefined ? '' : STATUS_LINES.authorization,
     backend: info === undefined ? '' : STATUS_LINES.backend,
+    observedNodeLabel: observedNodeLabel(current, daemon, state),
     nodeLabel: info === undefined ? '' : `${info.node.host}:${String(info.node.port)}`,
     exitIp: state === DISPLAY_STATES.connected ? (daemon?.exitIp ?? '') : '',
     pathVerified: state === DISPLAY_STATES.connected && daemon?.pathVerified === true,
@@ -414,6 +450,8 @@ export function connectionMessage(daemon: DaemonStateView): string {
     // P0-1 TOP3(7/45):失败路径写的 message=code,重连期写的是「自动重连中(n/5)」计数文案——
     // 两头都不在表里,客户看到的就是裸码或一句没有任何动作的话。补映射,与修复路径(REPAIR_REASONS)同一句可照做的话。
     '上游不可达': '通道出口暂时不可达，来信已自动重连；持续失败请换一个网络（如手机热点）重试，或复制诊断给客服',
+    'TUNNEL_CONNECTION_TIMEOUT': '连接在限定时间内没有完成，来信已自动重连；请先检查当前网络，或换一个网络（如手机热点）后重试，持续失败请复制诊断给客服',
+    'TUNNEL_TARGET_UNCONFIRMED': '通道已建立，但目标 AI 服务暂未确认；来信正在自动重试，持续失败请换一个网络（如手机热点）后重试，或复制诊断给客服',
     // 连接争抢止损的四个码(2026-09-15)。⛔ 漏掉映射:失败路径上 message 就是 code 本身,
     // 漏一个客户就会看到「TUNNEL_PEER_LAIXIN_RUNNING」这种内部码——上面那段注释记的
     // 正是 0.4.9 同一个坑。每条都要说清**客户能做什么**。

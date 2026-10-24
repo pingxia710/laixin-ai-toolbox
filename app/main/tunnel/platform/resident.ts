@@ -214,8 +214,8 @@ export interface WinTaskAction {
 
 
 /**
- * 计划任务动作里的参数只会再经过 conhost → cmd /s 一条链；它与 Node spawn('.cmd')
- * 的 cross-spawn 解析模型不同。后者的 ^" 会让任务表面以 0 退出、内层守护却根本不启动。
+ * 计划任务动作里的参数只会经过 cmd /s 一条链；它与 Node spawn('.cmd') 的
+ * cross-spawn 解析模型不同。后者的 ^" 会让任务表面以 0 退出、内层守护却根本不启动。
  * 这里只接收不含 cmd 元字符的参数；空格仍须按这条链的普通引号规则成组。
  */
 function quoteWinTaskArgument(value: string): string {
@@ -227,7 +227,7 @@ function quoteWinTaskArgument(value: string): string {
 }
 
 function winTaskSpecUnsupportedReason(spec: ResidentSpec): string | undefined {
-  // %VAR% 的展开先于本任务链的参数解析，^% 与 %% 都不能在真实 conhost → cmd /s 中保真。
+  // %VAR% 的展开先于本任务链的参数解析，^% 与 %% 都不能在真实 cmd /s 中保真。
   // 与其让任务返回 0、守护却没起来，不如拒绝常驻并回落到主进程直启；连接本身不受影响。
   const values = [spec.executable, ...spec.args, spec.logDir, ...Object.entries(spec.env).flat()]
   if (values.some((value) => value.includes('%'))) {
@@ -271,36 +271,30 @@ export function winTaskAction(spec: ResidentSpec): WinTaskAction {
   if (unsupportedReason !== undefined) throw new Error(unsupportedReason)
   // 2026-09-18 客户故障:用户名带空格(MR WHITE)时，exe 位不能加裸引号；空格必须保留 ^ 转义，
   // 否则会被 cmd 从中间切开。参数与重定向目标则不能复用 cross-spawn 的 ^"：它在任务计划的
-  // conhost→cmd /s 链路会静默吞掉启动。两套解析契约不同，⛔ 再把它们合并成一条通用转义。
+  // cmd /s 链路会静默吞掉启动。两套解析契约不同，⛔ 再把它们合并成一条通用转义。
   // 推导只此一份:注册(XML)与读回比对(sameWinTaskAction)两条路径同享,⛔ 只改一半。
   const launch = [escapeCommandToken(spec.executable), ...spec.args.map(quoteWinTaskArgument)].join(' ')
   const sets = Object.entries(spec.env).map(([key, value]) => `set "${key}=${value}"`).join('&& ')
   // 日志路径按 Windows 规矩统一反斜杠(node 的 join 在非 Windows 宿主上拼出混合分隔符,测试也要能逐字核对)
   const logPath = join(spec.logDir, 'tunnel-daemon.log').replace(/[/\\]+/g, '\\')
-  const inner = `(${sets}&& ${launch} >> ${quoteWinTaskArgument(logPath)} 2>&1)`
+  // 不再让 conhost/cmd 包装进程一直占住计划任务。start /b 把守护脱离出这次调度，
+  // 任务动作很快返回，下一分钟仍能重试；守护自己的 instance lock 负责阻止重复接管。
+  // 这同时绕开慢机上 conhost 卡住后 MultipleInstancesPolicy=IgnoreNew 把后续重试全部吞掉的故障。
+  const inner = `(${sets}&& start "" /b ${launch} >> ${quoteWinTaskArgument(logPath)} 2>&1)`
   return {
-    execute: 'C:\\Windows\\System32\\conhost.exe',
-    arguments: `--headless C:\\Windows\\System32\\cmd.exe /d /v:off /s /c "${inner}"`,
+    execute: 'C:\\Windows\\System32\\cmd.exe',
+    arguments: `/d /v:off /s /c "${inner}"`,
     workingDirectory: spec.logDir
   }
 }
 
 /** 计划任务定义（schtasks /xml 用）。纯函数，便于用例逐字核对。 */
 export function winTaskXml(spec: ResidentSpec, author = '来信AI工具箱'): string {
-  // ⛔ 直接把 cmd.exe 当 Command:任务以 InteractiveToken 跑(见下方 Principal——非提升建不了
-  // LogonTrigger,只能走交互令牌),交互身份启动控制台程序 **窗口会显示给客户**;而守护一直跑着,
-  // cmd 就一直等着它,所以那不是闪一下、是一个常驻的黑窗口杵在客户桌面上(2026-09-16 创始人真机撞见)。
-  // Settings 里的 <Hidden>true</Hidden> 管不着这个——它只让任务在「任务计划程序」列表里不显示。
-  // conhost --headless 是 Windows 自带的无窗口控制台宿主(WSL 用的同一个机制),让 cmd 照常跑、
-  // 环境变量与日志重定向都不变,只是不再给它开窗口。⛔ 改用 powershell -WindowStyle Hidden:
-  // 每分钟起一次 PowerShell 开销大得多,而且仍会闪一下。
-  // 2026-09-16 Windows 真机三组对照(以截图为准,⛔ 用 MainWindowHandle 判:任务跑在交互桌面会话,
-  // 从 SSH 会话查窗口句柄一律是 0,那个判据连对照组都不会红,等于没验):
-  //   旧定义(直接 cmd.exe)        → 桌面出现 cmd.exe 黑窗口,守护起来
-  //   本定义(conhost --headless)  → 桌面干净无窗口,守护照常起来
-  //   参数不被识别(模拟 1809 前)  → conhost 忽略未知参数,**守护照常起来**,LastTaskResult=0;
-  //     即老系统最坏退回「有黑窗口」,⛔ 变成「任务装上但守护起不来」的静默没网。失败形状可接受,
-  //     故 ⛔ 为此再加一道装后自检。
+  // 任务以 InteractiveToken 运行，不能依赖 LogonTrigger（非提升创建会被系统拒绝）。
+  // 旧动作是 conhost → cmd，并让外层包装进程一直等待守护；慢机上这条链一旦卡住，
+  // MultipleInstancesPolicy=IgnoreNew 会把每分钟的补拉全部吞掉。现在由 cmd 只做环境设置和
+  // start /b，立即释放任务调度位；守护进程自己用 instance lock 防重复接管，日志仍落到原路径。
+  // 这里保留 Hidden 任务设置，但不把它当成窗口控制手段；连接可靠性优先于旧的无窗口外观。
   const action = winTaskAction(spec)
   return `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">

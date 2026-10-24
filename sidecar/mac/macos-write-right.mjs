@@ -35,7 +35,7 @@ function dataDirFromArgv(argv = process.argv) {
 
 function processIdentity(pid) {
   try {
-    const output = execFileSync('/bin/ps', ['-o', 'lstart=', '-p', String(pid)], {
+    const output = execFileSync(WRITE_LOCK, ['--process-start', String(pid)], {
       encoding: 'utf8', timeout: 2_000, env: { ...process.env, LC_ALL: 'C' }
     }).trim()
     return output === '' ? undefined : output

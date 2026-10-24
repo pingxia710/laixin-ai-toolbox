@@ -32,6 +32,7 @@ import { explainRoute as explainRouteForHost, routeUnavailable, type RouteExplan
 import { idleNetworkRepair, type NetworkRepairStatus } from '../../shared/network-repair'
 import { readActiveMacNetworkPath } from './platform/mac-active-network'
 import type { ActiveNetworkPath } from '../../../sidecar/mac/active-network-path.mjs'
+import type { NetworkAccessOptions } from '../account/client'
 
 export const DEFAULT_BRIDGE_PORT = 18080
 
@@ -42,6 +43,30 @@ export { repairBudgetMs, REPAIR_BUDGET_BASE_MS, REPAIR_BUDGET_PER_ENTRY_MS, REPA
 export const BRIDGE_PORT_CANDIDATES: readonly number[] = Object.freeze([18080, 18180, 18280, 18380, 18480, 0]) // 0 = 兜底任选空闲口(硬标准:点了连接就要连上)
 export const DEFAULT_LOCAL_SOCKS_PORT = 18081
 const REJECTED_CONFIG_RETRY_MS = 5 * 60_000
+// 注册/登录/领取后的首连必须跨过本地恢复、停止确认和互斥锁的短暂过渡。
+// 这里只重试本机状态过渡，不把后台拒绝或真实连接故障吞成“再等等”；总预算封顶，
+// 避免账号已登录但后台定时器无限存活。
+// 与恢复/还原流程共用同一上限：慢机上的合法逐项还原可能超过一分钟，
+// 但不会超过 repair-budget 的病态账本封顶。
+const AUTO_CONNECT_RETRY_BUDGET_MS = REPAIR_BUDGET_MAX_MS
+const AUTO_CONNECT_RETRY_DELAY_MS = 1_000
+const AUTO_CONNECT_TRANSITION_CODES: ReadonlySet<string> = new Set([
+  MUTEX_BUSY_CODE,
+  'TUNNEL_STOP_UNCONFIRMED',
+  'NETWORK_LOCAL_BUSY',
+  'TUNNEL_RESTORE_INCOMPLETE',
+  'NETWORK_DISCONNECT_REQUIRED'
+])
+
+interface AutoConnectRetry {
+  readonly access: NetworkAccountAccess
+  readonly stopSequence: number
+  readonly deadline: number
+  needsSync: boolean
+  lastCode?: string
+  timer?: ReturnType<typeof setTimeout>
+  running: boolean
+}
 
 /** 仅从当前守护代次、当前活动 macOS 服务的未结算恢复证据里重建接管前代理；Windows 规则不变。 */
 export function diagnosticExistingProxyFromLedger(
@@ -214,6 +239,8 @@ export const REPAIR_REASONS: Record<string, string> = {
   // N-23:一次性恢复的受控失败从守护/主进程落盘后,修复流程遇到同样要给客户可照做的一句。
   'TUNNEL_RESTORE_TIMEOUT': '恢复原设置这一轮超时被中止。请再点一次「重试恢复原设置」；电脑很卡时请等它跑完，不要连续点击。',
   'TUNNEL_RESTORE_SPAWN_FAILED': '恢复程序未能启动，原设置还没有恢复。请再点一次「重试恢复原设置」；仍不行请重启电脑后重试。',
+  'TUNNEL_CONNECTION_TIMEOUT': '连接阶段在限定时间内没有完成。请检查本机网络，或换一个网络（如手机热点）后重试；持续失败请复制诊断给客服。',
+  'TUNNEL_TARGET_UNCONFIRMED': '通道已建立，但目标 AI 服务暂未确认。请换一个网络（如手机热点）后重试；持续失败请复制诊断给客服。',
   // P0-1 TOP3(7/45):与 status-service instructions 表同一句可照做的话,⛔ 两头各说各的。
   '上游不可达': '通道出口暂时不可达。请检查本机网络后重试；持续失败请换一个网络（如手机热点），仍不行请复制诊断给客服。'
 }
@@ -263,6 +290,8 @@ export class TunnelService {
   // FB-3 件二:客户主动断开的次数(stop() 意图入口递增)。start() 以「窗口内计数是否变化」
   // 识别「客户在连接过程中点了断开」,⛔ 把自救记成失败终态回传。
   private userStopSequence = 0
+  /** 注册/登录/领取后的后台首连重试；只在同一账号代次内存活。 */
+  private autoConnectRetry?: AutoConnectRetry
   private repairView: NetworkRepairStatus = { ...idleNetworkRepair }
   // FB-1:失败终态回传。deps.diagnosis 不给就是 undefined,所有挂钩一行都不走。
   private readonly diagnosisReporter?: DiagnosisReporter
@@ -447,16 +476,29 @@ export class TunnelService {
       (!this.supervisor.isRunning() || this.supervisor.isResidentOnlyRunning() && this.intentSnapshot()?.desired === 'user-disconnected')
   }
 
-  async setAccountAccess(access: NetworkAccountAccess | undefined, reason?: AccountAccessReason): Promise<ActionResult> {
+  async setAccountAccess(access: NetworkAccountAccess | undefined, reason?: AccountAccessReason,
+    options?: NetworkAccessOptions): Promise<ActionResult> {
     const active = this.accountAccess
+    const autoConnectBaseline = options?.autoConnect === true ? this.userStopSequence : undefined
+    const sameSession = access !== undefined && active !== undefined &&
+      access.session.accountId === active.session.accountId &&
+      access.session.accessToken === active.session.accessToken &&
+      access.session.deviceId === active.session.deviceId && active.client.sameEndpoint(access.client)
     if (access || reason === undefined) this.accountLoginExpired = false
     else if (reason === 'login-expired') this.accountLoginExpired = true
-    if (access && active && access.session.accountId === active.session.accountId &&
-        access.session.accessToken === active.session.accessToken && access.session.deviceId === active.session.deviceId && active.client.sameEndpoint(access.client)) {
+    if (sameSession) {
       // Periodic account checks must not abort a manual sync of the same authenticated session.
       await this.accountRequestDone
       if (this.accountAccess !== active) return accountFailure('NETWORK_SESSION_CHANGED')
-      return this.syncAccountConfig()
+      const synced = await this.syncAccountConfig()
+      if (options?.autoConnect && ['applied', 'unchanged', 'continued'].includes(synced.outcome)) {
+        this.scheduleAccountAutoConnect(active, autoConnectBaseline!)
+        return { outcome: 'started', code: '', message: '连接中' }
+      } else if (options?.autoConnect && this.isAutoConnectTransition(synced)) {
+        this.scheduleAccountAutoConnect(active, autoConnectBaseline!, true, synced.code)
+        return { outcome: 'started', code: '', message: '连接中' }
+      }
+      return synced
     }
     if (this.repairController) {
       this.repairController.abort()
@@ -467,7 +509,10 @@ export class TunnelService {
     // 账号暂时问不到 / 登录过期 ⛔ 拆客户正在用的网络:本地配置没到期就继续(创始人 09-13)。
     // 登录过期时旧会话已作废:先清租约与会话(clearConnectionLease 会顺手把「暂时」位复位,所以放在保留判断之前)。
     if (!access && reason === 'login-expired') { this.clearConnectionLease(); this.accountAccess = undefined }
+    // 账号切换、明确退出或无法继续本地授权时，旧账号的定时器必须失效；
+    // 暂时问不到但本地连接仍有效的续期路径保留首连代次，避免一次后台抖动把它取消。
     if (!access && reason !== undefined && this.retainLocalConnection()) return localContinuation()
+    if (!sameSession) this.cancelAutoConnectRetry()
     if (!access || !active || access.session.accountId !== active.session.accountId || access.session.accessToken !== active.session.accessToken ||
         !active.client.sameEndpoint(access.client)) this.clearConnectionLease()
     if (!access && reason !== undefined) this.rememberAccountPause()
@@ -499,7 +544,13 @@ export class TunnelService {
           if (this.accountAccess !== next) return accountFailure('NETWORK_SESSION_CHANGED')
           if (this.supervisor.isRunning() || this.supervisor.isRestoring()) {
             void this.diagnosisReporter?.flushPending()
-            this.syncAccountAfterRestore(next)
+            this.syncAccountAfterRestore(next, options?.autoConnect === true, autoConnectBaseline)
+            return { outcome: 'started', code: '', message: '旧账号的系统设置恢复后，将自动同步当前账号配置' }
+          }
+          if (options?.autoConnect && autoConnectBaseline !== undefined) {
+            // 守护已退出但旧设置仍未落入可应用态：把它当作本地交接过渡，
+            // 在预算内反复确认恢复完成；预算耗尽才回到人工恢复提示。
+            this.scheduleAccountAutoConnect(next, autoConnectBaseline, true, 'NETWORK_DISCONNECT_REQUIRED')
             return { outcome: 'started', code: '', message: '旧账号的系统设置恢复后，将自动同步当前账号配置' }
           }
           return accountFailure('NETWORK_DISCONNECT_REQUIRED')
@@ -513,26 +564,240 @@ export class TunnelService {
       void this.diagnosisReporter?.flushPending()
       void this.diagnosticEventQueue?.resumeUploads().catch(() => undefined)
     }
-    return access ? this.syncAccountConfig() : { outcome: 'stopped', code: '', message: reason !== undefined ? '账号状态暂时无法确认，通道已暂停；确认有效后恢复先前连接' : '已退出账号，账号通道已断开' }
+    if (!access) return { outcome: 'stopped', code: '', message: reason !== undefined ? '账号状态暂时无法确认，通道已暂停；确认有效后恢复先前连接' : '已退出账号，账号通道已断开' }
+    const synced = await this.syncAccountConfig()
+    // 注册/登录/领取是用户明确要求开始使用网络的动作。同步拿到配置后立即走与“连接”按钮相同的
+    // 入口，避免出现“账号已登录、配置已拿到、还要再点一次连接”的断链。后台刷新不传 autoConnect，
+    // 因此不会接管用户明确断开的网络。
+    if (options?.autoConnect && ['applied', 'unchanged', 'continued'].includes(synced.outcome)) {
+      this.scheduleAccountAutoConnect(next!, autoConnectBaseline!)
+      return { outcome: 'started', code: '', message: '连接中' }
+    }
+    if (options?.autoConnect && this.isAutoConnectTransition(synced)) {
+      // 配置同步被本机恢复/停止过渡挡住时，不能把“已登录”留成静默终点。
+      // 后台任务会在过渡结束后重新同步，再走同一条连接入口。
+      this.scheduleAccountAutoConnect(next!, autoConnectBaseline!, true, synced.code)
+      return { outcome: 'started', code: '', message: '连接中' }
+    }
+    return synced
   }
 
-  private syncAccountAfterRestore(access: NetworkAccountAccess): void {
-    // 旧守护可能在逐项恢复后再走慢速重试；用修复流程的总上限等待，不再另设五秒失败点。
-    const deadline = Date.now() + REPAIR_BUDGET_MAX_MS
-    void (async () => {
-      while (this.accountAccess === access && Date.now() < deadline) {
-        if (this.accountSwitchReady()) {
-          await this.accountRequestDone
-          if (this.accountAccess === access) await this.syncAccountConfig()
+  private isAutoConnectTransition(result: ActionResult): boolean {
+    return result.outcome === 'rejected' && AUTO_CONNECT_TRANSITION_CODES.has(result.code)
+  }
+
+  private cancelAutoConnectRetry(): void {
+    const pending = this.autoConnectRetry
+    if (pending?.timer !== undefined) clearTimeout(pending.timer)
+    this.autoConnectRetry = undefined
+  }
+
+  private expireAutoConnectRetry(pending: AutoConnectRetry): void {
+    if (this.autoConnectRetry !== pending) return
+    this.autoConnectRetry = undefined
+    const code = pending.lastCode ?? 'NETWORK_LOCAL_BUSY'
+    this.deps.logFailure?.('account-auto-connect-failed', code)
+    void this.reportFailure(code, 'connect-start')
+  }
+
+  private queueAutoConnectRetry(pending: AutoConnectRetry, delayMs: number): void {
+    if (this.autoConnectRetry !== pending || this.accountAccess !== pending.access ||
+        this.userStopSequence !== pending.stopSequence || pending.timer !== undefined) return
+    const remaining = pending.deadline - Date.now()
+    if (remaining <= 0) {
+      this.expireAutoConnectRetry(pending)
+      return
+    }
+    pending.timer = setTimeout(() => {
+      pending.timer = undefined
+      void this.runAutoConnectRetry(pending)
+    }, Math.min(delayMs, remaining))
+  }
+
+  private scheduleAccountAutoConnect(access: NetworkAccountAccess, baselineStopSequence: number,
+    needsSync = false, initialCode?: string): void {
+    if (this.accountAccess !== access || this.userStopSequence !== baselineStopSequence) return
+    const existing = this.autoConnectRetry
+    if (existing !== undefined && existing.access === access && existing.stopSequence === baselineStopSequence) {
+      existing.needsSync ||= needsSync
+      if (initialCode !== undefined) existing.lastCode = initialCode
+      if (existing.timer === undefined && !existing.running) this.queueAutoConnectRetry(existing, 0)
+      return
+    }
+    this.cancelAutoConnectRetry()
+    const pending = {
+      access,
+      stopSequence: baselineStopSequence,
+      deadline: Date.now() + AUTO_CONNECT_RETRY_BUDGET_MS,
+      needsSync,
+      lastCode: initialCode,
+      running: false
+    }
+    this.autoConnectRetry = pending
+    // 登录/领取是明确的使用动作；先排到当前账号调用返回后，避免与权益回读/配置切换互相取消。
+    this.queueAutoConnectRetry(pending, 0)
+  }
+
+  private async runAutoConnectRetry(pending: AutoConnectRetry): Promise<void> {
+    if (this.autoConnectRetry !== pending || this.accountAccess !== pending.access ||
+        this.userStopSequence !== pending.stopSequence || pending.running) return
+    pending.running = true
+    const isCurrent = () => this.autoConnectRetry === pending && this.accountAccess === pending.access &&
+      this.userStopSequence === pending.stopSequence
+    try {
+      if (!isCurrent()) return
+      if (Date.now() >= pending.deadline) {
+        this.expireAutoConnectRetry(pending)
+        return
+      }
+      // Check authorization before account sync as well as immediately before
+      // starting. A paused account can be resumed by syncAccountConfig(); that
+      // path writes the connected intent, so it must not run before the helper
+      // has accepted this generation. During an account switch, however, the
+      // current package can still belong to the old account. That package is
+      // about to be replaced by syncAccountConfig(); asking its authorization
+      // gate first can reject the handoff before the new account is fetched.
+      const configuredBeforeSync = readCurrentInfo(this.deps.dataDir)
+      const syncRequested = pending.needsSync
+      const currentPackageMatchesAccount = configuredBeforeSync === undefined ||
+        configuredBeforeSync.accountId === pending.access.session.accountId
+      let authorizationFailure = !syncRequested || currentPackageMatchesAccount
+        ? await this.ensureProxyAuthorizationForStart(pending.access, pending.stopSequence)
+        : undefined
+      if (!isCurrent()) return
+      if (Date.now() >= pending.deadline) {
+        this.expireAutoConnectRetry(pending)
+        return
+      }
+      if (authorizationFailure !== undefined) {
+        const result: ActionResult = { outcome: 'rejected', ...authorizationFailure }
+        this.recordBackgroundConnectResult(result, isCurrent, 'account-auto-connect-failed')
+        this.autoConnectRetry = undefined
+        return
+      }
+      if (syncRequested) {
+        const synced = await this.syncAccountConfig()
+        if (!isCurrent()) return
+        if (Date.now() >= pending.deadline) {
+          this.expireAutoConnectRetry(pending)
           return
         }
-        if (!this.supervisor.isRunning() && !this.supervisor.isRestoring()) return
+        if (!['applied', 'unchanged', 'continued'].includes(synced.outcome)) {
+          pending.lastCode = synced.code
+          if (this.isAutoConnectTransition(synced)) return this.queueAutoConnectRetry(pending, AUTO_CONNECT_RETRY_DELAY_MS)
+          this.recordBackgroundConnectResult(synced, isCurrent, 'account-auto-connect-failed')
+          this.autoConnectRetry = undefined
+          return
+        }
+        pending.needsSync = false
+      }
+      // 与显式“连接”共用 macOS 代理助手授权闸。授权失败是受控终态，
+      // 只有本地恢复/停止过渡才重试；授权拒绝绝不能写入 connected 意图。
+      // 无包、旧账号包被跳过，或同步实际换了批次时，必须在新包落定后再查一次。
+      const configuredAfterSync = readCurrentInfo(this.deps.dataDir)
+      const packageReplaced = configuredBeforeSync?.batchId !== configuredAfterSync?.batchId ||
+        configuredBeforeSync?.accountId !== configuredAfterSync?.accountId
+      if (syncRequested && (!currentPackageMatchesAccount || packageReplaced)) {
+        authorizationFailure = await this.ensureProxyAuthorizationForStart(pending.access, pending.stopSequence)
+      }
+      if (!isCurrent()) return
+      if (Date.now() >= pending.deadline) {
+        this.expireAutoConnectRetry(pending)
+        return
+      }
+      if (authorizationFailure !== undefined) {
+        const result: ActionResult = { outcome: 'rejected', ...authorizationFailure }
+        this.recordBackgroundConnectResult(result, isCurrent, 'account-auto-connect-failed')
+        this.autoConnectRetry = undefined
+        return
+      }
+      const result = await this.startConnection(undefined, true, pending.access, pending.stopSequence)
+      if (!isCurrent()) return
+      if (Date.now() >= pending.deadline) {
+        this.expireAutoConnectRetry(pending)
+        return
+      }
+      if (result.outcome === 'started' || result.outcome === 'continued') {
+        this.autoConnectRetry = undefined
+        return
+      }
+      pending.lastCode = result.code
+      if (this.isAutoConnectTransition(result)) return this.queueAutoConnectRetry(pending, AUTO_CONNECT_RETRY_DELAY_MS)
+      this.recordBackgroundConnectResult(result, isCurrent, 'account-auto-connect-failed')
+      this.autoConnectRetry = undefined
+    } catch (error: unknown) {
+      if (!isCurrent()) return
+      if (error instanceof RestoreInProgressError) {
+        pending.lastCode = 'NETWORK_LOCAL_BUSY'
+        return this.queueAutoConnectRetry(pending, AUTO_CONNECT_RETRY_DELAY_MS)
+      }
+      const code = error instanceof NetworkAccountError ? error.message : 'UNKNOWN'
+      pending.lastCode = code
+      this.autoConnectRetry = undefined
+      this.deps.logFailure?.('account-auto-connect-failed', code)
+      void this.reportFailure(code, 'connect-start')
+    } finally {
+      pending.running = false
+      // A same-generation caller may have merged a sync request while this attempt was in flight.
+      if (this.autoConnectRetry === pending && pending.timer === undefined &&
+          Date.now() < pending.deadline && isCurrent() && pending.needsSync) {
+        this.queueAutoConnectRetry(pending, AUTO_CONNECT_RETRY_DELAY_MS)
+      }
+    }
+  }
+
+  private syncAccountAfterRestore(access: NetworkAccountAccess, autoConnect = false, baselineStopSequence?: number): void {
+    // 旧守护可能在逐项恢复后再走慢速重试；用修复流程的总上限等待，不再另设五秒失败点。
+    const deadline = Date.now() + REPAIR_BUDGET_MAX_MS
+    const stopSequence = baselineStopSequence ?? this.userStopSequence
+    const isCurrent = () => this.accountAccess === access && this.userStopSequence === stopSequence
+    void (async () => {
+      while (isCurrent() && Date.now() < deadline) {
+        if (this.accountSwitchReady()) {
+          await this.accountRequestDone
+          if (isCurrent()) {
+            const synced = await this.syncAccountConfig()
+            if (autoConnect && baselineStopSequence !== undefined && this.isAutoConnectTransition(synced)) {
+              // 恢复刚结束但同步仍撞上停止/互斥过渡时，保留首连意图，
+              // 让有界重试再做一次同步；不能把这次受控忙拒绝当成最终结果。
+              this.scheduleAccountAutoConnect(access, baselineStopSequence, true, synced.code)
+            } else {
+              if (autoConnect && baselineStopSequence !== undefined && ['applied', 'unchanged', 'continued'].includes(synced.outcome)) {
+                this.scheduleAccountAutoConnect(access, baselineStopSequence)
+              }
+              this.recordBackgroundConnectResult(synced, isCurrent, 'account-switch-sync-failed')
+            }
+          }
+          return
+        }
+        if (!this.supervisor.isRunning() && !this.supervisor.isRestoring()) {
+          if (autoConnect && baselineStopSequence !== undefined && isCurrent()) {
+            this.scheduleAccountAutoConnect(access, baselineStopSequence, true, 'NETWORK_LOCAL_BUSY')
+          }
+          return
+        }
         await new Promise((resolve) => setTimeout(resolve, 1_000))
       }
     })().catch((error: unknown) => {
+      if (!isCurrent()) return
       const code = error instanceof NetworkAccountError && KNOWN_FAILURE_CODES.has(error.message) ? error.message : 'UNKNOWN'
+      if (code === 'NETWORK_SESSION_CHANGED') return
       this.deps.logFailure?.('account-switch-sync-failed', code)
+      void this.reportFailure(code, 'connect-start')
     })
+  }
+
+  /**
+   * Background account flows do not return an ActionResult to the bridge.
+   * Keep their controlled failures on the same diagnostic path as start(),
+   * while treating cancellation and contention as expected control flow.
+   */
+  private recordBackgroundConnectResult(result: ActionResult, isCurrent: () => boolean, event: string): void {
+    if (result.outcome !== 'rejected' || !isCurrent() || result.code === '' ||
+        result.code === MUTEX_BUSY_CODE || result.code === 'TUNNEL_STOP_UNCONFIRMED' ||
+        result.code === 'TUNNEL_START_CANCELLED' || result.code === 'NETWORK_SESSION_CHANGED') return
+    this.deps.logFailure?.(event, result.code)
+    void this.reportFailure(result.code, 'connect-start')
   }
 
   async syncAccountConfig(): Promise<ActionResult> {
@@ -816,17 +1081,12 @@ export class TunnelService {
         }
         if (this.accountAccess !== accountAtEntry) return accountFailure('NETWORK_SESSION_CHANGED')
       }
-      const configured = readCurrentInfo(this.deps.dataDir)
-      if (configured !== undefined && missingSidecarComponents(this.platform, this.deps.sidecarDir, {
-        requireSshBinary: configured.protocol !== 'vless-reality'
-      }).length === 0) {
-        const failure = await this.deps.ensureProxyAuthorization?.()
-        if (this.userStopSequence !== stopsAtEntry) {
-          return { outcome: 'cancelled', code: 'TUNNEL_START_CANCELLED', message: '已保持断开状态' }
-        }
-        if (this.accountAccess !== accountAtEntry) return accountFailure('NETWORK_SESSION_CHANGED')
-        if (failure) return { outcome: 'rejected', ...failure }
+      const failure = await this.ensureProxyAuthorizationForStart(accountAtEntry, stopsAtEntry)
+      if (this.userStopSequence !== stopsAtEntry) {
+        return { outcome: 'cancelled', code: 'TUNNEL_START_CANCELLED', message: '已保持断开状态' }
       }
+      if (this.accountAccess !== accountAtEntry) return accountFailure('NETWORK_SESSION_CHANGED')
+      if (failure !== undefined) return { outcome: 'rejected', ...failure }
       const result = await this.startConnection()
       // FB-1:发起即失败的终态。互斥忙(TUNNEL_BUSY)是「另一个操作在途」不是连不上;
       // cancelled 是客户自己取消——两类 ⛔ 冒充失败终态回传。窗口内客户主动断开同样 ⛔。
@@ -859,16 +1119,44 @@ export class TunnelService {
     }
   }
 
-  private async startConnection(signal?: AbortSignal, accountChecked = false): Promise<ActionResult> {
+  /**
+   * macOS 打开系统代理助手前的授权闸。显式连接与注册后的后台首连必须共用，
+   * 否则后者会绕过管理员授权直接写连接意图，最终表现为“已连接”但通道没有启动。
+   * 代次检查由调用方在 await 返回后完成，避免把账号/停止状态耦合进授权回调。
+   */
+  private async ensureProxyAuthorizationForStart(expectedAccount: NetworkAccountAccess | undefined,
+    expectedStopSequence: number): Promise<{ code: string; message: string } | undefined> {
+    if (this.accountAccess !== expectedAccount || this.userStopSequence !== expectedStopSequence) {
+      return { code: 'TUNNEL_START_CANCELLED', message: '连接过程中检测到账号或断开操作变化，已保持当前状态' }
+    }
+    const configured = readCurrentInfo(this.deps.dataDir)
+    if (configured === undefined || missingSidecarComponents(this.platform, this.deps.sidecarDir, {
+      requireSshBinary: configured.protocol !== 'vless-reality'
+    }).length !== 0) return undefined
+    const failure = await this.deps.ensureProxyAuthorization?.()
+    if (this.accountAccess !== expectedAccount || this.userStopSequence !== expectedStopSequence) {
+      return { code: 'TUNNEL_START_CANCELLED', message: '连接过程中检测到账号或断开操作变化，已保持当前状态' }
+    }
+    return failure
+  }
+
+  private async startConnection(signal?: AbortSignal, accountChecked = false,
+    expectedAccount?: NetworkAccountAccess, expectedStopSequence?: number): Promise<ActionResult> {
+    const autoConnectCancelled = () => expectedAccount !== undefined &&
+      (this.accountAccess !== expectedAccount || this.userStopSequence !== expectedStopSequence)
+    const cancelledByAutoConnect = () => ({ outcome: 'rejected' as const, code: 'TUNNEL_START_CANCELLED',
+      message: '连接过程中检测到账号或断开操作变化，已保持当前状态' })
     const failure = ledgerFailure(this.deps.dataDir)
     if (failure) {
       // 账本损坏不再是单向砖(收敛包3·件4):先走恢复流程,成功即继续;失败才带诊断拒绝。
       const recovered = await this.supervisor.runRecoveryOnce()
       if (!recovered) {
         const still = ledgerFailure(this.deps.dataDir)
+        if (autoConnectCancelled()) return cancelledByAutoConnect()
         return { outcome: 'rejected', ...(still ?? failure) }
       }
     }
+    if (autoConnectCancelled()) return cancelledByAutoConnect()
     const localStatus = this.status()
     if (localStatus.state === DISPLAY_STATES.disconnecting) return rejectedBusy()
     if (localStatus.unrestored) return { outcome: 'rejected', code: 'TUNNEL_RESTORE_INCOMPLETE', message: '请先恢复原设置，再重新连接' }
@@ -903,6 +1191,7 @@ export class TunnelService {
       }
     }
     if (signal?.aborted) return { outcome: 'cancelled', code: 'TUNNEL_REPAIR_CANCELLED', message: '已取消修复' }
+    if (autoConnectCancelled()) return cancelledByAutoConnect()
     // 普通连接可能先在恢复子进程处等待，后来用户才点修复；迟到的普通连接不能插队。
     if (!signal && this.repairController) return rejectedBusy()
     const release = this.mutex.tryAcquire()
@@ -928,6 +1217,7 @@ export class TunnelService {
         const invalid = this.validateStored(batchId, false)
         if (invalid !== undefined) return invalid
       }
+      if (autoConnectCancelled()) return cancelledByAutoConnect()
       const intent = this.composeConnectIntent(current)
       writeFileAtomic(layout.intent(this.deps.dataDir), `${JSON.stringify(intent)}\n`)
       this.ensureRunningForConnection()
@@ -940,6 +1230,7 @@ export class TunnelService {
   async stop(): Promise<ActionResult> {
     // FB-3 件二:这里是客户断开的唯一入口(界面断开按钮 → actions/tunnel stop)。
     // 递增计数供 start() 识别「连接过程中客户主动断开」;内部流程的 disconnect() 不经过这里。
+    this.cancelAutoConnectRetry()
     this.userStopSequence += 1
     this.configRefreshResume = undefined
     const repairing = this.repairController !== undefined
@@ -1338,7 +1629,7 @@ export class TunnelService {
         ? recoveryActive ? '账号已退出或切换，正在恢复原设置；请等待完成。若长时间不变，请点击「重试恢复原设置」'
           : '原设置仍未恢复，请点击「重试恢复原设置」；仍不行请导出诊断给客服'
         : this.accountAccess ? '旧账号已断开，请点击「同步配置」领取当前账号的网络配置' : '请登录并领取当前账号的网络配置'), source: '', authorization: '',
-      backend: '', nodeLabel: '', exitIp: '', pathVerified: false, lastVerifiedAt: '', configVersion: '', expiresAt: '', pendingAvailable: false,
+      backend: '', nodeLabel: '', observedNodeLabel: '', exitIp: '', pathVerified: false, lastVerifiedAt: '', configVersion: '', expiresAt: '', pendingAvailable: false,
       currentConfig: '', pendingConfig: '', canApplyPending: false, traffic: '' }
   }
 
@@ -1356,7 +1647,7 @@ export class TunnelService {
     const restoring = this.supervisor.isRunning() || this.supervisor.isRestoring()
     return { ...status, state: settled ? DISPLAY_STATES.stoppedRestored
       : restoring ? DISPLAY_STATES.disconnecting : DISPLAY_STATES.userDisconnected,
-      exitIp: '', pathVerified: false, pathSource: '', lastVerifiedAt: '', traffic: '', pauseReason: 'entitlement-denied', message: settled
+      exitIp: '', observedNodeLabel: '', pathVerified: false, pathSource: '', lastVerifiedAt: '', traffic: '', pauseReason: 'entitlement-denied', message: settled
         ? '后台权益校验未通过，网络已暂停，原网络设置已恢复。请到「我的账号」核对套餐、流量和有效期。'
         : restoring ? '后台权益校验未通过，正在暂停网络；本次原网络设置恢复尚未确认。请到「我的账号」核对套餐、流量和有效期。'
           : '后台权益校验未通过，网络已暂停；守护未在运行，账本无待恢复项，但本次恢复完成状态尚未确认。可重新核验权益。' }

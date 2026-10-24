@@ -4,8 +4,10 @@
 // 放行钥匙是进程级环境变量,⛔ 在测试进程里改(并发文件共享 env)⇒ 断言在子进程内完成。
 import { describe, expect, it } from 'vitest'
 import { spawnSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 
 const ADAPTER_URL = new URL('../../sidecar/win/adapter-wininet.mjs', import.meta.url).href
+const WININET_SCRIPT_PATH = fileURLToPath(new URL('../../sidecar/win/wininet-settings.ps1', import.meta.url))
 
 interface ProbeResult {
   members: Record<string, boolean>
@@ -162,6 +164,7 @@ function pathIdentityProbe() {
       [{ metric: 10, interfaceIndex: 27, interfaceGuid: 'not-a-guid', kind: 'virtual-tun' }]
     ]
     const adapter = mod.createAdapter({
+      nativePathIdentity: null,
       execFile: (command, _args, options) => {
         if (command !== 'powershell.exe') throw new Error('UNEXPECTED_COMMAND')
         const request = JSON.parse(options.input)
@@ -195,6 +198,157 @@ describe('WinINET 默认路径身份（N-55 复用证据）', () => {
   it('默认路径缺少可验证接口 GUID 时受控拒绝，不制造稳定 sentinel', () => {
     expect(result.ambiguous).toBe(true)
     expect(result.rejected).toBe(true)
+  })
+})
+
+function nativePathProbe() {
+  const script = `
+    process.env.TOOLBOX_REAL_NETWORK_ADAPTER = '1'
+    const mod = await import(${JSON.stringify(ADAPTER_URL)})
+    const makeKoffi = (routes) => ({
+      load: () => ({ func: (signature) => {
+        if (signature.includes('GetIpForwardTable')) return (table, size) => {
+          size[0] = 4 + routes.length * 56
+          if (table === null) return 122
+          table.writeUInt32LE(routes.length, 0)
+          routes.forEach((route, index) => {
+            const row = 4 + index * 56
+            table.writeUInt32LE(0, row)
+            table.writeUInt32LE(0, row + 4)
+            table.writeUInt32LE(route.interfaceIndex, row + 16)
+            table.writeUInt32LE(route.metric, row + 36)
+          })
+          return 0
+        }
+        if (signature.includes('ConvertInterfaceIndexToLuid')) return (index, luid) => { luid.writeUInt32LE(index, 0); return 0 }
+        if (signature.includes('ConvertInterfaceLuidToGuid')) return (luid, guid) => {
+          const index = luid.readUInt32LE(0)
+          guid.writeUInt32LE(index === 12 ? 0xaaaaaaaa : 0xbbbbbbbb, 0)
+          guid.writeUInt16LE(index === 12 ? 0xaaaa : 0xbbbb, 4)
+          guid.writeUInt16LE(index === 12 ? 0xaaaa : 0xbbbb, 6)
+          guid.fill(index === 12 ? 0xaa : 0xbb, 8, 16)
+          return 0
+        }
+        if (signature.includes('GetIfEntry')) return (row) => {
+          row.writeUInt32LE(row.readUInt32LE(512) === 12 ? 6 : 24, 516)
+          return 0
+        }
+        throw new Error('unexpected native call:' + signature)
+      } })
+    })
+    const native = mod.loadNativePathIdentity(() => makeKoffi([{ interfaceIndex: 12, metric: 10 }]))
+    let powershell = 0
+    const adapter = mod.createAdapter({ nativePathIdentity: native, execFile: () => { powershell += 1; throw new Error('PowerShell must not run') } })
+    const selected = adapter.currentPathIdentity()
+    const tied = mod.loadNativePathIdentity(() => makeKoffi([
+      { interfaceIndex: 12, metric: 10 }, { interfaceIndex: 27, metric: 10 }
+    ]))?.()
+    const weighted = mod.loadNativePathIdentity(() => makeKoffi([
+      { interfaceIndex: 12, metric: 110 }, { interfaceIndex: 27, metric: 20 }
+    ]))?.()
+    const sameInterfaceTie = mod.loadNativePathIdentity(() => makeKoffi([
+      { interfaceIndex: 12, metric: 10 }, { interfaceIndex: 12, metric: 10 }
+    ]))?.()
+    console.log(JSON.stringify({ selected, tied: tied ?? null, weighted: weighted ?? null, sameInterfaceTie: sameInterfaceTie ?? null, powershell }))
+  `
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 20_000 })
+  if (result.status !== 0) throw new Error(`原生路径探针失败:${result.stderr}`)
+  return JSON.parse(result.stdout) as {
+    selected: { id: string; kind: string }
+    tied: unknown
+    weighted: { id: string; kind: string } | null
+    sameInterfaceTie: unknown
+    powershell: number
+  }
+}
+
+describe('WinINET 默认路径身份原生读取', () => {
+  it('唯一最低度量路由在进程内返回；ECMP 并列保持未知并交回精算', () => {
+    const result = nativePathProbe()
+    expect(result.selected).toEqual({
+      id: 'if:12:guid:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', kind: 'network-interface'
+    })
+    expect(result.tied).toBeNull()
+    expect(result.weighted).toEqual({ id: 'if:27:guid:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', kind: 'virtual-tun' })
+    expect(result.sameInterfaceTie).toBeNull()
+    expect(result.powershell).toBe(0)
+  })
+
+  it('带连接阶段 deadline 时仍优先走快速 native FFI，避免首连回到慢 PowerShell', () => {
+    const script = `
+      process.env.TOOLBOX_REAL_NETWORK_ADAPTER = '1'
+      const mod = await import(${JSON.stringify(ADAPTER_URL)})
+      let nativeCalls = 0
+      let powershellCalls = 0
+      const adapter = mod.createAdapter({
+        nativePathIdentity: () => { nativeCalls += 1; return { id: 'if:12:guid:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', kind: 'network-interface' } },
+        execFile: () => { powershellCalls += 1; throw new Error('PowerShell must not run') }
+      })
+      console.log(JSON.stringify({ identity: adapter.currentPathIdentity({ timeoutMs: 1000 }), nativeCalls, powershellCalls }))
+    `
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 20_000 })
+    expect(result.status).toBe(0)
+    expect(JSON.parse(result.stdout)).toEqual({
+      identity: { id: 'if:12:guid:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', kind: 'network-interface' }, nativeCalls: 1, powershellCalls: 0
+    })
+  })
+
+  it.runIf(process.platform === 'win32')('Windows 原生结果与 PowerShell 路径逐字段一致，连续读取稳定', () => {
+    const script = `
+      process.env.TOOLBOX_REAL_NETWORK_ADAPTER = '1'
+      const { execFileSync } = await import('node:child_process')
+      const mod = await import(${JSON.stringify(ADAPTER_URL)})
+      const native = mod.loadNativePathIdentity()
+      if (typeof native !== 'function') throw new Error('NATIVE_PATH_IDENTITY_UNAVAILABLE')
+      const first = native()
+      const second = native()
+      const output = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-File', ${JSON.stringify(WININET_SCRIPT_PATH)}], {
+        input: JSON.stringify({ operation: 'path' }), encoding: 'utf8', windowsHide: true,
+        stdio: ['pipe', 'pipe', 'pipe'], timeout: 30_000
+      })
+      const routes = JSON.parse(output.replace(/^\\uFEFF/, '').trim())
+      const candidates = Array.isArray(routes) ? routes : [routes]
+      const metric = Math.min(...candidates.map((route) => route.metric))
+      const selected = candidates.filter((route) => route.metric === metric)
+      const powershell = selected.length === 1 ? {
+        id: 'if:' + selected[0].interfaceIndex + ':guid:' + selected[0].interfaceGuid.toLowerCase(),
+        kind: selected[0].kind
+      } : null
+      console.log(JSON.stringify({ first: first ?? null, second: second ?? null, powershell }))
+    `
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 60_000 })
+    if (result.status !== 0) throw new Error(`Windows 原生路径对照失败:${result.stderr}`)
+    const compared = JSON.parse(result.stdout) as { first: unknown; second: unknown; powershell: unknown }
+    expect(compared.first).toEqual(compared.powershell)
+    expect(compared.second).toEqual(compared.first)
+  }, 45_000)
+})
+
+function deleteRaceProbe() {
+  const script = `
+    process.env.TOOLBOX_REAL_NETWORK_ADAPTER = '1'
+    const mod = await import(${JSON.stringify(ADAPTER_URL)})
+    let deletes = 0
+    const missing = () => { const error = new Error('missing'); error.stderr = 'ERROR: The system was unable to find the specified registry key or value.'; return error }
+    const adapter = mod.createAdapter({ nativeNotify: () => undefined, sleep: () => undefined, execFile: (command, args) => {
+      if (command !== 'reg.exe') throw new Error('unexpected command')
+      if (args[0] === 'query') return 'HKEY_CURRENT_USER\\\\Software\\r\\n    ProxyServer    REG_SZ    127.0.0.1:18080\\r\\n'
+      if (args[0] === 'delete') { deletes += 1; throw missing() }
+      throw new Error('unexpected operation')
+    } })
+    let threw = false
+    try { adapter.write({ service: 'WinINET', item: 'ProxyServer' }, null) } catch { threw = true }
+    console.log(JSON.stringify({ deletes, threw }))
+  `
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 20_000 })
+  if (result.status !== 0) throw new Error(`幂等删除探针失败:${result.stderr}`)
+  return JSON.parse(result.stdout) as { deletes: number; threw: boolean }
+}
+
+describe('WinINET 删除幂等', () => {
+  it('读到值后被并发删除，目标状态已经达成，不进入失败重试', () => {
+    expect(deleteRaceProbe()).toEqual({ deletes: 1, threw: false })
   })
 })
 
@@ -335,7 +489,9 @@ function regSzProbe(): RegSzProbeResult {
         }
         throw new Error('unexpected command')
       },
-      sleep: () => undefined
+      sleep: () => undefined,
+      // 强制覆盖原生通知失败后的 PowerShell 重试，不依赖当前测试平台是否能加载 wininet.dll。
+      nativeNotify: () => { throw new Error('native notify failed') }
     })
     const ascii = adapter.read({ service: 'WinINET', item: 'ProxyOverride' })
     mode = 'nonAscii'
@@ -432,7 +588,7 @@ function nativeProbe(): NativeProbeResult {
 describe('WinINET 原生通知与 reg.exe 策略探测', () => {
   const result = nativeProbe()
 
-  it('mac 上加载不到 wininet.dll:原生通道安静回落,不抛', () => {
+  it.runIf(process.platform !== 'win32')('mac 上加载不到 wininet.dll:原生通道安静回落,不抛', () => {
     expect(result.nativeOnMacUndefined).toBe(true)
   })
 

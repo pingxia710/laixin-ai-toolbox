@@ -54,7 +54,7 @@ async function bind(port: number): Promise<Server> {
 
 // 独立新建的本地 TLS 站点、REALITY 服务端与 HTTP 出口回显；无外部连接或真实凭据。
 export async function startRealityNode(root: string) {
-  execFileSync('/usr/bin/openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', join(root, 'tls.key'), '-out', join(root, 'tls.crt'), '-subj', '/CN=reality.test.invalid', '-days', '1'], { stdio: 'pipe', timeout: 10_000 })
+  execFileSync(process.platform === 'win32' ? 'openssl' : '/usr/bin/openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', join(root, 'tls.key'), '-out', join(root, 'tls.crt'), '-subj', '/CN=reality.test.invalid', '-days', '1'], { stdio: 'pipe', timeout: 10_000 })
   const sockets = new Set<Socket>()
   const track = (socket: Socket) => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)) }
   const tls = tlsServer({ key: readFileSync(join(root, 'tls.key')), cert: readFileSync(join(root, 'tls.crt')), minVersion: 'TLSv1.3', ecdhCurve: 'X25519', ALPNProtocols: ['h2', 'http/1.1'] })

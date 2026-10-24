@@ -6,6 +6,7 @@ import { forgetDiagnosticSession, parseDiagnosticRunSnapshot, rememberDiagnostic
 import type { DiagnosticAttempt } from '../diagnostic-session'
 import { localEgressDescription, type LocalEgressEvidence } from '../../../shared/local-egress-evidence'
 import type { PageModule } from './types'
+import { mountNetworkRepair } from './tunnel'
 
 const names: Record<DiagnosticSoftware, string> = { codex: 'Codex', claude: 'Claude Code', hermes: 'Hermes（DeepSeek）' }
 const states = { passed: '已确认', attention: '需要处理', unknown: '未能确认', 'not-checked': '未检查' } as const
@@ -166,7 +167,7 @@ function renderLocalEgress(container: HTMLElement, evidence: LocalEgressEvidence
 
 let cleanup = (): void => undefined
 export const page: PageModule = {
-  moduleId: 'network.diagnostics', tab: 'tunnel', order: 5,
+  moduleId: 'network.diagnostics', tab: 'tunnel', order: 10,
   mount: (element, context) => {
     cleanup()
     let active = true
@@ -176,15 +177,19 @@ export const page: PageModule = {
     let sessionAttemptsTotal = 0
     let sessionAttemptsComplete = false
     let generation = 0
+    let checking = false
+    let networkBusy = false
     let expiry: ReturnType<typeof setTimeout> | undefined
     const details = document.createElement('details'); details.className = 'technical-details network-diagnostics'
-    const summary = document.createElement('summary'); summary.textContent = 'AI 打不开？检查原因'
+    const summary = document.createElement('summary'); summary.textContent = '遇到问题'
     const body = document.createElement('div')
-    const note = document.createElement('p'); note.className = 'account-note'; note.textContent = '检查基础网络、当前通道和目标服务；登录与额度请在软件内确认。'
+    const note = document.createElement('p'); note.className = 'account-note'; note.textContent = '先检查原因，不会修改网络设置；需要时再修复或联系来信。'
     const row = document.createElement('div'); row.className = 'setting-row'
     const label = document.createElement('label'); label.htmlFor = 'network-diagnostic-software'; label.textContent = '遇到问题的软件'
     const select = document.createElement('select'); select.id = label.htmlFor; select.className = 'theme-select'
+    select.dataset.networkAction = 'repair-report-software'
     for (const [value, textContent] of Object.entries(names)) select.append(Object.assign(document.createElement('option'), { value, textContent }))
+    select.value = '' // No explicit context: let the repair controller restore the last report target.
     const feedback = document.createElement('p'); feedback.className = 'account-note'; feedback.setAttribute('role', 'status')
     const conclusion = document.createElement('section'); conclusion.className = 'diagnostic-conclusion'; conclusion.hidden = true; conclusion.setAttribute('aria-live', 'polite')
     const localEgress = document.createElement('section'); localEgress.className = 'diagnostic-local-egress'; localEgress.hidden = true
@@ -210,12 +215,14 @@ export const page: PageModule = {
       report = undefined; conclusion.replaceChildren(); conclusion.hidden = true; delete conclusion.dataset.ruleId; delete conclusion.dataset.status
       localEgress.replaceChildren(); localEgress.hidden = true
       list.replaceChildren(); list.hidden = true; help.hidden = true; copy.disabled = send.disabled = true; feedback.textContent = ''
+      results.hidden = true
       refreshSupportContext()
     }
     select.addEventListener('change', reset)
     const inspect = async () => {
       if (run.disabled) return
-      reset(); const request = generation; select.disabled = run.disabled = true; feedback.textContent = '正在检查，请稍候…'
+      reset(); results.hidden = false; checking = true
+      const request = generation; select.disabled = run.disabled = true; feedback.textContent = '正在检查，请稍候…'
       try {
         const result = parseDiagnosticRunSnapshot((await window.toolbox.diagnostics.run({ software: select.value as DiagnosticSoftware })).snapshot)
         if (!active || request !== generation) return
@@ -248,7 +255,7 @@ export const page: PageModule = {
         feedback.textContent = `检查完成 · ${new Date(report.checkedAt).toLocaleTimeString('zh-CN')}。复制与上报使用的都是本次结果。`
       } catch {
         if (active && request === generation) { report = undefined; sessionId = ''; copy.disabled = send.disabled = true; feedback.textContent = '本次检查未完成，请重试或联系客服。' }
-      } finally { if (active && request === generation) select.disabled = run.disabled = false }
+      } finally { if (active && request === generation) { checking = false; select.disabled = run.disabled = networkBusy } }
     }
     const copyResult = async () => {
       if (!sessionId) { feedback.textContent = '请先选择软件并完成一次检查。'; return }
@@ -279,7 +286,11 @@ export const page: PageModule = {
     const actions = document.createElement('div'); actions.className = 'action-row'; actions.append(copy, send, help)
     const reportNote = document.createElement('p'); reportNote.className = 'account-note'
     reportNote.textContent = '只有点击上报才会发送脱敏诊断包，可能包含账号/设备编号、出口 IP、代理与设置恢复状态、近期故障和网络运行日志。日志中的地址文本会做脱敏处理，但仍可能保留部分地址。'
-    row.append(label, select, run); body.append(note, row, feedback, conclusion, localEgress, list, actions, reportNote); details.append(summary, body); element.append(details)
+    const repair = document.createElement('div')
+    const results = document.createElement('details'); results.className = 'diagnostic-result-details'
+    const resultHeading = document.createElement('summary'); resultHeading.textContent = '本次检查的详细结果与上报'
+    results.append(resultHeading, localEgress, list, actions, reportNote)
+    row.append(label, select, run); body.append(note, row, feedback, conclusion, results, repair); details.append(summary, body); element.append(details)
     // 从出错的软件跳进来：预选那个软件、展开这一节并滚到眼前，客户不用自己找。
     if (context.diagnosticSoftware !== undefined && Object.hasOwn(names, context.diagnosticSoftware)) {
       select.value = context.diagnosticSoftware
@@ -287,7 +298,14 @@ export const page: PageModule = {
       feedback.textContent = `已选中${names[context.diagnosticSoftware]}，点「开始检查」看是哪一层不通。`
       requestAnimationFrame(() => { if (active) { details.scrollIntoView({ block: 'nearest' }); run.focus() } })
     }
-    cleanup = () => { active = false; generation += 1; clearTimeout(expiry); unregister(); select.removeEventListener('change', reset) }
+    const stopRepair = mountNetworkRepair(repair, details, select, busy => {
+      networkBusy = busy; select.disabled = run.disabled = checking || busy
+    })
+    if (context.diagnosticSoftware && select.value !== context.diagnosticSoftware) {
+      feedback.textContent = `正在上报${names[select.value as DiagnosticSoftware]}，完成后可切换到${names[context.diagnosticSoftware]}再检查。`
+    }
+    results.hidden = true
+    cleanup = () => { active = false; generation += 1; clearTimeout(expiry); unregister(); stopRepair(); select.removeEventListener('change', reset) }
   },
   unmount: () => cleanup()
 }

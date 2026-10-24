@@ -10,6 +10,7 @@ export interface VlessSpec {
 }
 export declare function createVlessConnector(spec: VlessSpec): Connector & { xrayOutbound(): Record<string, unknown> }
 export declare function verifyThroughProxy(port: number, verifyUrl: string, timeoutMs?: number): Promise<{ exitIp: string }>
+export declare function targetUnconfirmedError(): Error & { code: 'TUNNEL_TARGET_UNCONFIRMED' }
 export interface ExistingProxy { kind: 'http' | 'socks' | 'pac'; host?: string; port?: number; url?: string; source?: string }
 /** 这台电脑不经任何代理能不能出外网。**目前未接进连接流程**——判据未定（拿通用探测点会把「能开网页」误判成「能用 AI」）。 */
 /** 「客户真正要用的那些服务」:判断客户本来有没有一条能用的路时探这组,⛔ 用通用探测点。 */
@@ -20,3 +21,5 @@ export declare function probeExistingProxy(existing: ExistingProxy, urls?: reado
 export declare function aiProbeResponseAcceptable(target: URL, statusCode: number | undefined, headers: Record<string, string | string[] | undefined> | undefined): boolean
 
 export declare function verifyWithFallback(port: number, primary: string, fallback?: string, timeoutMs?: number, probe?: typeof verifyThroughProxy): Promise<{ exitIp: string }>
+export declare function probeTunnelReachability(port: number, urls?: readonly string[], timeoutMs?: number, probe?: (...args: any[]) => Promise<unknown>, isAcceptable?: (target: URL, response: { statusCode?: number; headers?: Record<string, string | string[] | undefined> }) => boolean): Promise<{ url: string }>
+export declare function probeTargetReachability(port: number, urls?: readonly string[], timeoutMs?: number, probe?: (...args: any[]) => Promise<unknown>): Promise<{ url: string }>

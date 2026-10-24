@@ -116,7 +116,7 @@ describe('CH-1 · 通用通道故障不影响专用路径', () => {
       .every((outbound) => asEntry(outbound).settings?.servers?.[0]?.port === 1)).toBe(true)
   })
 
-  it('真内核:掐掉一条入口(通用通道故障),claude.ai 与 github.com 继续走通', async () => {
+  it('真内核:掐掉实际承接请求的入口，claude.ai 与 github.com 经另一入口恢复', async () => {
     const dataDir = makeTempDir('toolbox-dedicated-')
     const target = await startFakeHttpMarker('DEDICATED-OK')
       // 探活也只打本机标记:⛔ 用缺省的 gstatic/cloudflare,离线环境会把两条入口都误判成死,演练失真
@@ -139,10 +139,14 @@ describe('CH-1 · 通用通道故障不影响专用路径', () => {
       const viaProxy = (host: string) => httpGetViaProxy(bridge!.port(), `http://${host}/`)
       // 掐之前:专用域名真的穿通道到达目标(假上游记到 CONNECT 域名)
       expect(await viaProxy('claude.ai')).toContain('DEDICATED-OK')
-      expect([...upstreamA.hits(), ...upstreamB.hits()].some((hit) => hit.host === 'claude.ai')).toBe(true)
-      // 造通用通道故障:整条入口 A 停服
-      await upstreamA.close()
-      // 专用路径不受影响:轮询窗口内 claude.ai / github.com 继续可达(经另一条入口)
+      const aUsed = upstreamA.hits().some((hit) => hit.host === 'claude.ai')
+      const bUsed = upstreamB.hits().some((hit) => hit.host === 'claude.ai')
+      expect(aUsed !== bUsed, '首个客户请求必须能归属到一条实际入口').toBe(true)
+      const used = aUsed ? upstreamA : upstreamB
+      const survivor = aUsed ? upstreamB : upstreamA
+      // 必须掐掉刚承接客户请求的入口；固定关闭 A 可能只关闭了一条闲置入口。
+      await used.close()
+      // 共享入口失效后:轮询窗口内 claude.ai / github.com 经另一条入口恢复
       const deadline = Date.now() + 15_000
       let claudeOk = false
       let githubOk = false
@@ -153,8 +157,11 @@ describe('CH-1 · 通用通道故障不影响专用路径', () => {
       }
       expect(claudeOk, 'claude.ai 在入口故障后 15 秒内未恢复').toBe(true)
       expect(githubOk, 'github.com 在入口故障后 15 秒内未恢复').toBe(true)
+      expect(survivor.hits().some(hit => hit.host === 'claude.ai')).toBe(true)
+      expect(survivor.hits().some(hit => hit.host === 'github.com')).toBe(true)
     } finally {
       await bridge?.close()
+      await upstreamA.close()
       await upstreamB.close()
       await target.close()
       removeTempDir(dataDir)

@@ -1,7 +1,7 @@
 import type { TerminalEnvironmentAdapter, TerminalProxy } from './terminal-environment.mjs'
 
 export interface ManagedNetworkAdapter {
-  currentPathIdentity?(): { readonly id: string; readonly kind?: string }
+  currentPathIdentity?(options?: { readonly timeoutMs?: number }): { readonly id: string; readonly kind?: string }
   preflight?(proxy: TerminalProxy): void
   managedItems(proxy: TerminalProxy): Array<{ readonly ref: { readonly service: string; readonly item: string }; readonly value: unknown }>
   read(ref: { readonly service: string; readonly item: string }): unknown
@@ -11,9 +11,9 @@ export interface ManagedNetworkAdapter {
   reapplyOnChange?(ref: { service: string; item: string }): boolean
   restoredValueMatches?(current: unknown, originalValue: unknown, writtenValue: unknown): boolean
   broadcastSettingsChanged?(): void
-  identifyPortOwner?(port: number | undefined): { readonly kind: string; readonly pid?: number; readonly name?: string } | undefined
+  identifyPortOwner?(port: number | undefined, options?: { readonly fresh?: boolean }): { readonly kind: string; readonly pid?: number; readonly name?: string } | undefined
   /** 09-13 发布审查 R4:电脑上别的代理(不是我们的)当前开着吗;守护据此决定复用还是接管。 */
-  existingProxy?(ours: { host: string; port: number; knownPorts?: readonly number[] }): { kind: 'http' | 'socks' | 'pac' | 'direct'; host?: string; port?: number; url?: string; source?: string } | undefined
+  existingProxy?(ours: { host: string; port: number; knownPorts?: readonly number[] }, options?: { readonly timeoutMs?: number }): { kind: 'http' | 'socks' | 'pac' | 'direct'; host?: string; port?: number; url?: string; source?: string } | undefined
   /** 09-13 发布审查 R2:可选项(终端接入)这次没启用的原因。 */
   optionalNote?(): string
 }
@@ -23,5 +23,5 @@ export declare function composeManagedAdapters(
   networkAdapter: ManagedNetworkAdapter,
   terminalAdapter: TerminalEnvironmentAdapter,
   acquireWriteRight?: (...args: readonly unknown[]) => unknown,
-  identifyPortOwner?: (port: number | undefined) => { readonly kind: string; readonly pid?: number; readonly name?: string } | undefined
+  identifyPortOwner?: (port: number | undefined, options?: { readonly fresh?: boolean }) => { readonly kind: string; readonly pid?: number; readonly name?: string } | undefined
 ): ManagedNetworkAdapter

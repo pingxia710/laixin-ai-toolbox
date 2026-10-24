@@ -5,6 +5,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { createDaemon } from '../../sidecar/win/daemon-core.mjs'
+import { loadLedger } from '../../sidecar/win/ledger.mjs'
 import { AI_SERVICE_PROBE_URLS } from '../../sidecar/win/vless-connector.mjs'
 import { createAdapter } from './fixtures/fake-wininet-adapter.mjs'
 import { FakeClock, flushMicrotasks, makeTempDir, removeTempDir, writeIntentFile } from './helpers'
@@ -30,6 +31,7 @@ describe('本来就能直连 AI 就复用', () => {
     pathChangesDuringProbe?: boolean
     pathChangesDuringReverify?: boolean
     pathIdentityUnavailable?: boolean
+    pathIdentityUnavailableAfterProbe?: boolean
     pathIdentityUnsupported?: boolean
   }) {
     const store = `${dataDir}/registry.json`
@@ -59,9 +61,10 @@ describe('本来就能直连 AI 就复用', () => {
       ...(options.reuseDirect === undefined ? {} : { reuseDirect: options.reuseDirect }),
       connector: { kind: 'loopback-probe', host: '127.0.0.1', port: 1, exitIp: '203.0.113.6' }
     })
+    let pathIdentityUnavailable = options.pathIdentityUnavailable === true
     const evidenceAdapter = options.pathIdentityUnsupported ? { ...adapter, currentPathIdentity: undefined } : { ...adapter, currentPathIdentity: () => {
         counters.pathReads += 1
-        if (options.pathIdentityUnavailable) throw new Error('active path unavailable')
+        if (pathIdentityUnavailable) throw new Error('active path unavailable')
         return { id: pathId, kind: 'fake-route' }
       } }
     const daemon = createDaemon({
@@ -87,6 +90,7 @@ describe('本来就能直连 AI 就复用', () => {
           writeFileSync(store, JSON.stringify(current))
         }
         if (options.pathChangesDuringProbe) pathId = 'direct-route:after'
+        if (options.pathIdentityUnavailableAfterProbe) pathIdentityUnavailable = true
         if (counters.directProbes >= 2 && options.pathChangesDuringReverify) pathId = 'direct-route:after'
         if (counters.directProbes >= 2 && options.pacAppearsDuringReverify) {
           const current = JSON.parse(readFileSync(store, 'utf8')) as Record<string, { type: string; data: string }>
@@ -110,7 +114,7 @@ describe('本来就能直连 AI 就复用', () => {
     })
     const view = () => JSON.parse(readFileSync(`${dataDir}/state.json`, 'utf8')) as { state: string; code: string; message: string; reusedProxy?: { kind: string } }
     const registry = () => (existsSync(store) ? JSON.parse(readFileSync(store, 'utf8')) : {}) as Record<string, { data: string }>
-    return { daemon, counters, view, registry }
+    return { daemon, counters, view, registry, ledger: () => loadLedger(dataDir) }
   }
 
   it('判据是「客户真正要用的那些服务」,⛔ 通用探测点', () => {
@@ -220,12 +224,23 @@ describe('本来就能直连 AI 就复用', () => {
     expect(h.view()).toMatchObject({ state: 'error', code: 'TUNNEL_ACTIVE_PROXY_CHANGED' })
   })
 
-  it('默认路径/TUN 身份无法确认时不把 unresolved 当作可复用路径，也不改建本地 connector', async () => {
+  it('默认路径/TUN 身份查询超时或失败时不复用直连，改建有账本保护的来信连接', async () => {
     const h = harness({ reuseDirect: true, pathIdentityUnavailable: true })
     await h.daemon.run()
     expect(h.counters.directProbes).toBe(0)
-    expect(h.counters.connectorStarts).toBe(0)
-    expect(h.view()).toMatchObject({ state: 'error', code: 'TUNNEL_AVAILABILITY_OBJECT_IDENTITY_MISSING' })
+    expect(h.counters.connectorStarts).toBe(1)
+    expect(h.view()).toMatchObject({ state: 'connected' })
+    expect(h.view().code).not.toBe('TUNNEL_REUSED_EXISTING')
+    expect(h.ledger().some((entry) => entry.kind === 'setting' && entry.status === 'applied')).toBe(true)
+  })
+
+  it('直连探测后路径复读超时或失败时不使用迟到绿灯，改建来信连接', async () => {
+    const h = harness({ reuseDirect: true, pathIdentityUnavailableAfterProbe: true })
+    await h.daemon.run()
+    expect(h.counters.directProbes).toBe(1)
+    expect(h.counters.connectorStarts).toBe(1)
+    expect(h.view()).toMatchObject({ state: 'connected' })
+    expect(h.view().code).not.toBe('TUNNEL_REUSED_EXISTING')
   })
 
   it('适配器尚无默认路径读取能力时不复用直连，但仍以快照和租约接管', async () => {

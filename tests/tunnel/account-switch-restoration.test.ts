@@ -8,7 +8,7 @@ import { readCurrentInfo } from '../../app/main/tunnel/import-meta'
 import { layout } from '../../app/main/tunnel/paths'
 import { buildPackageEntries, writePackageDir } from './fixtures/package-builder'
 import { tarFromPackageEntries } from './fixtures/tar-writer'
-import { makeTempDir, removeTempDir } from './helpers'
+import { makeTempDir, removeTempDir, writeIntentFile } from './helpers'
 
 const roots: string[] = []
 afterEach(() => { roots.splice(0).forEach(removeTempDir) })
@@ -52,6 +52,21 @@ async function setup() {
   }
   return { service, dataDir, access, claim, finish }
 }
+
+it('退出账号写入明确断开意图，清除 API 延续且不领取新配置', async () => {
+  const f = await setup()
+  writeIntentFile(f.dataDir, { desired: 'connected', sessionToken: 'old-session', updatedAt: 1,
+    apiOnly: { port: 43210, bootId: 'a'.repeat(32), pid: 321, identitySecret: 'b'.repeat(64), bridgePort: 18080 } })
+  expect((await f.service.setAccountAccess(undefined)).outcome).toBe('stopped')
+  const intent = JSON.parse(readFileSync(layout.intent(f.dataDir), 'utf8'))
+  expect(intent).toMatchObject({ desired: 'user-disconnected', reason: 'account-logout' })
+  expect(intent.apiOnly).toBeUndefined()
+  expect(intent.sessionToken).not.toBe('old-session')
+  f.finish(true)
+  await new Promise(resolve => setTimeout(resolve, 400))
+  expect(f.claim).not.toHaveBeenCalled()
+  expect(readCurrentInfo(f.dataDir)?.accountId).toBe('old-account')
+})
 
 it('切换账号时四项 WinINET 恢复超过五秒，恢复完成后自动同步新账号配置', async () => {
   const f = await setup()

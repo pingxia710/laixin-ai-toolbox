@@ -54,6 +54,8 @@ sidecar/mac/resident-integrity.mjs
 sidecar/mac/resident-integrity.d.mts
 sidecar/mac/restore.mjs
 sidecar/mac/restore.d.mts
+sidecar/mac/restore-observation.mjs
+sidecar/mac/restore-observation.d.mts
 sidecar/mac/routes.default.json
 sidecar/mac/socks5.mjs
 sidecar/mac/socks5.d.mts
@@ -90,6 +92,8 @@ sidecar/win/resident-integrity.mjs
 sidecar/win/resident-integrity.d.mts
 sidecar/win/restore.mjs
 sidecar/win/restore.d.mts
+sidecar/win/restore-observation.mjs
+sidecar/win/restore-observation.d.mts
 sidecar/win/routes.default.json
 sidecar/win/socks5.mjs
 sidecar/win/socks5.d.mts

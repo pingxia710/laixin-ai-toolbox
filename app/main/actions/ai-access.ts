@@ -16,6 +16,7 @@ import { readCodexUsage } from '../codex-usage/client'
 import { codexAccountKey } from '../codex-usage/normalize'
 import { readClaudeOfficialAccount } from '../ai-access/official-account'
 import { AiGateway } from '../ai-access/gateway'
+import { electronSystemFetch } from '../ai-access/electron-fetch'
 import { createDesktopRouteAttestor } from '../ai-access/desktop-route-attestation'
 import { modelProviders } from '../../shared/model-providers'
 import { apiRemedyActions, type ApiRemedyAction, type ApiRemedyResult } from '../../shared/api-service-types'
@@ -532,7 +533,10 @@ export function productionAiAccessService(): AiAccessService {
         if (route?.shell === 'codex' && route.isolated === true) return codexIsolationTransport.fetch(url, init)
         if (route?.shell === 'claude' && route.isolated === true) return claudeIsolationTransport.fetch(url, init)
         if (route?.shell === 'hermes' && route.isolated === true) return hermesIsolationTransport.fetch(url, init)
-        return fetch(input, init)
+        // Provider probes and API traffic must follow the same Chromium system path
+        // (WinINET/PAC/explicit proxy) that the customer can actually use. Node's
+        // global fetch is direct and is not valid evidence for this connection.
+        return electronSystemFetch(input, init)
       },
       desktopAttestor: createDesktopRouteAttestor(),
       onUsageEvent: event => usageReceipt.record(gatewayUsageEventToReceipt(event))

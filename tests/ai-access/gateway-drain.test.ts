@@ -24,14 +24,17 @@ describe('headless 有界 drain', () => {
     const draining = gateway.drain(1_000)
     finish?.(Response.json({ status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: 'OK' }] }] }))
 
-    await expect(request.then(response => response.status)).resolves.toBe(200)
+    const response = await request
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({ status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: 'OK' }] }] })
     await expect(draining).resolves.toBeUndefined()
     expect(gateway.snapshot().running).toBe(false)
   })
 
   it('超时后只中止本路由已记账的在途请求', async () => {
+    let upstreamAborted = false
     const fetcher = vi.fn(async (_url: URL | RequestInfo, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
-      init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true })
+      init?.signal?.addEventListener('abort', () => { upstreamAborted = true; reject(new DOMException('aborted', 'AbortError')) }, { once: true })
     })) as unknown as typeof fetch
     const gateway = new AiGateway({ fetch: fetcher })
     gateways.push(gateway)
@@ -47,6 +50,7 @@ describe('headless 有界 drain', () => {
 
     await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(1))
     await gateway.drain(20)
+    expect(upstreamAborted).toBe(true)
     await request
     expect(gateway.snapshot().running).toBe(false)
   })

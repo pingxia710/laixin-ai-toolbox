@@ -60,6 +60,17 @@ const defaultExec = async (command: string, args: readonly string[], env: NodeJS
   (await execFile(command, [...args], { encoding: 'utf8', timeout: 20_000, maxBuffer: 256 * 1024, env, windowsHide: true, ...options })).stdout
 const defaultExists = async (path: string): Promise<boolean> => { try { await access(path); return true } catch { return false } }
 
+/** registry 查询的缺省出口走 Electron 网络栈：客户的系统代理/PAC/专线（含通道代理）都算数；
+ * 非 Electron 进程（测试/工具）退回全局 fetch。 */
+async function registryFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  if (process.versions.electron === undefined) return fetch(input, init)
+  try {
+    const electron = await import('electron')
+    if (typeof electron.net.fetch === 'function') return electron.net.fetch(input as string | Request, init)
+  } catch { /* 退回全局 fetch。 */ }
+  return fetch(input, init)
+}
+
 export function extraBinDirectories(platform: string, home: string, env: NodeJS.ProcessEnv): string[] {
   if (platform === 'win32') {
     const appData = env.APPDATA ?? join(home, 'AppData', 'Roaming'), local = env.LOCALAPPDATA ?? join(home, 'AppData', 'Local')
@@ -485,7 +496,7 @@ export class ShellInventory {
       const controller = new AbortController()
       const timer = setTimeout(() => controller.abort(), 8_000)
       try {
-        const response = await (this.deps.fetch ?? fetch)(`${registry}/${recipe.npmPackage}/latest`, { signal: controller.signal })
+        const response = await (this.deps.fetch ?? registryFetch)(`${registry}/${recipe.npmPackage}/latest`, { signal: controller.signal })
         if (!response.ok) continue
         const data = await response.json() as { version?: unknown }
         const version = typeof data.version === 'string' ? parseVersion(data.version) : ''

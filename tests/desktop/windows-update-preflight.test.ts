@@ -102,6 +102,9 @@ interface FixtureOptions {
   readonly registerCode?: number
   readonly keepEnabledOnSuccess?: (typeof TASKS)[number]
   readonly queryXml?: Partial<Record<(typeof TASKS)[number], string>>
+  readonly consoleXml?: string
+  readonly exportCode?: number
+  readonly exportPayload?: string
   readonly missingQueryStderr?: string
   readonly existenceQueryCode?: number
   readonly unknownManagedPath?: boolean
@@ -114,14 +117,17 @@ interface FixtureOptions {
   readonly taskRunStartsResident?: boolean
   readonly advanceMsPerCall?: number
   readonly guardPid?: number
+  readonly managedProcesses?: boolean
 }
 
 function fixture(options: FixtureOptions = {}) {
   const tasks = new Map<string, TaskState>(TASKS.map((task) => [task, options.tasks?.[task] ?? 'missing']))
   const originalTasks = new Map(tasks)
   const processes = [
-    { ProcessId: 101, Name: win32.basename(EXECUTABLE), ExecutablePath: EXECUTABLE as string | null },
-    { ProcessId: 102, Name: 'xray.exe', ExecutablePath: `${TARGET}\\resources\\xray\\xray.exe` as string | null },
+    ...(options.managedProcesses === false ? [] : [
+      { ProcessId: 101, Name: win32.basename(EXECUTABLE), ExecutablePath: EXECUTABLE as string | null },
+      { ProcessId: 102, Name: 'xray.exe', ExecutablePath: `${TARGET}\\resources\\xray\\xray.exe` as string | null }
+    ]),
     { ProcessId: 103, Name: 'xray.exe', ExecutablePath: 'C:\\OtherProxy\\xray.exe' as string | null },
     { ProcessId: 999, Name: win32.basename(EXECUTABLE), ExecutablePath: EXECUTABLE as string | null },
     ...(options.guardPid ? [{ ProcessId: options.guardPid, Name: 'powershell.exe', ExecutablePath: POWERSHELL as string | null,
@@ -181,11 +187,21 @@ function fixture(options: FixtureOptions = {}) {
       if (state === 'unknown') return { code: 1, stdout: '', stderr: 'ERROR: Access is denied.' }
       return {
         code: 0,
-        stdout: options.queryXml?.[task] ?? `<Task><Settings><Enabled>${state === 'Enabled' ? 'true' : 'false'}</Enabled></Settings></Task>`,
+        stdout: options.consoleXml ?? options.queryXml?.[task] ?? `<Task><Settings><Enabled>${state === 'Enabled' ? 'true' : 'false'}</Enabled></Settings></Task>`,
         stderr: ''
       }
     }
     if (name === 'powershell.exe') {
+      if (encodedScript?.includes('LAIXIN_TASK_XML_QUERY')) {
+        const fullPathToken = Buffer.from('\\Laixin\\', 'utf8').toString('base64')
+        const task = encodedScript.includes(fullPathToken) ? TASKS[0] : TASKS[1]
+        if (options.timeout?.verb === 'query' && options.timeout.task === task) {
+          return { code: null, stdout: '', stderr: '', timedOut: true }
+        }
+        const xml = options.queryXml?.[task] ?? `<Task><Settings><Enabled>${tasks.get(task) === 'Enabled' ? 'true' : 'false'}</Enabled></Settings></Task>`
+        return { code: options.exportCode ?? (tasks.get(task) === 'missing' || tasks.get(task) === 'unknown' ? 1 : 0),
+          stdout: options.exportPayload ?? Buffer.from(xml, 'utf8').toString('base64'), stderr: '' }
+      }
       if (encodedScript?.includes('LAIXIN_TASK_EXISTENCE_QUERY')) {
         const fullPathToken = Buffer.from('\\Laixin\\', 'utf8').toString('base64')
         const task = encodedScript.includes(fullPathToken) ? TASKS[0] : TASKS[1]
@@ -292,6 +308,36 @@ describe('Windows 更新/卸载前置闸', () => {
     }
   })
 
+  it('恢复事务提交失败也写入同一本地日志，并标明 commit 阶段', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'laixin-preflight-commit-error-'))
+    try {
+      const result = spawnSync(process.execPath, [join(__dirname, '..', '..', 'resources', 'update-helper.cjs'),
+        'windows-preflight-commit', directory, String(process.pid), 'missing-transaction'], {
+        encoding: 'utf8', env: { ...process.env }
+      })
+      expect(result.status).toBe(1)
+      expect(await readFile(join(directory, 'windows-preflight-last-error.log'), 'utf8'))
+        .toMatch(/UPDATE_RECOVERY_MARKER_MISSING STAGE=recovery-commit/)
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('真卸载在连接运行、断开但进程还在、GUI 已退出时都能收敛任务和已知进程', async () => {
+    const states = [
+      { name: '连接运行', tasks: { [TASKS[0]]: 'Enabled' as const }, managedProcesses: true, killed: [101, 102] },
+      { name: '断开但进程还在', tasks: { [TASKS[0]]: 'Disabled' as const }, managedProcesses: true, killed: [101, 102] },
+      { name: 'GUI 已退出', tasks: {}, managedProcesses: false, killed: [] }
+    ]
+
+    for (const state of states) {
+      const f = fixture({ tasks: state.tasks, managedProcesses: state.managedProcesses })
+      await expect(runBeforeInstallWrite(f, 'uninstall'), state.name).resolves.toEqual(['install-directory-write'])
+      expect([...f.tasks.values()], state.name).toEqual(['missing', 'missing'])
+      expect(f.killed.sort(), state.name).toEqual(state.killed)
+    }
+  })
+
   it('结构化任务查询本身失败时不能把任务误判为已删除', async () => {
     const f = fixture({ existenceQueryCode: 2 })
 
@@ -323,7 +369,7 @@ describe('Windows 更新/卸载前置闸', () => {
     expect(f.killed.sort()).toEqual([101, 102])
     expect(f.processes).toContainEqual({ ProcessId: 103, Name: 'xray.exe', ExecutablePath: 'C:\\OtherProxy\\xray.exe' })
     expect(f.processes).toContainEqual({ ProcessId: 999, Name: win32.basename(EXECUTABLE), ExecutablePath: EXECUTABLE })
-    expect(f.calls.filter((call) => call.file === 'schtasks.exe' && call.args[0] === '/query')).toHaveLength(2)
+    expect(f.calls.filter((call) => call.script?.includes('LAIXIN_TASK_XML_QUERY'))).toHaveLength(2)
     expect(f.calls.some((call) => call.file === 'powershell.exe' && call.args.join(' ').includes('ToBase64String'))).toBe(true)
     const terminators = f.calls.filter((call) => call.script?.includes('LAIXIN_SAME_HANDLE_TERMINATE'))
     expect(terminators).toHaveLength(2)
@@ -341,6 +387,20 @@ describe('Windows 更新/卸载前置闸', () => {
     expect(await runBeforeInstallWrite(f)).toEqual(['install-directory-write'])
     expect([...f.tasks.values()]).toEqual(['Disabled', 'Disabled'])
     expect(f.killed.sort()).toEqual([101, 102])
+  })
+
+  it('任务 XML 导出失败：在任何任务停用或进程操作前拒绝', async () => {
+    const f = fixture({ tasks: { [TASKS[0]]: 'Enabled' }, exportCode: 1 })
+    await expect(runBeforeInstallWrite(f)).rejects.toThrow(/TASK_STATE_UNKNOWN/)
+    expect(f.killed).toEqual([])
+    expect(f.calls.some((call) => call.args.includes('/disable'))).toBe(false)
+  })
+
+  it.each(['', '%invalid', 'e30='])('任务导出内容无效 %j：不能生成错误快照或开始停进程', async (exportPayload) => {
+    const f = fixture({ tasks: { [TASKS[0]]: 'Enabled' }, exportPayload })
+    await expect(runBeforeInstallWrite(f)).rejects.toThrow(/TASK_XML_INVALID/)
+    expect(f.killed).toEqual([])
+    expect(f.calls.some((call) => call.args.includes('/disable'))).toBe(false)
   })
 
   it('同名来信/xray 进程路径不可读：身份不可确认，停止且不按名称误杀', async () => {
@@ -572,7 +632,9 @@ describe('Windows 更新/卸载前置闸', () => {
   it('preflight 成功后更新进程立即消失：持久快照可在下一启动恢复原任务并解除死回环', async () => {
     const recoveryDirectory = await mkdtemp(join(tmpdir(), 'laixin-preflight-recovery-'))
     const guardPid = 998
-    const f = fixture({ tasks: { [TASKS[0]]: 'Enabled', [TASKS[1]]: 'Disabled' }, guardPid })
+    const chineseXml = '<Task><Settings><Enabled>false</Enabled></Settings><Actions><Exec><Command>C:\\工具 箱\\来信.exe</Command></Exec></Actions></Task>'
+    const f = fixture({ tasks: { [TASKS[0]]: 'Enabled', [TASKS[1]]: 'Disabled' }, guardPid,
+      queryXml: { [TASKS[1]]: chineseXml }, consoleXml: '<Task><Settings><Enabled>false</Enabled></Settings><Actions>����</Actions></Task>' })
     try {
       await helper.windowsPreflight({
         mode: 'update', target: TARGET, executable: EXECUTABLE, residentLabel: LABEL,
@@ -595,6 +657,7 @@ describe('Windows 更新/卸载前置闸', () => {
         { task: TASKS[0], state: 'enabled' },
         { task: TASKS[1], state: 'disabled' }
       ])
+      expect(marker.tasks[1]?.xml).toBe(chineseXml)
       expect([...f.tasks.values()]).toEqual(['Disabled', 'Disabled'])
       expect(f.killed.sort()).toEqual([101, 102])
       expect(f.processes.some((process) => process.ProcessId === guardPid)).toBe(true)
@@ -764,7 +827,7 @@ describe('Windows 更新/卸载前置闸', () => {
       expect([...f.tasks.values()]).toEqual(['missing', 'missing'])
       expect(f.killed.sort()).toEqual([101, 102])
       expect(await readFile(join(recoveryDirectory, 'windows-preflight-last-error.log'), 'utf8'))
-        .toContain('UPDATE_RECOVERY_GUARD_BYPASSED GUARD_REASON=UPDATE_RECOVERY_GUARD_TIMEOUT')
+        .toContain('UPDATE_RECOVERY_GUARD_BYPASSED GUARD_REASON=UPDATE_RECOVERY_GUARD_TIMEOUT WAITED_MS=20027')
     } finally {
       await rm(recoveryDirectory, { recursive: true, force: true })
     }
@@ -993,7 +1056,7 @@ describe('Windows 更新/卸载前置闸', () => {
       await expect(readFile(guardPath, 'utf8')).resolves.toBe('native-guard')
       expect(spawnGuard).toHaveBeenCalledWith(guardPath,
         ['--laixin-recovery-guard', 'this-transaction'], expect.objectContaining({
-          detached: false, stdio: 'ignore', windowsHide: true, windowsVerbatimArguments: false,
+          detached: true, stdio: 'ignore', windowsHide: true, windowsVerbatimArguments: false,
           env: expect.objectContaining({
             LAIXIN_RECOVERY_GUARD_TRANSACTION: 'this-transaction',
             LAIXIN_RECOVERY_GUARD_OWNER_PID: '4242',
@@ -1234,8 +1297,9 @@ describe('真实入口守卫', () => {
     expect(preflightMacro).toContain('LAIXIN_PREFLIGHT_OWNER_EXECUTABLE')
     const uninstallMacro = source.slice(source.indexOf('!macro customUnInstall'), source.indexOf('!macroend', source.indexOf('!macro customUnInstall')))
     expect(uninstallMacro).toContain('${GetOptions} $3 "/S" $4')
-    expect(uninstallMacro).toContain('检测并修复连接')
+    expect(uninstallMacro).toContain('失败码：$laixinUninstallFailureCode')
     expect(uninstallMacro).toContain('一键诊断')
+    expect(uninstallMacro).not.toContain('重新打开工具箱')
     expect(uninstallMacro).not.toContain('请关闭所有来信 AI 工具箱的安装和卸载窗口')
     expect(uninstallMacro).not.toContain('退出码 $7')
     const initMacro = source.slice(source.indexOf('!macro customInit'), source.indexOf('!macroend', source.indexOf('!macro customInit')))
@@ -1329,6 +1393,28 @@ describe('真实入口守卫', () => {
     expect(abort).toBeGreaterThan(fallback)
   })
 
+  it('卸载只在 Laixin 计划任务文件夹完全为空时删除该文件夹', async () => {
+    const cleanup = await readFile(join(__dirname, '..', '..', 'resources', 'uninstall-task-cleanup.ps1'), 'utf8')
+    const tasksVerified = cleanup.indexOf('if ($left.Count -ne 0) { exit 1 }')
+    const deleteFolder = cleanup.indexOf("DeleteFolder('Laixin', 0)")
+
+    expect(cleanup.startsWith('\uFEFF')).toBe(true)
+    expect(cleanup).toContain("New-Object -ComObject 'Schedule.Service'")
+    expect(cleanup).toContain("GetFolder('\\Laixin')")
+    expect(cleanup).toContain('$folderTaskCount = $folder.GetTasks(1).Count')
+    expect(cleanup).toContain('$childFolderCount = $folder.GetFolders(0).Count')
+    expect(cleanup).toMatch(/if \(\$folderTaskCount -ne 0 -or \$childFolderCount -ne 0\) \{ return \}/)
+    expect(deleteFolder).toBeGreaterThan(tasksVerified)
+    expect(cleanup).not.toContain('DeleteTask(')
+    const installer = await readFile(join(__dirname, '..', '..', 'build', 'installer.nsh'), 'utf8')
+    const uninstall = installer.slice(installer.indexOf('!macro customUnInstall'),
+      installer.indexOf('!macroend', installer.indexOf('!macro customUnInstall')))
+    const success = uninstall.slice(uninstall.lastIndexOf('    Abort'))
+    expect(success).toContain('${If} $5 == "uninstall"')
+    expect(success).toContain('nsExec::ExecToLog /TIMEOUT=15000')
+    expect(success).toContain('laixin-uninstall-task-cleanup.ps1')
+  })
+
   it('安装入口在旧卸载器之前拒绝覆盖，静默安装非零退出且不弹阻塞框', async () => {
     const source = await readFile(join(__dirname, '..', '..', 'build', 'installer.nsh'), 'utf8')
     const initStart = source.indexOf('!macro customInit')
@@ -1363,6 +1449,36 @@ describe('真实入口守卫', () => {
     expect(section.indexOf('!insertmacro uninstallOldVersion')).toBeGreaterThan(-1)
     expect(installUtil).toContain('ExecWait \'"$uninstallerFileNameTemp"')
     expect(installUtil).toContain('${if} $R5 > 5')
+  })
+
+  it('重复启动安装器：在 electron-builder 单实例闸前留下明确阶段与错误码', async () => {
+    const source = await readFile(join(__dirname, '..', '..', 'build', 'installer.nsh'), 'utf8')
+    const preInitStart = source.indexOf('!macro preInit')
+    const preInitEnd = source.indexOf('!macroend', preInitStart)
+    expect(preInitStart).toBeGreaterThan(-1)
+    expect(preInitEnd).toBeGreaterThan(preInitStart)
+
+    const preInit = source.slice(preInitStart, preInitEnd)
+    expect(preInit).toContain('OpenMutexW')
+    expect(preInit).toContain('"${APP_GUID}"')
+    const existingInstanceStart = preInit.indexOf('${If} $7 != 0')
+    const existingInstanceEnd = preInit.indexOf('${EndIf}', existingInstanceStart)
+    expect(existingInstanceStart).toBeGreaterThan(-1)
+    expect(existingInstanceEnd).toBeGreaterThan(existingInstanceStart)
+    expect(preInit.slice(existingInstanceStart, existingInstanceEnd)).toMatch(/CloseHandle\(p r7\)[\s\S]*INSTALLER_INSTANCE_ALREADY_RUNNING[\s\S]*Abort/)
+    expect(preInit).toMatch(/GetCurrentProcessId\(\) i \.r9[\s\S]*PID=\$9/)
+    expect(preInit).toContain('INSTALLER_INSTANCE_ALREADY_RUNNING')
+    expect(preInit).toContain('STAGE=PRE_INIT')
+    expect(preInit).toContain('windows-preflight-last-error.log')
+    expect(preInit).toMatch(/FileOpen \$7[^\r\n]+ a[\s\S]*FileSeek \$7 0 END[\s\S]*FileWrite \$7/)
+    expect(preInit).toContain('本次启动未重新检查安装状态')
+    expect(preInit).toMatch(/IfSilent \+2[\s\S]*SetErrorLevel 2[\s\S]*Abort/)
+
+    const root = dirname(requireFromTest.resolve('app-builder-lib/package.json'))
+    const installer = await readFile(join(root, 'templates', 'nsis', 'installer.nsi'), 'utf8')
+    const onInit = installer.slice(installer.indexOf('Function .onInit'), installer.indexOf('FunctionEnd', installer.indexOf('Function .onInit')))
+    expect(onInit.indexOf('!insertmacro preInit')).toBeLessThan(onInit.indexOf('!insertmacro ALLOW_ONLY_ONE_INSTALLER_INSTANCE'))
+    expect(onInit.indexOf('!insertmacro ALLOW_ONLY_ONE_INSTALLER_INSTANCE')).toBeLessThan(onInit.indexOf('!insertmacro customInit'))
   })
 
   it('残缺旧安装主 EXE 已丢但登记仍在：无法验证 handoff 就在旧卸载器前拦截', async () => {

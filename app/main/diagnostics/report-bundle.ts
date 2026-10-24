@@ -17,12 +17,12 @@ import type { SupportDiagnosis } from './support-snapshot'
 import { normalizeLocalEgressEvidence } from '../../shared/local-egress-evidence'
 
 /** 通道状态里能出去的字段。⛔ authorization：它是句固定说明，没有诊断价值，反而会被字段名闸抹成问号。 */
-const tunnelStatusFields = ['state', 'message', 'source', 'backend', 'nodeLabel', 'exitIp', 'pathSource',
+const tunnelStatusFields = ['state', 'message', 'source', 'backend', 'nodeLabel', 'observedNodeLabel', 'exitIp', 'pathSource',
   'lastVerifiedAt', 'configVersion', 'expiresAt', 'pendingAvailable', 'currentConfig', 'pendingConfig',
-  'canApplyPending', 'unrestored', 'componentMissing', 'sshBinary', 'traffic'] as const
+  'canApplyPending', 'unrestored', 'componentMissing', 'sshBinary', 'traffic', 'recoveryDetail'] as const
 const repairFields = ['running', 'startedAt', 'finishedAt', 'phase', 'outcome', 'code', 'message'] as const
 /** state.json：⛔ sessionToken / intentToken，它们是真令牌。 */
-const daemonStateFields = ['state', 'code', 'message', 'exitIp', 'lastVerifiedAt', 'bridgePort', 'note', 'updatedAt', 'runId', 'reusedProxy'] as const
+const daemonStateFields = ['state', 'code', 'message', 'connectStage', 'exitIp', 'lastVerifiedAt', 'bridgePort', 'note', 'updatedAt', 'runId', 'reusedProxy'] as const
 /** 账本条目：⛔ id（里面嵌着会话令牌）、originalValue、writtenValue、sessionToken。 */
 const ledgerEntryFields = ['kind', 'service', 'item', 'status', 'time', 'note'] as const
 /** 系统代理读数：`resolved` 是各目标地址会走到哪，`env` 是命令行 AI 认的那几个环境变量。

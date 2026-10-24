@@ -249,7 +249,7 @@ describe('争抢时先看对方能不能用', () => {
       import { mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
       import { syncBuiltinESMExports } from 'node:module'
       import { tmpdir } from 'node:os'
-      import { join } from 'node:path'
+      import { basename, join } from 'node:path'
       const off = () => ({ enabled: false, host: '', port: 0, authenticated: '0' })
       const proxies = { web: off(), secure: off(), socks: off() }
       const pac = { enabled: false, url: '' }
@@ -257,7 +257,7 @@ describe('争抢时先看对方能不能用', () => {
         '\\nPort: ' + String(value.port) + '\\nAuthenticated Proxy Enabled: ' + value.authenticated + '\\n'
       const itemFor = (command) => command.includes('secure') ? proxies.secure : command.includes('socks') ? proxies.socks : proxies.web
       cp.execFileSync = (command, args, options) => {
-        if (command.endsWith('/bin/proxy-helper') && args[0] === 'request' &&
+        if (basename(command) === 'proxy-helper' && args[0] === 'request' &&
             JSON.parse(options.input).op === 'status') return JSON.stringify({ ok: true, version: 3 })
         if (command === '/sbin/route' && args.join(' ') === '-n get default') return '   interface: en0\\n'
         if (command !== 'networksetup') throw Error('UNEXPECTED_COMMAND ' + command)

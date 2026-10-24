@@ -53,10 +53,10 @@ export function composeManagedAdapters(networkAdapter, terminalAdapter, acquireW
     // 不能把适配器“没有路径读取能力”伪装成一个会返回 undefined 的读取函数。
     // 前者可走带快照/租约的接管；真实读取失败才是需要限制并重新取证的证据。
     ...(typeof networkAdapter.currentPathIdentity === 'function'
-      ? { currentPathIdentity: () => networkAdapter.currentPathIdentity() } : {}),
+      ? { currentPathIdentity: (options) => networkAdapter.currentPathIdentity(options) } : {}),
     preserveExternalChanges: (ref) => !isTerminalRef(ref) && networkAdapter.preserveExternalChanges?.(ref) === true,
     reapplyOnChange: (ref) => !isTerminalRef(ref) && networkAdapter.reapplyOnChange?.(ref) === true,
-    existingProxy: (ours) => networkAdapter.existingProxy?.(ours),
+    existingProxy: (ours, options) => networkAdapter.existingProxy?.(ours, options),
     // 「满足接管要求」与「修回写什么」两个钩子只对系统代理项有意义;终端项按完整值。
     settingSatisfied(current, written, ref) {
       if (isTerminalRef(ref) || !networkAdapter.settingSatisfied) return this.valuesEqual(current, written, ref)

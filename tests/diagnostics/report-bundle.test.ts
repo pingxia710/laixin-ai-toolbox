@@ -56,7 +56,8 @@ it('打出来的包里没有任何凭据：state.json 的令牌、VLESS 三件�
   const { userDataPath, tunnelDataDir, secrets } = machine()
   const files = await collectLocalFiles({ userDataPath, tunnelDataDir, files: nodeReportFiles })
   const body = buildReportBody({
-    tunnel: { state: '已连', exitIp: '203.0.113.7', nodeLabel: '洛杉矶 A', authorization: '授权:本地包载明' },
+    tunnel: { state: '已连', exitIp: '203.0.113.7', nodeLabel: '洛杉矶 A', observedNodeLabel: '纽约 B',
+      traffic: '上传 12 KB/秒 · 下载 1.4 MB/秒 · 累计 870 MB', authorization: '授权:本地包载明' },
     daemonState: files.daemonState, ledger: files.ledger, connection: files.connection, daemonLog: files.daemonLog,
     errorCodes: ['AI_DIAG_TUNNEL_UNREACHABLE', 'TUNNEL_CONNECTED'], notes: files.notes
   })
@@ -78,7 +79,21 @@ it('打出来的包里没有任何凭据：state.json 的令牌、VLESS 三件�
   // 客服真正要看的东西还在
   expect(serialized).toContain('AI_DIAG_TUNNEL_UNREACHABLE')
   expect(serialized).toContain('203.0.113.7')
+  expect(serialized).toContain('纽约 B')
+  expect(serialized).toContain('下载 1.4 MB/秒')
   expect(body.daemonLog).toMatchObject({ available: true })
+})
+
+it('诊断包保留连接阶段超时的受控阶段，同时不带进状态令牌', () => {
+  const body = buildReportBody({ daemonState: {
+    state: 'error', code: 'TUNNEL_CONNECTION_TIMEOUT', message: 'TUNNEL_CONNECTION_TIMEOUT',
+    connectStage: 'path-verify-before-settings', sessionToken: 'secret-session-token'
+  } })
+  expect(body.daemonState).toMatchObject({
+    code: 'TUNNEL_CONNECTION_TIMEOUT',
+    connectStage: 'path-verify-before-settings'
+  })
+  expect(JSON.stringify(body.daemonState)).not.toContain('secret-session-token')
 })
 
 it('采集本机诊断文件不跟随符号链接', async () => {
@@ -106,6 +121,13 @@ it('守护日志的父目录是符号链接时不采集目录外的个人文本'
   expect(JSON.stringify(files)).not.toContain('PRIVATE-TEXT-MUST-NOT-LEAVE')
   expect(files.daemonLogAbsence).toBe('unreadable')
   expect(files.notes).toContain('守护日志读取失败：REPORT_FILE_UNSAFE')
+})
+
+it('手动上报包含恢复摘要但不额外收集原始恢复对象', () => {
+  const body = buildReportBody({ tunnel: { recoveryDetail: '检查 3 次，已重试 2 次；端口查询超时' },
+    daemonState: { restoration: { secret: 'SECRET_DO_NOT_COPY' } } })
+  expect(JSON.stringify(body)).toContain('已重试 2 次')
+  expect(JSON.stringify(body)).not.toContain('SECRET_DO_NOT_COPY')
 })
 
 it('客服报告只保留日志文件名，不带客户用户名所在的绝对路径', () => {

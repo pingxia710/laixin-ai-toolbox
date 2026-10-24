@@ -1,4 +1,4 @@
-param([switch]$ProxyFallbackOnly, [string]$TunnelDataDir)
+﻿param([switch]$ProxyFallbackOnly, [string]$TunnelDataDir)
 $ErrorActionPreference = 'Stop'
 [IO.Directory]::SetCurrentDirectory([Environment]::SystemDirectory)
 
@@ -13,7 +13,7 @@ if ($ProxyFallbackOnly) {
     if (Test-Path -LiteralPath (Join-Path $TunnelDataDir 'ledger-recovery-required') -ErrorAction Stop) { exit 3 }
     $raw = Get-Content -LiteralPath $ledgerPath -Raw -Encoding UTF8 -ErrorAction Stop
     if (-not $raw.TrimStart().StartsWith('[')) { exit 3 }
-    $ledger = @(ConvertFrom-Json -InputObject $raw -ErrorAction Stop)
+    $ledger = ConvertFrom-Json -InputObject $raw -ErrorAction Stop
     if ($ledger.Count -eq 0) { exit 3 }
     foreach ($entry in $ledger) {
       if ($null -eq $entry -or [string]::IsNullOrWhiteSpace([string]$entry.id) -or $null -eq $entry.time) { exit 3 }
@@ -78,4 +78,26 @@ foreach ($task in $matches) {
 
 $left = @(Get-ScheduledTask -ErrorAction Stop | Where-Object $isLaixinTask)
 if ($left.Count -ne 0) { exit 1 }
+
+function Remove-LaixinTaskFolderIfEmpty {
+  try {
+    $scheduler = New-Object -ComObject 'Schedule.Service'
+    $scheduler.Connect()
+    try {
+      $folder = $scheduler.GetFolder('\Laixin')
+    } catch {
+      Write-Output 'LAIXIN_TASK_FOLDER_CLEANUP_SKIPPED REASON=FOLDER_UNAVAILABLE'
+      return
+    }
+    # TASK_ENUM_HIDDEN：隐藏任务同样占用文件夹，不能当作空目录。
+    $folderTaskCount = $folder.GetTasks(1).Count
+    $childFolderCount = $folder.GetFolders(0).Count
+    if ($folderTaskCount -ne 0 -or $childFolderCount -ne 0) { return }
+    $scheduler.GetFolder('\').DeleteFolder('Laixin', 0)
+  } catch {
+    Write-Warning 'LAIXIN_TASK_FOLDER_CLEANUP_FAILED'
+  }
+}
+
+Remove-LaixinTaskFolderIfEmpty
 exit 0

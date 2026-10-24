@@ -9,6 +9,7 @@ import { platformIcon } from '../platform-icons'
 import { buildNetworkOnboarding, renderNetworkOnboarding, type NetworkOnboardingView, type OnboardingAction } from '../ui/network-onboarding'
 import { revealSupport } from '../support-widget'
 import { buildTunnelPresentation, mountTunnelDetails, page as networkPage } from './tunnel'
+import { page as networkAccountPage } from './network-account'
 import { observeNetworkActivity, refreshNetworkActivity, renderTrafficMeter, type NetworkActivity } from '../ui/network-activity'
 import { page as networkDiagnosticsPage } from './network-diagnostics'
 
@@ -97,6 +98,7 @@ function mountOverview(element: HTMLElement, showNetwork: () => void): () => voi
     let lastRender = ''
     let busy = false
     let networkMessage = ''
+    let networkMessageAwaitingRestore = false
     let onboardingMessage = ''
     let selectedStep: NetworkOnboardingView['step'] | undefined
 
@@ -208,10 +210,13 @@ function mountOverview(element: HTMLElement, showNetwork: () => void): () => voi
         return
       }
       if (action === 'support') { revealSupport(); return }
-      busy = true; networkMessage = ''; render()
+      busy = true; networkMessage = ''; networkMessageAwaitingRestore = false; render()
       try {
         const result = await (action === 'sync' ? window.toolbox.tunnel.syncAccountConfig() : action === 'import' ? window.toolbox.tunnel.importConfig() : action === 'stop' ? window.toolbox.tunnel.stop() : window.toolbox.tunnel.start())
-        if (mounted) networkMessage = result.message
+        if (mounted) {
+          networkMessage = result.message
+          networkMessageAwaitingRestore = result.outcome === 'stopped' && result.code === ''
+        }
       } catch { if (mounted) networkMessage = '操作没有完成，请重试或查看网络详情。' }
       finally { if (mounted) { busy = false; await refreshNetworkActivity(); render() } }
     }
@@ -244,6 +249,11 @@ function mountOverview(element: HTMLElement, showNetwork: () => void): () => voi
     const stopAccount = onAccountChange(() => render())
     const stopNetwork = observeNetworkActivity((value) => {
       if (!mounted) return
+      if (networkMessageAwaitingRestore && value.kind === 'ready' && value.status.state === '已停止并恢复原设置'
+        && !value.status.unrestored && !value.status.componentMissing
+        && (!value.status.recoveryState || value.status.recoveryState === 'idle')) {
+        networkMessage = ''; networkMessageAwaitingRestore = false
+      }
       state = value; render()
       const meter = element.querySelector<HTMLElement>('.dashboard-rates')
       if (meter) renderTrafficMeter(meter, state)
@@ -296,11 +306,13 @@ export const page: PageModule = {
         const network = document.createElement('section')
         const details = document.createElement('section')
         const diagnostics = document.createElement('section')
-        content.append(network, diagnostics, details)
+        const allowance = document.createElement('section')
+        content.append(network, allowance, diagnostics, details)
         networkPage.mount(network, { tab: 'tunnel' })
+        networkAccountPage.mount(allowance, { tab: 'tunnel' })
         networkDiagnosticsPage.mount(diagnostics, { tab: 'tunnel' })
         const stopDetails = mountTunnelDetails(details)
-        stopView = () => { stopDetails(); networkDiagnosticsPage.unmount(); networkPage.unmount() }
+        stopView = () => { stopDetails(); networkDiagnosticsPage.unmount(); networkAccountPage.unmount(); networkPage.unmount() }
       }
     }
     switcher.addEventListener('keydown', (event) => {

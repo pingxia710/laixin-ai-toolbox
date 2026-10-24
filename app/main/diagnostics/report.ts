@@ -30,8 +30,10 @@ export function buildDiagnosticsText(input: DiagnosticsInput): string {
   lines.push('【AI网络】')
   const t = input.tunnel ?? {}
   lines.push(`状态：${str(t.state)} · ${str(t.message)}`)
-  lines.push(`配置：${str(t.currentConfig)} · 节点：${str(t.nodeLabel)} · 出口：${str(t.exitIp)} · 到期：${str(t.expiresAt)} · 最近复验：${str(t.lastVerifiedAt)}`)
+  lines.push(`配置：${str(t.currentConfig)} · 配置首节点：${str(t.nodeLabel)} · 最近实测节点：${str(t.observedNodeLabel)} · 出口：${str(t.exitIp)} · 到期：${str(t.expiresAt)} · 最近复验：${str(t.lastVerifiedAt)}`)
+  if (t.traffic) lines.push(`当前通道流量：${str(t.traffic)}`)
   if (t.unrestored) lines.push(`未恢复的系统设置：${str(t.unrestored)}`)
+  if (t.recoveryDetail) lines.push(`最近设置恢复：${str(t.recoveryDetail)}`)
   if (t.componentMissing) lines.push(`组件缺失：${str(t.componentMissing)}`)
   if (typeof t.sshBinary === 'string' && t.sshBinary !== '') lines.push(`随包 OpenSSH(SSH 稳定版需要)：${str(t.sshBinary)}`)
   lines.push(`账号权益：${str(t.authorization)} · 后台：${str(t.backend)}`)

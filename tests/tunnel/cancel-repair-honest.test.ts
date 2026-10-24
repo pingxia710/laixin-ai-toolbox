@@ -6,6 +6,7 @@ import { afterEach, expect, it } from 'vitest'
 import { TunnelService } from '../../app/main/tunnel/tunnel-service'
 import { layout } from '../../app/main/tunnel/paths'
 import { buildPackageEntries, writePackageDir } from './fixtures/package-builder'
+import { macServiceSidecar } from './fixtures/mac-service-sidecar'
 import { fakeAdapterEnv, makeTempDir, removeTempDir, startFakeUpstream, waitFor } from './helpers'
 
 const cleanups: (() => Promise<unknown> | void)[] = []
@@ -17,7 +18,7 @@ async function setup(timeoutMs = 10_000) {
   const upstream = await startFakeUpstream()
   cleanups.push(() => upstream.killAll())
   const dataDir = join(root, 'device'); const storePath = join(root, 'fake-system.json')
-  const sidecarDir = fileURLToPath(new URL('../../sidecar/mac', import.meta.url))
+  const sidecarDir = macServiceSidecar(root)
   const adapter = fileURLToPath(new URL('./fixtures/fake-adapter.mjs', import.meta.url))
   const built = buildPackageEntries({ configVersion: 1 })
   const packageDir = writePackageDir(join(root, 'package'), built)
@@ -28,7 +29,8 @@ async function setup(timeoutMs = 10_000) {
     { env: { ...process.env, ...fakeAdapterEnv(storePath) }, stdio: 'ignore' })
     children.push(child); return child
   }
-  const service = new TunnelService({ dataDir, sidecarDir, picker: async () => packageDir,
+  // 配置包和模拟适配器均为 Mac；不随 CI 宿主隐式切换平台。
+  const service = new TunnelService({ dataDir, sidecarDir, platform: 'macos', picker: async () => packageDir,
     trust: { whitelistDigests: [built.digest], signingPublicKeys: [] }, now: () => Date.parse('2026-10-01T00:00:00Z'),
     spawnDaemon: (_dir, runId) => launch('start', runId), spawnRestore: () => launch('restore'),
     routesFile: join(sidecarDir, 'routes.default.json'), repairTimeoutMs: timeoutMs, repairRestoreGraceMs: 800,
@@ -41,7 +43,8 @@ async function setup(timeoutMs = 10_000) {
       await waitFor(() => child.exitCode !== null || child.signalCode !== null, 3000)
     }
   })
-  await service.importConfig(); await service.applyPending()
+  expect((await service.importConfig()).outcome).toBe('imported')
+  expect((await service.applyPending()).outcome).toBe('applied')
   const intent = () => JSON.parse(readFileSync(layout.intent(dataDir), 'utf8'))
   const mutex = () => (service as unknown as { mutex: { tryAcquire(): (() => void) | undefined } }).mutex
   return { service, root, dataDir, storePath, children, intent, mutex }

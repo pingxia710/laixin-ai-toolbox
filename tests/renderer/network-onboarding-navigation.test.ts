@@ -38,6 +38,8 @@ afterEach(() => vi.unstubAllGlobals())
 it('四个步骤都能点击查看，切换不会触发注册、领取或连接', () => {
   const ui = setup()
   for (const [step, title] of [[2, '领取 5 GB 体验流量'], [3, '连接网络'], [4, '查看 Codex 下载与版本'], [1, '先注册或登录']] as const) {
+    const stepButton = ui.root.all().find((node) => node.dataset.onboardingStep === String(step))!
+    expect(stepButton.attributes.get('aria-label')).toBe(`查看第 ${step} 步：${title}`)
     ui.select(step)
     expect(ui.root.all().find((node) => node.tag === 'h2')?.textContent).toBe(title)
     expect(ui.root.all().filter((node) => node.attributes.get('aria-pressed') === 'true').map((node) => node.dataset.onboardingStep)).toEqual([String(step)])
