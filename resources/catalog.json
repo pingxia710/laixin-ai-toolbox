@@ -1,0 +1,233 @@
+{
+  "catalogVersion": "3",
+  "resources": [
+    {
+      "id": "codex-windows-official-installer",
+      "software": "Codex",
+      "platform": "windows",
+      "architecture": "x86_64",
+      "type": "external-entry",
+      "officialPageUrl": "https://get.microsoft.com/installer/download/9PLM9XGG6VKS?cid=website_cta_psi",
+      "allowedHosts": [
+        "get.microsoft.com"
+      ],
+      "version": "official-current",
+      "officialVersionLabel": "OpenAI 官方 Windows 安装助手",
+      "approval": {
+        "approvedAt": "2026-09-09T10:00:00+08:00",
+        "approvedBy": "Windows Codex 安装接入窗口",
+        "sourceBuild": "9PLM9XGG6VKS",
+        "scope": "OpenAI 官方部署文档公开的 Microsoft Web Installer 备用入口；浏览器打开仅记交接，不代表安装完成。"
+      }
+    },
+    {
+      "id": "codex-official-download",
+      "software": "Codex",
+      "platform": "macos",
+      "architecture": "arm64",
+      "type": "external-entry",
+      "officialPageUrl": "https://chatgpt.com/download/",
+      "allowedHosts": [
+        "chatgpt.com"
+      ],
+      "version": "official-current",
+      "officialVersionLabel": "OpenAI 官方 Codex 下载页",
+      "approval": {
+        "approvedAt": "2026-09-11T00:00:00+08:00",
+        "approvedBy": "来信 AI 工具箱",
+        "sourceBuild": "official-download-page",
+        "scope": "工具箱只打开 OpenAI 官方下载页，由该页面按客户系统提供当前安装包；浏览器打开不代表已经安装。"
+      }
+    },
+    {
+      "id": "claude-code-official-install",
+      "software": "claude",
+      "platform": "macos",
+      "architecture": "arm64",
+      "type": "external-entry",
+      "officialPageUrl": "https://code.claude.com/docs/zh-CN/setup",
+      "allowedHosts": [
+        "code.claude.com"
+      ],
+      "version": "official-current",
+      "officialVersionLabel": "Anthropic 官方 Claude Code 命令行版安装页（中文）",
+      "approval": {
+        "approvedAt": "2026-09-16T00:00:00+08:00",
+        "approvedBy": "来信 AI 工具箱",
+        "sourceBuild": "official-cli-setup-page-zh-cn",
+        "scope": "工具箱只打开 Anthropic 官方 Claude Code 命令行版中文安装页（不是 Claude 桌面版下载页；桌面版不能用模型 API Key），不代替客户执行命令或确认安装完成。"
+      }
+    },
+    {
+      "id": "hermes-official-download",
+      "software": "hermes",
+      "platform": "macos",
+      "architecture": "arm64",
+      "type": "external-entry",
+      "officialPageUrl": "https://hermes-agent.nousresearch.com/desktop",
+      "allowedHosts": [
+        "hermes-agent.nousresearch.com"
+      ],
+      "version": "official-current",
+      "officialVersionLabel": "Hermes 官方下载页",
+      "approval": {
+        "approvedAt": "2026-09-11T00:00:00+08:00",
+        "approvedBy": "来信 AI 工具箱",
+        "sourceBuild": "official-desktop-page",
+        "scope": "工具箱只打开 Nous Research 官方下载页，由客户选择适用的官方安装方式。"
+      }
+    },
+    {
+      "id": "deepseek-harness-official-install",
+      "software": "deepseek-harness",
+      "platform": "macos",
+      "architecture": "arm64",
+      "type": "external-entry",
+      "officialPageUrl": "https://www.deepseek.com/harness/",
+      "allowedHosts": [
+        "www.deepseek.com"
+      ],
+      "version": "official-current",
+      "officialVersionLabel": "DeepSeek Harness 官方安装页",
+      "approval": {
+        "approvedAt": "2026-09-11T00:00:00+08:00",
+        "approvedBy": "来信 AI 工具箱",
+        "sourceBuild": "official-harness-page",
+        "scope": "工具箱只打开 DeepSeek 官方 Harness 页面；该产品处于开发者预览，安装方式以官方页面当前说明为准。"
+      }
+    },
+    {
+      "id": "zcode-official-download",
+      "software": "zcode",
+      "platform": "macos",
+      "architecture": "arm64",
+      "type": "external-entry",
+      "officialPageUrl": "https://zcode.z.ai/cn/docs/install",
+      "allowedHosts": [
+        "zcode.z.ai"
+      ],
+      "version": "official-current",
+      "officialVersionLabel": "ZCode 官方下载页",
+      "approval": {
+        "approvedAt": "2026-09-11T00:00:00+08:00",
+        "approvedBy": "来信 AI 工具箱",
+        "sourceBuild": "official-install-page",
+        "scope": "工具箱只打开 ZCode 官方安装页，由该页面按客户系统提供当前安装包。"
+      }
+    },
+    {
+      "id": "kimi-code-official-install",
+      "software": "kimi-code",
+      "platform": "macos",
+      "architecture": "arm64",
+      "type": "external-entry",
+      "officialPageUrl": "https://www.kimi.com/code/docs/",
+      "allowedHosts": [
+        "www.kimi.com"
+      ],
+      "version": "official-current",
+      "officialVersionLabel": "Kimi Code 官方安装页",
+      "approval": {
+        "approvedAt": "2026-09-11T00:00:00+08:00",
+        "approvedBy": "来信 AI 工具箱",
+        "sourceBuild": "official-code-docs",
+        "scope": "工具箱只打开 Kimi 官方 Kimi Code 文档页，不代替客户执行安装命令或确认安装完成。"
+      }
+    },
+    {
+      "id": "codex-github",
+      "software": "Codex",
+      "platform": "macos",
+      "architecture": "arm64",
+      "type": "external-entry",
+      "officialPageUrl": "https://github.com/openai/codex",
+      "allowedHosts": [
+        "github.com"
+      ],
+      "version": "official-current",
+      "officialVersionLabel": "OpenAI Codex 官方 GitHub",
+      "approval": {
+        "approvedAt": "2026-09-11T00:00:00+08:00",
+        "approvedBy": "来信 AI 工具箱",
+        "sourceBuild": "openai-codex-repository",
+        "scope": "工具箱只打开 OpenAI 维护的 Codex 源码与发行说明页；不替客户挑选架构相关的 GitHub 发行包，也不代表已下载安装。"
+      }
+    },
+    {
+      "id": "claude-code-github",
+      "software": "claude",
+      "platform": "macos",
+      "architecture": "arm64",
+      "type": "external-entry",
+      "officialPageUrl": "https://github.com/anthropics/claude-code",
+      "allowedHosts": [
+        "github.com"
+      ],
+      "version": "official-current",
+      "officialVersionLabel": "Anthropic Claude Code 官方 GitHub",
+      "approval": {
+        "approvedAt": "2026-09-11T00:00:00+08:00",
+        "approvedBy": "来信 AI 工具箱",
+        "sourceBuild": "anthropics-claude-code-repository",
+        "scope": "工具箱只打开 Anthropic 维护的 Claude Code 源码与发行说明页；安装仍按官方下载页的推荐方式进行。"
+      }
+    },
+    {
+      "id": "hermes-github",
+      "software": "hermes",
+      "platform": "macos",
+      "architecture": "arm64",
+      "type": "external-entry",
+      "officialPageUrl": "https://github.com/NousResearch/hermes-agent",
+      "allowedHosts": [
+        "github.com"
+      ],
+      "version": "official-current",
+      "officialVersionLabel": "Nous Research Hermes 官方 GitHub",
+      "approval": {
+        "approvedAt": "2026-09-11T00:00:00+08:00",
+        "approvedBy": "来信 AI 工具箱",
+        "sourceBuild": "nousresearch-hermes-agent-repository",
+        "scope": "工具箱只打开 Nous Research 维护的 Hermes 源码与发行说明页；不把源码页当作受控安装包。"
+      }
+    },
+    {
+      "id": "deepseek-harness-github",
+      "software": "deepseek-harness",
+      "platform": "macos",
+      "architecture": "arm64",
+      "type": "external-entry",
+      "officialPageUrl": "https://github.com/deepseek-ai/deepseek-harness",
+      "allowedHosts": [
+        "github.com"
+      ],
+      "version": "official-current",
+      "officialVersionLabel": "DeepSeek Harness 官方 GitHub",
+      "approval": {
+        "approvedAt": "2026-09-11T00:00:00+08:00",
+        "approvedBy": "来信 AI 工具箱",
+        "sourceBuild": "deepseek-ai-deepseek-harness-repository",
+        "scope": "工具箱只打开 DeepSeek 维护的 Harness 源码与发行说明页；安装方式仍以官方安装页当前说明为准。"
+      }
+    },
+    {
+      "id": "kimi-code-github",
+      "software": "kimi-code",
+      "platform": "macos",
+      "architecture": "arm64",
+      "type": "external-entry",
+      "officialPageUrl": "https://github.com/MoonshotAI/kimi-code",
+      "allowedHosts": [
+        "github.com"
+      ],
+      "version": "official-current",
+      "officialVersionLabel": "Kimi Code 官方 GitHub",
+      "approval": {
+        "approvedAt": "2026-09-11T00:00:00+08:00",
+        "approvedBy": "来信 AI 工具箱",
+        "sourceBuild": "moonshotai-kimi-code-repository",
+        "scope": "工具箱只打开 Moonshot AI 维护的 Kimi Code 源码与发行说明页；不替客户挑选平台和架构对应的发行包。"
+      }
+    }
+  ]
+}

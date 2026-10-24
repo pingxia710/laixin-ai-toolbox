@@ -1,0 +1,211 @@
+import { describe, expect, it, vi } from 'vitest'
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile, chmod } from 'node:fs/promises'
+import { join, resolve } from 'node:path'
+import { tmpdir } from 'node:os'
+import { codexAccountKey, normalizeBuckets, maskAccount } from '../../app/main/codex-usage/normalize'
+import { readCodexUsage, readCodexUsageForAddedAccount, readCodexUsageWithFallback, UsageReadError } from '../../app/main/codex-usage/client'
+import { findCodexCommand, isCodexDesktopExecutable } from '../../app/main/codex-usage/runtime'
+import { createUsageMonitor } from '../../app/main/codex-usage/monitor'
+import { percentText, resetText, windowLabel } from '../../app/renderer/src/codex-usage/view'
+import packageInfo from '../../package.json'
+
+// 模拟带后缀工作包的运行时版本（electron-builder extraMetadata 在编译后改写成品版本）。
+vi.mock('electron', () => ({ app: { getVersion: () => '0.6.3-review.1' } }))
+
+const fixture = resolve('tests/codex-usage/fixtures/server.mjs')
+const account = { type: 'chatgpt', email: 'demo@example.test', planType: 'plus' }
+const limits = { rateLimits: { primary: { usedPercent: 27, windowDurationMins: 300, resetsAt: 2_100_000_000 } } }
+
+describe('Codex 用量口径', () => {
+  it('优先分组额度并换算剩余，缺失字段不变成零', () => {
+    const buckets = normalizeBuckets({ ...limits, rateLimitsByLimitId: {
+      codex: { primary: { usedPercent: 37.5, windowDurationMins: 300, resetsAt: 2_100_000_000 }, secondary: null },
+      model: { limitName: 'Additional', primary: { usedPercent: null }, secondary: { usedPercent: 0, windowDurationMins: 10080 } }
+    } })
+    expect(buckets).toHaveLength(2)
+    expect(buckets[0].primary?.remainingPercent).toBe(62.5)
+    expect(buckets[0].secondary).toBeNull()
+    expect(buckets[1].primary?.remainingPercent).toBeNull()
+    expect(buckets[1].secondary?.remainingPercent).toBe(100)
+    expect(windowLabel(buckets[1].secondary, 'unknown')).toBe('每周额度')
+  })
+  it('兼容旧格式，非法值未知、超过上限封顶、不猜窗口或余额', () => {
+    const [bucket] = normalizeBuckets({ rateLimits: { primary: { usedPercent: 150, windowDurationMins: 0, resetsAt: -1 }, secondary: { usedPercent: '30' }, credits: { unlimited: false, balance: 'not-a-number' } } })
+    expect(bucket.primary).toEqual({ usedPercent: 100, remainingPercent: 0, windowDurationMins: null, resetsAt: null })
+    expect(bucket.secondary?.usedPercent).toBeNull()
+    expect(bucket.credits?.balance).toBeNull()
+    expect(normalizeBuckets(null)).toEqual([])
+    expect(normalizeBuckets({ rateLimitsByLimitId: { invalid: null } })).toEqual([])
+  })
+  it('不同周期按返回值命名，到重置时间不自行声称额度已恢复', () => {
+    const window = normalizeBuckets({ rateLimits: { primary: { usedPercent: 100, windowDurationMins: 15 } } })[0].primary
+    expect(windowLabel(window, '未知')).toBe('15 分钟额度')
+    expect(resetText(1, 2_000)).toContain('等待刷新确认')
+    expect(percentText(null)).toBe('未知')
+    expect(maskAccount(account.email)).toBe('de***@example.test')
+    expect(maskAccount(null)).toBe('当前 ChatGPT 账号')
+  })
+})
+
+describe('实际子进程协议', () => {
+  it('完整初始化、读取账号与额度、再核对账号，仅允许只读方法', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'usage-protocol-'))
+    try {
+      const requests = join(directory, 'requests.jsonl')
+      const result = await readCodexUsage({ executable: process.execPath, args: [fixture] }, { cwd: directory, signal: new AbortController().signal, env: { ...process.env, USAGE_FIXTURE_REQUESTS: requests } })
+      expect(result.account.email).toBe(account.email)
+      expect(normalizeBuckets(result.limits)[0].primary?.remainingPercent).toBe(73)
+      const calls = (await readFile(requests, 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as { method: string; params?: { refreshToken: boolean } })
+      expect(calls.map((call) => call.method)).toEqual(['initialize', 'initialized', 'account/read', 'account/rateLimits/read', 'account/read'])
+      expect(calls.filter((call) => call.method === 'account/read').every((call) => call.params?.refreshToken === false)).toBe(true)
+      const initialize = calls.find((call) => call.method === 'initialize') as { params?: { clientInfo?: { version?: string } } } | undefined
+      expect(initialize?.params?.clientInfo?.version).toBe(packageInfo.version)
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  })
+
+  it('带后缀工作包上报实际运行版本，不用编译时源码版本', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'usage-runtime-version-'))
+    const versions = process.versions as { electron?: string }
+    const originalElectron = versions.electron
+    versions.electron = '33.0.0'
+    try {
+      const requests = join(directory, 'requests.jsonl')
+      await readCodexUsage({ executable: process.execPath, args: [fixture] }, { cwd: directory, signal: new AbortController().signal, env: { ...process.env, USAGE_FIXTURE_REQUESTS: requests } })
+      const calls = (await readFile(requests, 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as { method: string; params?: { clientInfo?: { version?: string } } })
+      const initialize = calls.find((call) => call.method === 'initialize')
+      expect(initialize?.params?.clientInfo?.version).toBe('0.6.3-review.1')
+    } finally {
+      if (originalElectron === undefined) delete versions.electron
+      else versions.electron = originalElectron
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+  it.each([
+    ['signed-out', 'signed-out'], ['api-key', 'unsupported'], ['changed', 'account-changed'],
+    ['failure', 'unavailable'], ['exit', 'unavailable'], ['malformed', 'unavailable'], ['oversize', 'unavailable'], ['unsupported-method', 'update-required']
+  ])('处理 %s，原始错误不外泄', async (mode, status) => {
+    await expect(readCodexUsage({ executable: process.execPath, args: [fixture, mode] }, { cwd: tmpdir(), signal: new AbortController().signal })).rejects.toEqual(new UsageReadError(status as UsageReadError['status']))
+  })
+  it('超时后回收拒绝退出的子进程', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'usage-timeout-'))
+    try {
+      const pidFile = join(directory, 'pid')
+      await expect(readCodexUsage({ executable: process.execPath, args: [fixture, 'ignore-term'] }, {
+        cwd: directory, signal: new AbortController().signal, timeoutMs: 250, env: { ...process.env, USAGE_FIXTURE_PID: pidFile }
+      })).rejects.toMatchObject({ status: 'timeout' })
+      const pid = Number(await readFile(pidFile, 'utf8'))
+      await vi.waitFor(() => expect(() => process.kill(pid, 0)).toThrow(), { timeout: 2500 })
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  })
+  it('取消与启动失败能结束请求', async () => {
+    const controller = new AbortController()
+    const pending = readCodexUsage({ executable: process.execPath, args: [fixture, 'hang'] }, { cwd: tmpdir(), signal: controller.signal })
+    controller.abort()
+    await expect(pending).rejects.toMatchObject({ status: 'unavailable' })
+    await expect(readCodexUsage({ executable: '/missing-codex', args: [] }, { cwd: tmpdir(), signal: new AbortController().signal })).rejects.toMatchObject({ status: 'unavailable' })
+  })
+})
+
+describe('候选二进制回退', () => {
+  const command = (mode?: string) => ({ executable: process.execPath, args: mode ? [fixture, mode] : [fixture] })
+  it('传输级失败依次回退，直到拿到额度', async () => {
+    const result = await readCodexUsageWithFallback([command('exit'), command('unsupported-method'), command()], { cwd: tmpdir(), signal: new AbortController().signal })
+    expect(result.account.email).toBe(account.email)
+    expect(normalizeBuckets(result.limits)[0].primary?.remainingPercent).toBe(73)
+  })
+  it('账号结论是权威答案：未登录不因换二进制重试而被盖掉', async () => {
+    await expect(readCodexUsageWithFallback([command('signed-out'), command()], { cwd: tmpdir(), signal: new AbortController().signal }))
+      .rejects.toEqual(new UsageReadError('signed-out'))
+  })
+  it('没有候选时按未安装处理', async () => {
+    await expect(readCodexUsageWithFallback([], { cwd: tmpdir(), signal: new AbortController().signal })).rejects.toEqual(new UsageReadError('not-installed'))
+  })
+  it('在案账号才放行：读到别人的账号按换号处理', async () => {
+    await expect(readCodexUsageForAddedAccount([command()], { cwd: tmpdir(), signal: new AbortController().signal, addedAccountKey: 'f'.repeat(64) }))
+      .rejects.toEqual(new UsageReadError('account-changed'))
+    const result = await readCodexUsageForAddedAccount([command()], { cwd: tmpdir(), signal: new AbortController().signal, addedAccountKey: codexAccountKey(account) })
+    expect(result.account.email).toBe(account.email)
+  })
+})
+
+describe('刷新与账号生命周期', () => {
+  it('登录不同账号后绕过旧缓存；查询过程中换号不回传其他人的额度', async () => {
+    let current = account
+    const monitor = createUsageMonitor(async () => ({ account: current, limits }))
+    await monitor.refresh(codexAccountKey(account))
+    current = { ...account, email: 'other@example.test' }
+    expect((await monitor.refresh(codexAccountKey(current))).snapshot?.accountLabel).toBe('ot***@example.test')
+    expect(await monitor.refresh(codexAccountKey(account))).toMatchObject({ status: 'account-changed', snapshot: null })
+    monitor.dispose()
+  })
+  it('并发合并、30 秒冷却，只有清洗后的额度进入界面', async () => {
+    let clock = 1_000
+    const read = vi.fn(async () => ({ account: { ...account, token: 'fixture-secret' }, limits }))
+    const monitor = createUsageMonitor(read, () => clock)
+    const [first, second] = await Promise.all([monitor.refresh(), monitor.refresh()])
+    expect(first).toEqual(second)
+    expect(read).toHaveBeenCalledTimes(1)
+    await monitor.refresh()
+    expect(read).toHaveBeenCalledTimes(1)
+    expect(JSON.stringify(first)).not.toContain('fixture-secret')
+    expect(JSON.stringify(first)).not.toContain(account.email)
+    clock += 30_001
+    await monitor.refresh()
+    expect(read).toHaveBeenCalledTimes(2)
+    monitor.dispose()
+  })
+  it('登出、失败和换号均不能沿用旧账号额度，恢复后能读新账号', async () => {
+    let clock = 0
+    const read = vi.fn().mockResolvedValueOnce({ account, limits })
+      .mockRejectedValueOnce(new UsageReadError('signed-out'))
+      .mockResolvedValueOnce({ account: { ...account, email: 'other@example.test' }, limits })
+      .mockRejectedValueOnce(new Error('fixture-secret'))
+    const monitor = createUsageMonitor(read, () => clock)
+    expect((await monitor.refresh()).status).toBe('ready')
+    clock += 30_001
+    expect(await monitor.refresh()).toMatchObject({ status: 'signed-out', snapshot: null })
+    clock += 30_001
+    expect((await monitor.refresh()).snapshot?.accountLabel).toBe('ot***@example.test')
+    clock += 30_001
+    expect(await monitor.refresh()).toMatchObject({ status: 'unavailable', snapshot: null })
+  })
+  it('退出中止请求，晚到结果不恢复缓存', async () => {
+    let done!: (data: { account: typeof account; limits: typeof limits }) => void
+    let signal!: AbortSignal
+    const monitor = createUsageMonitor((value) => { signal = value; return new Promise((resolve) => { done = resolve }) })
+    const pending = monitor.refresh()
+    monitor.dispose()
+    expect(signal.aborted).toBe(true)
+    done({ account, limits })
+    await pending
+    expect(monitor.last().snapshot).toBeNull()
+  })
+})
+
+describe('本机 Codex 发现', () => {
+  it('工作窗口只认 Desktop 应用内的受信任二进制，不把 CLI-only 安装当桌面版', () => {
+    expect(isCodexDesktopExecutable('/Applications/ChatGPT.app/Contents/Resources/codex', 'darwin')).toBe(true)
+    expect(isCodexDesktopExecutable('/Users/customer/.npm-global/lib/node_modules/@openai/codex/vendor/codex', 'darwin')).toBe(false)
+    expect(isCodexDesktopExecutable('C:\\Users\\customer\\AppData\\Local\\Programs\\Codex\\resources\\codex.exe', 'win32')).toBe(true)
+    expect(isCodexDesktopExecutable('C:\\Users\\customer\\AppData\\Roaming\\npm\\node_modules\\codex.exe', 'win32')).toBe(false)
+  })
+  it('固定 npm 全局目录中的官方原生文件可用，不通过 cmd、shell 或 PATH launcher', async () => {
+    const directory = await realpath(await mkdtemp(join(tmpdir(), 'usage-npm-')))
+    try {
+      const bin = join(directory, '.npm-global', 'lib', 'node_modules', '@openai', 'codex', 'node_modules', '@openai', 'codex-linux-x64', 'vendor', 'x86_64-unknown-linux-musl', 'bin')
+      await mkdir(bin, { recursive: true })
+      await writeFile(join(bin, 'codex'), Buffer.from('7f454c46', 'hex'))
+      expect(await findCodexCommand(directory, 'linux', { PATH: directory }, 'x64')).toEqual({ executable: join(bin, 'codex'), args: ['app-server', '--listen', 'stdio://'] })
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  })
+  it('忽略 PATH 包装器和伪造原生文件，不修改或执行其中命令', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'usage-runtime-'))
+    try {
+      await writeFile(join(directory, 'codex'), '#!/bin/sh\nexit 1\n')
+      await chmod(join(directory, 'codex'), 0o755)
+      expect(await findCodexCommand(directory, 'linux', { PATH: `.:${directory}` })).toBeNull()
+      await writeFile(join(directory, 'codex'), Buffer.from('7f454c46', 'hex'))
+      expect(await findCodexCommand(directory, 'linux', { PATH: directory })).toBeNull()
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  })
+})

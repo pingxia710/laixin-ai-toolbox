@@ -1,0 +1,6 @@
+.platform-logo { width: 20px; height: 20px; flex: 0 0 20px; object-fit: contain; border-radius: 4px; }
+[data-theme='dark'] .platform-logo-codex, [data-theme='console'] .platform-logo-codex, [data-theme='classic-dark'] .platform-logo-codex { filter: invert(1); }
+.pinned-platforms { flex-shrink: 0; }
+.more-platform-entry { width: 100%; text-align: left; }
+.more-platform-entry:hover { background: var(--surface-soft); }
+.more-platforms-list { min-height: 32px; }

@@ -1,0 +1,1073 @@
+import type { AccountDevice, AccountLogin, AccountOverview, AccountRegistration, AccountSession, AccountView, CommercialTerms, CustomerProfile, InstallationRecord, PaymentChannelName, PaymentOrderView, RecoveryResult } from '../../account-types'
+import { trialClaimedCopy } from '../../commercial-copy'
+import type { InstallationReportView } from './installation-report'
+import type { NetworkAccountAccess } from '../tunnel/account-client'
+import { NetworkAccountClient } from '../tunnel/account-client'
+import { subscriptionMessages, type SubscriptionOperation } from '../../subscription-types'
+import { sharingMessages, type SharingOperation } from '../../sharing-types'
+import { validDeviceReceipt, type DeviceFacts } from '../../customer-ops-types'
+
+type AccountRequestStage = 'prepare' | 'fetch' | 'response' | 'body' | 'http' | 'schema' | 'local'
+
+/** 登录/领取这类明确动作可以要求网络层在配置同步后立即发起首连。
+ * 后台状态刷新不传此选项，因此不会因为轮询或重开状态查询而接管用户已断开的网络。 */
+export interface NetworkAccessOptions {
+  readonly autoConnect?: boolean
+}
+
+const safeExceptionName = (error: unknown): string =>
+  error instanceof Error && ['TypeError', 'AbortError', 'TimeoutError', 'SyntaxError', 'RangeError'].includes(error.name) ? error.name : 'Other'
+
+const safeCauseCode = (error: unknown): string | undefined => {
+  const cause = error instanceof Error ? error.cause : undefined
+  const code = cause && typeof cause === 'object' && 'code' in cause ? cause.code : undefined
+  return typeof code === 'string' && [
+    'ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT',
+    'CERT_HAS_EXPIRED', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'ERR_TLS_CERT_ALTNAME_INVALID'
+  ].includes(code) ? code : undefined
+}
+
+export class AccountClientError extends Error {
+  constructor(code: string, readonly detail?: string, readonly httpStatus?: number, readonly serverCode?: string,
+    readonly requestStage?: AccountRequestStage, readonly exception?: string, readonly causeCode?: string) { super(code) }
+}
+export interface SessionStore {
+  deviceId?(): Promise<string>
+  read(): Promise<AccountSession | null>
+  write(session: AccountSession | null): Promise<void>
+  /** 损坏隔离后的一次性提示;无提示返回 undefined(与 read 的 null 配套)。 */
+  consumeCorruptionNote?: () => string | undefined
+}
+export const accountMessages: Record<string, string> = {
+  ...subscriptionMessages,
+  ...sharingMessages,
+  ACCOUNT_NOT_CONFIGURED: '账号服务尚未连接，请联系来信客服。',
+  ACCOUNT_LOGIN_REQUIRED: '请先登录来信账号。',
+  ACCOUNT_LOGIN_FAILED: '账号或密码不正确。',
+  ACCOUNT_ALREADY_EXISTS: '这个账号已注册，请登录或换一个账号。',
+  ACCOUNT_USERNAME_INVALID: '请填写账号名。',
+  ACCOUNT_PASSWORD_INVALID: '请填写密码。',
+  ACCOUNT_PASSWORD_INCORRECT: '当前密码不正确。',
+  ACCOUNT_RECOVERY_FAILED: '账号或恢复码不正确，或恢复码已经失效。',
+  ACCOUNT_RATE_LIMITED: '操作过于频繁，请稍后再试。',
+  ACCOUNT_SERVICE_UNAVAILABLE: '暂时无法连接账号服务，请稍后重试。',
+  ACCOUNT_RESPONSE_INVALID: '暂时无法确认账号状态，请稍后重试。',
+  ACCOUNT_REQUEST_INVALID: '账号服务暂不支持这项操作，请更新后重试。',
+  ACCOUNT_STORAGE_UNAVAILABLE: '本机无法安全保存登录状态，请稍后重试。',
+  WECHAT_LOGIN_NOT_CONFIGURED: '微信登录尚未配置，请联系来信客服。',
+  WECHAT_LOGIN_INVALID: '微信验证已失效，请重新开始。',
+  WECHAT_LOGIN_EXPIRED: '微信验证已过期，请重新开始。',
+  WECHAT_LOGIN_REJECTED: '微信未完成授权，请重试。',
+  WECHAT_LOGIN_UNAVAILABLE: '暂时无法连接微信登录服务，请稍后重试。',
+  WECHAT_LOGIN_OPEN_FAILED: '无法打开微信登录页面，请稍后重试。',
+  WECHAT_LOGIN_TIMEOUT: '等待微信授权超时，请重试。',
+  WECHAT_LOGIN_CANCELLED: '本次微信验证已取消，可重新发起。',
+  WECHAT_ACCOUNT_UNBOUND: '请在打开的网页中登录或注册来信账号，完成微信绑定。',
+  WECHAT_ALREADY_BOUND: '这个微信已绑定其他来信账号，请使用原账号登录。',
+  WECHAT_ACCOUNT_BOUND: '当前来信账号已绑定其他微信，请联系来信客服核对。',
+  ACCOUNT_BUSY: '正在处理账号操作，请稍候。',
+  NETWORK_NOT_CONFIGURED: '网络开通服务暂未开放。',
+  NETWORK_PROVISIONING_UNAVAILABLE: '网络开通服务暂时不可用，请稍后重试；持续失败请联系客服。',
+  APPLICATION_ALREADY_EXISTS: '已有网络套餐，请刷新查看当前套餐后重试。',
+  ALLOCATION_BUSY: '开通服务正在处理其他申请，请稍后重试。',
+  ACCOUNT_LOGOUT_PENDING: '网络暂不可用，尚未完成退出，请恢复连接后重试。',
+  PAYMENT_NOT_CONFIGURED: '在线支付暂时无法使用，请稍后重试或联系来信客服。',
+  PAYMENT_ALREADY_PAID: '原订单已付款，已保留原套餐。请查看当前套餐，无需重复购买。',
+  PAYMENT_CHANNEL_UNREADY: '该支付渠道暂未就绪，请换一种支付方式。',
+  PAYMENT_ORDER_NOT_FOUND: '订单不存在或已失效。',
+  PAYMENT_ORDER_BUSY: '正在处理支付，请稍候。',
+  PAYMENT_TERMS_CHANGED: '本次购买的套餐、价格或支付方式未能核对一致，未展示付款入口。请刷新权益并核对已有订单；再次出现，请联系客服。',
+  PLAN_INVALID: '套餐不存在或已下架。',
+  ACCOUNT_SESSION_NOT_FOUND: '这次登录已退出，请刷新设备列表。',
+  ACCOUNT_CLOSE_PENDING: '账号还有未完成订单或仍有效的网络，请先处理或到期后再注销。',
+  TOOLBOX_PAYMENT_CONFLICT: '该笔购买已确认，请刷新查看原收款记录。',
+  TOOLBOX_ALREADY_OWNED: '此账号已购买工具箱，无需重复付款。',
+  PAYMENT_CHANNEL_CONFLICT: '已有待付订单，请先取消原订单，再选择其他支付方式。',
+  PAYMENT_PLAN_CONFLICT: '已有待付套餐，请先取消原订单，再换套餐。',
+  PAYMENT_CANCEL_PENDING: '正在等待支付渠道确认取消结果。请稍后重试，确认关闭后即可更换套餐或支付方式。',
+  PAYMENT_ORDER_REFUNDED: '此订单有退款记录，请查看原订单或联系售后。',
+  TOOLBOX_RECEIPT_USED: '这笔收款已关联其他账号，请核对原购买账号。',
+  INVITE_CODE_INVALID: '邀请码无效，请核对后重试；不需要邀请码可清空后直接注册。',
+  INVITE_REWARD_LIMIT: '该邀请码的本月邀请奖励已达上限，暂时无法使用；可清空邀请码直接注册。',
+  INVITE_REWARD_RECORD_LIMIT: '该邀请码的邀请记录已达安全上限，请联系客服处理；也可清空邀请码直接注册。'
+}
+const canonicalAccountOrigin = 'https://laixin.work/'
+/** catalog/订单列表类端点（1MB 响应上限）在慢链路（≈1Mbps）合法需要超过 12s 才能收完；其余端点维持 12s。 */
+const catalogTimeoutMs = 25_000
+const migratedAccountOrigins = new Set(['https://laixin.net.cn/', 'https://laixin.net.cn/AI-tools/'])
+const signedOut = (code = '', message = ''): AccountView => ({ state: 'signed-out', account: null, code, message, overview: null })
+
+export function validSession(value: unknown): value is AccountSession {
+  const s = value as AccountSession | null
+  return Boolean(s && typeof s === 'object' && s.account && /^acct_[a-f0-9]{32}$/.test(s.account.id) &&
+    typeof s.account.username === 'string' && s.account.username.length > 0 &&
+    typeof s.accessToken === 'string' && /^[A-Za-z0-9_-]{43}$/.test(s.accessToken) && Number.isSafeInteger(s.expiresAt))
+}
+
+export class AccountClient {
+  private session: AccountSession | null = null
+  private restored = false
+  private busy = false
+  private wechatAttempt?: { attemptId: string; pollToken: string }
+  private wechatCancelled = false
+  private wechatStarting = false
+  private statusRequest?: Promise<AccountView>
+  private statusController?: AbortController
+  private networkRefresh?: { token: string; pending: Promise<void> }
+  private boundDevice?: { token: string; id: string }
+  private deviceBinding?: { token: string; id: string; pending: Promise<void> }
+  private controller = new AbortController()
+  private readonly base: URL | null
+  private view: AccountView = signedOut()
+  private readonly installationStates = new Map<string, { token: string; state: 'syncing' | 'synced' | 'failed'; version: number }>()
+  private installationWrites: Promise<void> = Promise.resolve()
+  private deviceReport: { token: string; state: 'syncing' | 'synced' | 'failed'; at: number; receipt?: string } | undefined
+  private terms?: CommercialTerms
+  private termsFailedAt = 0
+  private readonly device: AccountDevice = process.platform === 'darwin' ? 'macos' : process.platform === 'win32' ? 'windows' : process.platform === 'linux' ? 'linux' : 'unknown'
+  constructor(origin: string, private readonly store: SessionStore,
+    private readonly setNetwork: (access: NetworkAccountAccess | undefined, reason?: 'temporary-unavailable' | 'login-expired', options?: NetworkAccessOptions) => Promise<unknown>,
+    private readonly collectDevice?: () => Promise<DeviceFacts>,
+    private readonly openExternal: (url: string) => Promise<void> = async () => { throw new AccountClientError('WECHAT_LOGIN_OPEN_FAILED') },
+    private readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    private readonly logFailure?: (event: string, detail: string) => void) {
+    this.base = origin ? new URL(origin) : null
+    // 允许挂在单个路径前缀下；当前正式账号服务使用 https://laixin.work/。
+    const basePathOk = this.base !== null && (this.base.pathname === '/' || /^\/[A-Za-z0-9_-]+\/$/.test(this.base.pathname))
+    if (this.base && (!basePathOk ||
+      (this.base.protocol !== 'https:' && !(this.base.protocol === 'http:' && ['127.0.0.1', '[::1]'].includes(this.base.hostname))) ||
+      this.base.username || this.base.password || this.base.hash || this.base.search)) throw new AccountClientError('ACCOUNT_NOT_CONFIGURED')
+  }
+
+  /** 相对解析：'/v1/x' 归一成 'v1/x'，保住自定义基础路径前缀。 */
+  private resolve(path: string): URL {
+    return new URL(path.replace(/^\/+/, ''), this.base!)
+  }
+
+  private async transientRead<T>(read: () => Promise<T>, cancelled: () => boolean,
+    retryCodes: readonly string[] = ['ACCOUNT_SERVICE_UNAVAILABLE']): Promise<T> {
+    const retryDelays = [250, 750]
+    for (let attempt = 0; ; attempt += 1) {
+      try { return await read() }
+      catch (error) {
+        const retryable = error instanceof AccountClientError && retryCodes.includes(error.message) &&
+          (error.httpStatus === undefined || error.httpStatus >= 500)
+        if (!retryable || attempt >= retryDelays.length || cancelled() || this.controller.signal.aborted) throw error
+        await this.sleep(retryDelays[attempt])
+        if (cancelled() || this.controller.signal.aborted) throw error
+      }
+    }
+  }
+
+  private async request(path: string, body?: unknown, token?: string, maxBytes = 128 * 1024, signal?: AbortSignal,
+    onResponse?: (status: number) => void, timeoutMs = 12_000): Promise<unknown> {
+    if (!this.base) throw new AccountClientError('ACCOUNT_NOT_CONFIGURED')
+    let stage: AccountRequestStage = 'prepare'
+    let httpStatus: number | undefined
+    try {
+      const url = this.resolve(path)
+      const requestSignal = AbortSignal.any([this.controller.signal, AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : [])])
+      stage = 'fetch'
+      const response = await fetch(url, {
+        method: body === undefined ? 'GET' : 'POST', redirect: 'error', cache: 'no-store',
+        signal: requestSignal,
+        headers: { Accept: 'application/json', ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+          ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) })
+      })
+      httpStatus = response.status
+      onResponse?.(response.status)
+      stage = response.ok ? 'response' : 'http'
+      if (response.status >= 500) {
+        let serverCode: string | undefined
+        if (response.headers.get('content-type')?.split(';')[0] === 'application/json' && response.body) {
+          const reader = response.body.getReader(); const chunks: Uint8Array[] = []; let size = 0
+          try {
+            while (size <= 2048) {
+              const { done, value } = await reader.read(); if (done) break
+              size += value.length; if (size <= 2048) chunks.push(value)
+            }
+            if (size <= 2048) {
+              const data = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { code?: unknown }
+              if (typeof data?.code === 'string' && /^[A-Z][A-Z0-9_]{1,79}$/.test(data.code)) serverCode = data.code
+            }
+          } catch { /* An invalid error body cannot hide the HTTP status. */ }
+          finally { await reader.cancel().catch(() => undefined); reader.releaseLock() }
+        } else await response.body?.cancel()
+        const code = serverCode && Object.hasOwn(accountMessages, serverCode) ? serverCode : 'ACCOUNT_SERVICE_UNAVAILABLE'
+        throw new AccountClientError(code, undefined, response.status, serverCode)
+      }
+      if (!response.body || response.headers.get('content-type')?.split(';')[0] !== 'application/json') {
+        await response.body?.cancel(); throw new AccountClientError([401, 403].includes(response.status) ? 'ACCOUNT_LOGIN_REQUIRED' : 'ACCOUNT_RESPONSE_INVALID', undefined, response.status)
+      }
+      const reader = response.body.getReader(); const chunks: Uint8Array[] = []; let size = 0
+      if (response.ok) stage = 'body'
+      try {
+        while (true) {
+          const { done, value } = await reader.read(); if (done) break
+          size += value.length
+          if (size > maxBytes) { await reader.cancel(); throw new AccountClientError('ACCOUNT_RESPONSE_INVALID') }
+          chunks.push(value)
+        }
+      } finally { reader.releaseLock() }
+      let data: unknown
+      try { data = JSON.parse(Buffer.concat(chunks).toString('utf8')) } catch { throw new AccountClientError('ACCOUNT_RESPONSE_INVALID') }
+      if (!response.ok) {
+        const code = data && typeof data === 'object' && 'code' in data ? String(data.code) : ''
+        throw new AccountClientError(Object.hasOwn(accountMessages, code) ? code : [401, 403].includes(response.status) ? 'ACCOUNT_LOGIN_REQUIRED' : 'ACCOUNT_SERVICE_UNAVAILABLE',
+          undefined, response.status, /^[A-Z][A-Z0-9_]{1,79}$/.test(code) ? code : undefined)
+      }
+      return data
+    } catch (error) {
+      // stage/exception/causeCode 对全部端点富化:登录/支付等失败与 overview 一样需要机器可读归因(支持包按行检索)。
+      const failure = error instanceof AccountClientError
+        ? new AccountClientError(error.message, error.detail, error.httpStatus ?? httpStatus, error.serverCode,
+          error.requestStage ?? stage, error.exception, error.causeCode)
+        : new AccountClientError('ACCOUNT_SERVICE_UNAVAILABLE', undefined, httpStatus, undefined,
+          stage, safeExceptionName(error), safeCauseCode(error))
+      // 写操作的网络层失败(未到达业务语义)留痕一次;⛔ 记录请求体或异常原文(可能含凭据)。
+      if (body !== undefined && failure.message === 'ACCOUNT_SERVICE_UNAVAILABLE' &&
+        (['prepare', 'fetch', 'response', 'body'].includes(failure.requestStage ?? '') ||
+          (failure.requestStage === 'http' && (failure.httpStatus ?? 0) >= 500))) {
+        try {
+          this.logFailure?.('account-request-failed', JSON.stringify({ path, code: failure.message, stage: failure.requestStage ?? null,
+            status: failure.httpStatus ?? null, serverCode: failure.serverCode ?? null,
+            exception: failure.exception ?? null, causeCode: failure.causeCode ?? null }))
+        } catch { /* 诊断旁路 ⛔ 挡请求主流程 */ }
+      }
+      throw failure
+    }
+  }
+
+  private async run(action: () => Promise<AccountView>, refreshing = false): Promise<AccountView> {
+    if (!refreshing && this.statusRequest) {
+      // A user operation supersedes a background read; never merge writes into it.
+      this.statusController?.abort()
+      await this.statusRequest
+    }
+    if (this.busy) return { ...this.view, code: 'ACCOUNT_BUSY', message: accountMessages.ACCOUNT_BUSY }
+    this.busy = true
+    try {
+      this.view = this.withTerms(await action())
+      return this.view
+    }
+    catch (error) {
+      const code = error instanceof AccountClientError ? error.message : 'ACCOUNT_SERVICE_UNAVAILABLE'
+      if (code === 'PAYMENT_TERMS_CHANGED' || code === 'PLAN_INVALID') {
+        this.terms = undefined; this.termsFailedAt = 0
+        this.view = { ...this.view, overview: null, terms: null }
+      }
+      if (code === 'ACCOUNT_LOGIN_REQUIRED') {
+        // 登录过期 ≠ 用户退出:通道按本地配置有效期继续,只是之后领新配置要先登录。
+        await this.setNetwork(undefined, 'login-expired')
+        this.session = null
+        try { await this.store.write(null) } catch {
+          return this.view = signedOut('ACCOUNT_STORAGE_UNAVAILABLE', '登录已失效，本机记录未能清理，请重试。')
+        }
+        this.view = signedOut()
+      }
+      const detail = error instanceof AccountClientError && error.detail ? error.detail : undefined
+      return this.view = { ...this.view, code, message: detail ?? accountMessages[code] ?? accountMessages.ACCOUNT_SERVICE_UNAVAILABLE }
+    } finally { this.busy = false }
+  }
+
+  snapshot(): AccountView { return this.view }
+
+  /** 后台商业参数(价格/体验额度/设备上限):尽力拉取并缓存;失败十分钟内不重试,期间用通用文案。 */
+  private async ensureTerms(signal?: AbortSignal): Promise<void> {
+    if (this.terms || Date.now() < this.termsFailedAt + 10 * 60_000) return
+    try {
+      const data = await this.request('/v1/account/plans', undefined, undefined, undefined, signal)
+      this.terms = readTerms(data)
+    } catch { this.termsFailedAt = Date.now() }
+  }
+
+  private withTerms(view: AccountView): AccountView {
+    return { ...view, terms: this.terms ?? null }
+  }
+
+  status(): Promise<AccountView> {
+    if (this.statusRequest) return this.statusRequest
+    const controller = new AbortController()
+    this.statusController = controller
+    const pending = this.run(() => this.readStatus(controller.signal), true).finally(() => {
+      if (this.statusRequest === pending) { this.statusRequest = undefined; this.statusController = undefined }
+    })
+    this.statusRequest = pending
+    return pending
+  }
+
+  private async readStatus(signal: AbortSignal): Promise<AccountView> {
+    const current = () => { if (signal.aborted || this.controller.signal.aborted) throw new AccountClientError('ACCOUNT_BUSY') }
+
+    if (!this.base) return signedOut('ACCOUNT_NOT_CONFIGURED', accountMessages.ACCOUNT_NOT_CONFIGURED)
+    if (!this.restored) {
+      try {
+        const saved = await this.store.read() as (AccountSession & { serviceOrigin?: string }) | null
+        // 地址对不上要分两种,⛔ 一律当作废:
+        //  · 同一个服务、只是记录格式旧了(0.4.x 记 origin,0.5.x 起记含路径的 href)——这条记录永远对不上,
+        //    清掉当未登录、客户重登一次即可。⛔ 抛 ACCOUNT_STORAGE_UNAVAILABLE:它显示成「本机无法安全保存
+        //    登录状态，请稍后重试」,既指错方向(钥匙串与本机存储都好着),又给假希望(等多久都不会好)。
+        //    2026-09-16 在创始人机器上实证过这一卡死。
+        //  · 真换了服务地址(origin 都不同)——保持原样报存储不可用且 ⛔ 删记录:客户端在配错的地址下启动过
+        //    一次就把人家登录态清掉,配置改回来还得重登。安全要求(⛔ 把旧凭据发给新地址)由 session=null 保证,
+        //    ⛔ 靠删文件。tests/account/account.test.ts「更换服务地址不发送旧凭据」钉的就是这一条。
+        // write(null) 只删文件、⛔ 碰钥匙串,所以钥匙串真坏时它照样清得掉;read()/write() 里的
+        // available() 仍会如实报存储不可用,真故障不会被吞成未登录。
+        const mismatched = saved !== null && saved.serviceOrigin !== this.base.href
+        const sameService = (): boolean => {
+          if (saved?.serviceOrigin === undefined) return false
+          try { return new URL(saved.serviceOrigin).origin === this.base!.origin } catch { return false }
+        }
+        const migratedService = (): boolean => {
+          if (this.base!.href !== canonicalAccountOrigin || saved?.serviceOrigin === undefined) return false
+          try { return migratedAccountOrigins.has(new URL(saved.serviceOrigin).href) } catch { return false }
+        }
+        if (mismatched && migratedService()) {
+          // 域名迁移是已知的服务替换：不把旧 token 发给新域名，清掉旧会话并明确要求重登。
+          // 其他未知地址仍走下面的 ACCOUNT_STORAGE_UNAVAILABLE，避免把安全边界变成“一律清会话”。
+          await this.store.write(null)
+          current(); this.session = null; this.restored = true
+          return this.withTerms(signedOut('ACCOUNT_LOGIN_REQUIRED', '来信服务地址已更新，请重新登录。'))
+        }
+        if (mismatched && !sameService()) throw new AccountClientError('ACCOUNT_STORAGE_UNAVAILABLE')
+        if (mismatched) await this.store.write(null)
+        current(); this.session = mismatched ? null : saved; this.restored = true
+      }
+      catch { throw new AccountClientError('ACCOUNT_STORAGE_UNAVAILABLE') }
+    }
+    if (!this.session) {
+      await this.ensureTerms(signal)
+      const note = this.store.consumeCorruptionNote?.()
+      if (note) return this.withTerms(signedOut('ACCOUNT_STORAGE_CORRUPT', note))
+      return this.withTerms(signedOut())
+    }
+    try {
+      const data = await this.transientRead(
+        () => this.request('/v1/account/session', undefined, this.session!.accessToken, undefined, signal) as Promise<Omit<AccountSession, 'accessToken'>>,
+        () => signal.aborted)
+      current()
+      if (!validSession({ ...data, accessToken: this.session.accessToken }) || data.account.id !== this.session.account.id) throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
+      this.session = { ...data, accessToken: this.session.accessToken }
+      const boundId = await this.bindDevice(this.session, signal)
+      current()
+      // bindDevice 内部已读过一次 store；仅当它返回空（未生成/未确认）才回落再读，⛔ 同一轮双读。
+      const deviceId = boundId ?? await this.store.deviceId?.()
+      current()
+      // 商业参数串行预取:⛔ 与通道同步请求并发,避免扰动后台按客户的用量串行化。
+      await this.ensureTerms(signal)
+      this.refreshNetwork({ client: new NetworkAccountClient(new URL('v1/network/', this.base).href),
+        session: { accountId: this.session.account.id, accessToken: this.session.accessToken, deviceId } })
+      const overview = await this.overview(signal)
+      current()
+      return overview
+    } catch (error) {
+      if (signal.aborted || this.controller.signal.aborted) return this.view
+      const loginExpired = error instanceof AccountClientError && error.message === 'ACCOUNT_LOGIN_REQUIRED'
+      // 后台打不通、回包无效、本机存储忙……都是「暂时问不到」,⛔ 按退出账号处理(那会把客户正在用的网拆掉)。
+      if (loginExpired) await this.setNetwork(undefined, 'login-expired')
+      else await this.setNetwork(undefined, 'temporary-unavailable')
+      if (loginExpired) {
+        await this.store.write(null); this.session = null
+        return signedOut('ACCOUNT_LOGIN_REQUIRED', '登录已失效，请重新登录。')
+      }
+      this.view = { state: 'unavailable', account: null, code: 'ACCOUNT_SERVICE_UNAVAILABLE', message: '暂时无法确认登录状态，网络页会显示连接是否仍在授权期限内。', overview: null }
+      throw error
+    }
+  }
+
+  private refreshNetwork(access: NetworkAccountAccess): void {
+    const token = access.session.accessToken
+    if (this.networkRefresh?.token === token) return
+    // TunnelService owns connection state and cancels obsolete sessions. A slow
+    // network refresh must not hold confirmed account facts or queue duplicates.
+    const pending = (async () => {
+      try { await this.setNetwork(access) }
+      catch (error) {
+        if (this.session?.accessToken !== token || this.controller.signal.aborted) return
+        try { this.logFailure?.('account-network-sync-failed', safeExceptionName(error)) }
+        catch { /* Logging cannot replace the confirmed account view. */ }
+      }
+    })().finally(() => { if (this.networkRefresh?.pending === pending) this.networkRefresh = undefined })
+    this.networkRefresh = { token, pending }
+  }
+
+  authenticate(mode: 'register' | 'login', username: string, password: string, onRecovery: (code: string) => void = () => undefined,
+    inviteCode?: string): Promise<AccountView> { return this.run(async () => {
+    if (this.session) throw new AccountClientError('ACCOUNT_BUSY')
+    // 邀请码仅在注册时提交；归一化交给后台，这里只截断明显的粘贴噪声。
+    const normalizedInvite = mode === 'register' && typeof inviteCode === 'string' && inviteCode.trim() ? inviteCode.trim().toUpperCase() : undefined
+    let data: unknown
+    let droppedInvite = false
+    const payload = (base: Record<string, unknown>) => normalizedInvite ? { ...base, inviteCode: normalizedInvite } : base
+    try { data = await this.request(`/v1/account/${mode}`, payload({ username, password, device: this.device, deviceId: await this.store.deviceId?.() })) }
+    catch (error) {
+      // Older deployed servers reject unknown fields before creating an account/session.
+      if (!(error instanceof AccountClientError) || error.message !== 'ACCOUNT_REQUEST_INVALID') throw error
+      try { data = await this.request(`/v1/account/${mode}`, payload({ username, password })) }
+      catch (fallbackError) {
+        // 旧后台不认识邀请码字段：不带码完成注册，但如实告知没有奖励，⛔ 静默假装有。
+        if (!(fallbackError instanceof AccountClientError) || fallbackError.message !== 'ACCOUNT_REQUEST_INVALID' || !normalizedInvite) throw fallbackError
+        droppedInvite = true
+        data = await this.request(`/v1/account/${mode}`, { username, password })
+      }
+    }
+    if (!validSession(data) || data.expiresAt <= Date.now()) throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
+    if (mode === 'register' && !validRecovery((data as AccountRegistration).recoveryCode)) throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
+    // Explicit projection: the one-time recovery code must never enter the session store.
+    const session = { account: data.account, accessToken: data.accessToken, expiresAt: data.expiresAt }
+    const saved = { ...session, serviceOrigin: this.base!.href }
+    try { await this.store.write(saved) } catch {
+      // Do not leave an undisclosed newly issued server session after local storage fails.
+      await this.request('/v1/account/logout', {}, data.accessToken)
+      throw new AccountClientError('ACCOUNT_STORAGE_UNAVAILABLE')
+    }
+    this.session = session; this.restored = true
+    if (mode === 'register') onRecovery((data as AccountRegistration).recoveryCode)
+    this.view = { state: 'signed-in', account: data.account, code: '', message: '已登录', overview: null }
+    await this.ensureTerms()
+    await this.setNetwork({ client: new NetworkAccountClient(new URL('v1/network/', this.base!).href),
+      session: { accountId: data.account.id, accessToken: data.accessToken, deviceId: await this.store.deviceId?.() } }, undefined, { autoConnect: true })
+    const view = await this.overview()
+    return droppedInvite ? { ...view, message: '已登录。当前账号服务版本暂不支持邀请码，本次注册未获得邀请奖励。' } : view
+  }) }
+
+  async cancelWechatLogin(): Promise<boolean> {
+    const attempt = this.wechatAttempt
+    if (!attempt) {
+      if (this.wechatStarting) { this.wechatCancelled = true; return true }
+      return false
+    }
+    try {
+      const result = await this.request('/v1/account/wechat/cancel-attempt', attempt) as { cancelled?: unknown }
+      if (result.cancelled === true) { this.wechatCancelled = true; return true }
+    } catch { /* The pending poll will report its own failure or timeout. */ }
+    return false
+  }
+
+  wechatLogin(mode: 'login' | 'bind' = 'login', onRecovery: (code: string) => void = () => undefined,
+    present: (url: string) => Promise<void> = this.openExternal): Promise<AccountView> { return this.run(async () => {
+    if ((mode === 'bind') !== Boolean(this.session)) throw new AccountClientError('ACCOUNT_LOGIN_REQUIRED')
+    this.wechatCancelled = false
+    this.wechatStarting = true
+    let deviceId: string | undefined
+    let started: Record<string, unknown>
+    try {
+      deviceId = await this.store.deviceId?.()
+      started = await this.request('/v1/account/wechat/start',
+        { device: this.device, ...(deviceId ? { deviceId } : {}), mode },
+        mode === 'bind' ? this.session!.accessToken : undefined) as Record<string, unknown>
+    } finally { this.wechatStarting = false }
+    if (typeof started.attemptId !== 'string' || !/^[A-Za-z0-9_-]{20,64}$/.test(started.attemptId) ||
+        typeof started.pollToken !== 'string' || !/^[A-Za-z0-9_-]{32,64}$/.test(started.pollToken) ||
+        typeof started.authorizeUrl !== 'string' || typeof started.expiresAt !== 'number' ||
+        !Number.isSafeInteger(started.expiresAt) || started.expiresAt <= Date.now()) throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
+    let authorize: URL
+    try { authorize = new URL(started.authorizeUrl) } catch { throw new AccountClientError('ACCOUNT_RESPONSE_INVALID') }
+    const query = authorize.searchParams
+    const expected = ['appid', 'redirect_uri', 'response_type', 'scope', 'state']
+    if (!started.authorizeUrl.startsWith('https://open.weixin.qq.com/connect/qrconnect?') ||
+        authorize.protocol !== 'https:' || authorize.hostname !== 'open.weixin.qq.com' || authorize.port || authorize.username ||
+        authorize.password || authorize.pathname !== '/connect/qrconnect' || authorize.hash !== '#wechat_redirect' ||
+        [...query.keys()].length !== expected.length || expected.some((key) => query.getAll(key).length !== 1) ||
+        [...query.keys()].some((key) => !expected.includes(key)) || !/^wx[A-Za-z0-9]{6,64}$/.test(query.get('appid') ?? '') ||
+        query.get('redirect_uri') !== this.resolve('/v1/account/wechat/callback').href ||
+        query.get('response_type') !== 'code' || query.get('scope') !== 'snsapi_login' ||
+        !/^[A-Za-z0-9_-]{20,64}$/.test(query.get('state') ?? '')) throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
+    this.wechatAttempt = { attemptId: started.attemptId, pollToken: started.pollToken }
+    let result: Record<string, unknown> | undefined
+    try {
+      if (this.wechatCancelled) throw new AccountClientError('WECHAT_LOGIN_CANCELLED')
+      try { await present(authorize.href) } catch { throw new AccountClientError('WECHAT_LOGIN_OPEN_FAILED') }
+      while (Date.now() < Number(started.expiresAt)) {
+        if (this.wechatCancelled) throw new AccountClientError('WECHAT_LOGIN_CANCELLED')
+        try {
+          result = await this.transientRead(
+            () => this.request('/v1/account/wechat/poll', this.wechatAttempt) as Promise<Record<string, unknown>>,
+            () => this.wechatCancelled,
+            ['ACCOUNT_SERVICE_UNAVAILABLE', 'WECHAT_LOGIN_UNAVAILABLE'])
+        }
+        catch (error) { if (this.wechatCancelled) throw new AccountClientError('WECHAT_LOGIN_CANCELLED'); throw error }
+        if (result.status === 'pending' || result.status === 'awaiting_account') { await this.sleep(1000); continue }
+        if (result.status === 'failed' && typeof result.code === 'string') throw new AccountClientError(result.code)
+        break
+      }
+    } finally {
+      if (!result || ['pending', 'awaiting_account'].includes(String(result.status))) {
+        try { await this.request('/v1/account/wechat/cancel-attempt', this.wechatAttempt) } catch { /* Attempt expires on server. */ }
+      }
+      this.wechatAttempt = undefined
+    }
+    if (mode === 'bind') {
+      if (result?.status !== 'bound') throw new AccountClientError('WECHAT_LOGIN_TIMEOUT')
+      return { ...(await this.overview()), message: '微信已绑定到当前来信账号。' }
+    }
+    if (!result || !['complete', 'registered'].includes(String(result.status)) || !result.session || typeof result.session !== 'object') throw new AccountClientError('WECHAT_LOGIN_TIMEOUT')
+    const data = result.session as AccountSession
+    if (!validSession(data) || data.expiresAt <= Date.now()) throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
+    if (result.status === 'registered') {
+      const code = (result.session as AccountRegistration).recoveryCode
+      if (!validRecovery(code)) throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
+      onRecovery(code)
+    }
+    const session = { account: data.account, accessToken: data.accessToken, expiresAt: data.expiresAt }
+    const saved = { ...session, serviceOrigin: this.base!.href }
+    try { await this.store.write(saved) } catch {
+      try { await this.request('/v1/account/logout', {}, data.accessToken) } catch { /* Preserve storage failure. */ }
+      throw new AccountClientError('ACCOUNT_STORAGE_UNAVAILABLE')
+    }
+    this.session = session; this.restored = true
+    this.view = { state: 'signed-in', account: data.account, code: '', message: '已登录', overview: null }
+    await this.ensureTerms()
+    await this.setNetwork({ client: new NetworkAccountClient(new URL('v1/network/', this.base!).href),
+      session: { accountId: data.account.id, accessToken: data.accessToken, deviceId } }, undefined, { autoConnect: true })
+    return this.overview()
+  }) }
+
+  private async overview(signal?: AbortSignal): Promise<AccountView> {
+    if (!this.session) return signedOut()
+    const view: AccountView = { state: 'signed-in', account: this.session.account, code: '', message: '', overview: null }
+    let responseStatus: number | undefined
+    try {
+      let data: AccountOverview | undefined
+      const retryDelays = [250, 750]
+      for (let attempt = 0; data === undefined; attempt += 1) {
+        try {
+          responseStatus = undefined
+          data = await this.request('/v1/account/overview', undefined, this.session.accessToken, undefined, signal,
+            (status) => { responseStatus = status }) as AccountOverview
+        } catch (error) {
+          const retryable = error instanceof AccountClientError && (error.message === 'PAYMENT_ORDER_BUSY' ||
+            (error.message === 'ACCOUNT_SERVICE_UNAVAILABLE' && (['fetch', 'response', 'body'].includes(error.requestStage ?? '') ||
+              (error.requestStage === 'http' && (error.httpStatus ?? 0) >= 500))))
+          if (!retryable || attempt >= retryDelays.length || signal?.aborted || this.controller.signal.aborted) throw error
+          await this.sleep(retryDelays[attempt])
+        }
+      }
+      if (!data || !Array.isArray(data.plans) || typeof data.networkAvailable !== 'boolean' || !data.trial ||
+          typeof data.recoveryReady !== 'boolean' || typeof data.trial.available !== 'boolean' ||
+          (data.wechatBound !== undefined && typeof data.wechatBound !== 'boolean') ||
+          (data.passwordReady !== undefined && typeof data.passwordReady !== 'boolean') ||
+          (data.trial.usage !== null && (!validUsage(data.trial.usage) || data.trial.usage.kind !== 'trial')) ||
+          (data.subscription !== null && (!validUsage(data.subscription) || data.subscription.kind !== 'subscription')) ||
+          (data.subscriptions !== undefined && (!Array.isArray(data.subscriptions) || data.subscriptions.some((item) =>
+            !validUsage(item) || item.kind !== 'subscription'))) ||
+          (data.pendingSubscription !== undefined && data.pendingSubscription !== null &&
+            (!/^lx-[a-f0-9]{32}$/.test(data.pendingSubscription.id) || typeof data.pendingSubscription.planId !== 'string')) ||
+          (data.queuedSubscriptions !== undefined && (!Array.isArray(data.queuedSubscriptions) || data.queuedSubscriptions.some((item) =>
+            !item || !/^lx-[a-f0-9]{32}$/.test(item.id) || typeof item.planId !== 'string'))) ||
+          !Array.isArray(data.paymentChannels) || !data.paymentChannels.every((name) => ['alipay', 'wechat'].includes(name))) throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
+      // 邀请块可选（旧版后台不下发时界面不渲染邀请卡）。邀请码由客户手动填入注册页；
+      // 账号服务本身没有客户注册链接，不能把后台地址伪装成带码链接。
+      if (data.invite !== undefined) {
+        if (!validInvite(data.invite)) throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
+      }
+      const profile = data.profile === undefined ? undefined : readProfile(data.profile, this.session.account.id, this.terms)
+      return { ...view, overview: { ...data, profile } }
+    } catch (error) {
+      if (error instanceof AccountClientError && error.message === 'ACCOUNT_LOGIN_REQUIRED') throw error
+      const failure = error instanceof AccountClientError ? error :
+        new AccountClientError('ACCOUNT_SERVICE_UNAVAILABLE', undefined, undefined, undefined, 'local', safeExceptionName(error), safeCauseCode(error))
+      const stage = failure.requestStage ?? (failure.message === 'ACCOUNT_RESPONSE_INVALID' ? 'schema' : 'local')
+      try {
+        this.logFailure?.('account-overview-failed', JSON.stringify({ code: failure.message, stage, status: failure.httpStatus ?? responseStatus ?? null,
+          serverCode: failure.serverCode ?? null, exception: failure.exception ?? null, causeCode: failure.causeCode ?? null }))
+      } catch { /* Diagnostics cannot break the account view. */ }
+      return { ...view, code: 'ACCOUNT_SERVICE_UNAVAILABLE', message: '已登录，暂时无法获取账号权益与安装记录。' }
+    }
+  }
+
+  /** 开通名下待开通的邀请奖励；逐笔幂等，失败停留在可重试状态，随后回读账号页展示真实进度。 */
+  redeemInviteRewards(): Promise<AccountView> { return this.run(async () => {
+    if (!this.session) return signedOut('ACCOUNT_LOGIN_REQUIRED', accountMessages.ACCOUNT_LOGIN_REQUIRED)
+    let incomplete: boolean | undefined
+    try {
+      const result = await this.request('/v1/account/invite/redeem', {}, this.session.accessToken) as { ok?: unknown; redeemed?: unknown; remaining?: unknown }
+      const remainingCount = result && typeof result.remaining === 'number' && Number.isSafeInteger(result.remaining) ? result.remaining : null
+      if (!result || result.ok !== true || remainingCount === null) throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
+      incomplete = remainingCount > 0
+    } catch (error) {
+      if (error instanceof AccountClientError && error.message === 'ACCOUNT_LOGIN_REQUIRED') throw error
+      incomplete = undefined
+    }
+    const view = await this.overview()
+    if (incomplete === undefined) return { ...view, message: '暂时无法开通奖励流量，可稍后重试。' }
+    return { ...view, message: incomplete ? '部分奖励已开通，其余可稍后重试。' : '奖励流量已开通。' }
+  }) }
+
+  apply(planId: string): Promise<AccountView> { return this.run(async () => {
+    if (!this.session) return signedOut('ACCOUNT_LOGIN_REQUIRED', accountMessages.ACCOUNT_LOGIN_REQUIRED)
+    await this.request('/v1/network/application', { planId }, this.session.accessToken)
+    return { ...await this.overview(), message: '申请已提交，确认付款并开通后可领取配置。' }
+  }) }
+
+  async sessions(): Promise<AccountLogin[]> {
+    const session = this.session
+    if (!session || this.view.state !== 'signed-in') throw new AccountClientError('ACCOUNT_LOGIN_REQUIRED')
+    const data = await this.request('/v1/account/sessions', undefined, session.accessToken) as { sessions: AccountLogin[] }
+    if (this.session?.accessToken !== session.accessToken) throw new AccountClientError('ACCOUNT_LOGIN_REQUIRED')
+    if (!Array.isArray(data.sessions) || data.sessions.length > 10 || data.sessions.some((s) =>
+      !s || !/^session_[a-f0-9]{32}$/.test(s.id) || !['macos', 'windows', 'linux', 'web', 'unknown'].includes(s.device) ||
+      (s.createdAt !== null && !Number.isSafeInteger(s.createdAt)) || !Number.isSafeInteger(s.expiresAt) || typeof s.current !== 'boolean')) throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
+    return data.sessions.map(({ id, device, deviceId, createdAt, expiresAt, current }) => ({ id, device, deviceId, createdAt, expiresAt, current }))
+  }
+
+  revokeSession(sessionId: string): Promise<AccountView> { return this.run(async () => {
+    if (!this.session) return signedOut('ACCOUNT_LOGIN_REQUIRED', accountMessages.ACCOUNT_LOGIN_REQUIRED)
+    await this.request('/v1/account/sessions/revoke', { sessionId }, this.session.accessToken)
+    return { ...await this.overview(), message: '已退出所选登录。' }
+  }) }
+
+  changePassword(currentPassword: string, password: string): Promise<AccountView> { return this.run(async () => {
+    if (!this.session) return signedOut('ACCOUNT_LOGIN_REQUIRED', accountMessages.ACCOUNT_LOGIN_REQUIRED)
+    const data = await this.request('/v1/account/password', { currentPassword, password, device: this.device }, this.session.accessToken)
+    if (!validSession(data) || data.account.id !== this.session.account.id) throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
+    const session = { account: data.account, accessToken: data.accessToken, expiresAt: data.expiresAt }
+    this.session = session
+    const saved = { ...session, serviceOrigin: this.base!.href }
+    try { await this.store.write(saved) }
+    catch {
+      this.session = null; this.view = signedOut('', '密码已修改，请使用新密码重新登录。')
+      try { await this.setNetwork(undefined) } catch { /* The new session is not enabled; report incomplete local cleanup below. */ }
+      try { await this.request('/v1/account/logout', {}, data.accessToken) } catch { /* Local storage failure is reported; reopening revalidates the saved old token. */ }
+      return { ...this.view, code: 'ACCOUNT_STORAGE_UNAVAILABLE', message: '密码已修改，但本机未能保存新登录。请使用新密码重新登录。' }
+    }
+    try {
+      await this.setNetwork(undefined)
+      await this.setNetwork({ client: new NetworkAccountClient(new URL('v1/network/', this.base!).href),
+        session: { accountId: data.account.id, accessToken: data.accessToken, deviceId: await this.store.deviceId?.() } })
+    } catch {
+      return { state: 'unavailable', account: null, overview: null, code: 'ACCOUNT_SERVICE_UNAVAILABLE', message: '密码已修改；本机网络状态暂未确认，请重新读取账号。' }
+    }
+    return { ...await this.overview(), message: '密码已修改，其他登录已退出。' }
+  }) }
+
+  closeAccount(password: string, confirmed: boolean): Promise<AccountView> { return this.run(async () => {
+    if (!this.session) return signedOut('ACCOUNT_LOGIN_REQUIRED', accountMessages.ACCOUNT_LOGIN_REQUIRED)
+    await this.request('/v1/account/close', { password, confirmed }, this.session.accessToken)
+    this.session = null; this.restored = true; this.view = signedOut('', '账号已注销，历史订单保留供售后核对。')
+    const cleanup = await Promise.allSettled([this.setNetwork(undefined), this.store.write(null)])
+    if (cleanup.some((result) => result.status === 'rejected')) return { ...this.view, code: 'ACCOUNT_STORAGE_UNAVAILABLE', message: '账号已注销；本机状态未能完全清理，请关闭工具箱后重开。历史订单保留供售后核对。' }
+    return this.view
+  }) }
+
+  deviceReportStatus(): { state: string; message: string } {
+    if (!this.session || this.view.state !== 'signed-in') return { state: 'local', message: '登录后可把基本电脑配置发送给来信客服。' }
+    const report = this.deviceReport?.token === this.session.accessToken ? this.deviceReport : undefined
+    if (!report) return { state: 'local', message: '基本电脑配置尚未发送。' }
+    return { state: report.state, message: report.state === 'synced'
+      ? `基本电脑配置已发送给来信客服（回执号 ${report.receipt}，${new Date(report.at).toLocaleString('zh-CN')}）。`
+      : report.state === 'failed' ? '基本电脑配置发送未完成，可重试；你也可以继续使用工具箱。' : '正在发送基本电脑配置…' }
+  }
+
+  private async bindDevice(session: AccountSession, signal?: AbortSignal): Promise<string | undefined> {
+    const id = await this.store.deviceId?.()
+    const current = () => this.session?.accessToken === session.accessToken && !signal?.aborted && !this.controller.signal.aborted
+    if (!id || !current()) return undefined
+    if (this.boundDevice?.token === session.accessToken && this.boundDevice.id === id) return id
+    let binding = this.deviceBinding
+    if (!binding || binding.token !== session.accessToken || binding.id !== id) {
+      const pending = this.request('/v1/account/device', { deviceId: id }, session.accessToken, undefined, signal).then(() => {
+        if (current()) this.boundDevice = { token: session.accessToken, id }
+      })
+      binding = { token: session.accessToken, id, pending }
+      this.deviceBinding = binding
+    }
+    try { await binding.pending } finally { if (this.deviceBinding === binding) this.deviceBinding = undefined }
+    return current() ? id : undefined
+  }
+
+  /** 客户主动发送：只有本人点击才上报。同步中与已成功的再次点击不重复上报，失败后才允许重试。 */
+  sendDeviceReport(): { state: string; message: string } {
+    const session = this.session
+    if (!session || this.view.state !== 'signed-in' || !this.collectDevice || !this.store.deviceId) return this.deviceReportStatus()
+    const previous = this.deviceReport?.token === session.accessToken ? this.deviceReport : undefined
+    if (previous && previous.state !== 'failed') return this.deviceReportStatus()
+    const report: { token: string; state: 'syncing' | 'synced' | 'failed'; at: number; receipt?: string } = { token: session.accessToken, state: 'syncing', at: Date.now() }
+    this.deviceReport = report
+    const current = () => this.deviceReport === report && this.session?.accessToken === session.accessToken && this.view.state === 'signed-in' && !this.controller.signal.aborted
+    void (async () => {
+      try {
+        const facts = await this.collectDevice!()
+        if (!current()) return
+        if (!await this.bindDevice(session) || !current()) return
+        const result = await this.request('/v1/account/device-report', facts, session.accessToken) as { ok?: boolean; receipt?: string }
+        if (result?.ok !== true || !validDeviceReceipt(result.receipt)) throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
+        if (current()) { report.state = 'synced'; report.at = Date.now(); report.receipt = result.receipt }
+      } catch { if (current()) { report.state = 'failed'; report.at = Date.now() } }
+    })()
+    return this.deviceReportStatus()
+  }
+
+  captureInstallationReport(customerConfirmed = false): (view: InstallationReportView) => void {
+    const session = this.view.state === 'signed-in' ? this.session : null
+    return (view) => {
+      if (!session || this.session?.accessToken !== session.accessToken || this.view.state !== 'signed-in') return
+      const platform = view.platform === 'mac' || view.platform === 'windows' ? view.platform : undefined
+      if ((view.software !== 'hermes' && view.software !== 'codex' && view.software !== 'claude') || platform === undefined) return
+      // 存在本机的确认记录可能属于这台机器的上一个使用者。
+      const evidence = customerConfirmed ? 'customer-confirmation'
+        : view.detectors.some((d) => d.state === 'complete') ? 'reliable-detection' : 'unknown'
+      const errorCode = /(?:error|failure)/.test(view.stageCode) ? view.stageCode : null
+      this.reportInstallation(session, { software: view.software, platform, stage: view.stageCode, evidence, errorCode })
+    }
+  }
+
+  private reportInstallation(session: AccountSession, report: Pick<InstallationRecord, 'software' | 'platform' | 'stage' | 'evidence' | 'errorCode'>): void {
+    const version = (this.installationStates.get(report.software)?.version ?? 0) + 1
+    this.installationStates.set(report.software, { token: session.accessToken, state: 'syncing', version })
+    const current = () => this.session?.accessToken === session.accessToken && this.installationStates.get(report.software)?.version === version
+    this.installationWrites = this.installationWrites.then(async () => {
+      // Keep ordered error reports even if the next local step completes before this write starts.
+      if (this.session?.accessToken !== session.accessToken || this.view.state !== 'signed-in') return
+      let state: 'synced' | 'failed' = 'synced'
+      try { await this.request('/v1/account/installation', report, session.accessToken) } catch { state = 'failed' }
+      if (current()) this.installationStates.set(report.software, { token: session.accessToken, state, version })
+    })
+  }
+
+  installationStatus(software: string): { state: string; message: string } {
+    const report = this.installationStates.get(software)
+    if (!this.session || this.view.state !== 'signed-in') return { state: 'local', message: '安装进度保存在这台电脑。登录后继续操作，可把进度同步到自己的来信账号。' }
+    if (!report || report.token !== this.session.accessToken) return { state: 'local', message: '当前进度保存在本机；点击“重新检查”后同步到当前账号。' }
+    return { state: report.state, message: report.state === 'synced' ? '安装进度已同步到你的来信账号，客服可据此协助。'
+      : report.state === 'failed' ? '本机进度已保留，账号同步未完成。可继续安装，或点击“重新检查”重试同步。' : '本机进度已保留，正在同步账号…' }
+  }
+
+  /** 创建支付订单（幂等复用未结订单）；支付宝的跳转由主进程用返回的 URL 打开系统浏览器。 */
+  async pay(planId: string, channel: PaymentChannelName, displayedAmountFen: number): Promise<{ view: AccountView; order: PaymentOrderView | null }> {
+    let order: PaymentOrderView | null = null
+    const view = await this.run(async () => {
+      if (!this.session) return signedOut('ACCOUNT_LOGIN_REQUIRED', accountMessages.ACCOUNT_LOGIN_REQUIRED)
+      await this.prepareNetworkPurchase(planId, channel, displayedAmountFen)
+      const data = await this.request('/v1/payment/orders', { planId, channel }, this.session.accessToken) as PaymentOrderView
+      if (!validPaymentOrder(data)) throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
+      if (data.planId !== planId || data.channel !== channel || data.amountFen !== displayedAmountFen) {
+        try {
+          this.logFailure?.('payment-order-contract-mismatch', JSON.stringify({
+            expected: { planId, channel, amountFen: displayedAmountFen },
+            received: { planId: data.planId, channel: data.channel, amountFen: data.amountFen, status: data.status,
+              paid: data.paidAt !== null, hasRedirect: Boolean(data.redirect) }
+          }))
+        } catch { /* Diagnostics cannot alter payment safety behavior. */ }
+        throw new AccountClientError('PAYMENT_TERMS_CHANGED')
+      }
+      if (data.status !== 'open' || data.paidAt !== null || !data.redirect) throw new AccountClientError('PAYMENT_ORDER_INVALID')
+      order = data
+      return { ...await this.overview(), message: '订单已创建，完成支付后自动开通。' }
+    })
+    return { view, order }
+  }
+
+  private async prepareNetworkPurchase(planId: string, channel: PaymentChannelName, displayedAmountFen: number): Promise<void> {
+    this.view = await this.overview()
+    const overview = this.view.overview
+    if (!overview) throw new AccountClientError('ACCOUNT_SERVICE_UNAVAILABLE')
+    const selectedPlan = overview.plans.find((plan) => plan.id === planId)
+    if (!selectedPlan) throw new AccountClientError('PLAN_INVALID')
+    if (!overview.networkAvailable) throw new AccountClientError('NETWORK_NOT_CONFIGURED')
+    if (!overview.paymentChannels.includes(channel)) throw new AccountClientError('PAYMENT_CHANNEL_UNREADY')
+    if (selectedPlan.priceCents !== displayedAmountFen) throw new AccountClientError('PAYMENT_TERMS_CHANGED')
+  }
+
+  /** 轮询订单状态；不动账号视图，由调用方在确认后刷新，避免轮询噪音写进界面消息。 */
+  async pollPayment(orderId: string): Promise<PaymentOrderView | null> {
+    if (!this.session) return null
+    try {
+      const data = await this.request(`/v1/payment/orders/${encodeURIComponent(orderId)}`, undefined, this.session.accessToken) as PaymentOrderView
+      return validPaymentOrder(data) ? data : null
+    } catch (error) {
+      if (error instanceof AccountClientError && error.message === 'ACCOUNT_LOGIN_REQUIRED') throw error
+      return null
+    }
+  }
+
+  async paymentOrders(): Promise<PaymentOrderView[]> {
+    const session = this.session
+    if (!session) throw new AccountClientError('ACCOUNT_LOGIN_REQUIRED')
+    const data = await this.request('/v1/payment/orders', undefined, session.accessToken) as { orders: PaymentOrderView[] }
+    if (this.session?.accessToken !== session.accessToken || !Array.isArray(data.orders) || !data.orders.every(validPaymentOrder)) throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
+    return data.orders
+  }
+
+  cancelPayment(orderId: string): Promise<AccountView> { return this.run(async () => {
+    if (!this.session) throw new AccountClientError('ACCOUNT_LOGIN_REQUIRED')
+    const data = await this.request(`/v1/payment/orders/${encodeURIComponent(orderId)}/cancel`, {}, this.session.accessToken) as PaymentOrderView
+    if (!validPaymentOrder(data)) throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
+    return { ...await this.overview(), message: data.status === 'cancelled' ? '订单已取消，可以重新选择支付方式。' : '渠道确认此订单已付款，已更新交付状态。' }
+  }) }
+
+  cancelNetwork(applicationId: string): Promise<AccountView> { return this.run(async () => {
+    if (!this.session) throw new AccountClientError('ACCOUNT_LOGIN_REQUIRED')
+    await this.request('/v1/account/network-cancel', { applicationId }, this.session.accessToken)
+    return { ...await this.overview(), message: '未付款的套餐申请已取消，可重新选择套餐。' }
+  }) }
+
+  async supportContext(): Promise<{ customerId: string; purchaseId: string; deviceId: string }> {
+    return { customerId: this.view.account?.id ?? '', purchaseId: this.view.overview?.profile?.toolbox?.id ?? '', deviceId: await this.store.deviceId?.() ?? '' }
+  }
+
+  /** Fixed business routes only; neither renderer-supplied URLs nor session tokens cross this boundary. */
+  async subscription(operation: SubscriptionOperation, input: Record<string, string> = {}): Promise<unknown> {
+    if (operation === 'catalog') return this.request('/v1/subscription/catalog', undefined, undefined, 1024 * 1024, undefined, undefined, catalogTimeoutMs)
+    const session = this.session
+    if (!session || this.view.state !== 'signed-in') throw new AccountClientError('ACCOUNT_LOGIN_REQUIRED')
+    const base = '/v1/subscription/orders'
+    let path: string; let body: unknown
+    if (operation === 'list') {
+      if (input.cursor && !/^lx-[a-f0-9]{32}$/.test(input.cursor)) throw new AccountClientError('SUBSCRIPTION_INVALID')
+      path = `${base}${input.cursor ? `?before=${input.cursor}` : ''}`
+    }
+    else if (operation === 'create') { path = base; body = input }
+    else {
+      if (!/^lx-[a-f0-9]{32}$/.test(input.orderId ?? '')) throw new AccountClientError('SUBSCRIPTION_INVALID')
+      if (!['detail', 'pay', 'reveal', 'complete', 'cancel', 'report'].includes(operation)) throw new AccountClientError('SUBSCRIPTION_INVALID')
+      path = `${base}/${input.orderId}${operation === 'detail' ? '' : `/${operation}`}`
+      body = operation === 'detail' ? undefined : operation === 'report' ? { issue: input.issue } : {}
+    }
+    const data = await this.request(path, body, session.accessToken, 1024 * 1024, undefined, undefined, catalogTimeoutMs)
+    if (this.session?.accessToken !== session.accessToken || this.view.state !== 'signed-in') throw new AccountClientError('ACCOUNT_LOGIN_REQUIRED')
+    return data
+  }
+
+  /** 与 subscription() 同一约束:固定业务路由,渲染进程不提供 URL,会话 token 不过桥。 */
+  async sharing(operation: SharingOperation, input: Record<string, string> = {}): Promise<unknown> {
+    if (operation === 'catalog') return this.request('/v1/sharing/catalog', undefined, undefined, 1024 * 1024, undefined, undefined, catalogTimeoutMs)
+    if (operation === 'standards') return this.request('/v1/sharing/standard-products', undefined, undefined, 1024 * 1024, undefined, undefined, catalogTimeoutMs)
+    if (operation === 'posts') return this.request('/v1/sharing/posts', undefined, undefined, 1024 * 1024, undefined, undefined, catalogTimeoutMs)
+    const session = this.session
+    if (!session || this.view.state !== 'signed-in') throw new AccountClientError('ACCOUNT_LOGIN_REQUIRED')
+    const orderId = /^lx-[a-f0-9]{32}$/
+    const postId = /^sp-[a-f0-9]{32}$/
+    const responseId = /^sr-[a-f0-9]{32}$/
+    const requestId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+    const integer = (value: string | undefined, nullable = false): number | null => {
+      if (nullable && value === '') return null
+      if (!value || !/^\d+$/.test(value)) throw new AccountClientError('SHARING_POST_INVALID')
+      const parsed = Number(value)
+      if (!Number.isSafeInteger(parsed)) throw new AccountClientError('SHARING_POST_INVALID')
+      return parsed
+    }
+    const orders = '/v1/sharing/orders'
+    let path: string; let body: unknown
+    if (operation === 'list') {
+      if (input.cursor && !orderId.test(input.cursor)) throw new AccountClientError('SHARING_INVALID')
+      path = `${orders}${input.cursor ? `?before=${input.cursor}` : ''}`
+    }
+    else if (operation === 'create') {
+      if (!requestId.test(input.requestId ?? '')) throw new AccountClientError('SHARING_INVALID')
+      path = orders; body = { listingId: input.listingId, channel: input.channel, requestId: input.requestId }
+    }
+    else if (operation === 'intentions') { path = '/v1/sharing/intentions' }
+    else if (operation === 'myPosts') { path = '/v1/sharing/posts/mine' }
+    else if (operation === 'publish') {
+      if (!requestId.test(input.requestId ?? '')) throw new AccountClientError('SHARING_POST_INVALID')
+      path = '/v1/sharing/posts'
+      body = {
+        side: input.side, productId: input.productId, software: input.software,
+        accountPlan: input.accountPlan || null, apiProvider: input.apiProvider || null, apiModel: input.apiModel || null,
+        termDays: integer(input.termDays), quotaAmount: integer(input.quotaAmount, true), quotaUnit: input.quotaUnit || null,
+        usageTier: input.usageTier || null, priceCents: integer(input.priceCents), availableCount: integer(input.availableCount, true),
+        deliveryHours: integer(input.deliveryHours, true), requestId: input.requestId
+      }
+    }
+    else if (operation === 'closePost') {
+      if (!postId.test(input.postId ?? '')) throw new AccountClientError('SHARING_NOT_FOUND')
+      path = `/v1/sharing/posts/${input.postId}/close`; body = {}
+    }
+    else if (operation === 'respond') {
+      if (!postId.test(input.demandPostId ?? '') || !postId.test(input.supplyPostId ?? '')) throw new AccountClientError('SHARING_NOT_FOUND')
+      if (!requestId.test(input.requestId ?? '')) throw new AccountClientError('SHARING_INVALID')
+      path = `/v1/sharing/posts/${input.demandPostId}/responses`
+      body = { supplyPostId: input.supplyPostId, requestId: input.requestId }
+    }
+    else if (operation === 'demandResponses') {
+      if (!postId.test(input.demandPostId ?? '')) throw new AccountClientError('SHARING_NOT_FOUND')
+      path = `/v1/sharing/posts/${input.demandPostId}/responses`
+    }
+    else if (operation === 'myResponses') { path = '/v1/sharing/responses/mine' }
+    else if (operation === 'selectResponse') {
+      if (!responseId.test(input.responseId ?? '')) throw new AccountClientError('SHARING_NOT_FOUND')
+      if (!requestId.test(input.requestId ?? '')) throw new AccountClientError('SHARING_INVALID')
+      path = `/v1/sharing/responses/${input.responseId}/select`
+      body = { channel: input.channel, requestId: input.requestId }
+    }
+    else if (operation === 'confirmResponse' || operation === 'declineResponse' || operation === 'withdrawResponse') {
+      if (!responseId.test(input.responseId ?? '')) throw new AccountClientError('SHARING_NOT_FOUND')
+      path = `/v1/sharing/responses/${input.responseId}/${operation === 'confirmResponse' ? 'confirm' : operation === 'declineResponse' ? 'decline' : 'withdraw'}`; body = {}
+    }
+    else if (operation === 'share') {
+      if (!['codex', 'claude'].includes(input.software ?? '') || !requestId.test(input.requestId ?? '')) throw new AccountClientError('SHARING_INVALID')
+      path = '/v1/sharing/intentions'
+      body = { software: input.software, plan: input.plan, availableNote: input.availableNote, contact: input.contact, requestId: input.requestId }
+    }
+    else {
+      if (!orderId.test(input.orderId ?? '')) throw new AccountClientError('SHARING_INVALID')
+      if (!['detail', 'pay', 'reveal', 'complete', 'cancel', 'report'].includes(operation)) throw new AccountClientError('SHARING_INVALID')
+      path = `${orders}/${input.orderId}${operation === 'detail' ? '' : `/${operation}`}`
+      body = operation === 'detail' ? undefined : operation === 'report' ? { issue: input.issue } : {}
+    }
+    const data = await this.request(path, body, session.accessToken, 1024 * 1024, undefined, undefined, catalogTimeoutMs)
+    if (this.session?.accessToken !== session.accessToken || this.view.state !== 'signed-in') throw new AccountClientError('ACCOUNT_LOGIN_REQUIRED')
+    return data
+  }
+
+  claimTrial(): Promise<AccountView> { return this.run(async () => {
+    if (!this.session) return signedOut('ACCOUNT_LOGIN_REQUIRED', accountMessages.ACCOUNT_LOGIN_REQUIRED)
+    let claimError: AccountClientError | undefined
+    try { await this.request('/v1/account/trial', {}, this.session.accessToken) }
+    catch (error) {
+      if (error instanceof AccountClientError && error.message === 'ACCOUNT_LOGIN_REQUIRED') throw error
+      // A lost response does not prove that provisioning failed. Read back the entitlement.
+      if (error instanceof AccountClientError) claimError = error
+    }
+    await this.setNetwork({ client: new NetworkAccountClient(new URL('v1/network/', this.base!).href),
+      session: { accountId: this.session.account.id, accessToken: this.session.accessToken, deviceId: await this.store.deviceId?.() } }, undefined, { autoConnect: true })
+    const view = await this.overview()
+    if (!view.overview) return { ...view, message: '领取结果暂时无法确认，请稍后刷新权益查看。' }
+    const { usage, retryable } = view.overview.trial
+    if (!usage && claimError) return { ...view, code: claimError.message,
+      message: claimError.detail ?? accountMessages[claimError.message] ?? accountMessages.ACCOUNT_SERVICE_UNAVAILABLE }
+    const message = !usage ? '暂未确认领取成功，请稍后重试。'
+      : usage.state === 'active' ? trialClaimedCopy(this.terms)
+        : retryable || ['pending', 'queued', 'provisioning'].includes(usage.state) ? '体验领取记录已保存，开通中，可稍后重试。'
+          : usage.state === 'expired' ? '已领取的体验已到期。'
+            : usage.state === 'exhausted' ? '已领取的体验流量已用完。'
+              : usage.state === 'disabled' ? '已领取的体验已停用，请联系客服。'
+                : '已查到体验记录，但暂时无法确认是否可用，请刷新权益后查看。'
+    return { ...view, message }
+  }) }
+
+  async recover(username: string, recoveryCode: string, password: string): Promise<RecoveryResult> {
+    let replacement = ''
+    const view = await this.run(async () => {
+      if (this.session) throw new AccountClientError('ACCOUNT_BUSY')
+      const data = await this.request('/v1/account/recover', { username, recoveryCode, password }) as { recoveryCode: string }
+      if (!validRecovery(data?.recoveryCode)) throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
+      replacement = data.recoveryCode
+      return signedOut('', '密码已重设，旧登录已失效。请保存新恢复码，再使用新密码登录。')
+    })
+    return { view, recoveryCode: replacement }
+  }
+
+  async rotateRecovery(password: string): Promise<RecoveryResult> {
+    let replacement = ''
+    const view = await this.run(async () => {
+      if (!this.session) throw new AccountClientError('ACCOUNT_LOGIN_REQUIRED')
+      const data = await this.request('/v1/account/recovery-code', { password }, this.session.accessToken) as { recoveryCode: string }
+      if (!validRecovery(data?.recoveryCode)) throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
+      replacement = data.recoveryCode
+      return { ...await this.overview(), message: '新的恢复码已生成，旧恢复码已失效。' }
+    })
+    return { view, recoveryCode: replacement }
+  }
+
+  async logout(): Promise<AccountView> {
+    if (this.statusRequest) {
+      this.statusController?.abort()
+      try { await this.setNetwork(undefined) } catch { return { ...this.view, code: 'ACCOUNT_SERVICE_UNAVAILABLE', message: accountMessages.ACCOUNT_SERVICE_UNAVAILABLE } }
+    }
+    return this.run(async () => {
+      await this.setNetwork(undefined)
+      if (this.session) {
+        try { await this.request('/v1/account/logout', {}, this.session.accessToken) }
+        catch (error) {
+          if (!(error instanceof AccountClientError) || error.message !== 'ACCOUNT_LOGIN_REQUIRED') throw new AccountClientError('ACCOUNT_LOGOUT_PENDING')
+        }
+      }
+      try { await this.store.write(null) } catch { throw new AccountClientError('ACCOUNT_STORAGE_UNAVAILABLE') }
+      this.session = null; this.restored = true
+      return signedOut('', '已退出登录。')
+    })
+  }
+
+  dispose(): void { this.statusController?.abort(); this.controller.abort() }
+}
+
+function validRecovery(code: unknown): code is string { return typeof code === 'string' && /^[A-F0-9]{8}(?:-[A-F0-9]{8}){5}$/.test(code) }
+
+/** 校验 /v1/account/plans 下发的商业参数;结构不符视为无效响应,由调用方退回通用文案。 */
+function validTerms(data: unknown): data is CommercialTerms {
+  const positiveInt = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+  if (!data || typeof data !== 'object') return false
+  const v = data as Partial<CommercialTerms> & Record<string, unknown>
+  return Boolean(Array.isArray(v.plans) && v.plans.every((plan) => !!plan && typeof plan.id === 'string' && plan.id !== '' &&
+      typeof plan.label === 'string' && positiveInt(plan.bytes) && positiveInt(plan.priceCents)) &&
+    !!v.toolbox && typeof v.toolbox.id === 'string' && v.toolbox.id !== '' && positiveInt(v.toolbox.priceCents) &&
+    typeof v.toolbox.subject === 'string' && v.toolbox.subject !== '' &&
+    !!v.trial && positiveInt(v.trial.bytes) && positiveInt(v.trial.hours) && Number.isSafeInteger(v.trial.perAccount) && v.trial.perAccount >= 1 &&
+    positiveInt(v.deviceLimit) && v.deviceLimit <= 32 &&
+    (v.wechatLoginAvailable === undefined || typeof v.wechatLoginAvailable === 'boolean') &&
+    (v.invite === undefined || !!v.invite && positiveInt(v.invite.bytes) && positiveInt(v.invite.hours) &&
+      Number.isSafeInteger(v.invite.perMonth) && v.invite.perMonth >= 1))
+}
+
+/** 账号页邀请块的后台响应校验：字段白名单 + 取值范围，⛔ 未知状态进界面。 */
+function validInvite(value: unknown): value is NonNullable<AccountOverview['invite']> {
+  const v = value as NonNullable<AccountOverview['invite']> | undefined
+  if (!v || (v.code !== null && (typeof v.code !== 'string' || !/^[A-Z0-9]{8}$/.test(v.code))) ||
+      (v.invitedBy !== null && typeof v.invitedBy !== 'string') || !Array.isArray(v.rewards) || v.rewards.length > 10) return false
+  const states = ['pending', 'provisioning', 'active', 'exhausted', 'expired', 'disabled', 'unknown', 'unavailable']
+  const numberOrNull = (n: unknown) => n === null || (typeof n === 'number' && Number.isSafeInteger(n) && n >= 0)
+  return v.rewards.every((reward) => !!reward && /^lx-[a-f0-9]{32}$/.test(reward.id) &&
+    ['inviter', 'invitee'].includes(reward.role) && Number.isSafeInteger(reward.bytes) && reward.bytes > 0 &&
+    Number.isSafeInteger(reward.grantedAt) && Number.isSafeInteger(reward.expiresAt) && states.includes(reward.state) &&
+    numberOrNull(reward.remainingBytes) && numberOrNull(reward.usedBytes))
+}
+
+function readTerms(data: unknown): CommercialTerms {
+  if (!validTerms(data)) throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
+  return data
+}
+
+function readProfile(profile: CustomerProfile, accountId: string, terms?: CommercialTerms): CustomerProfile {
+  const date = (v: unknown) => v === null || (Number.isSafeInteger(v) && Number(v) > 0)
+  if (!profile || profile.id !== accountId || typeof profile.username !== 'string' || !profile.username ||
+    ![profile.createdAt, profile.lastLoginAt, profile.closedAt].every(date) || !Array.isArray(profile.installations) ||
+    profile.installations.some((r) => !r || !['hermes', 'codex', 'claude'].includes(r.software) || !['mac', 'windows'].includes(r.platform) ||
+      typeof r.stage !== 'string' || !/^[a-z][a-z0-9-]{0,79}$/.test(r.stage) || (r.stageLabel !== undefined && (typeof r.stageLabel !== 'string' || r.stageLabel.length > 120)) ||
+      !['unknown', 'reliable-detection', 'customer-confirmation'].includes(r.evidence) || !date(r.updatedAt) || r.updatedAt === null)) {
+    throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
+  }
+  const purchase = profile.toolbox
+  if (purchase !== null && (!purchase || !/^lx-[a-f0-9]{32}$/.test(purchase.id) || !['pending', 'paid', 'refunded'].includes(purchase.status) ||
+    (purchase.refundedFen !== undefined && (!Number.isSafeInteger(purchase.refundedFen) || purchase.refundedFen < 0 || purchase.refundedFen > purchase.amountFen)) ||
+    // 待付款记录按后台当前价校验;已付/退款记录保留历史价(改价不发版)。
+    !(Number.isSafeInteger(purchase.amountFen) && purchase.amountFen > 0 && (purchase.status !== 'pending' || !terms || purchase.amountFen === terms.toolbox.priceCents)) ||
+    !date(purchase.createdAt) || purchase.createdAt === null || !date(purchase.paidAt) ||
+    (purchase.status !== 'pending' ? purchase.paidAt === null : purchase.paidAt !== null))) throw new AccountClientError('ACCOUNT_RESPONSE_INVALID')
+  return { id: profile.id, username: profile.username, createdAt: profile.createdAt, lastLoginAt: profile.lastLoginAt, closedAt: profile.closedAt,
+    installations: profile.installations.map(({ software, platform, stage, stageLabel, evidence, updatedAt, deviceId }) => ({ software, platform, stage, stageLabel, evidence, updatedAt, deviceId })),
+    toolbox: purchase ? { id: purchase.id, status: purchase.status, amountFen: purchase.amountFen, createdAt: purchase.createdAt, paidAt: purchase.paidAt, refundedFen: purchase.refundedFen } : null }
+}
+
+function validPaymentOrder(value: unknown): value is PaymentOrderView {
+  if (!value || typeof value !== 'object') return false
+  const v = value as Record<string, unknown>
+  if (typeof v.orderId !== 'string' || !/^[a-f0-9]{32}$/.test(v.orderId) ||
+      typeof v.applicationId !== 'string' || !/^lx-[a-f0-9]{32}$/.test(v.applicationId) ||
+      typeof v.planId !== 'string' || !['alipay', 'wechat'].includes(String(v.channel)) ||
+      typeof v.amountFen !== 'number' || !Number.isSafeInteger(v.amountFen) || v.amountFen <= 0 ||
+      !['open', 'paid', 'confirmed', 'partially_refunded', 'refunded', 'cancelled'].includes(String(v.status))) return false
+  if (v.paidAt !== null && (typeof v.paidAt !== 'number' || !Number.isSafeInteger(v.paidAt))) return false
+  // 创建时间是可选的客户可读字段：旧版后台不下发时仍可读单，只是界面不显示创建时间。
+  if (v.createdAt !== undefined && (typeof v.createdAt !== 'number' || !Number.isSafeInteger(v.createdAt) || v.createdAt <= 0)) return false
+  if (v.confirmError !== null && typeof v.confirmError !== 'string') return false
+  if (v.redirect === null) return true
+  const redirect = v.redirect as Record<string, unknown>
+  return (redirect.kind === 'url' || redirect.kind === 'qrcode') && typeof redirect.data === 'string' &&
+    redirect.data.length > 0 && typeof redirect.expiresAt === 'number' && Number.isSafeInteger(redirect.expiresAt)
+}
+
+function validUsage(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false
+  const v = value as Record<string, unknown>
+  const numberOrNull = (n: unknown) => n === null || (typeof n === 'number' && Number.isSafeInteger(n) && n >= 0)
+  if (!['subscription', 'trial', 'invite'].includes(String(v.kind)) || typeof v.planId !== 'string' || typeof v.state !== 'string' ||
+      !['pending', 'queued', 'provisioning', 'active', 'exhausted', 'expired', 'disabled', 'unknown'].includes(v.state) ||
+      !['current', 'unavailable', 'not-requested'].includes(String(v.measurement)) ||
+      typeof v.totalBytes !== 'number' || !Number.isSafeInteger(v.totalBytes) || v.totalBytes <= 0 ||
+      ![v.usedBytes, v.remainingBytes, v.expiresAt, v.observedAt].every(numberOrNull) ||
+      (v.startsAt !== undefined && !numberOrNull(v.startsAt))) return false
+  return v.measurement !== 'current' || (typeof v.usedBytes === 'number' && typeof v.remainingBytes === 'number' && typeof v.observedAt === 'number')
+}

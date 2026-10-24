@@ -1,0 +1,47 @@
+/* Connection, details and actions keep the same places in every account/network state. */
+.tunnel-page { display: grid; gap: 18px; }
+#tab-panel .tunnel-page .connection-card { min-height: 190px; padding: 22px 26px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); }
+.tunnel-page .card-kicker { color: var(--accent-strong); font-weight: 600; }
+.tunnel-page .connection-main { min-height: 110px; padding: 12px 0 0; }
+.tunnel-page .connection-main > div:first-child { min-width: 0; }
+#tab-panel .tunnel-page .connection-main h2 { font-size: clamp(24px, 2.6vw, 30px); letter-spacing: -.035em; }
+#tab-panel .tunnel-page .connection-main p { max-width: 60em; font-size: 14px; line-height: 1.7; }
+.tunnel-page .connection-hint { min-height: 22px; margin-top: 12px; }
+#tab-panel .tunnel-page .power-button { width: 80px; height: 80px; min-height: 80px; margin: 0 8px; }
+.network-extra .network-details { padding: 0; border: 0; background: transparent; }
+.network-extra .network-details-header { padding: 12px 0; }
+.network-extra .network-details > .detail-list .detail-row { grid-template-columns: 115px minmax(0, 1fr); padding: 10px 0; }
+.network-account { padding: 22px 26px; border: 1px solid var(--line); border-radius: 13px; background: var(--surface); }
+.network-account-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 8px; }
+.network-account-header > h3 { margin: 0; }
+.network-account > .account-note { margin: 6px 0; }
+.network-remaining { display: block; color: var(--ink); font-size: clamp(24px, 3vw, 32px); font-weight: 650; font-variant-numeric: tabular-nums; line-height: 1.35; }
+.network-allowance-details { margin-top: 16px; border-top: 1px solid var(--line); }
+.network-allowance-details > summary { padding: 14px 0 0; color: var(--accent-strong); cursor: pointer; }
+.network-allowance-details > div { margin-top: 18px; }
+.network-diagnostics > summary { padding: 16px 20px; }
+.diagnostic-result-details { margin: 16px 0; }
+.diagnostic-result-details > summary { padding: 8px 0; cursor: pointer; color: var(--muted); }
+.network-extra { border: 1px solid var(--line); border-radius: 12px; background: var(--surface); overflow: hidden; }
+.network-extra > summary { padding: 14px 20px; cursor: pointer; color: var(--muted); }
+.network-extra .route-explanation { border: 0; }
+.network-repair { margin-top: 18px; padding-top: 18px; border-top: 1px solid var(--line); }
+#tab-panel .network-text-action { border-color: transparent; background: transparent; color: var(--accent-strong); }
+.network-repair h3 { margin: 0 0 8px; }
+.network-repair-actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 14px 0; }
+.network-repair small { display: block; color: var(--muted); }
+.network-repair-result { margin: 10px 0 0; color: var(--muted); overflow-wrap: anywhere; }
+.network-repair-result[data-outcome="recovered"] { color: var(--accent-strong); }
+/* 回执号要能被客户一眼看见、念得出来：等宽、可选中、字距拉开。 */
+.network-repair .network-report-scope { margin: 0 0 4px; }
+.network-report-receipt { margin: 10px 0 0; color: var(--muted); overflow-wrap: anywhere; }
+.network-report-receipt strong { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: .08em; color: var(--ink); user-select: text; }
+@media (max-width: 700px) {
+  #tab-panel .tunnel-page .connection-card { padding: 20px; }
+  .tunnel-page .connection-main { flex-direction: row; align-items: center; gap: 14px; }
+  #tab-panel .tunnel-page .power-button { width: 64px; height: 64px; min-height: 64px; margin: 0; }
+  .tunnel-page .connection-actions small { max-width: 80px; text-align: center; }
+}
+@media (max-width: 580px) {
+  .network-extra .network-details > .detail-list .detail-row { grid-template-columns: 90px minmax(0, 1fr); }
+}

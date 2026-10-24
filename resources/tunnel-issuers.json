@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "keys": [
+    {
+      "id": "laixin-b5b4a302ff4d6bc2",
+      "algorithm": "ed25519",
+      "publicKeySpkiBase64": "MCowBQYDK2VwAyEAOmZp68ONpQ+MvpAD6+jUyJOC/XOPEGv1Fs1YlY9PRmQ="
+    },
+    {
+      "id": "laixin-be2bc80915b00411",
+      "algorithm": "ed25519",
+      "publicKeySpkiBase64": "MCowBQYDK2VwAyEADoOMcKb5tPHY9Re6gzIOBLpN7rPa4AvdSvY9ExBt/Cc="
+    }
+  ]
+}

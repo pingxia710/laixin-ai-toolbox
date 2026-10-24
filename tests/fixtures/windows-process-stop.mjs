@@ -1,0 +1,12 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import Module from 'node:module';
+import process from 'node:process';
+import { Buffer } from 'node:buffer';
+const [helperPath, entryPath, outputPath] = process.argv.slice(2);
+const loaded = new Module(helperPath);
+loaded.filename = helperPath;
+loaded.paths = Module._nodeModulePaths(path.dirname(helperPath));
+loaded._compile(fs.readFileSync(helperPath, 'utf8') + '\nmodule.exports.sameHandleTerminationScript = sameHandleTerminationScript;', helperPath);
+const entry = JSON.parse(fs.readFileSync(entryPath, 'utf8').replace(/^\uFEFF/, ''));
+fs.writeFileSync(outputPath, Buffer.from(loaded.exports.sameHandleTerminationScript(entry), 'utf16le').toString('base64'));

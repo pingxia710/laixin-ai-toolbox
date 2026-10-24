@@ -1,0 +1,793 @@
+import { describe, expect, it, vi } from 'vitest'
+import { createConfigurationExecutionObserver } from '../../app/main/ai-access/configuration-execution-observer'
+import { createDeepSeekAdapters, observedConfigurationExecution } from '../../app/main/ai-access/adapters'
+import type { ManagedTextFile } from '../../app/main/ai-access/deepseek-config'
+import { defaultRecipes } from '../../app/main/recipes/recipes'
+import { ShellInventory } from '../../app/main/shells/inventory'
+import { CodexWorkspaceService } from '../../app/main/ai-access/codex-workspaces'
+
+function absentCommand(): never {
+  throw Object.assign(new Error('absent'), { code: 1 })
+}
+
+function files() {
+  const data = new Map<string, string>()
+  const io: ManagedTextFile = {
+    read: async path => data.get(path),
+    write: async (path, contents) => { data.set(path, contents) },
+    remove: async path => { data.delete(path) },
+    withConfigWriteLock: async (_path, task) => task()
+  }
+  return { data, io }
+}
+
+describe('配置生效观察器', () => {
+  it('只把已知原生进程的配置启动参数变成脱敏阻断事实', async () => {
+    const secret = 'sk-process-argument-must-not-leave-observer'
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      run: async (command) => {
+        if (command === '/bin/ps') return [
+          `/Applications/ChatGPT.app/Contents/Resources/codex exec --config model_provider=third-party ${secret}`,
+          '/customer/.local/share/claude/versions/2.1.270 --settings /private/company.json',
+          '/customer/.hermes/hermes-agent/venv/bin/hermes --provider custom'
+        ].join('\n')
+        if (command === '/usr/bin/profiles') return ''
+        return absentCommand()
+      }
+    })
+
+    const observed = await observer()
+
+    expect(observed).toEqual({
+      codex: { source: 'observed', commandLine: true },
+      claude: { source: 'observed', commandLine: true },
+      hermes: { source: 'observed', commandLine: true }
+    })
+    expect(JSON.stringify(observed)).not.toContain(secret)
+    expect(JSON.stringify(observed)).not.toContain('/private/company.json')
+  })
+
+  it('Claude 受管文件和系统策略会阻断，策略探测异常则只给该壳 unknown', async () => {
+    const managed = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer',
+      policyFilePresence: async path => path.includes('ClaudeCode') ? 'present' : 'absent',
+      run: async (command) => command === '/bin/ps' || command === '/usr/bin/profiles' ? '' : absentCommand()
+    })
+    await expect(managed()).resolves.toEqual({ claude: { source: 'observed', managed: true } })
+
+    const unreadable = createConfigurationExecutionObserver({
+      platform: 'linux', home: '/customer',
+      policyFilePresence: async path => path.includes('claude-code') ? 'unknown' : 'absent',
+      run: async () => ''
+    })
+    await expect(unreadable()).resolves.toEqual({ claude: { source: 'unknown' } })
+  })
+
+  it('不能读取进程事实时不假定默认用户根，而是让三壳都进入未知启动上下文', async () => {
+    const observer = createConfigurationExecutionObserver({
+      platform: 'linux', home: '/customer', policyFilePresence: async () => 'absent',
+      run: async command => command === '/usr/bin/profiles' ? '' : (() => { throw new Error('ps unavailable') })()
+    })
+    await expect(observer()).resolves.toEqual({
+      codex: { source: 'unknown' }, claude: { source: 'unknown' }, hermes: { source: 'unknown' }
+    })
+  })
+
+  it('Mac ChatGPT/Codex 桌面版开着时仍可写用户配置；应用自己的内部参数不算模型覆盖', async () => {
+    const f = files()
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      run: async command => command === '/bin/ps'
+        ? [
+            '101 1 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT',
+            '102 101 /Applications/ChatGPT.app/Contents/Resources/codex -c features.code_mode_host=true app-server --analytics-default-enabled -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true',
+            '105 101 /Applications/ChatGPT.app/Contents/Resources/codex-code-mode-host',
+            '104 103 /Applications/ChatGPT.app/Contents/Resources/codex sandbox -c default_permissions=node_repl',
+            '106 103 /Applications/ChatGPT.app/Contents/Resources/codex sandbox -c shell_environment_policy.inherit="all" -c default_permissions="node_repl" -c permissions.node_repl={filesystem = {":tmpdir" = "write"}, network = {enabled = false}} -- /Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node --experimental-vm-modules /private/kernel.js',
+            '103 107 /Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl',
+            '107 102 /Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node /Applications/ChatGPT.app/Contents/Resources/cua_node/lib/node_modules/@oai/cua-repl/bin/cua-repl.mjs',
+            '201 1 /Applications/Codex.app/Contents/MacOS/Codex',
+            '202 201 /Applications/Codex.app/Contents/Resources/codex -c features.code_mode_host=true app-server --analytics-default-enabled -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true'
+          ].join('\n')
+        : command === '/usr/bin/profiles' ? '' : absentCommand()
+    })
+    const codex = createDeepSeekAdapters({
+      home: '/customer', platform: 'darwin', file: f.io, observeConfigurationExecution: observer
+    }).find(adapter => adapter.shell === 'codex')!
+
+    await expect(codex.configurationTargetStatus!()).resolves.toMatchObject({ scope: 'user', writable: true })
+    await codex.applyDeepSeek('sk-fixture-mac-desktop-running')
+    expect(f.data.get('/customer/.codex/config.toml')).toContain('model_provider')
+  })
+
+  it.each(['codex-cli/bin/codex', 'codex-cli/CodexCLI.app/Contents/MacOS/codex'])('Mac 新布局 %s 不漏看独立 app-server 和覆盖参数', async relative => {
+    for (const [args, expected] of [
+      ['app-server --listen stdio://', { source: 'unknown' }],
+      ['app-server -c model_provider=third-party', { source: 'observed', commandLine: true }],
+      ['-c features.code_mode_host=true app-server --analytics-default-enabled -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true', { source: 'observed', commandLine: true }]
+    ] as const) {
+      const observer = createConfigurationExecutionObserver({
+        platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+        run: async command => command === '/bin/ps'
+          ? `101 1 /bin/zsh\n102 101 /Applications/ChatGPT.app/Contents/Resources/${relative} ${args}`
+          : command === '/usr/bin/profiles' ? '' : absentCommand()
+      })
+      await expect(observer()).resolves.toEqual({ codex: expected })
+    }
+  })
+
+  it.each(['/Applications/ChatGPT.app', '/customer/Applications/Codex.app'])('已知内部命令在 %s 的新旧 CLI 布局仍要求同包父进程', async bundle => {
+    const main = bundle.endsWith('/ChatGPT.app') ? 'ChatGPT' : 'Codex'
+    const suffix = '-c features.code_mode_host=true app-server --analytics-default-enabled -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true'
+    for (const relative of ['codex', 'codex-cli/bin/codex', 'codex-cli/CodexCLI.app/Contents/MacOS/codex']) {
+      let extra = ''
+      const cli = `${bundle}/Contents/Resources/${relative}`
+      const observer = () => createConfigurationExecutionObserver({
+        platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+        run: async command => command === '/bin/ps' ? [
+          `101 1 ${bundle}/Contents/MacOS/${main}`,
+          `102 101 ${cli} ${suffix}`,
+          `103 102 ${bundle}/Contents/Resources/cua_node/bin/node_repl`,
+          `104 103 ${cli} sandbox -c default_permissions=node_repl${extra}`
+        ].join('\n') : command === '/usr/bin/profiles' ? '' : absentCommand()
+      })()
+      await expect(observer()).resolves.toEqual({})
+      extra = ' -c model_provider=third-party'
+      await expect(observer()).resolves.toEqual({ codex: { source: 'observed', commandLine: true } })
+    }
+  })
+
+  it('Mac 应用包内 codex 带未知配置覆盖时仍拒写', async () => {
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      run: async command => command === '/bin/ps'
+        ? [
+            '101 1 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT',
+            '102 101 /Applications/ChatGPT.app/Contents/Resources/codex app-server -c model_provider=third-party'
+          ].join('\n')
+        : command === '/usr/bin/profiles' ? '' : absentCommand()
+    })
+    await expect(observer()).resolves.toEqual({ codex: { source: 'observed', commandLine: true } })
+  })
+
+  it('Mac 桌面版固定参数之外还有命令行参数时仍拒写', async () => {
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      run: async command => command === '/bin/ps'
+        ? [
+            '101 1 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT',
+            '102 101 /Applications/ChatGPT.app/Contents/Resources/codex -c features.code_mode_host=true app-server --analytics-default-enabled -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true --model third-party'
+          ].join('\n')
+        : command === '/usr/bin/profiles' ? '' : absentCommand()
+    })
+    await expect(observer()).resolves.toEqual({ codex: { source: 'observed', commandLine: true } })
+  })
+
+  it('Mac 应用主程序由其他父进程启动时不把同包 app-server 当作官方桌面进程', async () => {
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      run: async command => command === '/bin/ps'
+        ? [
+            '100 1 /bin/zsh',
+            '101 100 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT',
+            '102 101 /Applications/ChatGPT.app/Contents/Resources/codex -c features.code_mode_host=true app-server --analytics-default-enabled -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true'
+          ].join('\n')
+        : command === '/usr/bin/profiles' ? '' : absentCommand()
+    })
+    await expect(observer()).resolves.toEqual({ codex: { source: 'observed', commandLine: true } })
+  })
+
+  it.each([
+    ['显式来源覆盖', '-c model_provider=third-party', { source: 'observed', commandLine: true }],
+    ['未知参数', '--unexpected-option', { source: 'unknown' }]
+  ])('Mac 桌面进程树内 sandbox 带%s时仍拒写', async (_label, argument, expected) => {
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      run: async command => command === '/bin/ps'
+        ? [
+            '101 1 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT',
+            '102 101 /Applications/ChatGPT.app/Contents/Resources/codex -c features.code_mode_host=true app-server --analytics-default-enabled -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true',
+            '103 102 /Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl',
+            `104 103 /Applications/ChatGPT.app/Contents/Resources/codex sandbox ${argument}`
+          ].join('\n')
+        : command === '/usr/bin/profiles' ? '' : absentCommand()
+    })
+    await expect(observer()).resolves.toEqual({ codex: expected })
+  })
+
+  it('桌面工具终端经 shell 中转启动同包 sandbox 时仍拒写', async () => {
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      run: async command => command === '/bin/ps'
+        ? [
+            '101 1 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT',
+            '102 101 /Applications/ChatGPT.app/Contents/Resources/codex -c features.code_mode_host=true app-server --analytics-default-enabled -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true',
+            '103 102 /Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl',
+            '104 103 /bin/zsh',
+            '105 104 /Applications/ChatGPT.app/Contents/Resources/codex sandbox -c default_permissions=node_repl'
+          ].join('\n')
+        : command === '/usr/bin/profiles' ? '' : absentCommand()
+    })
+    await expect(observer()).resolves.toEqual({ codex: { source: 'observed', commandLine: true } })
+  })
+
+  it('ChatGPT 桌面进程树不能借用 Codex.app 内的 sandbox', async () => {
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      run: async command => command === '/bin/ps'
+        ? [
+            '101 1 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT',
+            '102 101 /Applications/ChatGPT.app/Contents/Resources/codex -c features.code_mode_host=true app-server --analytics-default-enabled -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true',
+            '103 102 /Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl',
+            '104 103 /Applications/Codex.app/Contents/Resources/codex sandbox -c default_permissions=node_repl'
+          ].join('\n')
+        : command === '/usr/bin/profiles' ? '' : absentCommand()
+    })
+    await expect(observer()).resolves.toEqual({ codex: { source: 'observed', commandLine: true } })
+  })
+
+  it('只看见应用包路径和 app-server 还不够，缺少桌面版固定启动参数时保持未知', async () => {
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      run: async command => command === '/bin/ps'
+        ? [
+            '101 1 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT',
+            '102 101 /Applications/ChatGPT.app/Contents/Resources/codex app-server --listen stdio://'
+          ].join('\n')
+        : command === '/usr/bin/profiles' ? '' : absentCommand()
+    })
+    await expect(observer()).resolves.toEqual({ codex: { source: 'unknown' } })
+  })
+
+  it('桌面工具终端另起相同参数的 app-server 时仍拒写', async () => {
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      run: async command => command === '/bin/ps'
+        ? [
+            '101 1 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT',
+            '102 101 /Applications/ChatGPT.app/Contents/Resources/codex -c features.code_mode_host=true app-server --analytics-default-enabled -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true',
+            '103 102 /Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl',
+            '104 103 /Applications/ChatGPT.app/Contents/Resources/codex -c features.code_mode_host=true app-server --analytics-default-enabled -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true'
+          ].join('\n')
+        : command === '/usr/bin/profiles' ? '' : absentCommand()
+    })
+    await expect(observer()).resolves.toEqual({ codex: { source: 'observed', commandLine: true } })
+  })
+
+  it('普通 defaults 偏好即使存在也不能被误判为受管策略', async () => {
+    const calls: string[] = []
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      run: async command => {
+        calls.push(command)
+        if (command === '/usr/bin/profiles' || command === '/bin/ps') return ''
+        throw new Error('unexpected command')
+      }
+    })
+    await expect(observer()).resolves.toEqual({})
+    expect(calls).not.toContain('/usr/bin/defaults')
+  })
+
+  it('macOS 配置描述文件中出现官方受管域时才阻断对应壳', async () => {
+    const calls: Array<readonly string[]> = []
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      run: async (command, args) => {
+        if (command === '/usr/bin/profiles') {
+          calls.push(args)
+          // The profile identifier is deliberately unrelated. The managed domain appears only
+          // in the XML payload, as it does for a normal MDM ManagedClient preference payload.
+          return '<plist><dict><key>PayloadIdentifier</key><string>company.policy.981</string><string>com.anthropic.claudecode</string><string>com.openai.codex</string></dict></plist>'
+        }
+        return command === '/bin/ps' ? '' : absentCommand()
+      }
+    })
+    await expect(observer()).resolves.toEqual({
+      codex: { source: 'observed', managed: true },
+      claude: { source: 'observed', managed: true }
+    })
+    expect(calls).toEqual([['show', '-type', 'configuration', '-output', 'stdout-xml']])
+  })
+
+  it('Finder 打开的工具箱也只读识别终端启动文件里的单一配置根，并写入该根', async () => {
+    const f = files()
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      readStartupFile: async path => path.endsWith('.zshenv') ? 'export CODEX_HOME="$HOME/terminal-codex"\n' : undefined,
+      run: async command => command === '/usr/bin/profiles' || command === '/bin/ps' ? '' : absentCommand()
+    })
+    const codex = createDeepSeekAdapters({
+      home: '/customer', platform: 'darwin', file: f.io, observeConfigurationExecution: observer
+    }).find(adapter => adapter.shell === 'codex')!
+
+    await expect(codex.codexOfficialLoginRoot!()).resolves.toBe('/customer/terminal-codex')
+    await codex.applyDeepSeek('sk-fixture-key-for-startup-root')
+
+    expect(f.data.has('/customer/.codex/config.toml')).toBe(false)
+    expect(f.data.get('/customer/terminal-codex/config.toml')).toContain('model_provider')
+    await expect(codex.configurationTargetStatus!()).resolves.toEqual({
+      shell: 'codex', scope: 'user', override: 'none', writable: true
+    })
+  })
+
+  it.each([
+    ['PATH 变量', 'export PATH="${PATH}:/opt/example/bin"\n'],
+    ['无关条件块', 'if [ -t 1 ]; then\n  export CLICOLOR=1\nfi\n'],
+    ['无关函数', 'prompt_color() {\n  printf blue\n}\n'],
+    ['注释中的动态语法', 'export CLICOLOR=1 # source other; if true; then eval ignored\n']
+  ])('%s不阻断三壳默认配置目录及 Codex 新工作窗口', async (_label, contents) => {
+    const f = files()
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      readStartupFile: async path => path.endsWith('.zshrc') ? contents : undefined,
+      run: async command => command === '/usr/bin/profiles' || command === '/bin/ps' ? '' : absentCommand()
+    })
+    const adapters = createDeepSeekAdapters({ home: '/customer', platform: 'darwin', file: f.io, observeConfigurationExecution: observer })
+    for (const adapter of adapters) {
+      await expect(adapter.configurationTargetStatus!()).resolves.toMatchObject({ scope: 'user', writable: true })
+    }
+    const codex = adapters.find(adapter => adapter.shell === 'codex')!
+    const launch = vi.fn(async () => ({ threadId: '01999999-1111-7111-8111-111111111111' }))
+    const service = new CodexWorkspaceService({
+      access: {
+        codexOfficialLoginRoot: () => codex.codexOfficialLoginRoot!(),
+        status: async () => ({
+          officialAuthentication: { codex: { state: 'official', reason: 'chatgpt-session' } },
+          shells: { codex: { selected: 'official' } } as never
+        }),
+        useOfficial: async () => { throw new Error('official route is already selected') },
+        codexMultiModelConnection: async () => ({ baseUrl: 'http://127.0.0.1:43123/codex/multi/v1', model: 'laixin.deepseek.deepseek-flash', models: ['laixin.deepseek.deepseek-flash'] })
+      },
+      findCommand: async () => ({ executable: '/fixture/codex', args: [] }),
+      readOfficialModels: async () => [{ slug: 'gpt-6-astra', catalog: { slug: 'gpt-6-astra' } }],
+      installProviders: async () => undefined,
+      launch,
+      openExternal: async () => undefined
+    })
+    for (const source of ['official', 'multi']) {
+      await expect(service.open(source)).resolves.toMatchObject({ ok: true, source })
+    }
+    expect(launch).toHaveBeenCalledTimes(2)
+    expect(f.data.size).toBe(0)
+  })
+
+  it('无关条件块前后的静态根和行尾注释仍解析到三壳各自目录', async () => {
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      readStartupFile: async path => path.endsWith('.zshrc') ? [
+        'export CODEX_HOME="$HOME/custom codex" # Codex directory',
+        'if [ -t 1 ]; then',
+        '  export CLICOLOR=1',
+        'fi',
+        'export CLAUDE_CONFIG_DIR="${HOME}/custom-claude" # Claude directory',
+        'set -gx HERMES_HOME "/customer/hermes # local" # Hermes directory'
+      ].join('\n') : undefined,
+      run: async command => command === '/usr/bin/profiles' || command === '/bin/ps' ? '' : absentCommand()
+    })
+    await expect(observer()).resolves.toEqual({
+      codex: { source: 'observed', userConfigPath: '/customer/custom codex/config.toml' },
+      claude: { source: 'observed', userConfigPath: '/customer/custom-claude/settings.json' },
+      hermes: { source: 'observed', userConfigPath: '/customer/hermes # local/.env' }
+    })
+  })
+
+  it.each([
+    'source "$HOME/.toolbox-roots"\n',
+    'eval "$TOOLBOX_ROOTS"\n',
+    'if [ -t 1 ]; then source "$HOME/.toolbox-roots"; fi\n',
+    'load_roots() { source "$HOME/.toolbox-roots"; }\nload_roots\n',
+    'cat <<EOF\nexport CODEX_HOME=/not-an-assignment\nEOF\n',
+    'export PATH="${PATH}:\nexport CODEX_HOME=/not-an-assignment\n"\n'
+  ])('没有显式根变量的动态加载仍报告所有根未知：%s', async contents => {
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      readStartupFile: async path => path.endsWith('.zshrc') ? contents : undefined,
+      run: async () => ''
+    })
+    await expect(observer()).resolves.toEqual({
+      codex: { source: 'unknown' }, claude: { source: 'unknown' }, hermes: { source: 'unknown' }
+    })
+  })
+
+  it('同一条件语句里的多个配置根都未知，不能只阻断第一个', async () => {
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      readStartupFile: async path => path.endsWith('.zshrc')
+        ? 'if test -t 1; then export CODEX_HOME=/conditional/codex CLAUDE_CONFIG_DIR=/conditional/claude HERMES_HOME=/conditional/hermes; fi\n'
+        : undefined,
+      run: async () => ''
+    })
+    await expect(observer()).resolves.toEqual({
+      codex: { source: 'unknown' }, claude: { source: 'unknown' }, hermes: { source: 'unknown' }
+    })
+  })
+
+  it.each([
+    ['export CLAUDE_CONFIG_DIR=/custom/claude; export CODEX_HOME=/custom/codex', ['claude', 'codex']],
+    ['export CODEX_HOME=/custom/codex; export CLAUDE_CONFIG_DIR=/custom/claude', ['codex', 'claude']],
+    ['export CODEX_HOME=/custom/codex; export CLAUDE_CONFIG_DIR=/custom/claude; export HERMES_HOME=/custom/hermes', ['codex', 'claude', 'hermes']],
+    ['export CODEX_HOME=/custom/codex CLAUDE_CONFIG_DIR=/custom/claude HERMES_HOME=/custom/hermes', ['codex', 'claude', 'hermes']]
+  ])('复合赋值里的每个根都未知：%s', async (contents, affected) => {
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      readStartupFile: async path => path.endsWith('.zshrc') ? contents : undefined,
+      run: async () => ''
+    })
+    await expect(observer()).resolves.toEqual(Object.fromEntries(affected.map(shell => [shell, { source: 'unknown' }])))
+  })
+
+  it.each([
+    ['codex', 'CODEX_HOME'], ['claude', 'CLAUDE_CONFIG_DIR'], ['hermes', 'HERMES_HOME']
+  ] as const)('%s 的单引号变量与冲突根不被猜成有效目录', async (shell, variable) => {
+    for (const contents of [
+      `export ${variable}='$HOME/not-expanded' # literal shell value\n`,
+      `export ${variable}=/first/root\nexport ${variable}=/second/root\n`
+    ]) {
+      const observer = createConfigurationExecutionObserver({
+        platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+        readStartupFile: async path => path.endsWith('.zshrc') ? contents : undefined,
+        run: async () => ''
+      })
+      await expect(observer()).resolves.toEqual({ [shell]: { source: 'unknown' } })
+    }
+  })
+
+  it('主进程观察到的三个重定向配置根会穿过复查并成为实际写入根', async () => {
+    const f = files()
+    const settings = new Map<string, string | undefined>()
+    const runHermes = vi.fn(async (_command: string, args: readonly string[]) => {
+      const key = args[2]
+      if (key === undefined) throw new Error('fixture Hermes setting key is missing')
+      if (args[1] === 'set') settings.set(key, args[3])
+      else if (args[1] === 'unset') settings.delete(key)
+    })
+    const environment = new ShellInventory({
+      platform: 'darwin', home: '/customer', recipes: () => defaultRecipes,
+      env: {
+        PATH: '/usr/bin:/bin',
+        CODEX_HOME: '/customer/moved/codex',
+        CLAUDE_CONFIG_DIR: '/customer/moved/claude',
+        HERMES_HOME: '/customer/moved/hermes'
+      }
+    }).environment()
+    const observed = observedConfigurationExecution('/customer', 'darwin', environment)
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      readStartupFile: async () => undefined,
+      run: async command => command === '/usr/bin/profiles' || command === '/bin/ps' ? '' : absentCommand()
+    })
+    const adapters = createDeepSeekAdapters({
+      home: '/customer', platform: 'darwin', file: f.io,
+      configurationExecution: observed, observeConfigurationExecution: observer,
+      findHermesCommand: async () => '/customer/moved/hermes/hermes-agent/venv/bin/hermes',
+      runHermes, readHermesConfig: async (_command, key) => settings.get(key)
+    })
+
+    await adapters.find(adapter => adapter.shell === 'codex')!.applyDeepSeek('sk-fixture-observed-root-codex')
+    await adapters.find(adapter => adapter.shell === 'claude')!.applyDeepSeek('sk-fixture-observed-root-claude')
+    await adapters.find(adapter => adapter.shell === 'hermes')!.applyDeepSeek('sk-fixture-observed-root-hermes')
+
+    expect(f.data.has('/customer/.codex/config.toml')).toBe(false)
+    expect(f.data.has('/customer/.claude/settings.json')).toBe(false)
+    expect(f.data.has('/customer/.hermes/.env')).toBe(false)
+    expect(f.data.get('/customer/moved/codex/config.toml')).toContain('model_provider')
+    expect(f.data.get('/customer/moved/claude/settings.json')).toContain('https://api.deepseek.com/anthropic')
+    expect(f.data.get('/customer/moved/hermes/.env')).toContain('DEEPSEEK_API_KEY=sk-fixture-observed-root-hermes')
+    expect(runHermes).toHaveBeenCalledWith(
+      '/customer/moved/hermes/hermes-agent/venv/bin/hermes',
+      ['config', 'set', 'model.provider', 'deepseek'],
+      '/customer/moved/hermes'
+    )
+  })
+
+  it('多个或无法静态解析的启动根会阻断，而不猜默认目录', async () => {
+    const f = files()
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      readStartupFile: async path => path.endsWith('.zshenv') ? 'export CODEX_HOME=$CUSTOM_ROOT\n' : undefined,
+      run: async command => command === '/usr/bin/profiles' || command === '/bin/ps' ? '' : absentCommand()
+    })
+    const codex = createDeepSeekAdapters({
+      home: '/customer', platform: 'darwin', file: f.io, observeConfigurationExecution: observer
+    }).find(adapter => adapter.shell === 'codex')!
+
+    await expect(codex.applyDeepSeek('sk-fixture-key-for-unknown-root')).rejects.toThrow('AI_ACCESS_CONFIGURATION_TARGET_BLOCKED')
+    expect(f.data.size).toBe(0)
+    await expect(codex.configurationTargetStatus!()).resolves.toMatchObject({
+      scope: 'unknown', override: 'unknown', writable: false
+    })
+  })
+
+  it.each([
+    ['条件分支', 'if [ "$TERM_PROGRAM" = iTerm ]; then\n  export CODEX_HOME="$HOME/terminal-codex"\nfi\n'],
+    ['函数作用域', 'configure_codex() {\n  export CODEX_HOME="$HOME/terminal-codex"\n}\n'],
+    ['逻辑组合块', '[[ "$TERM_PROGRAM" = iTerm ]] && {\n  export CODEX_HOME="$HOME/terminal-codex"\n}\n'],
+    ['子 shell', '(\n  export CODEX_HOME="$HOME/terminal-codex"\n)\n'],
+    ['赋值后的逻辑运算', 'export CODEX_HOME="$HOME/terminal-codex" && echo configured\n'],
+    ['source 动态加载', 'source "$HOME/.toolbox-roots"\nexport CODEX_HOME="$HOME/terminal-codex"\n'],
+    ['带命令前缀的 source 动态加载', 'builtin source "$HOME/.toolbox-roots"\nexport CODEX_HOME="$HOME/terminal-codex"\n'],
+    ['eval 动态加载', 'eval "$TOOLBOX_ROOTS"\nexport CODEX_HOME="$HOME/terminal-codex"\n'],
+    ['未展开的主机变量', 'export CODEX_HOME="$HOME/.config/$HOSTNAME/codex"\n'],
+    ['未引号 glob', 'export CODEX_HOME=$HOME/.codex-*\n']
+  ])('遇到%s的启动根时阻断写入，不能把它当成所有启动环境的有效根', async (_label, contents) => {
+    const f = files()
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      readStartupFile: async path => path.endsWith('.zshenv') ? contents : undefined,
+      run: async command => command === '/usr/bin/profiles' || command === '/bin/ps' ? '' : absentCommand()
+    })
+    const codex = createDeepSeekAdapters({
+      home: '/customer', platform: 'darwin', file: f.io, observeConfigurationExecution: observer
+    }).find(adapter => adapter.shell === 'codex')!
+
+    await expect(codex.applyDeepSeek('sk-fixture-key-for-conditional-root')).rejects.toThrow('AI_ACCESS_CONFIGURATION_TARGET_BLOCKED')
+    expect(f.data.size).toBe(0)
+    await expect(codex.configurationTargetStatus!()).resolves.toMatchObject({
+      scope: 'unknown', override: 'unknown', writable: false
+    })
+  })
+
+  it('工具箱自身环境和终端启动根不一致时阻断，避免对其中一个作假成功', async () => {
+    const f = files()
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      readStartupFile: async path => path.endsWith('.zshenv') ? 'export CLAUDE_CONFIG_DIR=/terminal/.claude\n' : undefined,
+      run: async command => command === '/usr/bin/profiles' || command === '/bin/ps' ? '' : absentCommand()
+    })
+    const claude = createDeepSeekAdapters({
+      home: '/customer', platform: 'darwin', file: f.io,
+      configurationExecution: { claude: { source: 'observed', userConfigPath: '/finder/.claude/settings.json' } },
+      observeConfigurationExecution: observer
+    }).find(adapter => adapter.shell === 'claude')!
+
+    await expect(claude.applyDeepSeek('sk-fixture-key-for-root-mismatch')).rejects.toThrow('AI_ACCESS_CONFIGURATION_TARGET_BLOCKED')
+    expect(f.data.size).toBe(0)
+  })
+
+  it('检测到 HERMES_HOME 后，配置文件和受控官方启动器使用同一个根', async () => {
+    const f = files()
+    const settings = new Map<string, string | undefined>()
+    const runHermes = vi.fn(async (_command: string, args: readonly string[]) => {
+      if (args[1] === 'set') settings.set(args[2], args[3])
+      else settings.delete(args[2])
+    })
+    const observer = createConfigurationExecutionObserver({
+      platform: 'darwin', home: '/customer', policyFilePresence: async () => 'absent',
+      readStartupFile: async path => path.endsWith('.zshenv') ? 'set -gx HERMES_HOME ~/terminal-hermes\n' : undefined,
+      run: async command => command === '/usr/bin/profiles' || command === '/bin/ps' ? '' : absentCommand()
+    })
+    const hermes = createDeepSeekAdapters({
+      home: '/customer', platform: 'darwin', file: f.io, observeConfigurationExecution: observer,
+      findHermesCommand: async () => '/customer/terminal-hermes/hermes-agent/venv/bin/hermes',
+      runHermes,
+      readHermesConfig: async (_command, key) => settings.get(key)
+    }).find(adapter => adapter.shell === 'hermes')!
+
+    await hermes.applyDeepSeek('sk-fixture-key-for-hermes-startup-root')
+
+    expect(f.data.has('/customer/.hermes/.env')).toBe(false)
+    expect(f.data.get('/customer/terminal-hermes/.env')).toContain('DEEPSEEK_API_KEY')
+    expect(runHermes).toHaveBeenCalledWith(
+      '/customer/terminal-hermes/hermes-agent/venv/bin/hermes', ['config', 'set', 'model.provider', 'deepseek'], '/customer/terminal-hermes'
+    )
+  })
+
+  it('Windows 只调用固定系统工具；活动客户端无法读取参数时阻断而不猜配置根', async () => {
+    const calls: Array<{ command: string; args: readonly string[] }> = []
+    const observer = createConfigurationExecutionObserver({
+      platform: 'win32', home: 'C:\\Users\\customer', policyFilePresence: async () => 'absent',
+      run: async (command, args) => {
+        calls.push({ command, args })
+        if (command.endsWith('tasklist.exe')) return args.includes('IMAGENAME eq codex.exe') ? '"codex.exe","1"' : 'INFO: No tasks'
+        return absentCommand()
+      }
+    })
+    const observed = await observer()
+    expect(observed).toEqual({ codex: { source: 'unknown' } })
+    expect(calls.filter(call => call.command.endsWith('tasklist.exe')).every(call => call.command === 'C:\\Windows\\System32\\tasklist.exe')).toBe(true)
+    expect(calls.filter(call => call.command.endsWith('powershell.exe')).map(call => call.command))
+      .toEqual(['C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'])
+    expect(calls.some(call => call.command.includes('Users\\customer') || call.args.some(arg => arg.includes('Users\\customer')))).toBe(false)
+  })
+
+  describe('Windows 按程序所在位置区分桌面应用与命令行版', () => {
+    const home = 'C:\\Users\\customer'
+    const claudeDesktop = 'C:\\Program Files\\WindowsApps\\Claude_2.110.0.0_x64__pzs8sxrjxfjjc\\app\\Claude.exe'
+    const codexDesktop = 'C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.915.0.0_x64__2p2nqsd0c76g0\\app\\Codex.exe'
+    const claudeCli = 'C:\\Users\\customer\\.local\\bin\\claude.exe'
+
+    interface FakeProcess { readonly image: string; readonly id: string; readonly path: string | null; readonly line: string | null }
+
+    /** tasklist 按镜像名过滤；PowerShell 按脚本里的 ProcessId 返回详情，和真机输出同形。 */
+    function windows(processes: () => readonly FakeProcess[], options: { powershell?: 'fail' | 'garbage' | 'bad-item' } = {}) {
+      const powershellCalls: string[] = []
+      const run = async (command: string, args: readonly string[]) => {
+        if (command === 'C:\\Windows\\System32\\tasklist.exe') {
+          const image = /IMAGENAME eq (.+)$/.exec(args[1] ?? '')?.[1] ?? ''
+          const rows = processes().filter(item => item.image.toLowerCase() === image.toLowerCase())
+          return rows.length === 0 ? 'INFO: No tasks are running which match the specified criteria.'
+            : rows.map(item => `"${item.image}","${item.id}","Console","1","125,672 K"`).join('\r\n')
+        }
+        if (command === 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe') {
+          const script = args[args.length - 1] ?? ''
+          powershellCalls.push(script)
+          if (options.powershell === 'fail') throw Object.assign(new Error('blocked by policy'), { code: 'ETIMEDOUT' })
+          if (options.powershell === 'garbage') return '{"id":"1"}'
+          if (options.powershell === 'bad-item') return '[null]'
+          const ids = [...script.matchAll(/ProcessId=(\d+)/g)].map(match => match[1])
+          return JSON.stringify(processes().filter(item => ids.includes(item.id)).map(item => ({ id: item.id, image: item.image, path: item.path, line: item.line })))
+        }
+        return absentCommand()
+      }
+      return { run, powershellCalls }
+    }
+
+    function observerFor(fake: ReturnType<typeof windows>, now?: () => number) {
+      return createConfigurationExecutionObserver({ platform: 'win32', home, policyFilePresence: async () => 'absent', run: fake.run, ...(now ? { now } : {}) })
+    }
+
+    it('Claude 桌面版与商店版 Codex 开着（含只剩托盘）不再阻断写配置', async () => {
+      const fake = windows(() => [
+        { image: 'claude.exe', id: '5500', path: claudeDesktop, line: `"${claudeDesktop}"` },
+        { image: 'claude.exe', id: '6264', path: claudeDesktop, line: `"${claudeDesktop}" --type=renderer` },
+        { image: 'Codex.exe', id: '7001', path: codexDesktop, line: `"${codexDesktop}"` }
+      ])
+      await expect(observerFor(fake)()).resolves.toEqual({})
+    })
+
+    it.each(['app-server --listen stdio://', '-c features.code_mode_host=true app-server --analytics-default-enabled'])('商店 Codex 的 GUI 和包内后台 %s 保持原桌面分类，不因新增安装发现而阻断', async args => {
+      const path = codexDesktop.replace(/Codex\.exe$/, 'resources\\codex.exe')
+      const fake = windows(() => [
+        { image: 'Codex.exe', id: '7001', path: codexDesktop, line: `"${codexDesktop}"` },
+        { image: 'codex.exe', id: '7101', path, line: `"${path}" ${args}` }
+      ])
+      await expect(observerFor(fake)()).resolves.toEqual({})
+    })
+
+    it('未核实进程关系的传统包内 CLI 保持原 unknown 分类，不臆测终端或桌面身份', async () => {
+      const path = 'C:\\Users\\customer\\AppData\\Local\\Programs\\Codex\\resources\\codex.exe'
+      const fake = windows(() => [{ image: 'codex.exe', id: '7101', path, line: `"${path}" app-server -c model_provider=third-party` }])
+      await expect(observerFor(fake)()).resolves.toEqual({ codex: { source: 'unknown' } })
+    })
+
+    it('桌面版自带的 Claude Code 会话、旧版安装目录与 Hermes 桌面版同样按桌面应用处理', async () => {
+      const fake = windows(() => [
+        { image: 'claude.exe', id: '11', path: 'C:\\Users\\customer\\AppData\\Local\\AnthropicClaude\\app-1.49585.0\\claude.exe', line: null },
+        { image: 'claude.exe', id: '12', path: 'C:\\Users\\customer\\AppData\\Roaming\\Claude\\claude-code\\2.1.273\\claude.exe', line: 'claude.exe --setting-sources user' },
+        { image: 'claude.exe', id: '13', path: 'C:\\Users\\customer\\AppData\\Local\\Claude-3p\\claude-code\\2.1.273\\claude.exe', line: null },
+        { image: 'hermes.exe', id: '14', path: 'C:\\Users\\customer\\.hermes\\hermes-agent\\apps\\desktop\\release\\win-unpacked\\Hermes.exe', line: null }
+      ])
+      await expect(observerFor(fake)()).resolves.toEqual({})
+    })
+
+    it('命令行版在运行时仍按看不到继承环境阻断；带改配置的启动参数时如实说成启动参数', async () => {
+      const secret = 'D:\\company\\private-settings.json'
+      const plain = windows(() => [{ image: 'claude.exe', id: '900', path: claudeCli, line: `"${claudeCli}"` }])
+      await expect(observerFor(plain)()).resolves.toEqual({ claude: { source: 'unknown' } })
+
+      const override = windows(() => [
+        { image: 'claude.exe', id: '901', path: claudeDesktop, line: null },
+        { image: 'claude.exe', id: '902', path: claudeCli, line: `"${claudeCli}" --settings ${secret}` },
+        { image: 'codex.exe', id: '903', path: 'C:\\Users\\customer\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\vendor\\x86_64-pc-windows-msvc\\codex\\codex.exe', line: 'codex.exe -c model_provider=x' },
+        { image: 'hermes.exe', id: '904', path: 'C:\\Users\\customer\\AppData\\Local\\hermes\\hermes-agent\\venv\\Scripts\\hermes.exe', line: 'hermes.exe chat' }
+      ])
+      const observed = await observerFor(override)()
+      expect(observed).toEqual({
+        claude: { source: 'observed', commandLine: true },
+        codex: { source: 'observed', commandLine: true },
+        hermes: { source: 'unknown' }
+      })
+      expect(JSON.stringify(observed)).not.toContain('private-settings')
+      expect(JSON.stringify(observed)).not.toContain('customer')
+    })
+
+    it('认不出的位置、读不到路径、查询失败或输出不合形时都保持原来的阻断', async () => {
+      const unknownPlace = windows(() => [{ image: 'claude.exe', id: '31', path: 'D:\\tools\\claude.exe', line: null }])
+      await expect(observerFor(unknownPlace)()).resolves.toEqual({ claude: { source: 'unknown' } })
+
+      const noPath = windows(() => [{ image: 'claude.exe', id: '32', path: null, line: null }])
+      await expect(observerFor(noPath)()).resolves.toEqual({ claude: { source: 'unknown' } })
+
+      const failed = windows(() => [{ image: 'claude.exe', id: '33', path: claudeDesktop, line: null }], { powershell: 'fail' })
+      await expect(observerFor(failed)()).resolves.toEqual({ claude: { source: 'unknown' } })
+
+      const garbage = windows(() => [{ image: 'claude.exe', id: '34', path: claudeDesktop, line: null }], { powershell: 'garbage' })
+      await expect(observerFor(garbage)()).resolves.toEqual({ claude: { source: 'unknown' } })
+
+      const badItem = windows(() => [{ image: 'claude.exe', id: '35', path: claudeDesktop, line: null }], { powershell: 'bad-item' })
+      await expect(observerFor(badItem)()).resolves.toEqual({ claude: { source: 'unknown' } })
+    })
+
+    it('tasklist 之后已退出的进程不算在运行；进程号被别的程序复用时不冒用旧详情', async () => {
+      let processes: FakeProcess[] = [{ image: 'claude.exe', id: '41', path: claudeCli, line: null }]
+      const gone = windows(() => processes)
+      const observer = observerFor(gone)
+      await expect(observer()).resolves.toEqual({ claude: { source: 'unknown' } })
+
+      // 同一个进程号被另一个程序复用：缓存按进程号＋镜像名核对，旧详情必须丢掉重查。
+      processes = [{ image: 'codex.exe', id: '41', path: codexDesktop, line: null }]
+      await expect(observer()).resolves.toEqual({})
+      expect(gone.powershellCalls).toHaveLength(2)
+
+      const exited = windows(() => [{ image: 'claude.exe', id: '42', path: claudeCli, line: null }])
+      const exitedRun = exited.run
+      const vanished = createConfigurationExecutionObserver({
+        platform: 'win32', home, policyFilePresence: async () => 'absent',
+        run: async (command, args) => command.endsWith('powershell.exe') ? '[]' : exitedRun(command, args)
+      })
+      await expect(vanished()).resolves.toEqual({})
+    })
+
+    it('关掉桌面版后命令行版复用了同一个进程号：进程号集合一变就重查，⛔ 沿用桌面版的旧详情放行', async () => {
+      let processes: FakeProcess[] = ['71', '72', '73', '74', '75', '76'].map(id => ({ image: 'claude.exe', id, path: claudeDesktop, line: null }))
+      const fake = windows(() => processes)
+      const observer = observerFor(fake, () => 5_000)
+      await expect(observer()).resolves.toEqual({})
+      processes = [{ image: 'claude.exe', id: '73', path: claudeCli, line: `"${claudeCli}" --settings D:\\company.json` }]
+      await expect(observer()).resolves.toEqual({ claude: { source: 'observed', commandLine: true } })
+      expect(fake.powershellCalls).toHaveLength(2)
+    })
+
+    it('托盘里常驻的桌面版不会让每次读状态都启动 PowerShell；新进程或过期才重查', async () => {
+      let clock = 1_000
+      let processes: FakeProcess[] = [{ image: 'claude.exe', id: '51', path: claudeDesktop, line: null }]
+      const fake = windows(() => processes)
+      const observer = observerFor(fake, () => clock)
+      for (let index = 0; index < 5; index++) {
+        await expect(observer()).resolves.toEqual({})
+        clock += 1_000
+      }
+      expect(fake.powershellCalls).toHaveLength(1)
+
+      processes = [...processes, { image: 'claude.exe', id: '52', path: claudeCli, line: null }]
+      await expect(observer()).resolves.toEqual({ claude: { source: 'unknown' } })
+      expect(fake.powershellCalls).toHaveLength(2)
+      // 同名进程集合变了（多了 52）：整组重查，⛔ 只查新进程而沿用 51 的旧详情——进程号可能已被复用。
+      expect(fake.powershellCalls[1]).toContain('ProcessId=52')
+      expect(fake.powershellCalls[1]).toContain('ProcessId=51')
+
+      clock += 61_000
+      await observer()
+      expect(fake.powershellCalls).toHaveLength(3)
+    })
+
+    it('Claude 桌面版开着时，Windows 适配器可以写入用户级配置；命令行版开着时仍拒写', async () => {
+      const key = 'sk-toolbox-desktop-running-fixture-key'
+      const adapterWith = (processes: readonly FakeProcess[]) => {
+        const f = files()
+        const claude = createDeepSeekAdapters({
+          home, platform: 'win32', file: f.io, observeConfigurationExecution: observerFor(windows(() => processes))
+        }).find(adapter => adapter.shell === 'claude')!
+        return { f, claude }
+      }
+
+      const desktop = adapterWith([{ image: 'claude.exe', id: '61', path: claudeDesktop, line: null }])
+      await expect(desktop.claude.configurationTargetStatus!()).resolves.toMatchObject({ scope: 'user', writable: true })
+      await desktop.claude.applyDeepSeek(key)
+      expect([...desktop.f.data.values()].some(contents => contents.includes(key))).toBe(true)
+
+      const cli = adapterWith([{ image: 'claude.exe', id: '62', path: claudeCli, line: null }])
+      await expect(cli.claude.configurationTargetStatus!()).resolves.toMatchObject({ scope: 'unknown', writable: false, reason: 'unknown-launch-context' })
+      await expect(cli.claude.applyDeepSeek(key)).rejects.toThrow()
+      expect(cli.f.data.size).toBe(0)
+    })
+  })
+
+  it('同一个适配器在后续观察到受管策略后立即禁止写入，也不覆盖现有配置', async () => {
+    const f = files()
+    let managed = false
+    const observe = vi.fn(async () => managed ? { claude: { source: 'observed' as const, managed: true } } : {})
+    const claude = createDeepSeekAdapters({
+      home: '/customer', platform: 'darwin', file: f.io, observeConfigurationExecution: observe
+    }).find(adapter => adapter.shell === 'claude')!
+
+    await claude.applyDeepSeek('sk-fixture-key-for-configuration-observer')
+    const before = f.data.get('/customer/.claude/settings.json')
+    managed = true
+
+    await expect(claude.configurationTargetStatus!()).resolves.toMatchObject({ scope: 'unknown', override: 'managed', writable: false })
+    await expect(claude.applyDeepSeek('sk-different-fixture-key')).rejects.toThrow('AI_ACCESS_CONFIGURATION_TARGET_BLOCKED')
+    expect(f.data.get('/customer/.claude/settings.json')).toBe(before)
+  })
+})
