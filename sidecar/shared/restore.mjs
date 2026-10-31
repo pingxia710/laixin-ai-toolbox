@@ -6,6 +6,7 @@ import {
   ENTRY_STATUS, clearRecoveryMarker, isIntactLedgerEntry, isOptionalSettingService, isSettingLikeEntry, isSettledSetting, loadLedger, loadLedgerCached,
   loadQuarantinedEntries, readRecoveryMarker, saveLedger, ledgerPath, withSettingsLock, assertSettingsLockHeld
 } from './ledger.mjs'
+import { randomBytes } from 'node:crypto'
 import { existsSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { RESTORE_REASONS } from './restore-observation.mjs'
@@ -264,9 +265,11 @@ function recoverLedgerLocked(dataDir, adapter, options = {}) {
     return repairQuarantinedEntry(entry, status, typeof entry.note === 'string' ? entry.note : '损坏恢复:账目结构已修补')
   })
   const path = ledgerPath(dataDir)
-  const temporary = `${path}.tmp-recovery`
-  writeFileSync(temporary, `${JSON.stringify(nextEntries, null, 1)}\n`, { mode: 0o600 })
-  renameSync(temporary, path)
+  const temporary = `${path}.tmp-recovery-${randomBytes(8).toString('hex')}`
+  try {
+    writeFileSync(temporary, `${JSON.stringify(nextEntries, null, 1)}\n`, { mode: 0o600 })
+    renameSync(temporary, path)
+  } finally { rmSync(temporary, { force: true }) }
   clearRecoveryMarker(dataDir)
   return { recovered, keptModified, failed: [], diagnostics: undefined }
 }

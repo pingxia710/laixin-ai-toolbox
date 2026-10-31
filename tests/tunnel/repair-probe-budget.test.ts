@@ -49,11 +49,11 @@ it('双组回显都超时但通道可达，新增专用复验不能把原本够�
     return child
   }
   const service = new TunnelService({ dataDir, sidecarDir, picker: async () => packageDir,
-    trust: { whitelistDigests: [built.digest], signingPublicKeys: [] }, now: () => Date.parse('2026-10-01T00:00:00Z'),
+    trust: { whitelistDigests: [built.digest], signingPublicKeys: [] }, now: () => Date.parse('2026-10-01T00:00:00Z'), allowLocalVerifyUrls: true,
     spawnDaemon: (dir, runId) => { forceTunnelPathForTest(dir); return launch('start', runId) },
     spawnRestore: () => launch('restore'), routesFile: join(sidecarDir, 'routes.default.json'),
     repairTimeoutMs: 3_600, repairRestoreGraceMs: 800,
-    connectorOverride: { kind: 'loopback-probe', host: '127.0.0.1', port: upstream.port, exitIp: '' } })
+    connectorOverride: { kind: 'loopback-probe', host: '127.0.0.1', port: upstream.port, exitIp: '', allowLocalVerifyUrls: true } })
   try {
     await service.importConfig(); await service.applyPending()
     const started = Date.now()

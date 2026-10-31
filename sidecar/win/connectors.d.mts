@@ -48,6 +48,8 @@ export interface SshSocksSpec {
   readonly localPort: number
   readonly verifyUrl: string
   readonly verifyFallbackUrl?: string
+  /** 仅本地测试夹具允许回环 HTTP；生产意图不设置。 */
+  readonly allowLocalVerifyUrls?: boolean
   // 测试注入;生产固定为随包 sidecar/win/bin/ssh.exe(缺失即「组件缺失」拒)。
   readonly sshExecutable?: string
   readonly readyTimeoutMs?: number

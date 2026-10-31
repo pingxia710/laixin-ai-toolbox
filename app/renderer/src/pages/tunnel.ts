@@ -24,6 +24,8 @@ interface TunnelPageState {
   routeBusy: boolean
   repair: NetworkRepairStatus
   repairReadError: boolean
+  /** N-80 开机自启读数;undefined=还没读到(此时不打扰)。 */
+  loginItem: { enabled: boolean; supported: boolean } | undefined
   /** 最近一次上报的回执号；客户要把它念给客服。 */
   reportReceipt: string
   /** 没送出去时诊断包落在本机哪儿；送出去了为空串。 */
@@ -52,6 +54,7 @@ function isHealthyLocalBackendContinuation(status: TunnelStatusView, now: number
 }
 
 const state: TunnelPageState = {
+  loginItem: undefined,
   status: undefined, statusReadError: '', lastActionMessage: '', lastActionTone: 'neutral', lastActionAwaitingRestore: false,
   routeHost: '', routeResult: undefined, routeError: '', routeBusy: false,
   repair: { ...idleNetworkRepair }, repairReadError: false,
@@ -99,6 +102,7 @@ export const page: PageModule = {
     lastRender = ''
     busy = reportInProgress
     stopAccount = onAccountChange(() => render(element))
+    void readLoginItem().then(() => render(element))
     render(element)
     void refresh(version)
     pollTimer = setInterval(() => void refresh(version), 2_000)
@@ -113,6 +117,18 @@ export const page: PageModule = {
     for (const remove of listeners.splice(0)) remove()
     activeElement = undefined
   }
+}
+
+/**
+ * N-80 开机自启建议闸:只在真正用上网络(已连/通道待确认)且明确读到「支持但未开启」
+ * 时建议;读不到自启状态、不支持或已开启一律不打扰(⛔ 拿猜测当事实)。
+ * 守护常驻与 GUI 自启是两条独立的保活路径——建议开 GUI 自启是为了登录后立即拉起,
+ * 消除任务分钟补拉的空窗(PLAN N-80)。
+ */
+export function autoLaunchSuggestion(status: TunnelStatusView | undefined,
+  loginItem: { enabled: boolean; supported: boolean } | undefined): boolean {
+  return status !== undefined && ['已连', '通道待确认'].includes(status.state) &&
+    loginItem !== undefined && loginItem.supported && !loginItem.enabled
 }
 
 export function buildTunnelPresentation(status: TunnelStatusView | undefined): TunnelPresentation {
@@ -185,11 +201,27 @@ export function buildTunnelPresentation(status: TunnelStatusView | undefined): T
           hint: status.lastVerifiedAt === '' ? '等待最近一次校验信息。' : `最近复验：${formatTime(status.lastVerifiedAt)}`,
           primaryAction: 'stop', primaryLabel: '断开通道'
         }
-    case '连接中':
+    case '连接中': {
+      // N-77:把守护阶段透成人话——各阶段有界预算合计可达约两分钟,只给一句静态文案
+      // 等于让客户对着「卡住」猜。未识别的阶段码不显示(⛔ 裸码给客户)。
+      const stageCopy: Record<string, string> = {
+        'startup-restore': '正在恢复原网络设置',
+        'shutdown-recovery': '正在交还原网络设置',
+        'existing-proxy-probe': '正在探测电脑现有网络',
+        'direct-path-probe': '正在确认直连路径',
+        'connector-start': '正在启动安全连接器',
+        'bridge-start': '正在建立本地通道',
+        'path-verify-before-settings': '正在验证通道可达',
+        'settings-write': '正在写入系统网络设置',
+        'path-verify-after-settings': '正在校验设置生效'
+      }
+      const stageLine = typeof status.connectStage === 'string' && status.connectStage !== '' ? stageCopy[status.connectStage] : undefined
       return {
         tone: 'warning', headline: '正在连接', description: '正在等待通道建立和校验完成，请不要重复点击连接。',
-        hint: '连接结果会自动更新，也可以随时取消。', primaryAction: 'stop', primaryLabel: '取消连接'
+        hint: stageLine !== undefined ? `当前步骤：${stageLine}。连接结果会自动更新，也可以随时取消。` : '连接结果会自动更新，也可以随时取消。',
+        primaryAction: 'stop', primaryLabel: '取消连接'
       }
+    }
     case '正在接续':
       // 甲-1 返工:常驻接续等待期(重开工具箱、校准未落定/正在叫醒守护)。标题如实说「正在接续」,
       // ⛔ 曾在此窗口显示「已停止」并给「连接通道」,照点立即 spawn 非常驻守护 → 落定后双守护。
@@ -317,6 +349,7 @@ function render(element: HTMLElement): void {
     ? { ...buildTunnelPresentation(status), headline: '暂时无法确认连接状态', description: '状态读取失败，正在等待重新读取。', hint: '请稍后重试，或联系来信客服。' }
     : buildTunnelPresentation(status)
   element.append(connectionCard(presentation))
+  appendAutoLaunchSuggestion(element, status)
   appendFeedback(element, status, now)
   element.querySelectorAll<HTMLDetailsElement>('details').forEach(details => { details.open = opened.has(details.className) })
   renderAdvanced()
@@ -728,6 +761,30 @@ function primaryAction(action: PrimaryAction): (() => Promise<TunnelActionResult
 function statusFeedback(status: TunnelStatusView | undefined, now: number): string {
   return status?.message && status.recoveryState !== 'running' && status.recoveryState !== 'required' && !isHealthyLocalBackendContinuation(status, now)
     ? status.message : ''
+}
+
+function appendAutoLaunchSuggestion(element: HTMLElement, status: TunnelStatusView | undefined): void {
+  if (!autoLaunchSuggestion(status, state.loginItem)) return
+  const box = document.createElement('p')
+  box.className = 'auto-launch-hint'
+  box.textContent = '开启「开机自启」后，开机登录即可自动恢复连接，不用等系统任务补拉。'
+  const enable = document.createElement('button')
+  enable.type = 'button'
+  enable.textContent = '开启开机自启'
+  enable.addEventListener('click', () => {
+    enable.disabled = true
+    void window.toolbox.desktop.setLoginItem({ enabled: true }).then((next) => {
+      state.loginItem = next
+    }).catch(() => {
+      enable.disabled = false
+    }).finally(() => { lastRender = ''; render(document.querySelector('.tunnel-page') ?? document.body) })
+  })
+  box.append(enable)
+  element.append(box)
+}
+
+async function readLoginItem(): Promise<void> {
+  try { state.loginItem = await window.toolbox.desktop.loginItem() } catch { state.loginItem = undefined }
 }
 
 function appendFeedback(element: HTMLElement, status: TunnelStatusView | undefined, now: number): void {

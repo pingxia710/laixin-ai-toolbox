@@ -52,6 +52,8 @@ sidecar/mac/proxy-identity.mjs
 sidecar/mac/proxy-identity.d.mts
 sidecar/mac/resident-integrity.mjs
 sidecar/mac/resident-integrity.d.mts
+sidecar/mac/runtime-observation.mjs
+sidecar/mac/runtime-observation.d.mts
 sidecar/mac/restore.mjs
 sidecar/mac/restore.d.mts
 sidecar/mac/restore-observation.mjs
@@ -90,6 +92,8 @@ sidecar/win/proxy-identity.mjs
 sidecar/win/proxy-identity.d.mts
 sidecar/win/resident-integrity.mjs
 sidecar/win/resident-integrity.d.mts
+sidecar/win/runtime-observation.mjs
+sidecar/win/runtime-observation.d.mts
 sidecar/win/restore.mjs
 sidecar/win/restore.d.mts
 sidecar/win/restore-observation.mjs

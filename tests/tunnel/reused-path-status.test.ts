@@ -38,6 +38,20 @@ function statusOf(daemon: DaemonStateView): TunnelStatus {
   } finally { removeTempDir(dataDir) }
 }
 
+describe('N-77 连接阶段透出', () => {
+  it('连接中透出守护阶段码;已连/未连接不透出', () => {
+    const connecting = statusOf({ state: 'connecting', connectStage: 'bridge-start' } as DaemonStateView)
+    expect(connecting.state).toBe('连接中')
+    expect(connecting.connectStage).toBe('bridge-start')
+    const connected = statusOf({ state: 'connected', connectStage: 'bridge-start', exitIp: '203.0.113.42',
+      lastVerifiedAt: Date.parse('2026-09-13T10:00:00Z'), pathVerified: true } as unknown as DaemonStateView)
+    expect(connected.state).toBe('已连')
+    expect(connected.connectStage).toBe('')
+    const bare = statusOf({ state: 'connecting' } as DaemonStateView)
+    expect(bare.connectStage).toBe('')
+  })
+})
+
 describe('复用本机已有外网时的状态', () => {
   it('本机路径身份缺失说明连接重试和问题反馈，不让客户重复购买', () => {
     const status = statusOf({ state: 'error', code: 'TUNNEL_AVAILABILITY_OBJECT_IDENTITY_MISSING', message: '',

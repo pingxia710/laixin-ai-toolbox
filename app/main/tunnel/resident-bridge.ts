@@ -1,7 +1,8 @@
 // 常驻接线(主进程侧,0.5.0):把「守护由系统承载」这件事翻译成守护监管能问的三个问题。
 //
 // 两条硬边界(与 platform/resident.ts 文件头的三条一脉):
-//  · **装不上 ⛔ 不给客户连网**。校准失败就回落到主进程自己 spawn 的老路,最坏不比上一版差。
+//  · 常驻装不上时不能把 parent-ipc 守护当作安全的「意外退出不断网」兜底；连接路径会改用
+//    无父 IPC 的独立守护，避免 GUI 被强杀后留下死代理。只有客户主动关闭常驻选择时才回落普通手动连接。
 //  · **armed() 必须同步且便宜**。它挂在 isRunning() 下,状态轮询每次都问;Windows 查计划任务要起
 //    一个 schtasks 进程,⛔ 放进这条路径——内存态由校准与拨开关维护,那两处才去碰系统。
 import { existsSync } from 'node:fs'
@@ -24,6 +25,8 @@ export function residentSpecFor(options: {
   readonly launch: DaemonLaunch
   readonly dataDir: string
   readonly logDir: string
+  /** 运行观测版本闸；生产入口传入版本，缺失时守护按关闭处理。 */
+  readonly clientVersion?: string
   /** Windows 侧传入任务全路径:守护干净收尾后据此自禁任务(防每分钟重入空转),见 platform/resident.ts。 */
   readonly taskPath?: string
 }): ResidentSpec {
@@ -31,6 +34,7 @@ export function residentSpecFor(options: {
     executable: options.executable,
     args: [
       options.launch.daemonPath, 'start', '--data-dir', options.dataDir, '--adapter', options.launch.adapterPath, '--resident', '1',
+      ...(options.clientVersion === undefined ? [] : ['--client-version', options.clientVersion]),
       ...(options.taskPath === undefined ? [] : ['--task-path', options.taskPath])
     ],
     env: { ...options.launch.env },
@@ -121,7 +125,8 @@ export function makeResidentRuntime(deps: ResidentRuntimeDeps): ResidentRuntime 
       if (!outcome.installed) {
         deps.logFailure?.('calibrate-not-installed', outcome.reason ?? '原因未给')
       }
-      // 装不上就如实记下没装(设置页由识别层如实显示),主进程回落到自己 spawn——⛔ 因为常驻装不上就不给客户连网。
+      // 装不上就如实记下没装(设置页由识别层如实显示);连接路径会据此选择独立生命周期的
+      // fallback 守护，不再把带 parent-ipc 的普通守护误当作常驻兜底。
       // 例外(甲-10 返工):当前用户无法接管的存量任务还在(existingTaskStale)时,armed 仍答「在」——
       // 运行时**先**走叫醒由它承载,⛔ 一上来就自起:整分钟任务也会再拉一次,两份并存就是
       // TUNNEL_WRITE_RIGHT_HELD、主程序退出后没人接手(2026-09-17 真机 B/C 时间线)。
@@ -166,6 +171,22 @@ export function makeResidentRuntime(deps: ResidentRuntimeDeps): ResidentRuntime 
       return settle
     }
   }
+}
+
+/** 常驻注册失败后的安全 fallback 条件。不可停的存量任务仍交给原有叫醒与恢复路径；
+ * 可停但三轮叫不醒的 staleCarry 已由 supervisor 判定旧任务不会承载本轮，fallback 守护取席位后，
+ * 旧任务即使迟到也会按席位让位，不会同时写系统代理。 */
+export function shouldUseResidentFallback(
+  bridge: Pick<ResidentBridge, 'armed' | 'alive' | 'staleCarry' | 'unmanagedStale'>,
+  requested: boolean
+): boolean {
+  const staleCarry = bridge.staleCarry?.() === true
+  return requested && !bridge.alive() && bridge.unmanagedStale?.() !== true && (!bridge.armed() || staleCarry)
+}
+
+/** fallback 仍由主进程监管启动，因此带本轮 runId；它与系统常驻描述文件的启动参数保持分开。 */
+export function residentFallbackArgs(runId: string): readonly string[] {
+  return ['--resident', '1', '--run-id', runId]
 }
 
 /** 守护日志落点(窗口 B 的一键上报按这个路径收)。 */

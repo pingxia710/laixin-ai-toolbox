@@ -36,10 +36,7 @@ function inertBridge() {
   return { listen: async () => {}, close: async () => {}, isAlive: () => true, onLost: () => {} }
 }
 
-describe.each([
-  ['writeFileSync', (dataDir: string) => join(dataDir, 'recovery-owner.json.tmp')],
-  ['renameSync', (dataDir: string) => join(dataDir, 'recovery-owner.json')]
-] as const)('recovery owner %s failure', (_operation, blockedPath) => {
+describe('recovery owner publish failure', () => {
   it('启动恢复会释放写权、写明失败并按有界梯子重试', async () => {
     const dataDir = makeTempDir('recovery-owner-publish-')
     roots.push(dataDir)
@@ -54,8 +51,9 @@ describe.each([
         writtenValue: DEAD_PROXY, sessionToken: 'old-session', time: 1, status: 'applied', note: '' }
     ])}\n`, { mode: 0o600 })
     writeIntentFile(dataDir, { desired: 'user-disconnected', sessionToken: 'idle-after-recovery' })
-    // tmp 是目录时 writeFileSync 抛错；目标是目录时写 tmp 成功、renameSync 抛错。
-    mkdirSync(blockedPath(dataDir))
+    // 目标是目录时随机临时文件仍可写，但原子 rename 会失败；这不依赖固定临时文件名。
+    const blockedPath = join(dataDir, 'recovery-owner.json')
+    mkdirSync(blockedPath)
 
     const adapter = {
       managedItems: () => [{ ref: { service: 'test', item: 'proxy' }, value: DEAD_PROXY }],
@@ -95,7 +93,7 @@ describe.each([
       code: 'TUNNEL_RECOVERY_OWNER_PUBLISH_FAILED'
     })
 
-    rmSync(blockedPath(dataDir), { recursive: true, force: true })
+    rmSync(blockedPath, { recursive: true, force: true })
     clock.advance(1_000)
     await settle()
 
@@ -119,7 +117,7 @@ it('普通首次连接无旧账时恢复 owner 写盘失败应保留错误并在
   const clock = new FakeClock()
   const starts: number[] = []
   let value: unknown = null
-  const blocked = join(dataDir, 'recovery-owner.json.tmp')
+  const blocked = join(dataDir, 'recovery-owner.json')
   writeIntentFile(dataDir, { desired: 'connected', sessionToken: 'fresh-connect', bridgePort: 18080,
     connector: { kind: 'loopback-probe', host: '127.0.0.1', port: 1, exitIp: '203.0.113.1' } })
   mkdirSync(blocked)

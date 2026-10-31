@@ -47,6 +47,8 @@ export interface SshSocksSpec {
   readonly localPort: number
   readonly verifyUrl: string
   readonly verifyFallbackUrl?: string
+  /** 仅本地测试夹具允许回环 HTTP；生产意图不设置。 */
+  readonly allowLocalVerifyUrls?: boolean
   readonly readyTimeoutMs?: number
   readonly timeoutMs?: number
 }

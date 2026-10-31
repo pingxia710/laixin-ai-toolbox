@@ -31,7 +31,7 @@ it('真实 Xray 通道连接后到期：关闭监听、恢复假系统设置、�
     writeFileSync(credentialPath, JSON.stringify(node.credential), { mode: 0o600 })
     const expiresAt = Date.now() + 5000
     writeFileAtomic(layout.intent(dataDir), JSON.stringify({ desired: 'connected', authorization: { id: 'local-expiry-test', expiresAt }, bridgePort: port,
-      connector: { kind: 'vless-reality', node: node.node, credentialPath, verifyUrl: node.verifyUrl, localPort: port, timeoutMs: 500 } }))
+      connector: { kind: 'vless-reality', node: node.node, credentialPath, verifyUrl: node.verifyUrl, localPort: port, timeoutMs: 500, allowLocalVerifyUrls: true } }))
     const executable = process.env.TOOLBOX_TEST_PACKAGED_EXECUTABLE
     const daemonPath = process.env.TOOLBOX_TEST_PACKAGED_RESOURCES
       ? join(process.env.TOOLBOX_TEST_PACKAGED_RESOURCES, 'sidecar/mac/tunnel-daemon.mjs')

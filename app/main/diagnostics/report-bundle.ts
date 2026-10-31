@@ -15,6 +15,7 @@ import { REPORT_MAX_BYTES } from '../../report-types'
 import { supportDiagnosticAttemptLimit, type DiagnosticSoftware } from '../../network-diagnostics-types'
 import type { SupportDiagnosis } from './support-snapshot'
 import { normalizeLocalEgressEvidence } from '../../shared/local-egress-evidence'
+import { sanitizeFunnelAttempt, type FunnelAttempt } from '../../../sidecar/shared/connection-funnel.mjs'
 
 /** 通道状态里能出去的字段。⛔ authorization：它是句固定说明，没有诊断价值，反而会被字段名闸抹成问号。 */
 const tunnelStatusFields = ['state', 'message', 'source', 'backend', 'nodeLabel', 'observedNodeLabel', 'exitIp', 'pathSource',
@@ -34,6 +35,9 @@ const MAX_LOG_LINES = 300
 const MAX_LEDGER_ENTRIES = 60
 const MAX_FAULTS = 20
 const MAX_ERROR_CODES = 20
+/** 漏斗阶段行/尝试行的字段白名单(与 sidecar connection-funnel 落盘口径一致)。 */
+const funnelStageFields = ['name', 'durationMs', 'outcome', 'code', 'at', 'phase'] as const
+const MAX_FUNNEL_ATTEMPTS = 10
 
 export interface ReportSources {
   /** 客户刚才在界面看到并可复制的那一次诊断；上报不得重新跑一遍替换它。 */
@@ -56,6 +60,8 @@ export interface ReportSources {
   readonly systemProxy?: unknown
   /** 连接与复验记录。 */
   readonly connection?: unknown
+  /** N-79 连接漏斗台账(守护白名单落盘;这里再过一遍验形)。 */
+  readonly connectionFunnel?: unknown
   /** 守护日志：取自最后若干行；没生成就给 undefined，包里如实写「未生成」。 */
   readonly daemonLog?: { readonly source: string; readonly lines: readonly string[] }
   /** 日志没进包时，是「确实没生成」还是「读不出来」。⛔ 两种都写成「未生成」——
@@ -148,6 +154,25 @@ function daemonLogSection(log: ReportSources['daemonLog'], absence: ReportSource
  * 打包。返回**已封包**的 body：白名单取值 → 字段名与形状闸 → 整包复扫。
  * `filtered` 是复扫又抹掉的处数，正常为 0。
  */
+/** 漏斗台账进包:逐条过 sidecar 验形(被改写的行整条丢弃),再按白名单挑字段。
+ *  台账本体只有阶段码/毫秒/受控码,这里二次验形是双保险——⛔ 把未验形的自由文本带进包。 */
+function connectionFunnelSummary(source: unknown): unknown {
+  if (!Array.isArray((source as { attempts?: unknown } | undefined)?.attempts)) return undefined
+  const attempts = (source as { attempts: readonly unknown[] }).attempts
+    .map((row) => sanitizeFunnelAttempt(row))
+    .filter((row): row is FunnelAttempt => row !== undefined)
+    .slice(-MAX_FUNNEL_ATTEMPTS)
+  if (attempts.length === 0) return undefined
+  return attempts.map((attempt) => ({
+    trigger: attempt.trigger,
+    startedAt: attempt.startedAt,
+    outcome: attempt.outcome,
+    endedAt: attempt.endedAt,
+    ...(attempt.code !== undefined ? { code: attempt.code } : {}),
+    stages: attempt.stages.map((stage) => pickRedacted(stage, [...funnelStageFields]))
+  }))
+}
+
 export function buildReportBody(sources: ReportSources): ReportBody {
   const notes = [...(sources.notes ?? [])]
   const draft = {
@@ -161,6 +186,7 @@ export function buildReportBody(sources: ReportSources): ReportBody {
     ledger: ledgerSummary(sources.ledger, sources.unrestored),
     systemProxy: pickRedacted(sources.systemProxy, [...systemProxySections]),
     connection: redactValue(sources.connection ?? {}) as Record<string, unknown>,
+    connectionFunnel: connectionFunnelSummary(sources.connectionFunnel),
     daemonLog: daemonLogSection(sources.daemonLog, sources.daemonLogAbsence),
     faults: (sources.faults ?? []).slice(0, MAX_FAULTS).map((fault) => redactValue(fault)),
     errorCodes: [...new Set((sources.errorCodes ?? []).filter((code) => errorCodePattern.test(code)))].slice(0, MAX_ERROR_CODES),

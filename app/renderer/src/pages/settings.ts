@@ -56,14 +56,14 @@ export const page: PageModule = {
     const residentToggle = document.createElement('input'); residentToggle.type = 'checkbox'; residentToggle.disabled = true
     residentLabel.append(Object.assign(document.createElement('span'), { textContent: '工具箱意外退出时，网络不断' }), residentToggle)
     const residentNote = document.createElement('p'); residentNote.className = 'account-note'
-    const residentDefaultNote = '打开后，工具箱崩溃、被系统或安全软件关掉、或者开机后你还没打开工具箱，网络都照常连着。退出工具箱后仅保留 API 所需通道，并按原套餐计量；点击断开或退出账号会停止通道。'
+    const residentDefaultNote = '打开后，工具箱崩溃、被系统或安全软件关掉、或者开机后你还没打开工具箱，网络都照常连着。退出工具箱后会停止通道并恢复电脑原有网络设置；点击断开或退出账号也会停止通道。'
     // 客户选了开、但这次没装上：开关显示着开而那件事并没有发生，就是假装成功，必须说出来。
     // ⛔ 把开关拨回去（那是替客户改了他的选择，比静默失败更糟），也 ⛔ 弹窗——网络本身好好的，
     // 丢的只是「工具箱不在时保持」。下次打开工具箱会按客户的选择再装一次，所以说得清「还会再试」。
-    const residentInactiveNote = '已记下你的选择，但这次没能生效：工具箱关掉后网络不会保持。网络本身不受影响，下次打开工具箱会再试一次。'
+    const residentInactiveNote = '已记下你的选择，但这台电脑的后台保护设置没有完成。网络本身不受影响，连接时会自动选择可用的保护方式。'
     // 甲-10 返工：存量管理员任务与本版定义对不上（例如以管理员运行过一次工具箱，之后安装位置变了）。
     // 覆盖注册永远被拒，「下次打开会再试一次」在这个状态下不成立，⛔ 照抄上面那句——要说清客户能做什么。
-    const residentStaleTaskNote = '已记下你的选择，但这次没能生效：这台电脑上有一个当前用户无法替换或停用的旧常驻任务，当前安装不能确认它可用。处理办法二选一：以管理员身份运行一次工具箱；或以管理员身份打开终端，执行 schtasks /delete /tn "\\Laixin\\cn.laixin.toolbox.tunnel" /f，再正常打开工具箱。处理之前，工具箱关掉后网络不会保持。'
+    const residentStaleTaskNote = '这台电脑的后台保护设置没有完成，但不影响当前使用。连接时会自动选择可用的保护方式；如果关掉工具箱后网络没有保持，请重新打开工具箱并联系客服。'
     const residentNoteFor = (status: { enabled: boolean; supported: boolean; active: boolean; staleResidentTask?: boolean }): string =>
       !status.supported ? '当前安装暂不支持这项设置。'
         : status.enabled && !status.active ? (status.staleResidentTask ? residentStaleTaskNote : residentInactiveNote)
@@ -186,7 +186,7 @@ export const page: PageModule = {
     zoom.addEventListener('change', () => { void configure() }); notify.addEventListener('change', () => { void configure() }); auto.addEventListener('change', () => { void configure() })
     const preferences = (value: DesktopView) => {
       zoom.value = String(value.preferences.zoom); notify.checked = value.preferences.quotaNotifications; auto.checked = value.preferences.autoUpdate
-      backgroundNote.textContent = value.backgroundAvailable ? '关闭窗口后工具箱仍在后台运行，AI网络保持连接，可从系统菜单栏或托盘打开。退出工具箱后仅保留 API 所需通道，并按原套餐计量；如需全部停止，请先断开 AI网络。' : '系统托盘暂不可用。关闭窗口将退出工具箱，仅保留 API 所需通道并按原套餐计量；如需全部停止，请先断开 AI网络。'
+      backgroundNote.textContent = value.backgroundAvailable ? '关闭窗口后工具箱仍在后台运行，AI网络保持连接，可从系统菜单栏或托盘打开。退出工具箱后会停止通道并恢复电脑原有网络设置。' : '系统托盘暂不可用。关闭窗口将退出工具箱并停止通道，电脑会恢复原有网络设置。'
     }
 
     const help = group('帮助')

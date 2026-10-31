@@ -52,10 +52,11 @@ it.each(['invalid-ip', 'http-101'])('真实回显 %s、后备可达：修复完�
   }
   const service = new TunnelService({ dataDir, sidecarDir, picker: async () => packageDir,
     trust: { whitelistDigests: [built.digest], signingPublicKeys: [] }, now: () => Date.parse('2026-10-01T00:00:00Z'),
+    allowLocalVerifyUrls: true,
     spawnDaemon: (dir, runId) => { forceTunnelPathForTest(dir); return launch('start', runId) },
     spawnRestore: () => launch('restore'), routesFile: join(sidecarDir, 'routes.default.json'),
     repairTimeoutMs: 3_000, repairRestoreGraceMs: 800,
-    connectorOverride: { kind: 'loopback-probe', host: '127.0.0.1', port: upstream.port, exitIp: '' } })
+    connectorOverride: { kind: 'loopback-probe', host: '127.0.0.1', port: upstream.port, exitIp: '', allowLocalVerifyUrls: true } })
   try {
     const registry = new BridgeRegistry(); registerActions(registry, { service })
     await service.importConfig(); await service.applyPending()

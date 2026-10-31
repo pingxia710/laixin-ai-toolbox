@@ -47,7 +47,8 @@ it('专用组回显没有 IP，但真实后备 HTTP 可达时仍通过复验', a
     'probe.invalid:80': ['127.0.0.1', target.port] })
   const bridge = createLocalBridge({ listenPort: 0, dataDir, routes, upstream: undefined,
     outbounds: [entry('a', upstream.port), entry('b', upstream.port)],
-    verifyUrl: 'http://echo.invalid/ip', probeUrls: ['http://probe.invalid/'], verifyTimeoutMs: 500 })
+    verifyUrl: 'http://echo.invalid/ip', probeUrls: ['http://probe.invalid/'], verifyTimeoutMs: 500,
+    allowLocalVerifyUrls: true })
   try {
     await bridge.listen()
     expect(bridge.verifyDedicated).toBeTypeOf('function')

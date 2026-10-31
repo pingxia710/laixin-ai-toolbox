@@ -200,10 +200,12 @@ export class ToolboxUpdater {
         executable: this.options.executable, version: this.release.version,
         previous: this.options.version, notes: this.release.notes, asarSha256: asset.asarSha256,
         assetSha256: asset.sha256, assetSize: asset.size,
-        // 助手等回执的上限:客户本来没连着就照旧 45 秒,⛔ 多等一秒;本来连着的要容下
-        // 「新版起来 → 装常驻 → 首连(含守护自己 42 秒的退避梯子)」,再留 30 秒给新版退出。
-        // 两端都认这个字段(mac update-helper.cjs / win update-helper.ps1),⛔ 各写一个数。
-        startupTimeoutMs: residentHandoff.tunnelResume ? 90_000 : 45_000,
+        // Mac 沿用原有 45/90s 预算。Windows 还要等新版完成常驻任务注册/状态回读:
+        // 没连着给 120s,本来连着再加一轮 60s 连接等待。两端都认这个字段,
+        // ⛔ 不能让 helper 的默认 45s 抢在校准落定前回滚。
+        startupTimeoutMs: mac
+          ? (residentHandoff.tunnelResume ? 90_000 : 45_000)
+          : (residentHandoff.tunnelResume ? WINDOWS_CONNECTED_STARTUP_TIMEOUT_MS : WINDOWS_STARTUP_TIMEOUT_MS),
         result: join(this.options.directory, 'result.json'), ready: join(jobDirectory, 'helper-ready'),
         acknowledgement: join(this.options.directory, 'acknowledgement.json') }
       const jobPath = join(jobDirectory, 'job.json')
@@ -375,6 +377,9 @@ export interface AcknowledgeDeps {
   readonly pollMs?: number
   readonly wait?: (ms: number) => Promise<void>
   readonly now?: () => number
+  /** Windows 更新前先完成一次常驻校准；更新前置闸可能暂时把任务留在 Disabled。
+   * false/抛错都不能写启动回执,否则助手会提交一个常驻仍未生效的版本。 */
+  readonly residentReady?: () => Promise<boolean>
   /** Windows 的启动回执只放行助手提交；它本身不是最终更新成功。 */
   readonly deferSuccessUntilCommit?: boolean
 }
@@ -382,6 +387,10 @@ export interface AcknowledgeDeps {
 /** 新版这边等多久才判「这一版连不上」。按 spawn 模式守护自己的退避梯子（2+10+30≈42 秒）留余量——
  *  ⛔ 抢在守护还在重试时就判死；也 ⛔ 等太久，助手那头还留着 30 秒给退出用。 */
 export const UPDATE_CONNECT_TIMEOUT_MS = 60_000
+// Windows 常驻校准的最坏串行预算:注册 30s + 查询/回读/启用各 20s。
+// 更新助手必须把这段预算算进去,否则慢机上校准尚未落定就先判新版启动失败。
+const WINDOWS_STARTUP_TIMEOUT_MS = 120_000
+const WINDOWS_CONNECTED_STARTUP_TIMEOUT_MS = WINDOWS_STARTUP_TIMEOUT_MS + UPDATE_CONNECT_TIMEOUT_MS
 
 /** 被回退过的版本记在这里，⛔ 让自动更新下一轮又装上去、又连不上、又回退，把客户卡在循环里。 */
 export function rejectedVersionPath(directory: string): string { return join(directory, 'rejected.json') }
@@ -402,6 +411,18 @@ export async function acknowledgeUpdate(directory: string, version: string, deps
     const pending = JSON.parse(await readFile(join(directory, 'pending.json'), 'utf8')) as
       { version: string; previous?: unknown; notes?: unknown; requireConnected?: boolean }
     if (pending.version !== version) return undefined
+    // 更新前置闸会暂时停用 Windows 常驻任务；先让新版完成一次校准和状态回读，
+    // 再写启动回执，避免助手在任务仍为 Disabled 时提交更新事务。
+    if (deps?.residentReady !== undefined) {
+      let residentReady = false
+      try { residentReady = await deps.residentReady() } catch { residentReady = false }
+      if (!residentReady) {
+        // 常驻校准失败不是网络回退:不要写 rejected.json,否则下一轮会被误报成
+        // 「AI 网络无法连接」并阻断这版重试。只退出让更新助手按未确认启动回滚。
+        deps.giveUp()
+        return undefined
+      }
+    }
     // 更新前客户是连着的 ⇒ 「起来了」还不算数，要等网络真的连上才写回执。
     // 在此之前 ⛔ 修剪 previous-*.app —— 那是唯一的退路，提前剪掉就回不去了。
     if (pending.requireConnected === true && deps !== undefined) {

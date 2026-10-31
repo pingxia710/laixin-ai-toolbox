@@ -9,7 +9,9 @@ import { connect } from 'node:net'
 import { spawn as defaultSpawn } from 'node:child_process'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { verifyHttpExitIp } from './http-verify.mjs'
 import { socks5Connect } from './socks5.mjs'
+import { validProductionVerifyFallbackUrl, validProductionVerifyUrl } from './vless-settings.mjs'
 
 export const CONTROL_CODES = Object.freeze({
   portBusy: '端口占用',
@@ -31,7 +33,6 @@ export class ConnectorError extends Error {
     this.code = code
   }
 }
-
 export function createLoopbackProbeConnector(spec) {
   if (spec.host !== '127.0.0.1' && spec.host !== '::1') {
     throw new ConnectorError(CONTROL_CODES.upstreamUnreachable, `loopback-probe 只接受回环地址,收到 ${spec.host}`)
@@ -84,8 +85,14 @@ export function createLoopbackProbeConnector(spec) {
 }
 
 export function createSshSocksConnector(spec, injected = {}) {
+  const verifyOptions = { allowLocalVerifyUrls: spec.allowLocalVerifyUrls === true }
+  if (!validProductionVerifyUrl(spec.verifyUrl, verifyOptions) ||
+      (spec.verifyFallbackUrl !== undefined && !validProductionVerifyFallbackUrl(spec.verifyUrl, spec.verifyFallbackUrl, verifyOptions))) {
+    throw new ConnectorError(CONTROL_CODES.upstreamUnreachable, '复验配置无效')
+  }
   const spawnImpl = injected.spawn ?? defaultSpawn
   let child
+  let childState
   let lostCallback
   let stopped = false
   let stderrTail = ''
@@ -99,6 +106,7 @@ export function createSshSocksConnector(spec, injected = {}) {
     async start() {
       stopped = false
       stderrTail = ''
+      const state = { finished: false }
       // 随包 OpenSSH(定稿 2):⛔ 依赖系统可选功能;供应链未放入 bin/ssh.exe 时按「组件缺失」拒,
       // 该检查只在 ssh-socks 连接器真实起连接时发生,VLESS/REALITY 包不受影响。
       const executable = spec.sshExecutable ?? bundledSshPath()
@@ -120,6 +128,7 @@ export function createSshSocksConnector(spec, injected = {}) {
         `${spec.node.sshUser}@${spec.node.host}`
       ]
       child = spawnImpl(executable, args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true })
+      childState = state
       child.stderr.on('data', (chunk) => {
         stderrTail = `${stderrTail}${chunk.toString('utf8')}`.slice(-4000)
       })
@@ -127,12 +136,14 @@ export function createSshSocksConnector(spec, injected = {}) {
       // 上面的 existsSync 只挡住「文件不在」;文件在但不可执行(EACCES/EPERM)或其它 spawn
       // 失败只发 'error',不发 'exit'。⛔ 不监听:未捕获异常会把守护打崩成「守护异常退出」。
       child.once('error', (error) => {
+        state.finished = true
         exitFailure = classifySpawnError(error)
         if (!stopped && lostCallback !== undefined) {
           lostCallback(exitFailure)
         }
       })
       child.on('exit', (code) => {
+        state.finished = true
         // 已有 spawn 失败结论时不覆盖:那一条比退出码更准。
         exitFailure ??= classifySshExit(code, stderrTail)
         if (!stopped && lostCallback !== undefined) {
@@ -147,23 +158,44 @@ export function createSshSocksConnector(spec, injected = {}) {
         host: '127.0.0.1',
         port: spec.localPort,
         targetHost: url.hostname,
-        targetPort: url.port === '' ? 80 : Number.parseInt(url.port, 10),
+        targetPort: url.port === '' ? (url.protocol === 'https:' ? 443 : 80) : Number.parseInt(url.port, 10),
         timeoutMs: spec.timeoutMs ?? 10_000
       })
       try {
-        return { exitIp: await httpGetBody(socket, url) }
+        return { exitIp: await verifyHttpExitIp(socket, url, spec.timeoutMs ?? 10_000) }
       } finally {
         socket.destroy()
       }
     },
     async stop() {
       stopped = true
-      if (child !== undefined && child.exitCode === null) {
-        child.kill('SIGTERM')
-      }
+      const current = child
+      const state = childState
       child = undefined
+      childState = undefined
+      if (current === undefined || current.exitCode !== null || state?.finished === true) return
+      current.kill('SIGTERM')
+      await waitForChildExit(current)
     }
   }
+}
+
+function waitForChildExit(child, timeoutMs = 5_000) {
+  if (child.exitCode !== null) return Promise.resolve()
+  return new Promise((resolvePromise) => {
+    let timer
+    const finish = () => {
+      if (timer !== undefined) clearTimeout(timer)
+      child.removeListener('exit', finish)
+      child.removeListener('close', finish)
+      child.removeListener('error', finish)
+      resolvePromise()
+    }
+    child.once('exit', finish)
+    child.once('close', finish)
+    child.once('error', finish)
+    timer = setTimeout(finish, timeoutMs)
+  })
 }
 
 async function waitForLocalSocks(port, timeoutMs, failureOf) {
@@ -226,28 +258,4 @@ function classifySshExit(code, stderr) {
 // 真实 ssh.exe 由供应链核准后放入(sidecar/win/bin/README.md);⛔ 回退到系统可选功能 OpenSSH。
 function bundledSshPath() {
   return join(dirname(fileURLToPath(import.meta.url)), 'bin', 'ssh.exe')
-}
-
-function httpGetBody(socket, url) {
-  return new Promise((resolvePromise, rejectPromise) => {
-    socket.write(
-      `GET ${url.pathname} HTTP/1.1\r\nHost: ${url.host}\r\nConnection: close\r\n\r\n`
-    )
-    let buffer = Buffer.alloc(0)
-    socket.on('data', (chunk) => {
-      buffer = Buffer.concat([buffer, chunk])
-    })
-    socket.on('close', () => {
-      const text = buffer.toString('utf8')
-      const separator = text.indexOf('\r\n\r\n')
-      if (separator === -1) {
-        rejectPromise(new ConnectorError(CONTROL_CODES.upstreamUnreachable, '复验响应畸形'))
-        return
-      }
-      resolvePromise(text.slice(separator + 4).trim())
-    })
-    socket.on('error', (error) =>
-      rejectPromise(new ConnectorError(CONTROL_CODES.upstreamUnreachable, error.message))
-    )
-  })
 }

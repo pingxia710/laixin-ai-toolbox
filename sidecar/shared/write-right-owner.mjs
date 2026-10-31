@@ -8,6 +8,7 @@
 // 所以读到的一切都当「线索」用,⛔ 拿它判断对方死活——死活由 WAIT_ABANDONED 说了算。
 //
 // 位置必须跨数据目录、跨安装目录固定:这次的故障正是两份来信各用各的目录、互相看不见。
+import { randomBytes } from 'node:crypto'
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -33,9 +34,11 @@ export function writeRightOwnerPath(platform = process.platform, env = process.e
 export function publishWriteRightOwner(info, path = writeRightOwnerPath()) {
   try {
     mkdirSync(join(path, '..'), { recursive: true })
-    const temporary = `${path}.tmp`
-    writeFileSync(temporary, `${JSON.stringify({ ...info, at: Date.now() })}\n`, { mode: 0o600 })
-    renameSync(temporary, path)
+    const temporary = `${path}.tmp-${randomBytes(8).toString('hex')}`
+    try {
+      writeFileSync(temporary, `${JSON.stringify({ ...info, at: Date.now() })}\n`, { mode: 0o600 })
+      renameSync(temporary, path)
+    } finally { rmSync(temporary, { force: true }) }
     return true
   } catch { return false }
 }

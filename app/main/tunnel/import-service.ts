@@ -49,6 +49,8 @@ export interface ImportDeps {
   readonly sourceLineOf: (validated: ValidatedPackage) => string
   // 接收方运行平台:包平台与它不符即拒;缺省由 package-format 按进程平台推导。
   readonly runtimePlatform?: Platform
+  /** 仅本地测试夹具允许回环验证地址。 */
+  readonly allowLocalVerifyUrls?: boolean
   // 测试钩子(判据 13③ 的 kill 窗口):校验通过、任何提交字节落盘之前调用
   readonly afterValidation?: (validated: ValidatedPackage) => Promise<void>
 }
@@ -67,7 +69,7 @@ function storedPackageDigest(deps: Omit<ImportDeps, 'picker'>, current: NonNulla
     const entries = readPackageEntries(layout.batchDir(deps.dataDir, current.batchId)).filter((entry) => entry.path !== 'import-meta.json')
     const expiresAt = Date.parse(current.expiresAt)
     return validatePackage(entries, { now: Number.isFinite(expiresAt) ? Math.min(deps.now(), expiresAt - 1) : deps.now(), currentVersion: undefined, currentAuthorizationId: current.authorizationId,
-      trust: deps.trust, runtimePlatform: deps.runtimePlatform }).packageDigest
+      trust: deps.trust, runtimePlatform: deps.runtimePlatform, allowLocalVerifyUrls: deps.allowLocalVerifyUrls }).packageDigest
   } catch { return undefined }
 }
 
@@ -175,10 +177,13 @@ async function commitPackage(deps: Omit<ImportDeps, 'picker'>, readEntries: () =
       currentAuthorizationId: account?.authorizationId ?? current?.authorizationId,
       currentPackageDigest: comparesCurrent && current ? storedPackageDigest(deps, current) : undefined,
       trust: deps.trust,
-      runtimePlatform: deps.runtimePlatform
+      runtimePlatform: deps.runtimePlatform,
+      allowLocalVerifyUrls: deps.allowLocalVerifyUrls
     })
     if (account && Date.parse(validated.manifest.expiresAt) !== account.expiresAt) throw new PackageReject('PACKAGE_MALFORMED')
     await deps.afterValidation?.(validated)
+    const node = validated.manifest.node ?? validated.manifest.customerEntry
+    if (node === undefined) throw new PackageReject('PACKAGE_MALFORMED')
     beforeCommit?.()
     // 全部校验通过才落盘:先 staging,再原子 rename 进 imports/,最后原子写 pending 指针。
     writeEntriesToStaging(stagingDir, entries)
@@ -197,7 +202,7 @@ async function commitPackage(deps: Omit<ImportDeps, 'picker'>, readEntries: () =
       outcome: 'imported',
       batchId,
       authorizationId: validated.manifest.authorizationId,
-      nodeLabel: `${validated.manifest.node.host}:${String(validated.manifest.node.port)}`,
+      nodeLabel: `${node.host}:${String(node.port)}`,
       expiresAt: validated.manifest.expiresAt,
       sourceLine: deps.sourceLineOf(validated),
       packageDigest: validated.packageDigest

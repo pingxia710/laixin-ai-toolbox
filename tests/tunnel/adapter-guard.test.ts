@@ -56,13 +56,17 @@ describe('真实适配器守卫(判据 7)与平台原语', () => {
       'app/main/tunnel/platform/mac.ts',
       'app/main/tunnel/platform/win.ts',
       'sidecar/mac/adapter-networksetup.mjs',
+      'sidecar/mac/tunnel-daemon.mjs',
+      'sidecar/shared/tunnel-daemon.mjs',
       'sidecar/win/adapter-wininet.mjs',
+      'sidecar/win/tunnel-daemon.mjs',
       'tests/tunnel/adapter-guard.test.ts',
       // 恢复回归先替换所有系统命令、写入与锁，再加载真实 Mac 读取契约。
       'tests/tunnel/fixtures/mac-restore-inspection-adapter.mjs',
       // 守护常驻的描述文件必须把放行钥匙原样带上,否则常驻起来的守护写不了系统设置;这条用例就是在钉它。
       'tests/tunnel/mac-proxy-authorization.test.ts',
       'tests/tunnel/resident-agent.test.ts',
+      'tests/tunnel/startup-watchdog.test.ts',
       'tests/tunnel/system-adapters-reliability.test.ts',
       'tests/tunnel/win-adapter.test.ts',
       'tests/tunnel/win-daemon-entry.test.ts',
@@ -91,52 +95,10 @@ describe('真实适配器守卫(判据 7)与平台原语', () => {
     const sidecarDir = resolveSidecarDir({ platform: 'macos', isPackaged: false, resourcesPath: '', repoRoot: REPO_ROOT })
     expect(missingSidecarComponents('macos', sidecarDir)).toEqual([])
     expect(missingSidecarComponents('macos', '/nonexistent')).toEqual([
-      'tunnel-daemon.mjs',
-      'adapter-networksetup.mjs',
-      'proxy-privilege.mjs',
-      'bin/proxy-helper',
-      'active-network-path.mjs',
-      'managed-adapter.mjs',
-      'port-owner.mjs',
-      'macos-write-right.mjs',
-      'bin/write-lock',
-      'terminal-environment.mjs',
-      'power-events.mjs',
-      'ledger.mjs',
-      'restore.mjs',
-      'restore-observation.mjs',
-      'daemon-core.mjs',
-      'routes.default.json',
-      'local-bridge.mjs',
-      'xray-runner.mjs',
-      'vless-connector.mjs',
-      'vless-settings.mjs',
-      'instance-lock.mjs',
-      'resident-integrity.mjs',
-      'xray',
-      'geoip.dat',
-      'geosite.dat'
+      ...sidecarComponents('macos'), 'xray', 'geoip.dat', 'geosite.dat'
     ])
     expect(missingSidecarComponents('windows', '/nonexistent')).toEqual([
-      'tunnel-daemon.mjs',
-      'adapter-wininet.mjs',
-      'managed-adapter.mjs',
-      'terminal-environment.mjs',
-      'wininet-settings.ps1',
-      'power-events.mjs',
-      'ledger.mjs',
-      'restore.mjs',
-      'restore-observation.mjs',
-      'daemon-core.mjs',      'routes.default.json',
-      'local-bridge.mjs',
-      'xray-runner.mjs',
-      'vless-connector.mjs',
-      'vless-settings.mjs',
-      'instance-lock.mjs',
-      'resident-integrity.mjs',
-      'xray.exe',
-      'geoip.dat',
-      'geosite.dat'
+      ...sidecarComponents('windows'), 'xray.exe', 'geoip.dat', 'geosite.dat'
     ])
   })
 
