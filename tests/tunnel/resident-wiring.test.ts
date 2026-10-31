@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { makeResidentRuntime, residentLogDir, residentSpecFor } from '../../app/main/tunnel/resident-bridge'
+import { makeResidentRuntime, residentFallbackArgs, residentLogDir, residentSpecFor, shouldUseResidentFallback } from '../../app/main/tunnel/resident-bridge'
 import { calibrateResident, resetResidentRuntime, setResidentRuntime } from '../../app/main/tunnel/resident-owner'
 import type { ResidentOutcome, ResidentSpec } from '../../app/main/tunnel/platform/resident'
 
@@ -59,16 +59,25 @@ describe('常驻接线', () => {
     h.cleanup()
   })
 
-  it('装不上就如实记下没装——⛔ 因为常驻装不上就不给客户连网', async () => {
+  it('装不上就如实记下没装，连接路径改用独立生命周期 fallback', async () => {
     const h = makeRuntime({ installOutcome: { installed: false, reason: '目录不可写' } })
     const outcome = await h.runtime.calibrate(true)
     // 正向证据:确实试过装(⛔ 只断言 armed 是 false——根本没试也长这样)
     expect(h.calls.map((c) => c.op)).toEqual(['install'])
     expect(outcome.installed).toBe(false)
-    // armed 为假且席位无人 → 守护监管走 spawn 老路兜底(装不上 ⛔ 因此不给客户连网);
-    // 席位上有在席常驻守护时(校准完成前的盲区)按常驻轮处理,不再走老路起第二份(甲-1)
+    // armed 为假且席位无人 → 连接路径可选择无 parent-ipc 的独立 fallback；
+    // 席位上有在席常驻守护时(校准完成前的盲区)仍按常驻轮处理,不再起第二份(甲-1)
     expect(h.runtime.bridge.armed()).toBe(false)
     h.cleanup()
+  })
+
+  it('不可停用旧任务不启用 fallback；可停但三轮叫不醒允许 fallback', () => {
+    const unavailable = { armed: () => false, alive: () => false, staleCarry: () => false, unmanagedStale: () => false }
+    expect(shouldUseResidentFallback(unavailable, true)).toBe(true)
+    expect(shouldUseResidentFallback(unavailable, false)).toBe(false)
+    expect(shouldUseResidentFallback({ ...unavailable, staleCarry: () => true }, true)).toBe(true)
+    expect(shouldUseResidentFallback({ ...unavailable, unmanagedStale: () => true }, true)).toBe(false)
+    expect(residentFallbackArgs('run-123')).toEqual(['--resident', '1', '--run-id', 'run-123'])
   })
 
   it('开发态不装常驻,但也 ⛔ 报成失败', async () => {

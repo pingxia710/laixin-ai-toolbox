@@ -60,6 +60,7 @@ export class DesktopRuntime {
   private notifications = new Map<string, Notification>()
   private timers: ReturnType<typeof setInterval>[] = []
   private startupTimers: ReturnType<typeof setTimeout>[] = []
+  private residentBootCalibration?: Promise<boolean>
   private updateDirectory = join(app.getPath('userData'), 'updates')
   // resize/move 防抖落盘;签名未变化时不重建托盘菜单。
   private readonly persistWindowBounds = debounce(() => { void this.saveWindowAsync() }, 300)
@@ -104,8 +105,7 @@ export class DesktopRuntime {
     } catch { console.error('[toolbox-desktop] TRAY_UNAVAILABLE') }
     app.on('before-quit', () => { this.quitting = true; this.saveWindow() })
     registry.registerShutdownHook('desktop', () => this.dispose())
-    // 启动固定跑一次「按开关校准常驻」(装或卸)。⛔ 依赖更新助手去装——助手跑在旧版上下文里,
-    // 而更新原地换过 bundle 之后,旧描述文件里的可执行路径已经不对了,必须由新版自己重装。
+    // 渲染进程未能加载时也要完成启动校准；正常更新启动由 ready() 复用同一 Promise。
     this.startupTimers.push(setTimeout(() => { void this.calibrateResidentOnBoot() }, 1_000))
     this.startupTimers.push(setTimeout(() => { void this.pollQuotas() }, 15_000))
     this.startupTimers.push(setTimeout(() => { void this.runAutoUpdate('startup') }, 30_000))
@@ -130,7 +130,7 @@ export class DesktopRuntime {
         showCloseToTrayHintOnce(this.store, () => {
           dialog.showMessageBoxSync(window, { type: 'info', title: '来信 AI 工具箱',
             message: '窗口会收起到托盘，工具箱继续在后台运行',
-            detail: `如需退出，请在${process.platform === 'win32' ? '任务栏右下角' : '屏幕顶部菜单栏'}打开来信图标菜单，选择“退出工具箱”。退出后仅保留 API 所需通道，并按原套餐计量；如需全部停止，请先断开 AI网络。`,
+            detail: `如需退出，请在${process.platform === 'win32' ? '任务栏右下角' : '屏幕顶部菜单栏'}打开来信图标菜单，选择“退出工具箱”。退出后会停止通道并恢复电脑原有网络设置。`,
             buttons: ['知道了'], noLink: true })
         })
       } catch { console.error('[toolbox-desktop] CLOSE_TO_TRAY_HINT_UNAVAILABLE') }
@@ -144,6 +144,10 @@ export class DesktopRuntime {
   }
 
   async ready(): Promise<void> {
+    // 启动固定跑一次「按开关校准常驻」(装或卸)。⛔ 依赖更新助手去装——助手跑在旧版上下文里,
+    // 而更新原地换过 bundle 之后,旧描述文件里的可执行路径已经不对了,必须由新版自己重装。
+    // 更新回执会等待这次校准，避免前置闸留下 Disabled 的任务先被提交。
+    const residentReady = this.calibrateResidentOnBoot()
     // 回执可能要等网络连上(更新前客户是连着的那种),⛔ 卡住 ready ——界面还等着它返回。
     // 放到后台盯;盯到「已连」或「客户自己不要连了」就写回执,到点没连上就记下这一版并退出让台。
     // 写回执成功 ⇒ 这次启动就是「更新装好了」的第一眼,把成功信息留给界面拉(updateSuccess),
@@ -156,6 +160,7 @@ export class DesktopRuntime {
         if (outcome === 'ready') await acceptVerifiedProductionAiRouterRecovery()
         return outcome
       },
+      residentReady: process.platform === 'win32' ? () => residentReady : undefined,
       deferSuccessUntilCommit: process.platform === 'win32'
     }).then(async (acknowledged) => {
       const success = process.platform === 'win32'
@@ -193,7 +198,7 @@ export class DesktopRuntime {
     const alerts = preferences.quotaNotifications ? [...this.alerts] : []
     const residentError = app.isPackaged && (this.store.residentChoice() ?? RESIDENT_DEFAULT_ENABLED) ? residentCalibrationError() : ''
     if (residentError) alerts.push({ id: `resident:${residentError}`, kind: 'resident',
-      message: `网络常驻未生效，无法保障开机或意外退出后的自动接续。当前仍可手动连接，请保持工具箱开启。错误码：${residentError}。点击查看设置或联系客服。` })
+      message: '后台保护设置没有完成，但不影响正常使用。连接时会自动选择可用的保护方式；如果遇到网络中断，请重新打开工具箱。' })
     return { preferences, backgroundAvailable: !!this.tray, alerts, update: this.updater.status() }
   }
 
@@ -238,13 +243,20 @@ export class DesktopRuntime {
     return applyResidentChoice(this.residentPreference(), this.resident, enabled, app.isPackaged, calibrateResident)
   }
 
-  /** 启动校准:读客户的选择,该装就装、该卸就卸。装不上只记日志——⛔ 因为常驻装不上就不给客户连网。 */
-  private async calibrateResidentOnBoot(): Promise<void> {
-    if (!app.isPackaged) return
-    let wanted: boolean
-    try { wanted = this.residentPreference().read() } catch { return }
-    const outcome = await calibrateResident(wanted).catch(() => undefined)
-    if (wanted && outcome && !outcome.installed) console.error('[toolbox-desktop] RESIDENT_INSTALL_FAILED')
+  /** 启动校准:读客户的选择,该装就装、该卸就卸。装不上只记日志——⛔ 因为常驻装不上就不给客户连网。
+   * 返回值给 Windows 更新回执闸:只有本轮选择已经按要求落定,助手才可提交更新。 */
+  private calibrateResidentOnBoot(): Promise<boolean> {
+    if (this.residentBootCalibration !== undefined) return this.residentBootCalibration
+    this.residentBootCalibration = (async () => {
+      if (!app.isPackaged) return true
+      let wanted: boolean
+      try { wanted = this.residentPreference().read() } catch { return false }
+      const outcome = await calibrateResident(wanted).catch(() => undefined)
+      const ready = outcome !== undefined && (!wanted || outcome.installed)
+      if (!ready && wanted) console.error('[toolbox-desktop] RESIDENT_INSTALL_FAILED')
+      return ready
+    })()
+    return this.residentBootCalibration
   }
 
   private residentPreference(): ResidentPreference {

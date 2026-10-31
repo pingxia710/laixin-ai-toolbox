@@ -40,8 +40,9 @@ it('关闭低额度通知仍显示常驻失败，关闭常驻选择后不继续�
   const status = await runtime.status()
   expect(status.alerts).toHaveLength(1)
   expect(status.alerts[0]).toMatchObject({ kind: 'resident' })
-  expect(status.alerts[0].message).toContain('0x80070005')
-  expect(status.alerts[0].message).toContain('常驻未生效')
+  expect(status.alerts[0].message).toContain('后台保护设置没有完成')
+  expect(status.alerts[0].message).toContain('自动选择可用的保护方式')
+  expect(status.alerts[0].message).not.toContain('0x80070005')
   enabled = false
   expect((await runtime.status()).alerts).toEqual([])
 })

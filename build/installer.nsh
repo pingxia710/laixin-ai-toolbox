@@ -62,6 +62,7 @@ Var /GLOBAL laixinUninstallPreflight
 Var /GLOBAL laixinUninstallProxyFallback
 Var /GLOBAL laixinUninstallRecoveryCommit
 Var /GLOBAL laixinUninstallFailureCode
+Var /GLOBAL laixinUninstallRetrying
 !macro customCheckAppRunning
   StrCpy $laixinEarlyUninstallPreflight "not-run"
   StrCpy $laixinEarlyUninstallRecoveryArmed "not-run"
@@ -189,6 +190,13 @@ Var /GLOBAL laixinUninstallFailureCode
   ; templates/nsis/include/installUtil.nsh 的 `StrCpy $0 "$0 --updated"`),
   ; 本产品的 Windows 更新助手 resources\update-helper.ps1 也是用 `/S --updated` 调安装器;
   ; 客户从「应用和功能」里自己卸载时没有这个参数。
+laixinUninstallRetry:
+  ${If} $laixinUninstallRetrying == "1"
+    ; 上一轮前置闸已经完成补偿；重试必须重新读取任务和进程，不能复用失败结果。
+    StrCpy $laixinEarlyUninstallPreflight "not-run"
+    StrCpy $laixinEarlyUninstallRecoveryArmed "not-run"
+  ${EndIf}
+  StrCpy $laixinUninstallRetrying "0"
   ClearErrors
   ${GetParameters} $3
   ${GetOptions} $3 "--updated" $4
@@ -208,6 +216,7 @@ Var /GLOBAL laixinUninstallFailureCode
 
   ; AI 路由与网络隧道是两个独立 owner。在任何文件替换前，让已安装的 D+
   ; 用 HMAC + runtime + seat 证明并停止自己的 headless。结果单独保留，网络恢复完成后再统一失败关闭。
+  DetailPrint "正在停止 AI 路由并准备卸载..."
   StrCpy $laixinAiRouterCleanup "not-run"
   ${If} ${FileExists} "$INSTDIR\${APP_EXECUTABLE_FILENAME}"
     nsExec::ExecToLog '"$INSTDIR\${APP_EXECUTABLE_FILENAME}" --laixin-ai-router-cleanup'
@@ -218,6 +227,7 @@ Var /GLOBAL laixinUninstallFailureCode
   ;    升级只停用并回读 Disabled。同一安装进程树已完成过 update 前置闸时必须复用，不能
   ;    对 Disabled 状态重新拍快照后丢掉第一次调用前的 Enabled 恢复责任。
   ${If} $5 == "uninstall"
+    DetailPrint "正在停止守护并移除常驻任务..."
     ${If} $laixinEarlyUninstallPreflight != ""
     ${AndIf} $laixinEarlyUninstallPreflight != "not-run"
       Push $8
@@ -254,6 +264,11 @@ Var /GLOBAL laixinUninstallFailureCode
     ${Else}
       ${If} ${FileExists} "$INSTDIR\${APP_EXECUTABLE_FILENAME}"
         !insertmacro runLaixinWindowsPreflight update
+        ; update 模式 preflight 成功时同样武装了恢复事务(与 uninstall 同一 arm 路径),
+        ; commit 语义对齐:P2-L1 后升级也要在本进程(owner 仍活)提交,标记必须置位。
+        ${If} $7 == "0"
+          StrCpy $laixinUninstallRecoveryArmed "1"
+        ${EndIf}
       ${Else}
         StrCpy $7 "1"
       ${EndIf}
@@ -271,6 +286,7 @@ Var /GLOBAL laixinUninstallFailureCode
   System::Call 'Kernel32::SetEnvironmentVariable(t "TOOLBOX_REAL_NETWORK_ADAPTER", t "1")'
   System::Call 'Kernel32::SetEnvironmentVariable(t "TOOLBOX_REAL_TERMINAL_ENVIRONMENT", t "1")'
   StrCpy $6 "not-run"
+  DetailPrint "正在恢复系统代理和环境设置..."
   ${If} ${FileExists} "$INSTDIR\resources\sidecar\win\tunnel-daemon.mjs"
   ${AndIf} ${FileExists} "$INSTDIR\${APP_EXECUTABLE_FILENAME}"
     nsExec::ExecToLog '"$INSTDIR\${APP_EXECUTABLE_FILENAME}" "$INSTDIR\resources\sidecar\win\tunnel-daemon.mjs" restore --data-dir "$APPDATA\${PRODUCT_NAME}\tunnel" --adapter "$INSTDIR\resources\sidecar\win\managed-adapter.mjs"'
@@ -282,15 +298,31 @@ Var /GLOBAL laixinUninstallFailureCode
     ${EndIf}
   ${EndIf}
 
-  ; 3) 还原没成功才兜底；脚本核同会话未结算账目、当前值及端口监听。
-  ;    空账本或无法核归属返回非零并中止卸载，保留程序和现场供离线客服接力。
+  ; 3) 真卸载不再走弱化的 WinINET fallback。已安装的守护 restore 本身带同款账本/写权/
+  ;    端口归属和重试梯子；它失败就保留程序和现场，不能用一套更窄的脚本把连接态误判成未知。
+  ;    只有安装目录残缺、无法启动守护时才保留 fallback 作为最后的受限接力；升级语义照旧。
   ${If} $6 != "0"
-    nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\laixin-uninstall-task-cleanup.ps1" -ProxyFallbackOnly -TunnelDataDir "$APPDATA\${PRODUCT_NAME}\tunnel"'
-    Pop $0
-    StrCpy $laixinUninstallProxyFallback $0
-    ${If} $0 != "0"
-      StrCpy $7 $0
-      StrCpy $laixinUninstallFailureCode "UNINSTALL_PROXY_FALLBACK_FAILED"
+    ${If} $5 == "uninstall"
+      ${If} $6 == "not-run"
+        nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\laixin-uninstall-task-cleanup.ps1" -ProxyFallbackOnly -TunnelDataDir "$APPDATA\${PRODUCT_NAME}\tunnel"'
+        Pop $0
+        StrCpy $laixinUninstallProxyFallback $0
+        ${If} $0 != "0"
+          StrCpy $7 $0
+          StrCpy $laixinUninstallFailureCode "UNINSTALL_PROXY_FALLBACK_FAILED"
+        ${EndIf}
+      ${Else}
+        StrCpy $7 $6
+        StrCpy $laixinUninstallFailureCode "UNINSTALL_TUNNEL_RESTORE_FAILED"
+      ${EndIf}
+    ${Else}
+      nsExec::ExecToLog 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\laixin-uninstall-task-cleanup.ps1" -ProxyFallbackOnly -TunnelDataDir "$APPDATA\${PRODUCT_NAME}\tunnel"'
+      Pop $0
+      StrCpy $laixinUninstallProxyFallback $0
+      ${If} $0 != "0"
+        StrCpy $7 $0
+        StrCpy $laixinUninstallFailureCode "UNINSTALL_PROXY_FALLBACK_FAILED"
+      ${EndIf}
     ${EndIf}
   ${EndIf}
   ${If} $laixinAiRouterCleanup != "0"
@@ -309,9 +341,12 @@ Var /GLOBAL laixinUninstallFailureCode
     StrCpy $laixinUninstallFailureCode "UNINSTALL_TUNNEL_RESTORE_FAILED"
   ${EndIf}
   ; 真卸载已经完成任务删除回读和网络恢复后才提交恢复事务；如果这里失败，保留 marker，
-  ; 看守会在卸载器退出后按原快照恢复，而不是留下半卸载。升级必须等新版启动回执，不能在旧卸载器里提交。
-  ${If} $5 == "uninstall"
-  ${AndIf} $7 == "0"
+  ; 看守会在卸载器退出后按原快照恢复，而不是留下半卸载。
+  ; P2-L1(R3 验收实锤):升级也在此提交。原设计「等新版启动回执」把 commit 推给只有重启才会跑的
+  ; Run 键恢复——升级不重启就永远 armed,下次卸载/升级全被僵尸事务闸死。此刻(任务已停用回读+
+  ; 账本还原+兜底全零)恢复责任已了结,新版启动回执只影响启动,不影响已完成的网络恢复;
+  ; 此刻旧卸载器进程(owner)仍活着,正是 assertLiveOwner 认可的唯一提交时机。
+  ${If} $7 == "0"
   ${AndIf} $laixinUninstallRecoveryArmed == "1"
   ${AndIf} ${FileExists} "$INSTDIR\${APP_EXECUTABLE_FILENAME}"
     !insertmacro commitLaixinWindowsPreflight
@@ -325,7 +360,8 @@ Var /GLOBAL laixinUninstallFailureCode
       ClearErrors
       ${GetOptions} $3 "/S" $4
       ${If} ${Errors}
-        MessageBox MB_OK|MB_ICONSTOP "卸载前安全收尾未完成，程序尚未删除。失败码：$laixinUninstallFailureCode。请使用“一键诊断”联系来信客服。"
+        StrCpy $laixinUninstallRetrying "1"
+        MessageBox MB_RETRYCANCEL|MB_ICONSTOP "卸载前安全收尾未完成，程序尚未删除。失败码：$laixinUninstallFailureCode。请关闭外部占用后点击“重试”；仍失败可取消后使用“一键诊断”联系来信客服。" IDRETRY laixinUninstallRetry
       ${EndIf}
     ${EndIf}
     SetErrorLevel 1
@@ -335,6 +371,7 @@ Var /GLOBAL laixinUninstallFailureCode
   ; 只在真卸载且网络/常驻收尾成功后清理本产品独占的下载缓存。
   ; reparse point 不能递归追进去；Roaming 会话、tunnel 账本与恢复证据不在此范围。
   ${If} $5 == "uninstall"
+    DetailPrint "正在删除程序文件和本产品残留..."
     ; 任务与网络已安全收尾，再尽力清理空任务文件夹；清理失败留在卸载日志中。
     nsExec::ExecToLog /TIMEOUT=15000 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\laixin-uninstall-task-cleanup.ps1"'
     Pop $0
@@ -347,6 +384,11 @@ Var /GLOBAL laixinUninstallFailureCode
       RMDir /r "$LOCALAPPDATA\laixin-ai-toolbox-updater"
     ${EndIf}
     RMDir "$LOCALAPPDATA\Laixin"
+    ; 这是工具箱唯一写入的终端 helper；AutoRun 块已由 restore 链清除后再删单文件，
+    ; 不递归删除用户目录里的其他内容。
+    ReadEnvStr $8 "USERPROFILE"
+    Delete "$8\.laixin-ai-toolbox\terminal-proxy.cmd"
+    RMDir "$8\.laixin-ai-toolbox"
     Pop $9
     Pop $8
   ${EndIf}
@@ -393,23 +435,59 @@ Var /GLOBAL laixinInstallEvidence
   ${If} $R8 == "1"
     !insertmacro readLaixinWindowsPreflightHandoff $R7
     ${If} $R7 != "1"
-      CreateDirectory "$APPDATA\${PRODUCT_NAME}\updates"
-      ClearErrors
-      FileOpen $R9 "$APPDATA\${PRODUCT_NAME}\updates\windows-preflight-last-error.log" a
-      ${IfNot} ${Errors}
-        FileSeek $R9 0 END
-        FileWrite $R9 "$\r$\nINSTALLER_HANDOFF_REQUIRED STAGE=CUSTOM_INIT EXIT_CODE=1 EVIDENCE=$laixinInstallEvidence TARGET=$INSTDIR$\r$\n"
-        FileClose $R9
+      ; P1(0.7.1 验收)修复:这里曾把「无 handoff 的任何旧安装」一刀切 Abort,连客户双击
+      ; 新版安装器的正常升级也拦死(升级链路首次真测即暴露,存量用户会永远停在旧版)。
+      ; 现在分两类:
+      ;  · 目标 EXE 还在(健康旧安装)→ 降级继续:uninstallOldVersion 会复制旧卸载器并以
+      ;    --updated 调用,其 customUnInstall 的 update 前置闸(持久化恢复事务+看守+任务/
+      ;    进程核验)才是真正的安全验证点;它失败仍会以非零退出并保留现场,半开风险不放大。
+      ;  · 目标 EXE 已丢(残缺安装,INST 系)→ 维持硬拦:没有可运行的 Electron 就没有
+      ;    前置闸能力,继续覆盖才是半开风险。
+      ${If} ${FileExists} "$INSTDIR\${APP_EXECUTABLE_FILENAME}"
+        CreateDirectory "$APPDATA\${PRODUCT_NAME}\updates"
+        ClearErrors
+        FileOpen $R9 "$APPDATA\${PRODUCT_NAME}\updates\windows-preflight-last-error.log" a
+        ${IfNot} ${Errors}
+          FileSeek $R9 0 END
+          FileWrite $R9 "$\r$\nINSTALLER_HANDOFF_DEGRADED STAGE=CUSTOM_INIT EVIDENCE=$laixinInstallEvidence TARGET=$INSTDIR ACTION=PROCEED_VIA_OLD_UNINSTALLER_GATE$\r$\n"
+          FileClose $R9
+        ${EndIf}
+        ; P2-L2(R4 验收实锤):此处放行后,恢复将由旧卸载器内嵌的旧模板执行——存量僵尸事务
+        ; 在旧语义(终端一票否决)下必败死循环。先用【随包新版 helper】对存量事务自愈一次:
+        ; 有事务→新版闸(L3 范围核验)恢复并提交,旧卸载器随后走 cleanup-only;无事务→立即成功。
+        ; 失败不拦升级(与 P1 放行语义一致),旧卸载器仍按自己的闸收尾并如实失败关闭。
+        InitPluginsDir
+        SetOutPath "$PLUGINSDIR"
+        File /oname=laixin-update-helper.cjs "${PROJECT_DIR}/resources/update-helper.cjs"
+        System::Call 'Kernel32::SetEnvironmentVariable(t "ELECTRON_RUN_AS_NODE", t "1")'
+        nsExec::ExecToLog '"$INSTDIR\${APP_EXECUTABLE_FILENAME}" "$PLUGINSDIR\laixin-update-helper.cjs" windows-preflight-resume "$APPDATA\${PRODUCT_NAME}\updates"'
+        Pop $R7
+        System::Call 'Kernel32::SetEnvironmentVariable(t "ELECTRON_RUN_AS_NODE", i 0)'
+        ; 自愈结果只记日志:0/无事务=已解锁;非零=旧卸载器路径仍按其闸执行(可能失败关闭)。
+        CreateDirectory "$APPDATA\${PRODUCT_NAME}\updates"
+        ClearErrors
+        FileOpen $R9 "$APPDATA\${PRODUCT_NAME}\updates\windows-preflight-last-error.log" a
+        ${IfNot} ${Errors}
+          FileSeek $R9 0 END
+          FileWrite $R9 "$\r$\nINSTALLER_ZOMBIE_SELF_HEAL STAGE=CUSTOM_INIT RESULT=$R7 TARGET=$INSTDIR$\r$\n"
+          FileClose $R9
+        ${EndIf}
+        Goto laixinCustomInitDone
+      ${Else}
+        FileOpen $R9 "$APPDATA\${PRODUCT_NAME}\updates\windows-preflight-last-error.log" a
+        ${IfNot} ${Errors}
+          FileSeek $R9 0 END
+          FileWrite $R9 "$\r$\nINSTALLER_HANDOFF_REQUIRED STAGE=CUSTOM_INIT EXIT_CODE=1 EVIDENCE=$laixinInstallEvidence TARGET=$INSTDIR$\r$\n"
+          FileClose $R9
+        ${EndIf}
+        IfSilent +2
+        MessageBox MB_OK|MB_ICONSTOP "检测到已安装版本，但无法确认本次更新交接。请先完成或关闭正在进行的卸载，关闭所有来信 AI 工具箱的安装和卸载窗口后，再从已安装的来信 AI 工具箱内检查更新。为保护现有程序，本次未开始覆盖。错误码：INSTALLER_HANDOFF_REQUIRED；判据：$laixinInstallEvidence"
+        SetErrorLevel 1
+        Abort
       ${EndIf}
-      Pop $R9
-      Pop $R8
-      Pop $R7
-      IfSilent +2
-      MessageBox MB_OK|MB_ICONSTOP "检测到已安装版本，但无法确认本次更新交接。请先完成或关闭正在进行的卸载，关闭所有来信 AI 工具箱的安装和卸载窗口后，再从已安装的来信 AI 工具箱内检查更新。为保护现有程序，本次未开始覆盖。错误码：INSTALLER_HANDOFF_REQUIRED；判据：$laixinInstallEvidence"
-      SetErrorLevel 1
-      Abort
     ${EndIf}
   ${EndIf}
+  laixinCustomInitDone:
   Pop $R9
   Pop $R8
   Pop $R7

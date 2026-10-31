@@ -169,21 +169,73 @@ async function boundedCommand(commands, file, args, deadlineAt, now = Date.now) 
 }
 
 async function taskConfirmedMissing(task, commands, schtasks, deadlineAt, now) {
-  const separator = task.lastIndexOf('\\');
-  const taskPath = separator >= 0 ? task.slice(0, separator + 1) : '\\';
-  const taskName = task.slice(separator + 1);
+  const { taskPath, taskName } = taskParts(task);
   const powershell = win32.join(win32.dirname(schtasks), 'WindowsPowerShell', 'v1.0', 'powershell.exe');
   const script = `# LAIXIN_TASK_EXISTENCE_QUERY\n` +
     `$taskPath=${decodeBase64PowerShell(taskPath)};$taskName=${decodeBase64PowerShell(taskName)};` +
-    `try {$matches=@(Get-ScheduledTask -ErrorAction Stop | Where-Object ` +
-    `{$_.TaskPath -eq $taskPath -and $_.TaskName -eq $taskName});` +
-    `if($matches.Count -eq 0){exit 3};if($matches.Count -eq 1){exit 0};exit 2} catch {exit 2}`;
+    `try {$task=Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction Stop;` +
+    `if($null -eq $task){exit 3};exit 0} catch {` +
+    `if($_.Exception.HResult -in @(-2147024894,-2147024893,-2147216625)){exit 3};exit 2}`;
   const result = await boundedCommand(commands, powershell, encodedPowerShell(script), deadlineAt, now);
   assertNotTimedOut(result, 'UPDATE_RESIDENT_TASK_QUERY_TIMEOUT');
   return result.code === 3;
 }
 
-async function queryResidentTask(task, commands, schtasks, deadlineAt, now) {
+function taskParts(task) {
+  const separator = task.lastIndexOf('\\');
+  return { taskPath: separator >= 0 ? task.slice(0, separator + 1) : '\\', taskName: separator >= 0 ? task.slice(separator + 1) : task };
+}
+
+async function queryResidentTaskViaCom(task, commands, powershell, deadlineAt, now) {
+  const { taskPath, taskName } = taskParts(task);
+  // 真卸载走 Task Scheduler COM：只读当前任务对象，不枚举 WMI/导出整份任务 XML。
+  // 这个查询只用于快照和失败诊断；删除本身仍按固定任务名幂等执行。
+  const script = `# LAIXIN_TASK_COM_QUERY\n$ErrorActionPreference='Stop';` +
+    `$service=New-Object -ComObject Schedule.Service;$service.Connect();` +
+    `try {$folder=$service.GetFolder(${decodeBase64PowerShell(taskPath)});}` +
+    `catch {if($_.Exception.HResult -in @(-2147024894,-2147024893,-2147216625)){exit 3};exit 2};` +
+    `try {$task=$folder.GetTask(${decodeBase64PowerShell(taskName)});` +
+    `[Console]::Out.Write([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$task.Xml)));}` +
+    `catch {if($_.Exception.HResult -in @(-2147024894,-2147024893,-2147216625)){exit 3};exit 2}`;
+  const result = await boundedCommand(commands, powershell, encodedPowerShell(script), deadlineAt, now);
+  assertNotTimedOut(result, 'UPDATE_RESIDENT_TASK_QUERY_TIMEOUT');
+  if (result.code === 3) return { task, state: 'missing', xml: '' };
+  if (result.code !== 0) throw new Error('UPDATE_RESIDENT_TASK_STATE_UNKNOWN');
+  const encoded = result.stdout.trim();
+  let xml;
+  try { xml = Buffer.from(encoded, 'base64').toString('utf8'); } catch { throw new Error('UPDATE_RESIDENT_TASK_XML_INVALID'); }
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(encoded) || !/<Task(?:\s|>)/.test(xml)) {
+    throw new Error('UPDATE_RESIDENT_TASK_XML_INVALID');
+  }
+  return { task, state: taskDisabled(xml) ? 'disabled' : 'enabled', xml };
+}
+
+async function queryResidentTaskViaSchtasks(task, commands, schtasks, deadlineAt, now) {
+  // Spawn 环境下 PowerShell 的任务枚举可能不可用；schtasks 只查询固定任务并直接回读 XML，
+  // 不再依赖 Get-ScheduledTask 的全量枚举。卸载只需要这两个固定任务的存在和 Enabled 状态。
+  const result = await boundedCommand(commands, schtasks, ['/query', '/tn', task, '/xml'], deadlineAt, now);
+  assertNotTimedOut(result, 'UPDATE_RESIDENT_TASK_QUERY_TIMEOUT');
+  if (result.code !== 0) {
+    if (await taskConfirmedMissing(task, commands, schtasks, deadlineAt, now)) return { task, state: 'missing', xml: '' };
+    throw new Error('UPDATE_RESIDENT_TASK_STATE_UNKNOWN');
+  }
+  const xml = result.stdout.trim();
+  if (!/<Task(?:\s|>)/.test(xml)) throw new Error('UPDATE_RESIDENT_TASK_XML_INVALID');
+  return { task, state: taskDisabled(xml) ? 'disabled' : 'enabled', xml };
+}
+
+async function queryResidentTask(task, commands, schtasks, deadlineAt, now, options = {}) {
+  if (options.preferCom === true) {
+    const powershell = win32.join(win32.dirname(schtasks), 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    try {
+      return await queryResidentTaskViaCom(task, commands, powershell, deadlineAt, now);
+    } catch (error) {
+      // COM 查询在某些安装器 spawn 环境中不可用；降级到固定任务的 schtasks XML 查询，
+      // 不能把环境差异扩大成“卸载前置闸失败”。超时仍遵守同一总预算，不另起无限等待。
+      if (error instanceof Error && error.message === 'UPDATE_RESIDENT_TASK_QUERY_TIMEOUT') throw error;
+      return queryResidentTaskViaSchtasks(task, commands, schtasks, deadlineAt, now);
+    }
+  }
   // schtasks can emit its XML in the active OEM code page despite the XML encoding declaration.
   // Export the Unicode task through an ASCII-only pipe before persisting its recovery snapshot.
   const separator = task.lastIndexOf('\\');
@@ -207,22 +259,23 @@ async function queryResidentTask(task, commands, schtasks, deadlineAt, now) {
   return { task, state: taskDisabled(xml) ? 'disabled' : 'enabled', xml };
 }
 
-async function changeResidentTask(task, state, commands, schtasks, deadlineAt, now) {
+async function changeResidentTask(task, state, commands, schtasks, deadlineAt, now, options = {}) {
   const action = await boundedCommand(commands, schtasks,
     ['/change', '/tn', task, state === 'enabled' ? '/enable' : '/disable'], deadlineAt, now);
   assertNotTimedOut(action, 'UPDATE_RESIDENT_TASK_TIMEOUT');
-  const readback = await queryResidentTask(task, commands, schtasks, deadlineAt, now);
+  const readback = await queryResidentTask(task, commands, schtasks, deadlineAt, now, options);
   if (action.code !== 0) throw new Error(`UPDATE_RESIDENT_TASK_${state === 'enabled' ? 'ENABLE' : 'DISABLE'}_FAILED`);
   if (readback.state !== state) throw new Error(`UPDATE_RESIDENT_TASK_STILL_${state === 'enabled' ? 'DISABLED' : 'ENABLED'}`);
 }
 
-async function deleteResidentTask(task, commands, schtasks, deadlineAt, now) {
+async function deleteResidentTask(task, commands, schtasks, deadlineAt, now, options = {}) {
   const action = await boundedCommand(commands, schtasks, ['/delete', '/tn', task, '/f'], deadlineAt, now);
   assertNotTimedOut(action, 'UPDATE_RESIDENT_TASK_TIMEOUT');
-  const readback = await queryResidentTask(task, commands, schtasks, deadlineAt, now);
-  if (readback.state !== 'missing') {
-    throw new Error(action.code === 0 ? 'UPDATE_RESIDENT_TASK_STILL_PRESENT' : 'UPDATE_RESIDENT_TASK_DELETE_FAILED');
-  }
+  // 删除成功就是终态；只有命令失败时才查询一次区分“任务已不存在”和真正的删除失败。
+  if (action.code === 0) return;
+  const readback = await queryResidentTask(task, commands, schtasks, deadlineAt, now, options);
+  if (readback.state === 'missing') return;
+  throw new Error('UPDATE_RESIDENT_TASK_DELETE_FAILED');
 }
 
 async function recreateResidentTask(snapshot, commands, powershell, deadlineAt, now, temporaryDirectory) {
@@ -387,20 +440,32 @@ function proxyOwnershipPowerShell() {
         throw 'UPDATE_PROXY_OWNERSHIP_UNKNOWN'
       }
     }
+    # P2-L3(0.7.1 R3 验收插桩实锤):真实连接会话的账本 pending=14~16 条,其中终端接入约 10 条
+    # ——旧闸「pending≤2 且终端为 0」在数学上不可能通过,恢复永败、事务永僵、卸载永闸。
+    # 终端条目由守护按账本恢复(restoreSettings 梯子),不属本恢复脚本的代理持有权范围;
+    # 代理核验范围=WinINET 自身,其他非终端服务的 pending 仍按原闸失败关闭。
     $pending=@($ledger | Where-Object {$_.kind -eq 'setting' -and $_.status -in @('applied','kept-modified','restore-failed')})
-    if(@($pending | Where-Object {$_.service -eq 'TerminalEnvironment'}).Count -gt 0){throw 'UPDATE_PROXY_OWNERSHIP_UNKNOWN'}
-    if([int]$Settings.ProxyEnable -ne 1){if($pending.Count -gt 0){throw 'UPDATE_PROXY_OWNERSHIP_UNKNOWN'};return $false}
+    $proxyPending=@($pending | Where-Object {$_.service -eq 'WinINET'})
+    $otherPending=@($pending | Where-Object {$_.service -ne 'WinINET' -and $_.service -ne 'TerminalEnvironment'})
+    if($otherPending.Count -gt 0){throw 'UPDATE_PROXY_OWNERSHIP_UNKNOWN'}
+    if([int]$Settings.ProxyEnable -ne 1){if($proxyPending.Count -gt 0){throw 'UPDATE_PROXY_OWNERSHIP_UNKNOWN'};return $false}
     $match=[regex]::Match([string]$Settings.ProxyServer,'^127\.0\.0\.1:([1-9][0-9]{0,4})$')
     if(-not $match.Success){
-      if($pending.Count -gt 0 -or [string]$Settings.ProxyServer -match '(?i)(?:localhost|127(?:\.\d{1,3}){3}|\[?::1\]?):\d{1,5}'){
+      if($proxyPending.Count -gt 0 -or [string]$Settings.ProxyServer -match '(?i)(?:localhost|127(?:\.\d{1,3}){3}|\[?::1\]?):\d{1,5}'){
         throw 'UPDATE_PROXY_OWNERSHIP_UNKNOWN'
       }
       return $false
     }
     $port=[int]$match.Groups[1].Value
-    if($port -gt 65535 -or $pending.Count -ne 2){throw 'UPDATE_PROXY_OWNERSHIP_UNKNOWN'}
+    # P2-L3 补(R5 验收实锤):连接会话的 WinINET pending 恒为 4 条(适配器 managedItems 全集:
+    # ProxyServer/ProxyEnable/ProxyOverride/AutoConfigURL)。恰好 2 条的旧假设只覆盖部分残局。
+    # 持有关断判定仍只核 ProxyServer+ProxyEnable(开关两项),Override/AutoConfig 要求同会话存在。
+    if($port -gt 65535 -or $proxyPending.Count -ne 4){throw 'UPDATE_PROXY_OWNERSHIP_UNKNOWN'}
     $server=@($pending | Where-Object {$_.service -eq 'WinINET' -and $_.item -eq 'ProxyServer'})
     $enable=@($pending | Where-Object {$_.service -eq 'WinINET' -and $_.item -eq 'ProxyEnable'})
+    $override=@($pending | Where-Object {$_.service -eq 'WinINET' -and $_.item -eq 'ProxyOverride'})
+    $autoConfig=@($pending | Where-Object {$_.service -eq 'WinINET' -and $_.item -eq 'AutoConfigURL'})
+    if($override.Count -ne 1 -or $autoConfig.Count -ne 1){throw 'UPDATE_PROXY_OWNERSHIP_UNKNOWN'}
     if($server.Count -ne 1 -or $enable.Count -ne 1){throw 'UPDATE_PROXY_OWNERSHIP_UNKNOWN'}
     $server=$server[0];$enable=$enable[0]
     $owned=$server.sessionToken -ceq $enable.sessionToken -and
@@ -494,10 +559,11 @@ function Complete-Recovery {
   }
 }
 function Get-RecoveryTask([string]$TaskPath,[string]$TaskName) {
-  $matches=@(Get-ScheduledTask -ErrorAction Stop | Where-Object {$_.TaskPath -eq $TaskPath -and $_.TaskName -eq $TaskName})
-  if($matches.Count -gt 1){throw 'UPDATE_RESIDENT_TASK_STATE_UNKNOWN'}
-  if($matches.Count -eq 1){return $matches[0]}
-  return $null
+  try { return Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction Stop }
+  catch {
+    if($_.Exception.HResult -in @(-2147024894,-2147024893,-2147216625)){return $null}
+    throw 'UPDATE_RESIDENT_TASK_STATE_UNKNOWN'
+  }
 }
 function Disabled-TaskXml([string]$Xml) {
   $options=[Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [Text.RegularExpressions.RegexOptions]::Singleline
@@ -1139,6 +1205,9 @@ async function recoverWindowsPreflightLocked(markerPath, commands, expectedTrans
     await commitWindowsPreflightLocked(dirname(markerPath), commands, { expectedTransactionId });
     return;
   }
+  // P2 逃生门:存量事务的 launcher ps1 可能是无 BOM 旧版(PS5.1 中文系统解析必败)。
+  // 先把 ps1 重写为 BOM 版再补偿——僵尸事务由此解锁,⛔ 不放宽任何安全判据。
+  await writeDurableFile(paths.launcherPath, '\ufeff' + recoveryLauncherScript(marker, paths.readyPath, paths.guardStartPath, paths.launcherPath, native.powershell));
   const failures = await compensateWindowsPreflight(marker.tasks, {
     mode: marker.mode,
     target: marker.target,
@@ -1217,7 +1286,10 @@ async function armWindowsPreflightRecovery(snapshots, options, commands, native,
     markerPath: paths.markerPath,
     tasks: snapshots
   };
-  await writeDurableFile(paths.launcherPath, recoveryLauncherScript(marker, paths.readyPath, paths.guardStartPath, paths.launcherPath, native.powershell));
+  // P2(0.7.1 R2 验收):launcher ps1 必须带 UTF-8 BOM——PowerShell 5.1 在中文系统对无 BOM
+  // 文件按 GBK 解析,脚本里的中文注释会破坏语法平衡(『Try 缺少 Catch』),恢复看守永久失败,
+  // 恢复事务僵死,堵死之后所有卸载/升级前置闸(验收实锤:卸载器五变体全 no-op)。
+  await writeDurableFile(paths.launcherPath, '\ufeff' + recoveryLauncherScript(marker, paths.readyPath, paths.guardStartPath, paths.launcherPath, native.powershell));
   await writeDurableJson(paths.markerPath, marker);
   try {
     const customGuardLauncher = options.launchRecoveryGuard !== undefined;
@@ -1273,6 +1345,7 @@ async function windowsPreflightLocked(options, commands) {
   const schtasks = win32.join(systemRoot, 'System32', 'schtasks.exe');
   const powershell = win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
   const native = { schtasks, powershell };
+  const taskQueryOptions = options.mode === 'uninstall' ? { preferCom: true } : {};
   if (options.recoveryDirectory !== undefined || options.ownerPid !== undefined) {
     if (typeof options.recoveryDirectory !== 'string' || options.recoveryDirectory === '') {
       throw new Error('INVALID_WINDOWS_RECOVERY');
@@ -1281,7 +1354,7 @@ async function windowsPreflightLocked(options, commands) {
   }
   const snapshots = [];
   for (const task of [`\\Laixin\\${options.residentLabel}`, options.residentLabel]) {
-    snapshots.push(await queryResidentTask(task, commands, schtasks, workDeadline, now));
+    snapshots.push(await queryResidentTask(task, commands, schtasks, workDeadline, now, taskQueryOptions));
   }
   let recovery;
   if (options.recoveryDirectory !== undefined || options.ownerPid !== undefined) {
@@ -1305,7 +1378,7 @@ async function windowsPreflightLocked(options, commands) {
     for (const snapshot of snapshots) {
       if (snapshot.state === 'missing') continue;
       mutated = true;
-      await changeResidentTask(snapshot.task, 'disabled', commands, schtasks, workDeadline, now);
+      await changeResidentTask(snapshot.task, 'disabled', commands, schtasks, workDeadline, now, taskQueryOptions);
     }
     const before = await windowsProcesses(commands, powershell, workDeadline, now);
     assertManagedIdentityKnown(before, guardedOptions);
@@ -1323,7 +1396,7 @@ async function windowsPreflightLocked(options, commands) {
       for (const snapshot of snapshots) {
         if (snapshot.state === 'missing') continue;
         mutated = true;
-        await deleteResidentTask(snapshot.task, commands, schtasks, workDeadline, now);
+        await deleteResidentTask(snapshot.task, commands, schtasks, workDeadline, now, taskQueryOptions);
       }
     }
   } catch (error) {
@@ -1515,6 +1588,16 @@ async function main() {
   }
   if (process.argv[2] === 'windows-preflight-handoff') {
     await verifyWindowsPreflightHandoff(process.argv[3], process.argv[4], process.argv[5]);
+    return;
+  }
+  if (process.argv[2] === 'windows-preflight-resume') {
+    // P2-L2:新安装器委派旧卸载器前的自愈入口。无事务=立即成功;有事务=新版闸(L3 范围核验)
+    // 恢复并提交,让旧卸载器随后走 cleanup-only。失败如实非零,由调用方决定是否继续。
+    const directory = process.argv[3] ?? '';
+    const paths = recoveryPaths(directory);
+    if (!await pathExists(paths.markerPath)) return;
+    const marker = await readRecoveryMarker(paths.markerPath);
+    await recoverWindowsPreflight(paths.markerPath, runNative, marker.transactionId);
     return;
   }
   if (process.argv[2] === 'windows-preflight-commit') {

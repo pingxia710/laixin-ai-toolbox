@@ -1,6 +1,6 @@
 // 通道动作注册(六个零参数动作 + 退出钩子登记)。
 // registerActions 由桥的 action-loader 以 registry 单参调用;deps 参数仅供测试注入。
-import { existsSync, readFileSync } from 'node:fs'
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { join } from 'node:path'
 import { app, dialog, powerMonitor, safeStorage } from 'electron'
@@ -14,7 +14,7 @@ import { createMacProxyAuthorization } from '../tunnel/mac-proxy-authorization'
 import { resolveTunnelDataDir } from '../tunnel/paths'
 import { createCalibrationGate } from '../tunnel/calibration-gate'
 import { initializeTunnelRuntime } from '../tunnel/runtime-owner'
-import { makeResidentRuntime, residentLogDir, residentSpecFor } from '../tunnel/resident-bridge'
+import { makeResidentRuntime, residentFallbackArgs, residentLogDir, residentSpecFor, shouldUseResidentFallback } from '../tunnel/resident-bridge'
 import { RESIDENT_TASK } from '../tunnel/platform/resident'
 import { setResidentRuntime } from '../tunnel/resident-owner'
 import { platformForRuntime, resolveSidecarDir } from '../tunnel/sidecar-path'
@@ -26,6 +26,7 @@ import { PackageReject } from '../tunnel/package-format'
 import type { SpawnedDaemon } from '../tunnel/supervisor'
 import type { Platform } from '../precheck/software-platform'
 import type { EncryptedQueueCodec } from '../tunnel/diagnostic-event-queue'
+import { isPreOneRuntimeObservationVersion } from '../../runtime-observation-types'
 import { readApiNetworkContinuation } from '../ai-access/network-continuation'
 
 function diagnosticQueueCodec(): EncryptedQueueCodec {
@@ -39,6 +40,28 @@ function diagnosticQueueCodec(): EncryptedQueueCodec {
     encrypt(plain) { available(); return safeStorage.encryptString(plain) },
     decrypt(encrypted) { available(); return safeStorage.decryptString(encrypted) }
   }
+}
+
+/** 常驻开关与通道动作分属两个模块；这里只读同一份偏好，判断是否必须启用独立 fallback。
+ * 缺失/损坏按默认开启处理，不能把 parent-ipc 守护当作安全的意外退出兜底。 */
+function residentRequired(userDataPath: string, packaged: boolean): boolean {
+  if (!packaged) return false
+  try {
+    const saved = JSON.parse(readFileSync(join(userDataPath, 'desktop.json'), 'utf8')) as { keepNetworkWhenClosed?: unknown }
+    return saved.keepNetworkWhenClosed !== false
+  } catch {
+    return true
+  }
+}
+
+/** 1.0 起停止旧常驻守护的运行观测；降级到 0.x 时移除标记，避免误关掉旧版本采样。 */
+function syncRuntimeObservationStopMarker(dataDir: string, enabled: boolean): void {
+  const marker = join(dataDir, 'runtime-observation.disabled')
+  try {
+    if (enabled) { rmSync(marker, { force: true }); return }
+    mkdirSync(dataDir, { recursive: true, mode: 0o700 })
+    writeFileSync(marker, '1\n', { flag: 'wx', mode: 0o600 })
+  } catch { /* 观测旁路标记失败不得阻断通道启动 */ }
 }
 
 /** 动作异常就地翻译成受控失败(⛔ 落到桥层「重新导入配置包」的通用兜底——那个兜底只留给
@@ -117,7 +140,9 @@ export const statusResultSchema = schema.object({
   traffic: schema.string({ maxLength: 160 }),
   // N-55:仅传控制器的脱敏阶段和已证实限制原因；对象、快照和租约留在守护/账本。
   availabilityStatus: schema.string({ maxLength: 20 }),
-  availabilityReason: schema.string({ maxLength: 300 })
+  availabilityReason: schema.string({ maxLength: 300 }),
+  // N-77:连接中的当前守护阶段码(白名单内),非连接中为空串。
+  connectStage: schema.string({ maxLength: 48 })
 })
 
 const routeExplainParamsSchema = schema.object({
@@ -213,6 +238,7 @@ function productionDeps(deps: TunnelActionDeps) {
       repoRoot
     })
   const launch = daemonLaunchFor(platform, sidecarDir)
+  syncRuntimeObservationStopMarker(dataDir, isPreOneRuntimeObservationVersion(app.getVersion()))
   // Phase 1 ④:失败留痕与守护/恢复子进程 stderr 同落 <userData>/logs/tunnel-daemon.log——
   // 它已是常驻日志(mac launchd StandardErrorPath / win schtasks 重定向),诊断包既有通道收录。
   const supervisorLog = createFailureLog(daemonLogPath(app.getPath('userData')))
@@ -232,6 +258,7 @@ function productionDeps(deps: TunnelActionDeps) {
       launch,
       dataDir,
       logDir: residentLogDir(app.getPath('userData')),
+      clientVersion: app.getVersion(),
       // Windows:守护干净收尾后据这条路径自禁任务(防每分钟重入空转);mac 无此物。
       ...(platform === 'windows' ? { taskPath: RESIDENT_TASK } : {})
     })
@@ -263,6 +290,13 @@ function productionDeps(deps: TunnelActionDeps) {
       queueCodec,
       eventQueue: { codec: queueCodec }
     },
+    // 0.7.3:后台当前尚未提供经核验的省份/运营商映射，保持零上报；接线先随包落地。
+    reachabilityTelemetry: { enabled: () => false, codec: queueCodec },
+    runtimeObservationTelemetry: {
+      enabled: () => isPreOneRuntimeObservationVersion(app.getVersion()),
+      version: () => app.getVersion(),
+      codec: queueCodec
+    },
     picker:
       deps.picker ??
       (async () => {
@@ -286,18 +320,42 @@ function productionDeps(deps: TunnelActionDeps) {
         ((dir: string, runId?: string) => attachStderrSink(deps.spawnDaemon?.(dir, runId) as SpawnedDaemon,
           supervisorLog, 'daemon-stderr')) :
         ((dir: string, runId?: string) => {
-          // 独立于主进程 Job 存活，仅为完成关闭恢复；IPC 断开即停止，不能常驻后台。
-          const child = spawn(process.execPath, [launch.daemonPath, 'start', '--data-dir', dir, '--adapter', launch.adapterPath,
-            '--parent-ipc', '1', '--run-id', runId ?? ''], {
-            env: { ...process.env, ...launch.env }, detached: true, windowsHide: true,
-            // Phase 1 ④:spawn 路径守护的 stderr 基线走 inherit(打包后无处可去)——接流进常驻日志。
-            stdio: ['ignore', 'ignore', 'pipe', 'ipc']
-          })
-          const resume = () => { if (child.connected) child.send({ type: 'network-event', event: 'wake' }, () => {}) }
-          powerMonitor.on('resume', resume)
-          const cleanup = () => powerMonitor.removeListener('resume', resume)
-          child.once('exit', cleanup)
-          child.once('error', cleanup)
+          const fallbackResident = shouldUseResidentFallback(resident.bridge,
+            residentRequired(app.getPath('userData'), app.isPackaged))
+          const args = [launch.daemonPath, 'start', '--data-dir', dir, '--adapter', launch.adapterPath,
+            '--client-version', app.getVersion(),
+            ...(fallbackResident ? residentFallbackArgs(runId ?? '') : ['--parent-ipc', '1', '--run-id', runId ?? ''])]
+          // 常驻 fallback 不依赖 GUI 的 IPC；普通手动连接仍保留 parent-ipc，正常退出时由 GUI 交接恢复。
+          let fallbackLogFd: number | undefined
+          if (fallbackResident) {
+            // GUI 被强杀会关闭父子 stderr 管道；fallback 直接继承日志文件，不能把 EPIPE 变成第二次崩溃。
+            supervisorLog('daemon-fallback-start', `runId=${runId ?? ''}`)
+            try { fallbackLogFd = openSync(daemonLogPath(app.getPath('userData')), 'a', 0o600) } catch { /* 日志旁路失败不挡连接 */ }
+          }
+          let child
+          try {
+            child = spawn(process.execPath, args, {
+              env: { ...process.env, ...launch.env }, detached: true, windowsHide: true,
+              // fallback 的守护自己拥有生命周期；普通守护还需要 IPC 通知父进程退出。
+              stdio: fallbackResident
+                ? ['ignore', 'ignore', fallbackLogFd ?? 'ignore']
+                : ['ignore', 'ignore', 'pipe', 'ipc']
+            })
+          } finally {
+            if (fallbackLogFd !== undefined) {
+              try { closeSync(fallbackLogFd) } catch { /* 子进程已经持有自己的副本 */ }
+            }
+          }
+          if (fallbackResident) {
+            // GUI 被强杀时不能因 ChildProcess 句柄把主进程生命周期绑住；守护接管席位并自行存活。
+            child.unref()
+          } else {
+            const resume = () => { if (child.connected) child.send({ type: 'network-event', event: 'wake' }, () => {}) }
+            powerMonitor.on('resume', resume)
+            const cleanup = () => powerMonitor.removeListener('resume', resume)
+            child.once('exit', cleanup)
+            child.once('error', cleanup)
+          }
           return attachStderrSink(child, supervisorLog, 'daemon-stderr')
         }),
     spawnRestore:

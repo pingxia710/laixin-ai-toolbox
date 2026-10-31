@@ -7,6 +7,8 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { prepareSidecar } from '../scripts/prepare-sidecar.mjs'
 
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)))
+// 这是验证脚本的固定官方源，不参与客户构建；外部显式传值仍优先。
+process.env.TOOLBOX_ACCOUNT_ORIGIN ??= 'https://laixin.work/'
 const tempRoot = mkdtempSync(join(tmpdir(), 'laixin-toolbox-bridge-'))
 const evidence = []
 const verificationMutation = process.env.TOOLBOX_VERIFY_MUTATION
@@ -82,7 +84,11 @@ function injectExampleModule(name) {
 
 function runVerificationBuild(projectRoot) {
   run(projectRoot, 'tsc', ['--noEmit'])
-  run(projectRoot, 'electron-vite', ['build'])
+  run(projectRoot, 'electron-vite', ['build'], { TOOLBOX_BRIDGE_PROBE: '1' })
+  // electron-vite 的未打包主进程从 out/main/chunks 计算 repoRoot;
+  // 将构建时 sidecar 副本放到 out,否则 tunnel.status 只会看到整套组件缺失,
+  // 在桥 schema 的 componentMissing 长度闸上假失败。
+  cpSync(join(projectRoot, 'sidecar'), join(projectRoot, 'out', 'sidecar'), { recursive: true })
 }
 
 async function verifyRealElectronBridge() {
@@ -140,10 +146,11 @@ function verifyCleanCustomerBuild(variant) {
   }
 }
 
-function run(cwd, executable, args) {
+function run(cwd, executable, args, environment = {}) {
   execFileSync(join(root, 'node_modules/.bin', executable), args, {
     cwd,
     encoding: 'utf8',
+    env: { ...process.env, ...environment },
     stdio: 'pipe'
   })
 }

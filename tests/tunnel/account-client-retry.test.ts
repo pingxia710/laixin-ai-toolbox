@@ -62,4 +62,19 @@ describe('AccountClient 幂等 GET 抖动重试', () => {
       expect(s.calls()).toBe(3)
     } finally { await s.close() }
   }, 15_000)
+
+  it('单地址绑定刷新只增加受控请求头，不改变数据响应契约', async () => {
+    let refreshHeader = ''
+    const s = await start((req, res) => {
+      refreshHeader = String(req.headers['x-laixin-refresh-binding'] ?? '')
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ application: { id: 'lx-' + 'a'.repeat(32), status: 'ready', expiresAt: 9999999999999 } }))
+    })
+    try {
+      const c = client(s.base)
+      await c.request('application', session, new AbortController().signal, 16384, 'application/json', undefined, undefined,
+        { 'X-Laixin-Refresh-Binding': '1' })
+      expect(refreshHeader).toBe('1')
+    } finally { await s.close() }
+  })
 })

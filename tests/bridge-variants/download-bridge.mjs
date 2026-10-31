@@ -108,7 +108,6 @@ async function invokeDownloadBridge(tempRoot, root) {
 }
 
 const mainActionSource = `import type { BridgeRegistry } from '../bridge/bridge-registry'
-import type { DownloadManager } from '../download/download-manager'
 import { schema } from '../bridge/schema'
 
 export function registerActions(registry: BridgeRegistry): void {
@@ -121,9 +120,5 @@ export function registerActions(registry: BridgeRegistry): void {
     }),
     handler: () => ({ taskId: 'download-fixture', state: 'ready' })
   })
-}
-
-export function registerDownloadActions(registry: BridgeRegistry, _manager: DownloadManager): void {
-  registerActions(registry)
 }
 `

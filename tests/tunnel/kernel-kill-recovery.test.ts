@@ -24,7 +24,7 @@ it('内核被外部杀掉:先还系统代理、再自己拉起内核重新接上
     const credentialPath = join(root, 'vless.json')
     writeFileSync(credentialPath, JSON.stringify(node.credential), { mode: 0o600 })
     writeFileAtomic(layout.intent(dataDir), JSON.stringify({ desired: 'connected', authorization: { id: 'local-test', expiresAt: Date.now() + 60_000 }, bridgePort: port,
-      connector: { kind: 'vless-reality', node: node.node, credentialPath, verifyUrl: node.verifyUrl, localPort: port, timeoutMs: 500 } }))
+      connector: { kind: 'vless-reality', node: node.node, credentialPath, verifyUrl: node.verifyUrl, localPort: port, timeoutMs: 500, allowLocalVerifyUrls: true } }))
     const daemonPath = fileURLToPath(new URL('../../sidecar/mac/tunnel-daemon.mjs', import.meta.url))
     child = spawn(process.execPath, [daemonPath, 'start', '--data-dir', dataDir, '--adapter', fileURLToPath(new URL('./fixtures/fake-adapter.mjs', import.meta.url)),
       '--intent-poll-ms', '50', '--verify-interval-ms', '200'], { env: { ...process.env, ...fakeAdapterEnv(storePath) }, stdio: ['ignore', 'pipe', 'pipe'] })

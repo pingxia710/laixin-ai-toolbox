@@ -2,7 +2,7 @@
 // 职责:持账本执行写入与恢复、意图与实际分离(用户主动断开持久化、守护 ⛔ 拉起)、
 // 状态机、五次快速退避后低频同节点恢复、短确认与探测目标故障区分、
 // 父进程消失 → 按账本恢复再退出。全部 I/O 经注入的适配器 / 连接器 / bridge / 时钟。
-import { lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { join } from 'node:path'
 import { CONTROL_CODES } from './connectors.mjs'
@@ -14,6 +14,12 @@ import { CONNECTION_FLAGS, hexToBlob, readConnectionSettings } from './connectio
 import { NetworkAvailabilityController } from './network-availability-controller.mjs'
 import { readRestoreObservation, safeRestoreReason } from './restore-observation.mjs'
 import { probeApiNetwork } from './api-network-continuation.mjs'
+import { appendFunnelAttempt, blankFunnelAttempt, funnelStageRow, readFunnelAttempts, sanitizeFunnelCode, setFunnelLeg, writeFunnelAttempts } from './connection-funnel.mjs'
+import { appendRuntimeObservation, buildRuntimeObservationSample, isPreOneRuntimeObservationVersion, readRuntimeObservations, runtimeObservationPath, RUNTIME_OBSERVATION_INTERVAL_MS, writeRuntimeObservations } from './runtime-observation.mjs'
+import { classifyNetworkPhase } from './net-phase.mjs'
+import { createEntryHealthStore } from './entry-health.mjs'
+
+export { RUNTIME_OBSERVATION_INTERVAL_MS }
 
 // 退出时恢复系统代理写失败(注册表被杀软短暂锁住等)⛔ 直接退出留下指向死端口的代理(发布审查 R1):
 // 按这个节奏重试；停止入口仍有未还账目时继续留守，直到还原或明确交给新守护。
@@ -23,6 +29,11 @@ export const SHUTDOWN_RESTORE_RETRY_MS = Object.freeze([1_000, 2_000, 5_000, 10_
 // 慢梯子 60 轮后，停止入口若仍欠恢复则继续留守，不能把死代理留给客户。
 export const SHUTDOWN_RESTORE_SLOW_MS = 30_000
 export const SHUTDOWN_RESTORE_SLOW_ROUNDS = 60
+// 启动接续是无人值守的意外退出恢复；不能沿用停止入口的 60 轮慢梯子，把客户卡在
+// “启动恢复”数分钟。达到这一轮后保留当前守护的恢复责任，短周期继续尝试，不能把死代理
+// 留给常驻任务下一分钟才重入。
+export const STARTUP_RESTORE_SLOW_ROUNDS = 1
+export const STARTUP_RESTORE_RETRY_MS = 5_000
 const RECOVERY_OWNER_PUBLISH_FAILED = 'TUNNEL_RECOVERY_OWNER_PUBLISH_FAILED'
 const CONTINUITY_HEARTBEAT_MS = 5 * 60_000
 // 连续性留证的 per-key 冷却表上限:超过即先清过期再挤最旧,⛔ 无上限攒 Map(常驻守护按周跑)。
@@ -51,6 +62,14 @@ export const REUSE_PATH_PROBE_TIMEOUT_MS = 8_000
 // 恢复交给常规退避(2/4/8/16/32 秒)照常推进。
 // 反过来说:网络连续稳定满 10 秒之后的下一次变化,又是一条新证据,立即恢复照旧生效。
 export const NETWORK_SETTLE_MS = 10_000
+
+/**
+ * N-78 唤醒兜底阈值:平台事件源(mac IOKit / win PowerShell 订阅)拿不到唤醒输入时
+ * (如 Windows 源连续失败后放弃),挂起期间定时器停走,醒来后第一个意图轮询的墙钟间距
+ * 会远超轮询间隔。超过该值按唤醒事件处理;notifyEvent 自带意图/状态闸,误报代价只是
+ * 一次复验。取 60s:大于慢机(N-74)的正常抖动,小于「等 30s 复验+流量失败」的自然发现路径。
+ */
+export const WAKE_JUMP_THRESHOLD_MS = 60_000
 
 /**
  * 按平台创建电源/网络事件源,把 wake 与 network-change 喂给守护。
@@ -144,7 +163,7 @@ function readRecoveryOwner(dataDir) {
   } catch { return undefined }
 }
 
-function observeRecoveryOwnership(dataDir) {
+export function observeRecoveryOwnership(dataDir) {
   const owner = readRecoveryOwner(dataDir)
   return {
     generation: owner?.generation ?? 0
@@ -159,9 +178,11 @@ function publishRecoveryOwner(dataDir, runId, observedGeneration = 0) {
   const current = readRecoveryOwner(dataDir)
   const generation = Math.max(observedGeneration, current?.generation ?? 0) + 1
   const path = recoveryOwnerPath(dataDir)
-  const temporary = `${path}.tmp`
-  writeFileSync(temporary, `${JSON.stringify({ runId, generation, claimedAt: Date.now() })}\n`, { mode: 0o600 })
-  renameSync(temporary, path)
+  const temporary = `${path}.tmp-${randomBytes(8).toString('hex')}`
+  try {
+    writeFileSync(temporary, `${JSON.stringify({ runId, generation, claimedAt: Date.now() })}\n`, { mode: 0o600 })
+    renameSync(temporary, path)
+  } finally { rmSync(temporary, { force: true }) }
   return generation
 }
 
@@ -313,16 +334,21 @@ export function installCrashBailout({ dataDir, adapterOf, runId = '', exit = (co
 export function writeState(dataDir, state) {
   mkdirSync(dataDir, { recursive: true })
   const path = statePath(dataDir)
-  const temporary = `${path}.tmp`
-  writeFileSync(temporary, `${JSON.stringify({ ...state, updatedAt: Date.now() })}\n`, { mode: 0o600 })
-  renameSync(temporary, path)
+  const temporary = `${path}.tmp-${randomBytes(8).toString('hex')}`
+  try {
+    writeFileSync(temporary, `${JSON.stringify({ ...state, updatedAt: Date.now() })}\n`, { mode: 0o600 })
+    renameSync(temporary, path)
+  } finally { rmSync(temporary, { force: true }) }
 }
 
 export function writeTraffic(dataDir, traffic) {
   mkdirSync(dataDir, { recursive: true })
   const path = trafficPath(dataDir)
-  writeFileSync(`${path}.tmp`, `${JSON.stringify(traffic)}\n`, { mode: 0o600 })
-  renameSync(`${path}.tmp`, path)
+  const temporary = `${path}.tmp-${randomBytes(8).toString('hex')}`
+  try {
+    writeFileSync(temporary, `${JSON.stringify(traffic)}\n`, { mode: 0o600 })
+    renameSync(temporary, path)
+  } finally { rmSync(temporary, { force: true }) }
 }
 
 export function createDaemon(options) {
@@ -395,11 +421,40 @@ class DaemonCore {
     this.verifyIntervalMs = verifyIntervalMs
     this.random = random
     this.log = log
+
     this.continuityEvidence = options.continuityEvidence === true
     this.readContinuityFaces = options.readContinuityFaces
     this.continuityCooldowns = new Map()
     this.continuityProbeActive = false
     this.continuityPending = undefined
+
+    // N-79 连接漏斗台账:环形留最近若干条;读回逐条验形,损坏即从空继续(⛔ 台账问题拦连接)。
+    this.funnelPath = join(dataDir, 'connection-funnel.json')
+    this.funnelAttempts = readFunnelAttempts(this.funnelPath)
+    // N-87:本代尚未开过任何尝试,读到 in-progress 一定是上一代硬终止的遗留——
+    // 标为 abandoned 落盘,⛔ 永远 pending,也 ⛔ 遗留假成功。
+    if (this.funnelAttempts.some((attempt) => attempt.outcome === 'in-progress')) {
+      this.funnelAttempts = this.funnelAttempts.map((attempt) => attempt.outcome === 'in-progress'
+        ? { ...attempt, outcome: 'abandoned', endedAt: this.clock.now() }
+        : attempt)
+      try { writeFunnelAttempts(this.funnelPath, this.funnelAttempts) } catch { /* 台账落盘失败不得影响连接 */ }
+    }
+    this.funnelAttempt = undefined
+    this.wakeProbeAt = undefined
+    // V1.0 前运行观测:只落状态/资源趋势,不参与连接判定,写失败不得影响通道。
+    this.runtimeObservationPath = runtimeObservationPath(dataDir)
+    this.runtimeObservationDisabledPath = join(dataDir, 'runtime-observation.disabled')
+    // 版本缺失按关闭处理：生产入口必须显式传版本，避免 1.0 以后因启动参数丢失继续采集。
+    // 另读主进程写入的停采标记，覆盖升级时旧守护尚未重启的短窗口。
+    this.runtimeObservationEnabled = typeof options.clientVersion === 'string' &&
+      isPreOneRuntimeObservationVersion(options.clientVersion) && !existsSync(this.runtimeObservationDisabledPath)
+    this.runtimeObservationSamples = this.runtimeObservationEnabled ? readRuntimeObservations(this.runtimeObservationPath) : []
+    this.runtimeObservationTimer = undefined
+    this.runtimeObservationIntervalMs = Number.isSafeInteger(options.runtimeObservationIntervalMs) && options.runtimeObservationIntervalMs >= 1_000
+      ? options.runtimeObservationIntervalMs : RUNTIME_OBSERVATION_INTERVAL_MS
+    this.runtimeObservationPreviousCpu = undefined
+    // N-86:入口健康账(证据只按当头入口记;单入口语义不变,仅记录)。
+    this.entryHealth = createEntryHealthStore({ path: join(dataDir, 'entry-health.json'), now: () => this.clock.now() })
 
     this.intent = undefined
     this.connector = undefined
@@ -422,6 +477,7 @@ class DaemonCore {
     this.lastTrafficWritten = undefined
     this.confirmationTimer = undefined
     this.settingsBusyTimer = undefined
+    this.startupRecoveryRetryTimer = undefined
     this.recoveryOwnerRetryTimer = undefined
     this.lastVerification = undefined
     this.connectStage = undefined
@@ -692,6 +748,46 @@ class DaemonCore {
     // 梯子必须停——新意图自己的 connect()/restoreAfterDisconnect 接手恢复与写入,⛔ 醒来再
     // restoreSettings 把新连接写下的 ProxyServer 当旧账删掉。意图没变(引用相同)时照旧还账、照旧接续。
     const startupLadder = { intent: undefined }
+    const retryStartupRecovery = () => {
+      if (this.startupRecoveryRetryTimer !== undefined || this.exited || this.shutdownTask !== undefined || this.intent !== startupLadder.intent) return
+      this.startupRecoveryRetryTimer = this.clock.setTimeout(() => {
+        this.startupRecoveryRetryTimer = undefined
+        if (this.exited || this.shutdownTask !== undefined || this.intent !== startupLadder.intent) return
+        let recovered
+        try { recovered = this.restoreSettings({ claimRecovery: true }) } catch { recovered = undefined }
+        void finishStartupRecovery(recovered).catch((error) => {
+          if (!this.exited) this.log('启动恢复重试中断')
+          throw error
+        })
+      }, STARTUP_RESTORE_RETRY_MS)
+    }
+    const finishStartupRecovery = async (recovered) => {
+      if (this.exited) return
+      if (this.recoveryHandedOver()) { this.handedOver = true; this.exitAfterHandover(); return }
+      // 恢复梯子被新意图取消时，交给新的 applyIntent/connect 流程；不能把取消误报成超时，
+      // 更不能退出让新意图失去守护。
+      if (this.shutdownTask !== undefined || this.intent !== startupLadder.intent) return
+      if (!recovered) {
+        this.writeStateNow('error', {
+          code: 'TUNNEL_STARTUP_RECOVERY_TIMEOUT',
+          message: '启动时恢复原网络设置超时，守护将继续重试；若仍未恢复，请点击「重试恢复原设置」'
+        })
+        this.log('启动恢复未完成:本轮已到上限,保留恢复责任并继续重试')
+        retryStartupRecovery()
+        return
+      }
+      this.log(`启动恢复:已恢复 ${recovered.restored.length} 项`)
+      // 梯子落定后按意图落定状态:要连就现在接上(⛔ 等客户再点一次);不连就把待命状态落盘。
+      // 这两个出口都归这里;run() 尾段看见 startupRestoreNeeded 一律不动笔(⛔ 抢写盖掉在途连接)。
+      if (this.shutdownTask !== undefined) return
+      if (this.intent?.desired === 'connected' && this.state !== 'connected' && this.state !== 'degraded') {
+        void this.connect().catch(() => this.requestShutdown())
+      } else if (this.intent?.desired !== 'connected' && unrestoredEntries(this.dataDir).length === 0) {
+        await this.finalizeAfterRestored(startupLadder.intent, () => {
+          this.writeStateNow(this.intent?.desired === 'user-disconnected' ? 'stopped-restored' : 'idle')
+        })
+      }
+    }
     const failure = ledgerFailure(this.dataDir)
     if (failure) { await this.failLedger(failure); return }
     // 任一进程再次启动时先读账本:有未恢复项先按规则处理,再做别的(判据 3③)。
@@ -715,35 +811,9 @@ class DaemonCore {
       })
       void this.restoreWithRetryLadder('启动恢复未完成', {
         claimRecovery: true,
+        maxSlowRounds: STARTUP_RESTORE_SLOW_ROUNDS,
         shouldContinue: () => !this.exited && this.shutdownTask === undefined && this.intent === startupLadder.intent
-      }).then(async (recovered) => {
-        if (this.exited) return
-        if (this.recoveryHandedOver()) { this.handedOver = true; this.exitAfterHandover(); return }
-        if (!recovered) {
-          // 恢复没做完就 ⛔ 继续连接(P1):connect() 开头会把 fatalStopped 清掉,于是在**没还干净的设置**上
-          // 又写一层——退出时再也还不回客户原来的样子。判据用「恢复是否成功」,⛔ 用 pendingSettingEntries:
-          // 还原写失败的条目会转成 restore-failed,不再计入 pending,那条判据拦不住这一幕。
-          //
-          // ⛔ 在这里 return(第二轮 P1):那样意图轮询还没装,而外层 keepalive 让进程继续活着、
-          // 监管器又认为守护在跑 —— 客户点「重新连接」只改了 intent 文件,守护永远不会读它,
-          // 界面卡在「连接中」,客户只能退出重开工具箱。改成:本轮不连,但**照常装上轮询**,
-          // 客户显式重试时 tickIntent 接得住,connect() 里会再试一次恢复。
-          this.log('启动恢复未完成:本次不建立连接,继续监听意图等待客户重试')
-          return
-        }
-        this.log(`启动恢复:已恢复 ${recovered.restored.length} 项`)
-        // 梯子落定后按意图落定状态:要连就现在接上(⛔ 等客户再点一次);不连就把待命状态落盘。
-        // 这两个出口都归这里;run() 尾段看见 startupRestoreNeeded 一律不动笔(⛔ 抢写盖掉在途连接)。
-        // (落定后 ⛔ 回写 recoveryBlocked:它是 run() 的局部量,尾段已过,读了也没人看。)
-        if (this.shutdownTask !== undefined) return
-        if (this.intent?.desired === 'connected' && this.state !== 'connected' && this.state !== 'degraded') {
-          void this.connect().catch(() => this.requestShutdown())
-        } else if (this.intent?.desired !== 'connected' && unrestoredEntries(this.dataDir).length === 0) {
-          await this.finalizeAfterRestored(startupLadder.intent, () => {
-            this.writeStateNow(this.intent?.desired === 'user-disconnected' ? 'stopped-restored' : 'idle')
-          })
-        }
-      }).catch((error) => {
+      }).then(finishStartupRecovery).catch((error) => {
         // owner 失败由梯子消化；其余意外异常必须重新抛成 unhandled rejection，才能真正进入顶层崩溃兜底。
         // ⛔ 只记日志后吞掉：那会既不再重试，也不触发恢复+非零退出。
         if (!this.exited) this.log('启动恢复的重试中断')
@@ -769,9 +839,10 @@ class DaemonCore {
     this.authorizationTimer = this.clock.setInterval(() => this.tickAuthorization(), this.intentPollMs)
     this.intentTimer = this.clock.setInterval(() => this.tickIntent(), this.intentPollMs)
     this.parentTimer = this.clock.setInterval(() => this.tickParent(), this.parentPollMs)
+    this.scheduleRuntimeObservation()
     if (this.intent?.desired === 'connected' && !recoveryBlocked && !startupRestoreNeeded) {
       // startupRestoreNeeded 为真时,接续归上面的梯子落定回调独有(⛔ 两处各点一次火 = 双连接)。
-      await this.connect()
+            await this.connect()
     } else if (this.intent?.desired === 'shutdown') {
       // shutdown() 进入后台恢复梯子后 run() 会立即返回；先留本轮状态，避免入口看门狗
       // 把合法的慢收尾当成坏启动并以退出码 75 打断代理恢复。
@@ -791,6 +862,14 @@ class DaemonCore {
 
   tickIntent() {
     if (this.exited || this.shutdownTask) return
+    // N-78:唤醒事件丢失时的兜底(见 WAKE_JUMP_THRESHOLD_MS 注释)。必须放在意图
+    // 早退之前——意图稳定不变时也要能感知唤醒。
+    const wakeProbeNow = this.clock.now()
+    if (this.wakeProbeAt !== undefined && wakeProbeNow - this.wakeProbeAt > WAKE_JUMP_THRESHOLD_MS) {
+      this.log(`时钟跳变 ${wakeProbeNow - this.wakeProbeAt}ms:按唤醒处理`)
+      this.notifyEvent('wake')
+    }
+    this.wakeProbeAt = wakeProbeNow
     const { intent: next, corrupted } = readIntentChecked(this.dataDir)
     if (corrupted && !this.intentCorruptionNoted) {
       this.intentCorruptionNoted = true
@@ -836,6 +915,7 @@ class DaemonCore {
 
   async stopForAuthorization(code) {
     if (this.authorizationStopped || this.exited) return
+    this.funnelClose('stopped', code)
     const stoppedIntent = this.intent
     this.authorizationStopped = true
     this.state = 'error'
@@ -858,7 +938,7 @@ class DaemonCore {
    *  shouldContinue 在每次再试前问调用方(意图已变/已交接/已退出就停);甲-2 返工:**每一格醒来后、
    *  执行恢复前也要再问一次**——睡的那一格里客户可能已经点了连接/断开,⛔ 醒来不看就把新连接写下的
    *  设置当旧账还一遍(它恢复的正是活连接刚记的账,ProxyServer 当场被删,直到下个复验周期才写回)。 */
-  async restoreWithRetryLadder(label, { checkHandover = false, keepFatalStopped = false, claimRecovery = false, keepWriteRight = false, stayUntilRestored = false, timeoutMs, onGraceExpired, shouldContinue = () => true } = {}) {
+  async restoreWithRetryLadder(label, { checkHandover = false, keepFatalStopped = false, claimRecovery = false, keepWriteRight = false, stayUntilRestored = false, timeoutMs, onGraceExpired, maxSlowRounds = SHUTDOWN_RESTORE_SLOW_ROUNDS, shouldContinue = () => true } = {}) {
     if (!shouldContinue()) return false
     let recovered = this.restoreSettings({ checkHandover, claimRecovery, keepWriteRight, timeoutMs })
     const transientFailure = () => this.settingsBusy || (claimRecovery && this.recoveryOwnerPublishFailed) ||
@@ -877,7 +957,7 @@ class DaemonCore {
       try { void Promise.resolve(onGraceExpired()).catch(() => undefined) } catch { /* 收通道失败由守候与下一轮重试兜住 */ }
     }
     // 快速梯子用尽仍是暂时性写失败:留下来慢节奏继续还。
-    for (let round = 1; !recovered && transientFailure() && round <= SHUTDOWN_RESTORE_SLOW_ROUNDS && shouldContinue(); round += 1) {
+    for (let round = 1; !recovered && transientFailure() && round <= maxSlowRounds && shouldContinue(); round += 1) {
       this.log(`${label},${String(SHUTDOWN_RESTORE_SLOW_MS / 1000)} 秒后再试(慢节奏第 ${String(round)} 轮)`)
       this.noteRestoreRetry(SHUTDOWN_RESTORE_SLOW_MS)
       await new Promise((resolve) => this.clock.setTimeout(resolve, SHUTDOWN_RESTORE_SLOW_MS))
@@ -1137,6 +1217,7 @@ class DaemonCore {
         this.reconnectTimer = undefined
       }
       this.recoveryNotice = undefined
+      this.funnelClose('stopped')
       this.writeStateNow('user-disconnected')
       // 不占 transitioning 闸；客户重新连接时由新意图接手，旧恢复任务不会再停止新通道。
       void this.restoreAfterDisconnect(next).catch(() => {
@@ -1282,12 +1363,12 @@ class DaemonCore {
   async connect() {
     if (this.shutdownTask || this.exited || this.intent?.desired !== 'connected') return
     const failure = ledgerFailure(this.dataDir)
-    if (failure) { await this.failLedger(failure); return }
     const intent = this.intent
     // 即使状态落盘暂被新守护/锁拦住，当前动作也必须以 connecting 为内部事实，不能让随后取证把 idle 写回。
     this.state = 'connecting'
     this.connectStage = undefined
     this.writeStateNow('connecting')
+    this.funnelOpen('connect')
     const stopping = this.stopConnection()
     const epoch = this.reconnectEpoch
     if (!await this.stopAndRestoreForReconnect(stopping, intent, epoch)) return
@@ -1483,6 +1564,7 @@ class DaemonCore {
     const message = existing.kind === 'direct'
       ? '这台电脑本来就能直接访问，来信未接管系统代理。请在目标 AI 软件中确认登录和对话。'
       : `检测到电脑上的其他代理（${String(existing.host)}:${String(existing.port)}）可联网，来信未接管系统代理。请在目标 AI 软件中确认登录和对话。`
+    this.funnelClose('reused')
     return this.writeStateNow('connected', { ...this.lastVerification, code: 'TUNNEL_REUSED_EXISTING', reusedProxy: existing, message })
   }
 
@@ -1628,6 +1710,9 @@ class DaemonCore {
   //     让下一条排到第一位。慢几秒,但 ⛔ 让客户卡死在一条已经掐掉的入口上。
   entrySpecs() {
     const primary = this.intent?.connector
+    // 新客户单地址契约:即使旧包残留 connectors,也不得把节点池交给客户端轮转。
+    // 故障后由主进程刷新同一客户入口绑定,再写入新的单一 connector。
+    if (this.intent?.singleAddressMode === true) return primary === undefined ? [] : [primary]
     const list = this.intent?.connectors
     const single = primary === undefined ? [] : [primary]
     if (!Array.isArray(list) || list.length <= 1) return single
@@ -1636,8 +1721,47 @@ class DaemonCore {
     return offset === 0 ? [...list] : [...list.slice(offset), ...list.slice(0, offset)]
   }
 
+  // N-86:入口键(host:port,与 entry-health 的白名单 pattern 对齐;认不出的键不记不选)。
+  entryKeyOf(node) {
+    const host = String(node?.host ?? '').toLowerCase()
+    const port = Number(node?.port)
+    return host !== '' && Number.isInteger(port) && port > 0 ? `${host}:${port}` : undefined
+  }
+
+  entryHeadKey() {
+    return this.entryKeyOf(this.entrySpecs()[0]?.node)
+  }
+
+  /**
+   * N-86 守门换序:只有当头入口凭证据(连续失败到阈值)进入冷却才换;驻留窗内限速;
+   * 全部冷却=耗尽,不再空转换序(既有退避/还原链已交还普通网络)。单入口恒不换(语义不变)。
+   */
+  rotateEntryGuarded() {
+    if (this.intent?.singleAddressMode === true) return false
+    const list = this.intent?.connectors
+    if (!Array.isArray(list) || list.length <= 1) return false
+    const candidateKeys = this.entrySpecs().map((spec) => this.entryKeyOf(spec?.node)).filter((key) => key !== undefined)
+    if (candidateKeys.length <= 1) return false
+    const decision = this.entryHealth.nextHead(candidateKeys)
+    if (decision.reason === 'exhausted') {
+      this.log('入口全部冷却:本轮不换序,按退避恢复(系统代理按账本交还)')
+      return false
+    }
+    if (decision.reason === 'dwell') {
+      this.log('入口换序处于驻留窗:本轮保持当头,防止来回跳')
+      return false
+    }
+    if (decision.reason !== 'rotated' || decision.head === undefined) return false
+    const index = list.findIndex((spec) => this.entryKeyOf(spec?.node) === decision.head)
+    if (index <= 0) return false
+    this.entryRotation = index
+    this.log(`换序至入口 ${decision.head}(证据:当头冷却)`)
+    return true
+  }
+
   /** 换下一条入口打头。返回是否真的换了(只有一条入口时不换)。 */
   rotateEntry() {
+    if (this.intent?.singleAddressMode === true) return false
     const list = this.intent?.connectors
     if (!Array.isArray(list) || list.length <= 1) return false
     this.entryRotation = ((this.entryRotation ?? 0) + 1) % list.length
@@ -1651,6 +1775,8 @@ class DaemonCore {
     const epoch = this.reconnectEpoch
     // 退避重连/复用失效会直接进这里；上一轮的阶段只能描述上一轮，不能带进本轮错误。
     this.connectStage = undefined
+    // connect() 已开台账;直连 establish 的重连路径自己开,trigger 记 reconnect。
+    if (this.funnelAttempt === undefined) this.funnelOpen('reconnect')
     // 初连由 connect() 开启取证；退避重连、复用路径失效后的改建会直接进 establish，必须另开当前取证，
     // 不能拿上一轮已完成的 operation 做最终闸。
     if (!this.availability.isCurrent(this.availabilityOperation)) {
@@ -1676,6 +1802,7 @@ class DaemonCore {
     }
     // 多入口:轮转后的第一条当主连接器(复验、本地口都走它),全部入口一起交给内核。
     const specs = this.entrySpecs()
+    setFunnelLeg(this.funnelAttempt, specs[0]?.nodeId ?? specs[0]?.node?.nodeId, specs[0]?.legRole)
     this.connector = this.connectorFactory(specs[0] ?? spec)
     this.entryConnectors = specs.length > 1 ? specs.map((entry, index) => (index === 0 ? this.connector : this.connectorFactory(entry))) : undefined
     const connector = this.connector
@@ -1696,7 +1823,14 @@ class DaemonCore {
     const { exitIp } = await this.runConnectStage('path-verify-before-settings', () => this.verifyConnection(connector), CONNECTION_VERIFY_TIMEOUT_MS)
     await this.assertCurrent(connector)
     this.setConnectStage('settings-write')
-    this.applySettings()
+    const funnelSettingsStartedAt = this.clock.now()
+    try {
+      this.applySettings()
+    } catch (error) {
+      this.funnelNote('settings-write', funnelSettingsStartedAt, 'error', error?.code)
+      throw error
+    }
+    this.funnelNote('settings-write', funnelSettingsStartedAt, 'ok')
     this.reclaimFailedRestores()
     try { this.verifySettings() } catch (error) {
       this.failAvailabilityAction(this.availabilityOperation, 'READBACK_MISMATCH')
@@ -1729,6 +1863,7 @@ class DaemonCore {
     this.repairedItems = undefined
     this.connectStage = undefined
     this.state = 'connected'
+    this.funnelClose('connected')
     this.lastVerification = { exitIp: postWriteVerification.exitIp || exitIp, pathVerified: true, lastVerifiedAt: this.clock.now() }
     this.writeStateNow('connected', this.lastVerification)
     this.scheduleTraffic()
@@ -1741,21 +1876,63 @@ class DaemonCore {
     try { this.writeStateNow('connecting', { connectStage: stage }) } catch { /* 阶段留证失败不得改变网络动作 */ }
   }
 
+  // N-79 漏斗台账:开条(superseded 掉上一条未闭合的)/记阶段行/闭合落盘。
+  // 落盘只在闭合时(每次连接尝试至多一两笔写),失败静默——⛔ 台账影响连接本身。
+  funnelOpen(trigger) {
+    if (this.funnelAttempt !== undefined) this.funnelCloseInternal('superseded')
+    this.funnelAttempt = blankFunnelAttempt(trigger, this.clock.now())
+    this.funnelAttempts = appendFunnelAttempt(this.funnelAttempts, this.funnelAttempt)
+    // N-87:开条即落盘——守护被强杀时,半途尝试在现场留得下痕(闭合/取代时再各写一次)。
+    try { writeFunnelAttempts(this.funnelPath, this.funnelAttempts) } catch { /* 台账落盘失败不得影响连接 */ }
+  }
+
+  funnelNote(name, startedAt, outcome, code, phase) {
+    if (this.funnelAttempt === undefined) return
+    const row = funnelStageRow(name, this.clock.now() - startedAt, outcome, code, startedAt, phase)
+    if (row !== undefined) {
+      this.funnelAttempt.stages.push(row)
+      // 强杀/断电发生在连接阶段时，闭合写盘来不及发生；每个阶段完成后都更新一次，
+      // 让下一代守护能说明实际卡在哪一段。台账写失败仍不能影响连接本身。
+      try { writeFunnelAttempts(this.funnelPath, this.funnelAttempts) } catch { /* best effort */ }
+    }
+  }
+
+  funnelClose(outcome, code) {
+    if (this.funnelAttempt === undefined) return
+    this.funnelCloseInternal(outcome, code)
+  }
+
+  funnelCloseInternal(outcome, code) {
+    const safeCode = sanitizeFunnelCode(code)
+    this.funnelAttempt.outcome = outcome
+    this.funnelAttempt.endedAt = this.clock.now()
+    if (safeCode !== undefined) this.funnelAttempt.code = safeCode
+    this.funnelAttempt = undefined
+    try { writeFunnelAttempts(this.funnelPath, this.funnelAttempts) } catch { /* 台账落盘失败不得影响连接 */ }
+  }
+
   async runConnectStage(stage, operation, timeoutMs) {
     this.setConnectStage(stage)
+    const funnelStartedAt = this.clock.now()
     let timer
     let settled = false
     try {
-      return await new Promise((resolve, reject) => {
+      const value = await new Promise((resolve, reject) => {
         timer = this.clock.setTimeout(() => {
           settled = true
           reject(connectionStageTimeout(stage, timeoutMs))
         }, timeoutMs)
         Promise.resolve().then(operation).then(
-          (value) => { if (!settled) { settled = true; resolve(value) } },
+          (resolved) => { if (!settled) { settled = true; resolve(resolved) } },
           (error) => { if (!settled) { settled = true; reject(error) } }
         )
       })
+      this.funnelNote(stage, funnelStartedAt, 'ok')
+      return value
+    } catch (error) {
+      this.funnelNote(stage, funnelStartedAt, error?.code === 'TUNNEL_CONNECTION_TIMEOUT' ? 'timeout' : 'error', error?.code,
+        classifyNetworkPhase(error))
+      throw error
     } finally {
       if (timer !== undefined) this.clock.clearTimer(timer)
     }
@@ -1860,6 +2037,7 @@ class DaemonCore {
         outbounds: this.entryConnectors?.map((entry) => entry.xrayOutbound?.()).filter(Boolean),
         verifyUrl: this.intent.connector.kind === 'loopback-probe' ? undefined : this.intent.connector.verifyUrl,
         verifyFallbackUrl: this.intent.connector.kind === 'loopback-probe' ? undefined : this.intent.connector.verifyFallbackUrl,
+        allowLocalVerifyUrls: this.intent.connector.allowLocalVerifyUrls === true,
         verifyTimeoutMs: this.intent.connector.timeoutMs,
         listenPort,
         routes: this.intent.routes,
@@ -2626,6 +2804,9 @@ class DaemonCore {
     // 此前这里一行不写:连接器保留的细节(ssh 退出码、stderrTail、spawn 原文)全在这丢;
     // ssh 被拒/杀软删组件/程序 bug 三种病在客服和数据里长一个样。
     this.log(`连接失败[${errorNameOf(error)}] code=${String(code)}:${firstLineOf(error)}`)
+    this.funnelClose(FATAL_CODES.has(code) ? 'fatal' : 'failed', code)
+    // N-86:非致命失败在当头入口记证据(致命码是配置/权限问题,与入口健康无关)。
+    if (!FATAL_CODES.has(code)) this.entryHealth.recordFailure(this.entryHeadKey())
     // message 仍写 code(界面按码查文案表,是既有架构)。但「对方当前是什么状态」是**动态**的,
     // 查不了静态表 —— 单独落一个白名单状态词,由界面拼进那句话。
     // ⛔ 把它塞进 message:那样文案表就查不到、客户又会看到裸码。
@@ -2712,8 +2893,8 @@ class DaemonCore {
         { preserveLiveBridge: this.bridge })) return
       const connectorHandover = this.connectionOwnerFence(intent, epoch)
       if (connectorHandover !== undefined) await connectorHandover
-      // 多入口换序或旧桥失效都要收旧桥；关闭挂起时不能让系统代理指向死端口。
-      const rotate = this.rotateEntry()
+      // N-86:多入口换序走健康守门(证据+驻留+耗尽);旧桥失效仍要收桥。
+      const rotate = this.rotateEntryGuarded()
       if (this.bridge !== undefined && (rotate || this.bridge.isAlive?.() === false)) {
         const bridge = this.bridge
         this.bridge = undefined
@@ -2732,6 +2913,7 @@ class DaemonCore {
         this.reconnectAttempts = 0
         return
       }
+      this.entryHealth.recordSuccess(this.entryHeadKey())
       this.recordRecoverySuccess(slow)
       this.reconnectAttempts = 0
     } catch (error) {
@@ -2757,6 +2939,8 @@ class DaemonCore {
         await this.stopForFatal(code)
         return
       }
+      // N-86:本轮 establish 用的当头入口记失败证据(此处已在代次闸内,迟到结果 ⛔ 写账)。
+      this.entryHealth.recordFailure(this.entryHeadKey())
       // 这次没连上:中继要是没起来(内核起不来/端口没监听),先把系统代理还给客户再等下一轮。
       this.releaseSettingsForRecovery()
       this.writeStateNow('error', { code, message: this.reconnectMessage(), ...(typeof this.connectStage === 'string' ? { connectStage: this.connectStage } : {}) })
@@ -3370,6 +3554,51 @@ class DaemonCore {
     this.trafficTimer = this.clock.setInterval(() => { void this.refreshTraffic() }, 2_000)
   }
 
+  scheduleRuntimeObservation() {
+    if (!this.runtimeObservationEnabled) return
+    this.clearRuntimeObservation()
+    this.recordRuntimeObservation()
+    this.runtimeObservationTimer = this.clock.setInterval(() => { this.recordRuntimeObservation() }, this.runtimeObservationIntervalMs)
+  }
+
+  recordRuntimeObservation() {
+    if (this.exited || !this.runtimeObservationEnabled) return
+    if (existsSync(this.runtimeObservationDisabledPath)) {
+      this.runtimeObservationEnabled = false
+      this.clearRuntimeObservation()
+      return
+    }
+    let memoryUsage
+    let cpuUsage
+    try { memoryUsage = process.memoryUsage() } catch { memoryUsage = undefined }
+    try { cpuUsage = process.cpuUsage() } catch { cpuUsage = undefined }
+    let traffic
+    try { traffic = this.bridge?.traffic?.() } catch { traffic = undefined }
+    const result = buildRuntimeObservationSample({
+      at: this.clock.now(), state: this.state, stage: this.connectStage, reconnectAttempts: this.reconnectAttempts,
+      traffic, memoryUsage, cpuUsage, previous: this.runtimeObservationPreviousCpu
+    })
+    if (result === undefined) return
+    this.runtimeObservationPreviousCpu = result.cpu
+    this.runtimeObservationSamples = appendRuntimeObservation(this.runtimeObservationSamples, result.sample)
+    try {
+      // 与 traffic.json 同一份守护数据目录；只做原子落盘，不参与设置账本和连接状态。
+      withSettingsLock(this.dataDir, () => {
+        if (this.recoveryHandedOver()) return
+        writeRuntimeObservations(this.runtimeObservationPath, this.runtimeObservationSamples)
+      }, { owner: `runtime-observation:${this.runId}`, timeoutMs: 0 })
+    } catch {
+      // 观测写失败留在内存里，下一拍重试；绝不能改变网络状态机。
+    }
+  }
+
+  clearRuntimeObservation() {
+    if (this.runtimeObservationTimer !== undefined) {
+      this.clock.clearTimer(this.runtimeObservationTimer)
+      this.runtimeObservationTimer = undefined
+    }
+  }
+
   refreshTraffic() {
     const bridge = this.bridge
     if (!bridge?.traffic || this.exited || !['connected', 'degraded'].includes(this.state)) return
@@ -3444,8 +3673,12 @@ class DaemonCore {
           ...(this.recoveryNotice !== undefined ? { recovery: this.recoveryNotice } : {}) })
         if (state === 'connected' && Number.isFinite(extra.lastVerifiedAt)) {
           const verified = JSON.stringify({ verifiedAt: extra.lastVerifiedAt })
-          writeFileSync(join(this.dataDir, 'connection-verified.json.tmp'), verified, { mode: 0o600 })
-          renameSync(join(this.dataDir, 'connection-verified.json.tmp'), join(this.dataDir, 'connection-verified.json'))
+          const verifiedPath = join(this.dataDir, 'connection-verified.json')
+          const temporary = `${verifiedPath}.tmp-${randomBytes(8).toString('hex')}`
+          try {
+            writeFileSync(temporary, verified, { mode: 0o600 })
+            renameSync(temporary, verifiedPath)
+          } finally { rmSync(temporary, { force: true }) }
         }
       }, { owner: `state:${this.runId}`, timeoutMs })
       this.logContinuity(state, extra)
@@ -3522,10 +3755,15 @@ class DaemonCore {
     if (this.intentTimer !== undefined) this.clock.clearTimer(this.intentTimer)
     if (this.parentTimer !== undefined) this.clock.clearTimer(this.parentTimer)
     if (this.authorizationTimer !== undefined) this.clock.clearTimer(this.authorizationTimer)
+    this.clearRuntimeObservation()
     this.clearVerify()
     this.clearTraffic(!preserveTraffic)
     if (this.reconnectTimer !== undefined) {
       this.clock.clearTimer(this.reconnectTimer)
+    }
+    if (this.startupRecoveryRetryTimer !== undefined) {
+      this.clock.clearTimer(this.startupRecoveryRetryTimer)
+      this.startupRecoveryRetryTimer = undefined
     }
     if (this.notifyRetryTimer !== undefined) this.clock.clearTimer(this.notifyRetryTimer)
     this.onExit(code)

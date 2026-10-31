@@ -1,6 +1,6 @@
 // 通道服务门面:配置、账号领取与连接动作。互斥、状态闸、意图落盘、
 // 守护监管、退出交接。renderer 传不进任何路径 / 节点 / 命令。
-import { existsSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { generateSessionToken, isSettledSetting, ledgerFailure, ledgerFailureCached, loadLedgerCached,
   pendingSettingEntries, pendingSettingEntriesCached, type LedgerEntry, type SettingEntry } from '../../../sidecar/mac/ledger.mjs'
@@ -16,9 +16,17 @@ import { CONNECTION_LEASE_MS, verifyConnectionLease, type ConnectionLease } from
 import type { ApiNetworkBinding } from '../../../sidecar/shared/api-network-continuation.mjs'
 import { DiagnosisReporter, type DiagnosisPayload, type DiagnosisStage } from './diagnosis-reporter'
 import { DiagnosticEventQueue, diagnosticEventBelongsToAuthorization, type DiagnosticEvent, type EncryptedQueueCodec } from './diagnostic-event-queue'
+import { diagnosticAuthorizationHashAt } from '../../diagnostic-event-types'
+import { readFunnelAttempts, type FunnelAttempt } from '../../../sidecar/mac/connection-funnel.mjs'
+import { AttemptSendError, ConnectionAttemptQueue } from './connection-attempt-queue'
+import { ReachabilitySendError, ReachabilityTelemetryQueue } from './reachability-telemetry-queue'
+import { RuntimeObservationSendError, RuntimeObservationTelemetryQueue } from './runtime-observation-telemetry-queue'
 import { platformForRuntime } from './sidecar-path'
 import type { Platform } from '../precheck/software-platform'
 import type { FaultNoteId } from '../../shared/fault-log-types'
+import type { ReachabilityEvent } from '../../reachability-types'
+import type { RuntimeObservationEvent } from '../../runtime-observation-types'
+import { readRuntimeObservations, runtimeObservationPath } from '../../../sidecar/shared/runtime-observation.mjs'
 import { ActionMutex, MUTEX_BUSY_CODE } from './mutex'
 import { KNOWN_FAILURE_CODES } from './failure-codes'
 import { layout, statSignature, writeFileAtomic } from './paths'
@@ -50,6 +58,8 @@ const REJECTED_CONFIG_RETRY_MS = 5 * 60_000
 // 但不会超过 repair-budget 的病态账本封顶。
 const AUTO_CONNECT_RETRY_BUDGET_MS = REPAIR_BUDGET_MAX_MS
 const AUTO_CONNECT_RETRY_DELAY_MS = 1_000
+/** N-75:后台开通未完成(PENDING)的慢节奏重试——本地过渡 1 秒一拍,等后台批准 5 秒一拍,共用同一预算。 */
+const PROVISIONING_PENDING_RETRY_DELAY_MS = 5_000
 const AUTO_CONNECT_TRANSITION_CODES: ReadonlySet<string> = new Set([
   MUTEX_BUSY_CODE,
   'TUNNEL_STOP_UNCONFIRMED',
@@ -148,6 +158,8 @@ type DisconnectReason = 'boot-ineligible' | 'account-repair-abort' | 'account-sw
 const DEFINITIVE_DENIALS: ReadonlySet<string> = new Set(['NETWORK_AUTHORIZATION_UNAVAILABLE', 'NETWORK_NO_APPLICATION', 'NETWORK_APPLICATION_PENDING'])
 /** 点连接时后台这几种「问不到/答非所问」不挡客户:本地配置没到期就照连。会话变化、本地忙、要登录都不在列。 */
 const BACKEND_TRANSIENT_FAILURES: ReadonlySet<string> = new Set(['NETWORK_SERVICE_UNAVAILABLE', 'NETWORK_RESPONSE_INVALID', 'NETWORK_LEASE_INVALID'])
+// 单地址模式遇到真实数据面连接超时，自动刷新当前绑定；本机恢复/权限/守护崩溃等错误不触发换绑。
+const SINGLE_ADDRESS_REFRESH_FAILURES: ReadonlySet<string> = new Set(['TUNNEL_CONNECTION_TIMEOUT'])
 
 export interface ActionResult {
   readonly outcome: string
@@ -165,11 +177,15 @@ export interface ImportResult extends ActionResult {
 
 export interface TunnelServiceDeps {
   readonly apiNetworkContinuation?: (bridgePort: number) => Promise<ApiNetworkBinding | undefined>
+  /** N-82 测试注入:自动首连预算(缺省 REPAIR_BUDGET_MAX_MS 封顶)。预算计时一律单调时钟。 */
+  readonly autoConnectBudgetMs?: number
   /** 仅 GUI 显式操作调用；后台守护不弹密码框，只返回受控的本地权限故障。 */
   readonly ensureProxyAuthorization?: () => Promise<{ code: string; message: string } | undefined>
   readonly dataDir: string
   // 接收方运行平台;缺省按进程平台推导(开发与测试在 mac 上即 macos)。
   readonly platform?: Platform
+  /** 仅本地测试夹具允许回环验证地址；生产账号包始终严格校验。 */
+  readonly allowLocalVerifyUrls?: boolean
   readonly sidecarDir: string
   readonly picker: () => Promise<string | undefined>
   readonly trust: TrustContext
@@ -212,6 +228,22 @@ export interface TunnelServiceDeps {
       readonly canSend?: (event: DiagnosticEvent) => boolean
       readonly createId?: () => string
     }
+  }
+  /** 0.7.3 客户侧节点可达性遥测；默认关闭，未挂载后台来源映射时零上报。 */
+  readonly reachabilityTelemetry?: {
+    readonly enabled: () => boolean
+    readonly codec: EncryptedQueueCodec
+    readonly queuePath?: string
+    readonly send?: (events: readonly ReachabilityEvent[]) => Promise<void>
+  }
+  /** V1.0 前自动运行观测；安装成功首连一发，10/16/20 每日一发。 */
+  readonly runtimeObservationTelemetry?: {
+    readonly enabled: () => boolean
+    readonly codec: EncryptedQueueCodec
+    readonly version: () => string
+    readonly queuePath?: string
+    readonly send?: (event: RuntimeObservationEvent) => Promise<void>
+    readonly observationPath?: string
   }
 }
 
@@ -296,9 +328,17 @@ export class TunnelService {
   // FB-1:失败终态回传。deps.diagnosis 不给就是 undefined,所有挂钩一行都不走。
   private readonly diagnosisReporter?: DiagnosisReporter
   private readonly diagnosticEventQueue?: DiagnosticEventQueue
+  private readonly connectionAttemptQueue?: ConnectionAttemptQueue
+  private attemptCollectTimer?: ReturnType<typeof setInterval>
+  private readonly reachabilityTelemetryQueue?: ReachabilityTelemetryQueue
+  private reachabilityCollectTimer?: ReturnType<typeof setInterval>
+  private readonly runtimeObservationTelemetryQueue?: RuntimeObservationTelemetryQueue
+  private runtimeObservationCollectTimer?: ReturnType<typeof setInterval>
+  private funnelReadCache: { key: string; attempts: readonly FunnelAttempt[] } | undefined
   // 同一守护终态只回传一次的账(runId+code);cap 之外整表清空,防长驻进程无界增长。
   private reportedDaemonFailures = new Set<string>()
   private reportedStopTimeoutToken?: string
+  private singleAddressRefresh?: { sessionToken: string; startedAt: number }
   // 甲-9 返工:本轮 spawn 发出去的 runId(supervisor 每轮 ensureRunning/退避重启都新发一个)。
   // 常驻轮不 spawn,一直是空串——state.json 错误码的「本轮归属」判据见 daemonStateIsCurrentRound。
   private spawnedDaemonRunId = ''
@@ -339,9 +379,91 @@ export class TunnelService {
           }),
           send: deps.diagnosis.eventQueue.send ?? ((event) => this.deliverDiagnosticEvent(event))
         })
+        // N-79:漏斗终态→connection-attempt 上送。独立 30s 定时器(⛔ 挂 status() getter——
+        // 那是渲染层多路轮询的只读面);采集键持久化在队列文件,跨重启幂等。
+        this.connectionAttemptQueue = new ConnectionAttemptQueue({
+          queuePath: join(deps.dataDir, 'connection-attempts.enc'),
+          codec: deps.diagnosis.eventQueue.codec,
+          platform: this.platform,
+          version: deps.diagnosis.version,
+          authorizationHash: () => {
+            const current = readCurrentInfo(this.deps.dataDir)
+            return current === undefined ? 'none' : diagnosticAuthorizationHashAt(current.authorizationId, this.deps.now())
+          },
+          send: async (event) => {
+            const access = this.accountAccess
+            if (!access || !access.session.deviceId) throw new AttemptSendError('retryable', 'NO_SESSION')
+            try {
+              await access.client.reportConnectionAttempt(access.session, new AbortController().signal, event)
+            } catch (error) {
+              // ④分流:4xx 合同不兼容→丢弃;429/5xx/网络→退避;401/403→暂停等会话。
+              const code = error instanceof NetworkAccountError ? error.message : ''
+              if (code === 'NETWORK_RESPONSE_INVALID' || code === 'NETWORK_ROUTE_NOT_FOUND') {
+                throw new AttemptSendError('permanent', code)
+              }
+              if (code === 'NETWORK_LOGIN_REQUIRED') throw new AttemptSendError('auth', code)
+              throw new AttemptSendError('retryable', code !== '' ? code : 'NETWORK')
+            }
+          }
+        })
+        this.attemptCollectTimer = setInterval(() => { void this.collectConnectionAttempts().catch(() => undefined) }, 30_000)
+        this.attemptCollectTimer.unref?.()
       }
       // 「下次启动补传」:构造即启动时机;此刻多半还没有会话,flush 会原样保留队列。
       void this.diagnosisReporter.flushPending()
+    }
+    if (deps.reachabilityTelemetry !== undefined) {
+      this.reachabilityTelemetryQueue = new ReachabilityTelemetryQueue({
+        queuePath: deps.reachabilityTelemetry.queuePath ?? join(deps.dataDir, 'reachability-events.enc'),
+        codec: deps.reachabilityTelemetry.codec,
+        enabled: deps.reachabilityTelemetry.enabled,
+        platform: this.platform,
+        version: () => deps.diagnosis?.version() ?? '0.0.0',
+        send: deps.reachabilityTelemetry.send ?? (async (events) => {
+          const access = this.accountAccess
+          if (!access || !access.session.deviceId) throw new ReachabilitySendError('retryable', 'NO_SESSION')
+          try {
+            await access.client.reportReachability(access.session, new AbortController().signal, events)
+          } catch (error) {
+            const code = error instanceof NetworkAccountError ? error.message : ''
+            if (code === 'NETWORK_RESPONSE_INVALID' || code === 'NETWORK_ROUTE_NOT_FOUND') throw new ReachabilitySendError('permanent', code)
+            if (code === 'NETWORK_LOGIN_REQUIRED') throw new ReachabilitySendError('auth', code)
+            throw new ReachabilitySendError('retryable', code !== '' ? code : 'NETWORK')
+          }
+        }),
+        now: deps.now,
+        logFailure: deps.logFailure
+      })
+      this.reachabilityCollectTimer = setInterval(() => { void this.collectReachabilityEvents().catch(() => undefined) }, 5 * 60_000)
+      this.reachabilityCollectTimer.unref?.()
+    }
+    if (deps.runtimeObservationTelemetry !== undefined) {
+      this.runtimeObservationTelemetryQueue = new RuntimeObservationTelemetryQueue({
+        queuePath: deps.runtimeObservationTelemetry.queuePath ?? join(deps.dataDir, 'runtime-observations.enc'),
+        codec: deps.runtimeObservationTelemetry.codec,
+        enabled: deps.runtimeObservationTelemetry.enabled,
+        platform: this.platform,
+        version: deps.runtimeObservationTelemetry.version,
+        accountId: () => this.accountAccess?.session.accountId,
+        send: deps.runtimeObservationTelemetry.send ?? (async (event) => {
+          const access = this.accountAccess
+          if (!access) throw new RuntimeObservationSendError('retryable', 'NO_SESSION')
+          try {
+            await access.client.reportRuntimeObservation(access.session, new AbortController().signal, event)
+          } catch (error) {
+            const code = error instanceof NetworkAccountError ? error.message : ''
+            if (code === 'NETWORK_RESPONSE_INVALID' || code === 'NETWORK_ROUTE_NOT_FOUND' || code === 'RUNTIME_OBSERVATION_VERSION_CLOSED') {
+              throw new RuntimeObservationSendError('permanent', code)
+            }
+            if (code === 'NETWORK_LOGIN_REQUIRED') throw new RuntimeObservationSendError('auth', code)
+            throw new RuntimeObservationSendError('retryable', code !== '' ? code : 'NETWORK')
+          }
+        }),
+        now: deps.now,
+        logFailure: deps.logFailure
+      })
+      this.runtimeObservationCollectTimer = setInterval(() => { void this.collectRuntimeObservationTelemetry().catch(() => undefined) }, 30_000)
+      this.runtimeObservationCollectTimer.unref?.()
     }
     this.signedOutExplicitly = existsSync(join(deps.dataDir, 'account-signed-out'))
     // 任一进程再次启动先读账本 / 收尾指针(判据 3③ 主进程侧)
@@ -391,6 +513,8 @@ export class TunnelService {
       } catch { this.supervisor.recoverOnBoot() }
     } else if (current?.accountId) this.disconnect('boot-ineligible')
     else this.supervisor.recoverOnBoot()
+    // 立即检查一次：开机时守护可能已经常驻并连接，不依赖渲染层轮询才上报安装信息。
+    if (this.runtimeObservationTelemetryQueue !== undefined) void this.collectRuntimeObservationTelemetry().catch(() => undefined)
   }
 
   /** 校准落定后的接续补做(开机接续与等待期手动连接共用):落定后走 supervisor 同一套判断——
@@ -459,6 +583,7 @@ export class TunnelService {
         trust: this.deps.trust,
         now: this.deps.now,
         runtimePlatform: this.platform,
+        allowLocalVerifyUrls: this.deps.allowLocalVerifyUrls,
         sourceLineOf: (validated) => TRUST_LINES[validated.trust.tier]
       }, picked)
       return mapImportOutcome(outcome, this.status().state)
@@ -497,6 +622,11 @@ export class TunnelService {
       } else if (options?.autoConnect && this.isAutoConnectTransition(synced)) {
         this.scheduleAccountAutoConnect(active, autoConnectBaseline!, true, synced.code)
         return { outcome: 'started', code: '', message: '连接中' }
+      }
+      // N-75:后台开通未完成也要排上自动首连——重试回路会慢节奏等批准,⛔ 把「开通中」当失败还给用户。
+      if (options?.autoConnect && synced.outcome === 'rejected' && synced.code === 'NETWORK_APPLICATION_PENDING') {
+        this.scheduleAccountAutoConnect(active, autoConnectBaseline!, true, synced.code)
+        return { outcome: 'started', code: '', message: '网络开通申请正在处理中，批准后会自动连接' }
       }
       return synced
     }
@@ -563,6 +693,10 @@ export class TunnelService {
     if (access) {
       void this.diagnosisReporter?.flushPending()
       void this.diagnosticEventQueue?.resumeUploads().catch(() => undefined)
+      this.connectionAttemptQueue?.resume()
+      this.reachabilityTelemetryQueue?.resume()
+      this.runtimeObservationTelemetryQueue?.resume()
+      void this.collectRuntimeObservationTelemetry().catch(() => undefined)
     }
     if (!access) return { outcome: 'stopped', code: '', message: reason !== undefined ? '账号状态暂时无法确认，通道已暂停；确认有效后恢复先前连接' : '已退出账号，账号通道已断开' }
     const synced = await this.syncAccountConfig()
@@ -578,6 +712,11 @@ export class TunnelService {
       // 后台任务会在过渡结束后重新同步，再走同一条连接入口。
       this.scheduleAccountAutoConnect(next!, autoConnectBaseline!, true, synced.code)
       return { outcome: 'started', code: '', message: '连接中' }
+    }
+    // N-75:同上——「开通中」不是失败,排上自动首连在预算内等批准。
+    if (options?.autoConnect && synced.outcome === 'rejected' && synced.code === 'NETWORK_APPLICATION_PENDING') {
+      this.scheduleAccountAutoConnect(next!, autoConnectBaseline!, true, synced.code)
+      return { outcome: 'started', code: '', message: '网络开通申请正在处理中，批准后会自动连接' }
     }
     return synced
   }
@@ -603,7 +742,7 @@ export class TunnelService {
   private queueAutoConnectRetry(pending: AutoConnectRetry, delayMs: number): void {
     if (this.autoConnectRetry !== pending || this.accountAccess !== pending.access ||
         this.userStopSequence !== pending.stopSequence || pending.timer !== undefined) return
-    const remaining = pending.deadline - Date.now()
+    const remaining = pending.deadline - performance.now()
     if (remaining <= 0) {
       this.expireAutoConnectRetry(pending)
       return
@@ -628,7 +767,8 @@ export class TunnelService {
     const pending = {
       access,
       stopSequence: baselineStopSequence,
-      deadline: Date.now() + AUTO_CONNECT_RETRY_BUDGET_MS,
+      // N-82:预算用单调时钟(performance.now)——Date.now 会被校时/睡眠唤醒拨动,预算可能被拉长或提前耗尽。
+      deadline: performance.now() + (this.deps.autoConnectBudgetMs ?? AUTO_CONNECT_RETRY_BUDGET_MS),
       needsSync,
       lastCode: initialCode,
       running: false
@@ -646,7 +786,7 @@ export class TunnelService {
       this.userStopSequence === pending.stopSequence
     try {
       if (!isCurrent()) return
-      if (Date.now() >= pending.deadline) {
+      if (performance.now() >= pending.deadline) {
         this.expireAutoConnectRetry(pending)
         return
       }
@@ -665,7 +805,7 @@ export class TunnelService {
         ? await this.ensureProxyAuthorizationForStart(pending.access, pending.stopSequence)
         : undefined
       if (!isCurrent()) return
-      if (Date.now() >= pending.deadline) {
+      if (performance.now() >= pending.deadline) {
         this.expireAutoConnectRetry(pending)
         return
       }
@@ -678,13 +818,15 @@ export class TunnelService {
       if (syncRequested) {
         const synced = await this.syncAccountConfig()
         if (!isCurrent()) return
-        if (Date.now() >= pending.deadline) {
+        if (performance.now() >= pending.deadline) {
           this.expireAutoConnectRetry(pending)
           return
         }
         if (!['applied', 'unchanged', 'continued'].includes(synced.outcome)) {
           pending.lastCode = synced.code
           if (this.isAutoConnectTransition(synced)) return this.queueAutoConnectRetry(pending, AUTO_CONNECT_RETRY_DELAY_MS)
+          // N-75:后台还没批准不是失败——同一预算内慢节奏等,⛔ 直接终止让刚注册的用户看到失败。
+          if (synced.code === 'NETWORK_APPLICATION_PENDING') return this.queueAutoConnectRetry(pending, PROVISIONING_PENDING_RETRY_DELAY_MS)
           this.recordBackgroundConnectResult(synced, isCurrent, 'account-auto-connect-failed')
           this.autoConnectRetry = undefined
           return
@@ -701,7 +843,7 @@ export class TunnelService {
         authorizationFailure = await this.ensureProxyAuthorizationForStart(pending.access, pending.stopSequence)
       }
       if (!isCurrent()) return
-      if (Date.now() >= pending.deadline) {
+      if (performance.now() >= pending.deadline) {
         this.expireAutoConnectRetry(pending)
         return
       }
@@ -713,7 +855,7 @@ export class TunnelService {
       }
       const result = await this.startConnection(undefined, true, pending.access, pending.stopSequence)
       if (!isCurrent()) return
-      if (Date.now() >= pending.deadline) {
+      if (performance.now() >= pending.deadline) {
         this.expireAutoConnectRetry(pending)
         return
       }
@@ -723,6 +865,7 @@ export class TunnelService {
       }
       pending.lastCode = result.code
       if (this.isAutoConnectTransition(result)) return this.queueAutoConnectRetry(pending, AUTO_CONNECT_RETRY_DELAY_MS)
+      if (result.code === 'NETWORK_APPLICATION_PENDING') return this.queueAutoConnectRetry(pending, PROVISIONING_PENDING_RETRY_DELAY_MS)
       this.recordBackgroundConnectResult(result, isCurrent, 'account-auto-connect-failed')
       this.autoConnectRetry = undefined
     } catch (error: unknown) {
@@ -733,6 +876,9 @@ export class TunnelService {
       }
       const code = error instanceof NetworkAccountError ? error.message : 'UNKNOWN'
       pending.lastCode = code
+      if (code === 'NETWORK_APPLICATION_PENDING' && performance.now() < pending.deadline) {
+        return this.queueAutoConnectRetry(pending, PROVISIONING_PENDING_RETRY_DELAY_MS)
+      }
       this.autoConnectRetry = undefined
       this.deps.logFailure?.('account-auto-connect-failed', code)
       void this.reportFailure(code, 'connect-start')
@@ -740,7 +886,7 @@ export class TunnelService {
       pending.running = false
       // A same-generation caller may have merged a sync request while this attempt was in flight.
       if (this.autoConnectRetry === pending && pending.timer === undefined &&
-          Date.now() < pending.deadline && isCurrent() && pending.needsSync) {
+          performance.now() < pending.deadline && isCurrent() && pending.needsSync) {
         this.queueAutoConnectRetry(pending, AUTO_CONNECT_RETRY_DELAY_MS)
       }
     }
@@ -837,7 +983,8 @@ export class TunnelService {
       // 网络往返在锁外:后台再慢,互斥锁也只盖住「拿到结果写本地状态」的短窗口。
       // ⛔ 整个往返攥着锁——后台一慢,应用配置/导入配置全吃「另一个通道正在进行」,点什么都没反应;
       // 断开靠中止在途请求自救,其余动作没有这条退路(0.4.x 线上:后台一慢界面像卡死)。
-      config = await access.client.claim(access.session, controller.signal, retryCache ?? cached)
+      config = await access.client.claim(access.session, controller.signal, retryCache ?? cached,
+        { refreshBinding: forConnectionAttempt && current?.singleAddressMode === true })
       configWasUnchanged = config.unchanged === true
       assertSession()
       if (this.rawStatus().state === DISPLAY_STATES.disconnecting) return rejectedBusy()
@@ -869,6 +1016,7 @@ export class TunnelService {
         const entries = parseTarEntries(config.archive)
         const checked = validatePackage(entries, { now: this.deps.now(), trust: this.deps.trust,
           runtimePlatform: this.platform,
+          allowLocalVerifyUrls: this.deps.allowLocalVerifyUrls,
           currentAuthorizationId: config.id, currentVersion: current?.authorizationId === config.id ? current.configVersion : undefined,
           currentPackageDigest: current?.authorizationId === config.id ? this.storedPackageDigest(current) : undefined })
         if (Date.parse(checked.manifest.expiresAt) !== config.expiresAt) throw new NetworkAccountError('NETWORK_RESPONSE_INVALID')
@@ -889,6 +1037,7 @@ export class TunnelService {
         // A disk/write failure must not turn a background refresh into a user disconnect.
         const imported = await importAccountConfig({ dataDir: this.deps.dataDir, picker: this.deps.picker,
           trust: this.deps.trust, now: this.deps.now, runtimePlatform: this.platform,
+          allowLocalVerifyUrls: this.deps.allowLocalVerifyUrls,
           sourceLineOf: (v) => TRUST_LINES[v.trust.tier] }, config.archive,
         { id: access.session.accountId, authorizationId: config.id, expiresAt: config.expiresAt }, assertSession)
         assertSession()
@@ -1715,6 +1864,7 @@ export class TunnelService {
       componentMissing: missingSidecarComponents(this.platform, this.deps.sidecarDir, { requireSshBinary }),
       sshBinary: this.platform === 'windows' ? (sshBinaryPresent(this.platform, this.deps.sidecarDir) ? '有' : '无') : ''
     })
+    this.scheduleSingleAddressRefresh(currentInfo, currentIntent, daemonState, status)
     this.reportDaemonTerminalFailure(previousRound ? undefined : daemonState, status.state, unexpectedExitAt)
     if (networkPathReady(status)) {
       const pathType = status.pathSource === 'reused' ? 'reused' : 'laixin'
@@ -1745,6 +1895,30 @@ export class TunnelService {
         message: '断开指令已提交，原网络设置恢复尚未确认', canApplyPending: false, traffic: '' }
     }
     return status
+  }
+
+  /**
+   * A single-address package must not fall back to a client-side node list.
+   * When the data-plane timeout is the current daemon error, refresh the same
+   * customer's binding through the authenticated account path and let the
+   * existing config-refresh transaction reconnect automatically.
+   */
+  private scheduleSingleAddressRefresh(current: CurrentInfo | undefined,
+    intent: { desired: string; sessionToken?: string } | undefined,
+    daemon: DaemonStateView | undefined, status: TunnelStatus): void {
+    if (!current?.singleAddressMode || !this.accountAccess || intent?.desired !== 'connected' ||
+        !intent.sessionToken || status.state !== DISPLAY_STATES.error ||
+        daemon?.code === undefined || !SINGLE_ADDRESS_REFRESH_FAILURES.has(daemon.code)) return
+    if (this.singleAddressRefresh?.sessionToken === intent.sessionToken) return
+    const sessionToken = intent.sessionToken
+    this.singleAddressRefresh = { sessionToken, startedAt: this.deps.now() }
+    void this.syncAccountConfiguration(true).then((result) => {
+      if (result.outcome === 'rejected' && result.code !== 'NETWORK_SESSION_CHANGED') {
+        this.deps.logFailure?.('single-address-refresh-failed', result.code)
+      }
+    }).catch((error) => {
+      this.deps.logFailure?.('single-address-refresh-failed', error instanceof Error ? error.message : 'UNKNOWN')
+    })
   }
 
   private stopConfirmationPending(intent = this.intentSnapshot(), daemon = this.supervisor.currentState(readDaemonState(this.deps.dataDir))): boolean {
@@ -1836,6 +2010,65 @@ export class TunnelService {
     await access.client.reportDiagnosis(access.session, new AbortController().signal, payload)
   }
 
+  /** N-79:读漏斗终态行(mtime 记忆化)→入队(持久去重)→补传。 */
+  private async collectConnectionAttempts(): Promise<void> {
+    const queue = this.connectionAttemptQueue
+    if (queue === undefined) return
+    let attempts: readonly FunnelAttempt[]
+    try {
+      const filePath = join(this.deps.dataDir, 'connection-funnel.json')
+      const stat = statSync(filePath)
+      const key = `${stat.mtimeMs}:${stat.size}`
+      if (this.funnelReadCache?.key !== key) {
+        this.funnelReadCache = { key, attempts: readFunnelAttempts(filePath) }
+      }
+      attempts = this.funnelReadCache.attempts
+    } catch { return /* 漏斗未生成:无采集 */ }
+    queue.collect(attempts)
+    await queue.flush()
+  }
+
+  /** 0.7.3:复用同一份漏斗台账；只有带新包 nodeId 的终态才形成节点可达性事件。 */
+  private async collectReachabilityEvents(): Promise<void> {
+    const queue = this.reachabilityTelemetryQueue
+    if (queue === undefined) return
+    let attempts: readonly FunnelAttempt[]
+    try {
+      const filePath = join(this.deps.dataDir, 'connection-funnel.json')
+      const stat = statSync(filePath)
+      const key = `${stat.mtimeMs}:${stat.size}`
+      if (this.funnelReadCache?.key !== key) this.funnelReadCache = { key, attempts: readFunnelAttempts(filePath) }
+      attempts = this.funnelReadCache.attempts
+    } catch { return }
+    queue.collect(attempts)
+    await queue.flush()
+  }
+
+  /** V1.0 前自动运行观测：联网成功后发一次安装信息，按本机时间补齐 10/16/20 三个日槽。 */
+  private runtimeObservationNetworkReady(): boolean {
+    const intent = this.intentSnapshot()
+    const daemon = readDaemonState(this.deps.dataDir)
+    const lastVerifiedAt = daemon?.lastVerifiedAt
+    if (intent?.desired !== 'connected' || !intent.sessionToken || daemon?.state !== 'connected' ||
+        daemon.intentToken !== intent.sessionToken || typeof lastVerifiedAt !== 'number' || !Number.isSafeInteger(lastVerifiedAt) || lastVerifiedAt <= 0) return false
+    // 来信出口和复用本机已有外网都算已确认；这里只读盘面，不调用 rawStatus，避免遥测定时器触发
+    // 单地址刷新、失败上报或诊断恢复等状态副作用。
+    return daemon.pathVerified === true || daemon.reusedProxy !== undefined
+  }
+
+  private async collectRuntimeObservationTelemetry(): Promise<void> {
+    const queue = this.runtimeObservationTelemetryQueue
+    const telemetry = this.deps.runtimeObservationTelemetry
+    if (queue === undefined || telemetry === undefined || !telemetry.enabled()) return
+    let samples: ReturnType<typeof readRuntimeObservations> = []
+    try { samples = readRuntimeObservations(telemetry.observationPath ?? runtimeObservationPath(this.deps.dataDir)) } catch { /* local observation is optional */ }
+    if (this.runtimeObservationNetworkReady()) {
+      queue.collectInstall(samples)
+      queue.collectDaily(samples)
+    }
+    await queue.flush()
+  }
+
   private async deliverDiagnosticEvent(event: DiagnosticEvent): Promise<void> {
     const access = this.accountAccess
     if (!access || !access.session.deviceId) {
@@ -1846,6 +2079,10 @@ export class TunnelService {
 
   // GUI 退出交接：已验证的 API 依赖保留必要通道；其余情况由守护恢复并退出。
   async requestShutdown(): Promise<void> {
+    if (this.runtimeObservationCollectTimer !== undefined) {
+      clearInterval(this.runtimeObservationCollectTimer)
+      this.runtimeObservationCollectTimer = undefined
+    }
     const previous = this.readFullIntent()
     const wasRunning = this.supervisor.isRunning()
     this.supervisor.prepareForShutdown()
@@ -2053,6 +2290,7 @@ export class TunnelService {
       const entries = readPackageEntries(layout.batchDir(this.deps.dataDir, current.batchId)).filter((entry) => entry.path !== 'import-meta.json')
       const expiresAt = Date.parse(current.expiresAt)
       return validatePackage(entries, { now: Number.isFinite(expiresAt) ? Math.min(this.deps.now(), expiresAt - 1) : this.deps.now(), trust: this.deps.trust, runtimePlatform: this.platform,
+        allowLocalVerifyUrls: this.deps.allowLocalVerifyUrls,
         currentAuthorizationId: current.authorizationId, currentVersion: undefined }).packageDigest
     } catch { return undefined }
   }
@@ -2067,6 +2305,7 @@ export class TunnelService {
         .filter((entry) => entry.path !== 'import-meta.json')
       validatePackage(entries, {
         now: this.deps.now(), trust: this.deps.trust, runtimePlatform: this.platform,
+        allowLocalVerifyUrls: this.deps.allowLocalVerifyUrls,
         currentVersion: replacement && target?.authorizationId === current?.authorizationId ? current?.configVersion : undefined,
         currentAuthorizationId: target?.accountId ? target.authorizationId : current?.authorizationId,
         currentPackageDigest: replacement && target?.authorizationId === current?.authorizationId && current
@@ -2121,6 +2360,10 @@ export class TunnelService {
   private composeConnectIntent(current: NonNullable<ReturnType<typeof readCurrentInfo>>): Record<string, unknown> {
     const routes = this.routeTable(current)
     const batchDir = layout.batchDir(this.deps.dataDir, current.batchId)
+    const customerEntry = current.customerEntry
+    const primaryNode = customerEntry ?? current.node
+    const primaryCredentialName = customerEntry?.credentialName ?? current.credentialName
+    const primaryVerifyUrl = customerEntry?.verifyUrl ?? current.verifyUrl
     return {
       desired: 'connected',
       authorization: { id: current.authorizationId, expiresAt: Date.parse(current.expiresAt) },
@@ -2128,28 +2371,35 @@ export class TunnelService {
       updatedAt: this.deps.now(),
       bridgePort: DEFAULT_BRIDGE_PORT,
       bridgePortCandidates: [...BRIDGE_PORT_CANDIDATES],
+      ...(current.singleAddressMode ? { singleAddressMode: true } : {}),
       // 「客户这台电脑本来就能到 AI 服务就用它、不改他的设置」。判据与探测都在守护侧；
       // 这里给开关是因为真实探测 ⛔ 在用例里默认发生（开着专线的机器上会把用例集体带进复用分支）。
       reuseDirect: true,
       // 隐藏多节点:这份授权带几个入口就给几个,守护把它们一起交给内核探活择路;单节点包这里就是一项,形状不变。
-      ...(this.deps.connectorOverride === undefined && current.protocol === 'vless-reality' && current.nodes.length > 1
-        ? { connectors: current.nodes.map((entry) => ({
-          kind: 'vless-reality', node: { host: entry.host, port: entry.port },
+      ...(this.deps.connectorOverride === undefined && !current.singleAddressMode && current.protocol === 'vless-reality' && current.nodes.length > 1
+        ? { connectors: current.nodes.map((entry, index) => ({
+          kind: 'vless-reality', node: { host: entry.host, port: entry.port, ...(entry.nodeId ? { nodeId: entry.nodeId } : {}) },
+          ...(entry.nodeId ? { nodeId: entry.nodeId, legRole: index === 0 ? 'primary' : 'secondary' } : {}),
           credentialPath: join(batchDir, 'credentials', entry.credentialName),
-          localPort: DEFAULT_BRIDGE_PORT, verifyUrl: entry.verifyUrl ?? current.verifyUrl, verifyFallbackUrl: current.verifyFallbackUrl
+          localPort: DEFAULT_BRIDGE_PORT, verifyUrl: entry.verifyUrl ?? current.verifyUrl, verifyFallbackUrl: current.verifyFallbackUrl,
+          ...(this.deps.allowLocalVerifyUrls === true ? { allowLocalVerifyUrls: true } : {})
         })) }
         : {}),
       connector: this.deps.connectorOverride ?? (current.protocol === 'vless-reality' ? {
-        kind: 'vless-reality', node: { host: current.node.host, port: current.node.port },
-        credentialPath: join(batchDir, 'credentials', current.credentialName),
-        localPort: DEFAULT_BRIDGE_PORT, verifyUrl: current.verifyUrl, verifyFallbackUrl: current.verifyFallbackUrl
+        kind: 'vless-reality', node: { host: primaryNode.host, port: primaryNode.port, ...('nodeId' in primaryNode && primaryNode.nodeId ? { nodeId: primaryNode.nodeId } : {}) },
+        ...('nodeId' in primaryNode && primaryNode.nodeId ? { nodeId: primaryNode.nodeId, legRole: 'primary' } : {}),
+        credentialPath: join(batchDir, 'credentials', primaryCredentialName),
+        localPort: DEFAULT_BRIDGE_PORT, verifyUrl: primaryVerifyUrl, verifyFallbackUrl: current.verifyFallbackUrl,
+        ...(this.deps.allowLocalVerifyUrls === true ? { allowLocalVerifyUrls: true } : {})
       } : {
         kind: 'ssh-socks',
-        node: { host: current.node.host, port: current.node.port, sshUser: current.node.sshUser },
-        keyPath: join(batchDir, 'credentials', current.credentialName),
+        node: { host: primaryNode.host, port: primaryNode.port, sshUser: current.node.sshUser },
+        keyPath: join(batchDir, 'credentials', primaryCredentialName),
         knownHostsPath: join(batchDir, 'hostkey.pub'),
         localPort: DEFAULT_LOCAL_SOCKS_PORT,
-        verifyUrl: `http://${current.node.host}/toolbox-exit-ip` // 节点 echo 端点待 01 供给(待真机)
+        // SSH 没有把节点 echo 地址写进旧版 manifest；统一走已核准的公司 HTTPS 出口端点。
+        verifyUrl: primaryVerifyUrl ?? 'https://laixin.work/toolbox-exit-ip',
+        ...(this.deps.allowLocalVerifyUrls === true ? { allowLocalVerifyUrls: true } : {})
       }),
       routes
     }

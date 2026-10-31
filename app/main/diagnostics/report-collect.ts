@@ -27,6 +27,8 @@ export interface CollectedFiles {
   /** 只供本机归因：明确 ENOENT 才算空账本；读失败或损坏不算。 */
   readonly ledgerMissing: boolean
   readonly connection?: unknown
+  /** N-79 连接漏斗台账:最近若干次连接尝试的阶段耗时与结局(守护白名单落盘)。 */
+  readonly connectionFunnel?: unknown
   readonly daemonLog?: { readonly source: string; readonly lines: readonly string[] }
   /** 日志没进包的原因：'not-generated' = 文件确实不在；'unreadable' = 文件在但读不出来。
    * ⛔ 合成一种说法——「没生成」与「读不到」对客服是两件事，后者说明这台机器上有别的毛病。 */
@@ -51,6 +53,7 @@ export async function collectLocalFiles(options: CollectOptions): Promise<Collec
   let ledgerMissing = false
   const ledger = await readJson(join(options.tunnelDataDir, 'ledger.json'), '设置账本 ledger.json', () => { ledgerMissing = true })
   const connection = await readJson(join(options.tunnelDataDir, 'connection-verified.json'), '复验记录 connection-verified.json')
+  const connectionFunnel = await readJson(join(options.tunnelDataDir, 'connection-funnel.json'), '连接漏斗台账 connection-funnel.json')
 
   let daemonLog: CollectedFiles['daemonLog']
   let daemonLogAbsence: CollectedFiles['daemonLogAbsence'] = 'not-generated'
@@ -77,7 +80,8 @@ export async function collectLocalFiles(options: CollectOptions): Promise<Collec
   // 摆一句人话进注记——**不对客户说 ≠ 不留痕**：公司网络的客户报「连上之后内网打不开」时，
   // 客服得一眼看到我们动过哪几项，否则只能猜。
   for (const line of describeManagedSettings(ledger)) notes.push(line)
-  return { daemonState, ledger, ledgerMissing, connection, daemonLog, ...(daemonLog ? {} : { daemonLogAbsence }), notes }
+  return { daemonState,
+    connectionFunnel, ledger, ledgerMissing, connection, daemonLog, ...(daemonLog ? {} : { daemonLogAbsence }), notes }
 }
 
 /** 账本里那些客服看不懂的项，给一句人话。⛔ 带原始值（那是客户机器上的设置内容）。 */
