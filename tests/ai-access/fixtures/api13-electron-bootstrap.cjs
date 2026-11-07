@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-require-imports, no-undef */
-const { app, BrowserWindow, Tray, nativeImage, safeStorage } = require('electron')
+const { app, BrowserWindow, Tray, nativeImage, safeStorage, net } = require('electron')
 const { existsSync, mkdirSync, readFileSync, writeFileSync } = require('node:fs')
 const path = require('node:path')
 const root = process.env.TOOLBOX_API13_ROOT
@@ -8,7 +8,7 @@ app.setPath('userData', root)
 
 if (process.argv.includes('--laixin-ai-router')) {
   const realFetch = global.fetch
-  global.fetch = (input, init) => {
+  net.fetch = (input, init) => {
     const url = new URL(String(input))
     return realFetch(url.protocol === 'https:' ? `http://127.0.0.1:${process.env.TOOLBOX_API13_UPSTREAM}${url.pathname}` : input, init)
   }

@@ -20,9 +20,12 @@ export interface CurrentInfo {
   readonly batchId: string
   readonly configVersion: number
   readonly authorizationId: string
-  readonly node: { readonly host: string; readonly port: number; readonly sshUser?: string }
+  readonly node: { readonly host: string; readonly port: number; readonly sshUser?: string; readonly nodeId?: string }
+  /** 新客户单地址契约;存在时忽略 manifest.nodes,不暴露节点池。 */
+  readonly customerEntry?: { readonly host: string; readonly port: number; readonly credentialName: string; readonly verifyUrl?: string; readonly bindingVersion?: number; readonly leaseExpiresAt?: string }
+  readonly singleAddressMode?: boolean
   /** 隐藏多节点:这份授权带的所有入口(第一项即 `node`)。单节点包解析出来就是一项,上层不必分两条路走。 */
-  readonly nodes: readonly { readonly host: string; readonly port: number; readonly credentialName: string; readonly verifyUrl?: string }[]
+  readonly nodes: readonly { readonly host: string; readonly port: number; readonly credentialName: string; readonly verifyUrl?: string; readonly nodeId?: string }[]
   readonly credentialName: string
   readonly expiresAt: string
   readonly sourceLine: string
@@ -35,18 +38,23 @@ export function writeImportMeta(dataDir: string, batchId: string, meta: ImportMe
 // 多入口清单:包里写了就用包里的(第一项已在校验时确认与 node 同址),没写就是单节点。
 // 每项的凭据文件缺省沿用主凭据——同一节点开多个端口时通常共用一份凭据。
 function readNodeList(
-  manifest: { node?: { host?: unknown; port?: unknown }; nodes?: unknown },
-  credentialName: string
+  manifest: { node?: { host?: unknown; port?: unknown; nodeId?: unknown }; nodes?: unknown },
+  credentialName: string,
+  customerEntry?: CurrentInfo['customerEntry']
 ): CurrentInfo['nodes'] {
-  const single = [{ host: String(manifest.node?.host), port: Number(manifest.node?.port), credentialName }]
+  if (customerEntry !== undefined) return [{ host: customerEntry.host, port: customerEntry.port, credentialName: customerEntry.credentialName,
+    verifyUrl: customerEntry.verifyUrl }]
+  const single = [{ host: String(manifest.node?.host), port: Number(manifest.node?.port), credentialName,
+    ...(typeof manifest.node?.nodeId === 'string' ? { nodeId: manifest.node.nodeId } : {}) }]
   if (!Array.isArray(manifest.nodes) || manifest.nodes.length === 0) return single
-  const parsed: { host: string; port: number; credentialName: string; verifyUrl?: string }[] = []
-  for (const raw of manifest.nodes as { host?: unknown; port?: unknown; credentialFile?: unknown; verifyUrl?: unknown }[]) {
+  const parsed: { host: string; port: number; credentialName: string; verifyUrl?: string; nodeId?: string }[] = []
+  for (const raw of manifest.nodes as { host?: unknown; port?: unknown; nodeId?: unknown; credentialFile?: unknown; verifyUrl?: unknown }[]) {
     if (typeof raw?.host !== 'string' || typeof raw.port !== 'number') return single
     parsed.push({
       host: raw.host, port: raw.port,
       credentialName: typeof raw.credentialFile === 'string' ? raw.credentialFile : credentialName,
-      verifyUrl: typeof raw.verifyUrl === 'string' ? raw.verifyUrl : undefined
+      verifyUrl: typeof raw.verifyUrl === 'string' ? raw.verifyUrl : undefined,
+      ...(typeof raw.nodeId === 'string' ? { nodeId: raw.nodeId } : {})
     })
   }
   return parsed
@@ -65,18 +73,17 @@ function readInfo(dataDir: string, batchId: string): CurrentInfo | undefined {
       verifyFallbackUrl?: unknown
       configVersion?: unknown
       authorizationId?: unknown
-      node?: { host?: unknown; port?: unknown; sshUser?: unknown }
+      node?: { host?: unknown; port?: unknown; sshUser?: unknown; nodeId?: unknown }
       nodes?: unknown
+      customerEntry?: { host?: unknown; port?: unknown; credentialFile?: unknown; verifyUrl?: unknown; bindingVersion?: unknown; leaseExpiresAt?: unknown }
       expiresAt?: unknown
       files?: Record<string, unknown>
     }
     if (
       typeof manifest.configVersion !== 'number' ||
       typeof manifest.authorizationId !== 'string' ||
-      typeof manifest.node?.host !== 'string' ||
-      typeof manifest.node.port !== 'number' ||
-      (manifest.protocol !== 'vless-reality' && typeof manifest.node.sshUser !== 'string') ||
-      typeof manifest.expiresAt !== 'string'
+      typeof manifest.expiresAt !== 'string' ||
+      manifest.node === undefined && (typeof manifest.customerEntry?.host !== 'string' || typeof manifest.customerEntry?.port !== 'number')
     ) {
       return undefined
     }
@@ -86,6 +93,29 @@ function readInfo(dataDir: string, batchId: string): CurrentInfo | undefined {
     if (credentialName === undefined || credentialName.includes('/')) {
       return undefined
     }
+    const legacyNode = manifest.node !== undefined && typeof manifest.node.host === 'string' && typeof manifest.node.port === 'number'
+      ? { host: manifest.node.host, port: manifest.node.port,
+          ...(typeof manifest.node.sshUser === 'string' ? { sshUser: manifest.node.sshUser } : {}),
+          ...(typeof manifest.node.nodeId === 'string' ? { nodeId: manifest.node.nodeId } : {}) }
+      : undefined
+    const customerEntry = manifest.customerEntry === undefined ? undefined : (() => {
+      const entry = manifest.customerEntry!
+      const host = entry.host
+      const port = entry.port
+      if (typeof host !== 'string' || host === '' || typeof port !== 'number' || !Number.isInteger(port) || port < 1 || port > 65_535) return undefined
+      if (entry.credentialFile !== undefined && (typeof entry.credentialFile !== 'string' || entry.credentialFile.includes('/') || entry.credentialFile === '')) return undefined
+      if (entry.verifyUrl !== undefined && typeof entry.verifyUrl !== 'string') return undefined
+      if (entry.bindingVersion !== undefined && (typeof entry.bindingVersion !== 'number' || !Number.isSafeInteger(entry.bindingVersion) || entry.bindingVersion < 1)) return undefined
+      if (entry.leaseExpiresAt !== undefined && typeof entry.leaseExpiresAt !== 'string') return undefined
+      const bindingVersion = typeof entry.bindingVersion === 'number' ? entry.bindingVersion : undefined
+      return { host, port, credentialName: typeof entry.credentialFile === 'string' ? entry.credentialFile : credentialName,
+        ...(typeof entry.verifyUrl === 'string' ? { verifyUrl: entry.verifyUrl } : {}),
+        ...(bindingVersion === undefined ? {} : { bindingVersion }),
+        ...(typeof entry.leaseExpiresAt === 'string' ? { leaseExpiresAt: entry.leaseExpiresAt } : {}) }
+    })()
+    if (manifest.customerEntry !== undefined && customerEntry === undefined) return undefined
+    const primaryNode = legacyNode ?? (customerEntry === undefined ? undefined : { host: customerEntry.host, port: customerEntry.port })
+    if (primaryNode === undefined || manifest.protocol !== 'vless-reality' && legacyNode?.sshUser === undefined) return undefined
     let sourceLine = ''
     let accountId: string | undefined
     const metaPath = join(dir, 'import-meta.json')
@@ -104,8 +134,10 @@ function readInfo(dataDir: string, batchId: string): CurrentInfo | undefined {
       batchId,
       configVersion: manifest.configVersion,
       authorizationId: manifest.authorizationId,
-      node: { host: manifest.node.host, port: manifest.node.port, sshUser: typeof manifest.node.sshUser === 'string' ? manifest.node.sshUser : undefined },
-      nodes: readNodeList(manifest, credentialName),
+      node: primaryNode,
+      customerEntry,
+      singleAddressMode: customerEntry !== undefined,
+      nodes: readNodeList(manifest, credentialName, customerEntry),
       credentialName,
       expiresAt: manifest.expiresAt,
       sourceLine

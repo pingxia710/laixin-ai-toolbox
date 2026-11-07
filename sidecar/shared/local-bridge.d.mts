@@ -1,4 +1,6 @@
+import type { Server, Socket } from 'node:net'
 import type { RouteTable } from './daemon-core.d.mts'
+import type { ApiDestinationGate } from './api-destination-gate.d.mts'
 
 export interface LocalBridgeOptions {
   readonly listenPort: number | undefined
@@ -11,6 +13,8 @@ export interface LocalBridgeOptions {
   readonly outbounds?: readonly Record<string, unknown>[]
   readonly verifyUrl?: string
   readonly verifyFallbackUrl?: string
+  /** 仅本地测试夹具允许回环 HTTP；生产意图不设置。 */
+  readonly allowLocalVerifyUrls?: boolean
   readonly verifyTimeoutMs?: number
   /** 回显失败后的通用探测点(缺省 TUNNEL_PROBE_URLS;用例注入本地地址)。 */
   readonly probeUrls?: readonly string[]
@@ -21,6 +25,8 @@ export interface LocalBridgeOptions {
   // 注入点(仅测试):spawnImpl 换假 runner/taskkill 执行,platform 模拟 win32/darwin。
   readonly spawnImpl?: ((executable: string, args: readonly string[], options?: Record<string, unknown>) => unknown)
   readonly platform?: NodeJS.Platform | string
+  /** 注入点(仅测试):复核 Windows PID 的实际启动时刻。生产默认走 ledger 的原生查询。 */
+  readonly readProcessStartedAt?: (pid: number) => number | undefined
 }
 export interface LocalBridgeHandle {
   restrict(targets: readonly string[] | undefined): void
@@ -49,6 +55,9 @@ export declare const PASSIVE_FAILURE_WINDOW_MS: number
 export declare function createFailureDetector(options?: { onDegraded?: () => void; threshold?: number; windowMs?: number; now?: () => number }): FailureDetector
 export declare function upstreamPayloadReader(): { noteRequest(chunk: Buffer): void; consume(chunk: Buffer): boolean; verdict(): RelayVerdict }
 
+/** 转发对直测入口:不经 xray 验证配对收尾语义(与 upstreamPayloadReader 同例)。 */
+export declare function startTrafficRelay(port: number, targetPort: number, traffic: { uploadBytes: number; downloadBytes: number; activeStreams: number }, sockets: Set<Socket>, idleStreamMs?: number, detector?: FailureDetector, apiDestinations?: ApiDestinationGate): Promise<{ server: Server; port: number }>
+
 export declare function createLocalBridge(options: LocalBridgeOptions): LocalBridgeHandle
 export declare function xrayExecutable(): string
 /** 本机网络名直连后缀:mDNS .local、home.arpa、localdomain、localhost。 */
@@ -68,7 +77,7 @@ export declare function buildXrayConfig(options: Pick<LocalBridgeOptions, 'liste
   observatory?: { subjectSelector: string[]; probeUrl: string; probeInterval: string; enableConcurrency: boolean }
   routing: {
     domainStrategy: string
-    balancers?: Array<{ tag: string; selector: string[]; strategy: { type: string } }>
+    balancers?: Array<{ tag: string; selector: string[]; fallbackTag?: string; strategy: { type: string } }>
     rules: Array<{ type: string; domain?: string[]; ip?: string[]; outboundTag?: string; balancerTag?: string }>
   }
 }

@@ -1,4 +1,6 @@
 import type { AccountDevice, AccountLogin, AccountOverview, AccountRegistration, AccountSession, AccountView, CommercialTerms, CustomerProfile, InstallationRecord, PaymentChannelName, PaymentOrderView, RecoveryResult } from '../../account-types'
+import { systemFetch } from '../network/system-fetch'
+import { classifyNetworkPhase, type NetworkPhase } from '../network/net-phase'
 import { trialClaimedCopy } from '../../commercial-copy'
 import type { InstallationReportView } from './installation-report'
 import type { NetworkAccountAccess } from '../tunnel/account-client'
@@ -29,7 +31,9 @@ const safeCauseCode = (error: unknown): string | undefined => {
 
 export class AccountClientError extends Error {
   constructor(code: string, readonly detail?: string, readonly httpStatus?: number, readonly serverCode?: string,
-    readonly requestStage?: AccountRequestStage, readonly exception?: string, readonly causeCode?: string) { super(code) }
+    readonly requestStage?: AccountRequestStage, readonly exception?: string, readonly causeCode?: string,
+    /** N-81 网络阶段;业务码语义不变,两维正交。 */
+    readonly phase?: NetworkPhase) { super(code) }
 }
 export interface SessionStore {
   deviceId?(): Promise<string>
@@ -130,7 +134,9 @@ export class AccountClient {
     private readonly collectDevice?: () => Promise<DeviceFacts>,
     private readonly openExternal: (url: string) => Promise<void> = async () => { throw new AccountClientError('WECHAT_LOGIN_OPEN_FAILED') },
     private readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-    private readonly logFailure?: (event: string, detail: string) => void) {
+    private readonly logFailure?: (event: string, detail: string) => void,
+    // N-81:传输注入。缺省走 Electron 系统网络栈(systemFetch);用例注入优先(与 INV-01 deps.fetch 同规)。
+    private readonly deps: { fetch?: typeof fetch } = {}) {
     this.base = origin ? new URL(origin) : null
     // 允许挂在单个路径前缀下；当前正式账号服务使用 https://laixin.work/。
     const basePathOk = this.base !== null && (this.base.pathname === '/' || /^\/[A-Za-z0-9_-]+\/$/.test(this.base.pathname))
@@ -168,7 +174,7 @@ export class AccountClient {
       const url = this.resolve(path)
       const requestSignal = AbortSignal.any([this.controller.signal, AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : [])])
       stage = 'fetch'
-      const response = await fetch(url, {
+      const response = await (this.deps.fetch ?? systemFetch)(url, {
         method: body === undefined ? 'GET' : 'POST', redirect: 'error', cache: 'no-store',
         signal: requestSignal,
         headers: { Accept: 'application/json', ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
@@ -220,17 +226,23 @@ export class AccountClient {
       return data
     } catch (error) {
       // stage/exception/causeCode 对全部端点富化:登录/支付等失败与 overview 一样需要机器可读归因(支持包按行检索)。
+      // 透传的受控错误也按既有事实补阶段:http 阶段且 5xx = backend(其余不猜)。
+      const passthroughPhase: NetworkPhase | undefined = error instanceof AccountClientError
+        ? (error.phase ?? ((error.requestStage ?? stage) === 'http' && (error.httpStatus ?? httpStatus ?? 0) >= 500 ? 'backend' : undefined))
+        : undefined
       const failure = error instanceof AccountClientError
         ? new AccountClientError(error.message, error.detail, error.httpStatus ?? httpStatus, error.serverCode,
-          error.requestStage ?? stage, error.exception, error.causeCode)
+          error.requestStage ?? stage, error.exception, error.causeCode, passthroughPhase)
         : new AccountClientError('ACCOUNT_SERVICE_UNAVAILABLE', undefined, httpStatus, undefined,
-          stage, safeExceptionName(error), safeCauseCode(error))
+          stage, safeExceptionName(error), safeCauseCode(error),
+          // N-81:HTTP 已有结论的按事实标 backend;传输层异常按证据分类;⛔ 猜。
+          ['http'].includes(stage) ? 'backend' : classifyNetworkPhase(error))
       // 写操作的网络层失败(未到达业务语义)留痕一次;⛔ 记录请求体或异常原文(可能含凭据)。
       if (body !== undefined && failure.message === 'ACCOUNT_SERVICE_UNAVAILABLE' &&
         (['prepare', 'fetch', 'response', 'body'].includes(failure.requestStage ?? '') ||
           (failure.requestStage === 'http' && (failure.httpStatus ?? 0) >= 500))) {
         try {
-          this.logFailure?.('account-request-failed', JSON.stringify({ path, code: failure.message, stage: failure.requestStage ?? null,
+          this.logFailure?.('account-request-failed', JSON.stringify({ path, code: failure.message, phase: failure.phase ?? null, stage: failure.requestStage ?? null,
             status: failure.httpStatus ?? null, serverCode: failure.serverCode ?? null,
             exception: failure.exception ?? null, causeCode: failure.causeCode ?? null }))
         } catch { /* 诊断旁路 ⛔ 挡请求主流程 */ }
@@ -356,7 +368,7 @@ export class AccountClient {
       current()
       // 商业参数串行预取:⛔ 与通道同步请求并发,避免扰动后台按客户的用量串行化。
       await this.ensureTerms(signal)
-      this.refreshNetwork({ client: new NetworkAccountClient(new URL('v1/network/', this.base).href),
+      this.refreshNetwork({ client: new NetworkAccountClient(new URL('v1/network/', this.base).href, undefined, undefined, { fetch: this.deps.fetch }),
         session: { accountId: this.session.account.id, accessToken: this.session.accessToken, deviceId } })
       const overview = await this.overview(signal)
       current()
@@ -426,7 +438,7 @@ export class AccountClient {
     if (mode === 'register') onRecovery((data as AccountRegistration).recoveryCode)
     this.view = { state: 'signed-in', account: data.account, code: '', message: '已登录', overview: null }
     await this.ensureTerms()
-    await this.setNetwork({ client: new NetworkAccountClient(new URL('v1/network/', this.base!).href),
+    await this.setNetwork({ client: new NetworkAccountClient(new URL('v1/network/', this.base!).href, undefined, undefined, { fetch: this.deps.fetch }),
       session: { accountId: data.account.id, accessToken: data.accessToken, deviceId: await this.store.deviceId?.() } }, undefined, { autoConnect: true })
     const view = await this.overview()
     return droppedInvite ? { ...view, message: '已登录。当前账号服务版本暂不支持邀请码，本次注册未获得邀请奖励。' } : view
@@ -519,7 +531,7 @@ export class AccountClient {
     this.session = session; this.restored = true
     this.view = { state: 'signed-in', account: data.account, code: '', message: '已登录', overview: null }
     await this.ensureTerms()
-    await this.setNetwork({ client: new NetworkAccountClient(new URL('v1/network/', this.base!).href),
+    await this.setNetwork({ client: new NetworkAccountClient(new URL('v1/network/', this.base!).href, undefined, undefined, { fetch: this.deps.fetch }),
       session: { accountId: data.account.id, accessToken: data.accessToken, deviceId } }, undefined, { autoConnect: true })
     return this.overview()
   }) }
@@ -634,7 +646,7 @@ export class AccountClient {
     }
     try {
       await this.setNetwork(undefined)
-      await this.setNetwork({ client: new NetworkAccountClient(new URL('v1/network/', this.base!).href),
+      await this.setNetwork({ client: new NetworkAccountClient(new URL('v1/network/', this.base!).href, undefined, undefined, { fetch: this.deps.fetch }),
         session: { accountId: data.account.id, accessToken: data.accessToken, deviceId: await this.store.deviceId?.() } })
     } catch {
       return { state: 'unavailable', account: null, overview: null, code: 'ACCOUNT_SERVICE_UNAVAILABLE', message: '密码已修改；本机网络状态暂未确认，请重新读取账号。' }
@@ -921,7 +933,7 @@ export class AccountClient {
       // A lost response does not prove that provisioning failed. Read back the entitlement.
       if (error instanceof AccountClientError) claimError = error
     }
-    await this.setNetwork({ client: new NetworkAccountClient(new URL('v1/network/', this.base!).href),
+    await this.setNetwork({ client: new NetworkAccountClient(new URL('v1/network/', this.base!).href, undefined, undefined, { fetch: this.deps.fetch }),
       session: { accountId: this.session.account.id, accessToken: this.session.accessToken, deviceId: await this.store.deviceId?.() } }, undefined, { autoConnect: true })
     const view = await this.overview()
     if (!view.overview) return { ...view, message: '领取结果暂时无法确认，请稍后刷新权益查看。' }

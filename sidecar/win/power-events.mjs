@@ -3,6 +3,7 @@
 // 真实 PowerShell 管道留待真机验收;自动化测试经注入 spawnProcess 喂事件行。
 // 仅 wake / network-change 两类:解锁不睡眠的场景由 network-change 与既有复验 tick 覆盖。
 import { spawn } from 'node:child_process'
+import { networkInterfaces } from 'node:os'
 
 const WATCHER_LINES = {
   'toolbox:wake': 'wake',
@@ -19,7 +20,30 @@ export function parsePowerEvent(line) {
   return WATCHER_LINES[trimmed]
 }
 
-export function createPowerEventSource({ emit, spawnProcess = spawn, onGiveUp, timers = { setTimeout, clearTimeout } }) {
+// N-83 第二条腿:node:os 网卡快照轮询(与 mac 源同款)。PowerShell 被杀软拦下或放弃后,
+// DHCP 同状态换 IP/网卡地址变化仍有输入;轮询间隙>5s 按唤醒处理。事件经守护侧
+// NETWORK_SETTLE_MS 闸去重——两条腿各自看到同一次变化时只算一条证据。
+function startSnapshotPoll({ emit, interfaces = networkInterfaces, now = Date.now, every = setInterval, cancel = clearInterval }) {
+  let previous
+  let lastTick = now()
+  const tick = () => {
+    const time = now()
+    if (time - lastTick > 5_000) emit('wake')
+    lastTick = time
+    try {
+      const current = JSON.stringify(Object.entries(interfaces()).sort(([a], [b]) => a.localeCompare(b))
+        .map(([name, addresses]) => [name, addresses?.map(({ address, netmask, family }) => ({ address, netmask, family }))]))
+      if (previous !== undefined && previous !== current) emit('network-change')
+      previous = current
+    } catch { /* 保留上次观察:失败不是断网,30s 复验仍在。 */ }
+  }
+  tick()
+  const timer = every(tick, 2_000)
+  return { stop: () => cancel(timer) }
+}
+
+export function createPowerEventSource({ emit, spawnProcess = spawn, onGiveUp, timers = { setTimeout, clearTimeout },
+  interfaces, now, every, cancel }) {
   let child
   let restart
   let closed = false
@@ -59,12 +83,14 @@ export function createPowerEventSource({ emit, spawnProcess = spawn, onGiveUp, t
     })
   }
   launch()
+  const poll = startSnapshotPoll({ emit, interfaces, now, every, cancel })
   return {
     stop: () => {
       if (closed) return
       closed = true
       timers.clearTimeout(restart)
       child?.kill()
+      poll.stop()
     }
   }
 }

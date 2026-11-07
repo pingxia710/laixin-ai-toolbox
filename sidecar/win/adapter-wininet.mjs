@@ -225,14 +225,18 @@ export function createAdapter(options = {}) {
     },
     managedItems(proxy) {
       const override = read({ service: SERVICE, item: 'ProxyOverride' })
+      const overrideRef = { service: SERVICE, item: 'ProxyOverride' }
+      const mergedOverride = registryValue('REG_SZ', mergeProxyOverride(override?.data ?? ''))
+      // 已包含全部必要豁免时，保持用户原始格式，避免恢复时把等价格式误认为已回原值。
+      const managedOverride = wininetValuesEqual(override, mergedOverride, overrideRef) ? override : mergedOverride
       // 顺序即写入顺序:先 Server 后 Enable,⛔ 反过来(Enable=1 先落时,窗口期系统代理
       // 指向旧值,客户流量瞬间走丢)。恢复按账本逆序:Enable 先归零,原 Server 后回填。
       return [
         { ref: { service: SERVICE, item: 'ProxyServer' }, value: registryValue('REG_SZ', localProxyValue(proxy)) },
         { ref: { service: SERVICE, item: 'ProxyEnable' }, value: registryValue('REG_DWORD', '1') },
         {
-          ref: { service: SERVICE, item: 'ProxyOverride' },
-          value: registryValue('REG_SZ', mergeProxyOverride(override?.data ?? ''))
+          ref: overrideRef,
+          value: managedOverride
         },
         { ref: { service: SERVICE, item: 'AutoConfigURL' }, value: null },
         ...(autoDetectItem() ?? [])

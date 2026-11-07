@@ -2,12 +2,15 @@
 // - ssh-socks:一人一包受限 SSH 用户 `ssh -N -D`,StrictHostKeyChecking=yes + 批次内
 //   known_hosts ⇒ 主机指纹连接时强制核验,不符即拒(节点身份不符),⛔ 关闭校验。
 // - loopback-probe:逻辑测试用的本地回环假 SOCKS 连接器,只连 127.0.0.1。
-// 错误统一分类为八类受控码:端口占用 / 节点身份不符 / 授权失效 / 配额或授权问题 / 上游不可达 /
-// 已有代理控制 / 受管理环境 / 组件缺失。后三类与 Windows 侧取值逐字相同——共享的 daemon-core
+// 远端错误统一分类为八类受控码:端口占用 / 节点身份不符 / 授权失效 / 配额或授权问题 / 上游不可达 /
+// 已有代理控制 / 受管理环境 / 组件缺失；本地 SOCKS 就绪超时另用 TUNNEL_LOCAL_SOCKS_UNAVAILABLE。
+// 后三类与 Windows 侧取值逐字相同——共享的 daemon-core
 // 致命码表直接引用它们,mac 这边缺一个就等于往致命码表里塞 undefined。
 import { connect } from 'node:net'
 import { spawn as defaultSpawn } from 'node:child_process'
+import { verifyHttpExitIp } from './http-verify.mjs'
 import { socks5Connect } from './socks5.mjs'
+import { validProductionVerifyFallbackUrl, validProductionVerifyUrl } from './vless-settings.mjs'
 
 export const CONTROL_CODES = Object.freeze({
   portBusy: '端口占用',
@@ -15,6 +18,7 @@ export const CONTROL_CODES = Object.freeze({
   authFailed: '授权失效',
   quotaOrAuth: '配额或授权问题',
   upstreamUnreachable: '上游不可达',
+  localSocksUnavailable: 'TUNNEL_LOCAL_SOCKS_UNAVAILABLE',
   probeUnavailable: 'TUNNEL_PROBE_UNAVAILABLE',
   proxyConflict: '已有代理控制',
   managedPolicy: '受管理环境',
@@ -28,7 +32,6 @@ export class ConnectorError extends Error {
     this.code = code
   }
 }
-
 export function createLoopbackProbeConnector(spec) {
   if (spec.host !== '127.0.0.1' && spec.host !== '::1') {
     throw new ConnectorError(CONTROL_CODES.upstreamUnreachable, `loopback-probe 只接受回环地址,收到 ${spec.host}`)
@@ -81,8 +84,14 @@ export function createLoopbackProbeConnector(spec) {
 }
 
 export function createSshSocksConnector(spec, injected = {}) {
+  const verifyOptions = { allowLocalVerifyUrls: spec.allowLocalVerifyUrls === true }
+  if (!validProductionVerifyUrl(spec.verifyUrl, verifyOptions) ||
+      (spec.verifyFallbackUrl !== undefined && !validProductionVerifyFallbackUrl(spec.verifyUrl, spec.verifyFallbackUrl, verifyOptions))) {
+    throw new ConnectorError(CONTROL_CODES.upstreamUnreachable, '复验配置无效')
+  }
   const spawnImpl = injected.spawn ?? defaultSpawn
   let child
+  let childState
   let lostCallback
   let stopped = false
   let stderrTail = ''
@@ -96,6 +105,7 @@ export function createSshSocksConnector(spec, injected = {}) {
     async start() {
       stopped = false
       stderrTail = ''
+      const state = { finished: false }
       const args = [
         '-N', '-T',
         '-D', `127.0.0.1:${spec.localPort}`,
@@ -111,6 +121,7 @@ export function createSshSocksConnector(spec, injected = {}) {
         `${spec.node.sshUser}@${spec.node.host}`
       ]
       child = spawnImpl('ssh', args, { stdio: ['ignore', 'ignore', 'pipe'] })
+      childState = state
       child.stderr.on('data', (chunk) => {
         stderrTail = `${stderrTail}${chunk.toString('utf8')}`.slice(-4000)
       })
@@ -119,12 +130,14 @@ export function createSshSocksConnector(spec, injected = {}) {
       // ⛔ 不监听:它会冒成未捕获异常 → 守护 exit(70) → 状态层「守护异常退出」+ 三次重启,
       // 客户从文案里根本看不出是缺组件,还要白等三轮恢复系统代理的抖动。
       child.once('error', (error) => {
+        state.finished = true
         exitFailure = classifySpawnError(error)
         if (!stopped && lostCallback !== undefined) {
           lostCallback(exitFailure)
         }
       })
       child.on('exit', (code) => {
+        state.finished = true
         // 已有 spawn 失败结论时不覆盖:那一条比退出码更准。
         exitFailure ??= classifySshExit(code, stderrTail)
         if (!stopped && lostCallback !== undefined) {
@@ -139,23 +152,44 @@ export function createSshSocksConnector(spec, injected = {}) {
         host: '127.0.0.1',
         port: spec.localPort,
         targetHost: url.hostname,
-        targetPort: url.port === '' ? 80 : Number.parseInt(url.port, 10),
+        targetPort: url.port === '' ? (url.protocol === 'https:' ? 443 : 80) : Number.parseInt(url.port, 10),
         timeoutMs: spec.timeoutMs ?? 10_000
       })
       try {
-        return { exitIp: await httpGetBody(socket, url) }
+        return { exitIp: await verifyHttpExitIp(socket, url, spec.timeoutMs ?? 10_000) }
       } finally {
         socket.destroy()
       }
     },
     async stop() {
       stopped = true
-      if (child !== undefined && child.exitCode === null) {
-        child.kill('SIGTERM')
-      }
+      const current = child
+      const state = childState
       child = undefined
+      childState = undefined
+      if (current === undefined || current.exitCode !== null || state?.finished === true) return
+      current.kill('SIGTERM')
+      await waitForChildExit(current)
     }
   }
+}
+
+function waitForChildExit(child, timeoutMs = 5_000) {
+  if (child.exitCode !== null) return Promise.resolve()
+  return new Promise((resolvePromise) => {
+    let timer
+    const finish = () => {
+      if (timer !== undefined) clearTimeout(timer)
+      child.removeListener('exit', finish)
+      child.removeListener('close', finish)
+      child.removeListener('error', finish)
+      resolvePromise()
+    }
+    child.once('exit', finish)
+    child.once('close', finish)
+    child.once('error', finish)
+    timer = setTimeout(finish, timeoutMs)
+  })
 }
 
 async function waitForLocalSocks(port, timeoutMs, failureOf) {
@@ -170,7 +204,7 @@ async function waitForLocalSocks(port, timeoutMs, failureOf) {
       return
     }
     if (Date.now() > deadline) {
-      throw new ConnectorError(CONTROL_CODES.upstreamUnreachable, `本地 SOCKS 端口 ${port} 等待超时`)
+      throw new ConnectorError(CONTROL_CODES.localSocksUnavailable, `本地 SOCKS 端口 ${port} 等待超时`)
     }
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 100))
   }
@@ -212,28 +246,4 @@ function classifySshExit(code, stderr) {
     return new ConnectorError(CONTROL_CODES.portBusy)
   }
   return new ConnectorError(CONTROL_CODES.upstreamUnreachable, `ssh 退出码 ${String(code)}`)
-}
-
-function httpGetBody(socket, url) {
-  return new Promise((resolvePromise, rejectPromise) => {
-    socket.write(
-      `GET ${url.pathname} HTTP/1.1\r\nHost: ${url.host}\r\nConnection: close\r\n\r\n`
-    )
-    let buffer = Buffer.alloc(0)
-    socket.on('data', (chunk) => {
-      buffer = Buffer.concat([buffer, chunk])
-    })
-    socket.on('close', () => {
-      const text = buffer.toString('utf8')
-      const separator = text.indexOf('\r\n\r\n')
-      if (separator === -1) {
-        rejectPromise(new ConnectorError(CONTROL_CODES.upstreamUnreachable, '复验响应畸形'))
-        return
-      }
-      resolvePromise(text.slice(separator + 4).trim())
-    })
-    socket.on('error', (error) =>
-      rejectPromise(new ConnectorError(CONTROL_CODES.upstreamUnreachable, error.message))
-    )
-  })
 }

@@ -41,6 +41,18 @@ describe('win 守护入口(CLI,真进程)', () => {
     expect(result.stderr).toContain('REAL_ADAPTER_GUARD')
   })
 
+  it('适配器传递依赖缺失 → 先装启动兜底并写受控错误状态,不裸退出覆盖旧状态', () => {
+    const dataDir = makeTempDir('laixin-win-entry-adapter-missing-')
+    roots.push(dataDir)
+    const adapter = join(dataDir, 'broken-adapter.mjs')
+    writeFileSync(adapter, "import './missing-transitive-dependency.mjs'\nexport function createAdapter() { return {} }\n")
+    const result = runDaemon(['start', '--resident', '1', '--data-dir', dataDir, '--adapter', adapter])
+    expect(result.status).toBe(70)
+    expect(JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8'))).toMatchObject({
+      state: 'error', code: 'TUNNEL_ADAPTER_LOAD_FAILED'
+    })
+  })
+
   it('N-44 空账本 + 候选口:无法证明是来信还是第三方同端口，保留现值并报告人工核实', () => {
     const dataDir = makeTempDir('laixin-win-entry-')
     roots.push(dataDir)

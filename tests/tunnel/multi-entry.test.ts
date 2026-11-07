@@ -58,8 +58,8 @@ describe('隐藏多节点 · Xray 配置形状', () => {
     }
     expect(config.observatory?.subjectSelector).toEqual([`${TUNNEL_BALANCER_TAG}-`, 'dedicated-'])
     expect(config.routing.balancers).toEqual([
-      { tag: TUNNEL_BALANCER_TAG, selector: [`${TUNNEL_BALANCER_TAG}-`], strategy: { type: 'leastPing' } },
-      { tag: 'dedicated', selector: ['dedicated-'], strategy: { type: 'leastPing' } }
+      { tag: TUNNEL_BALANCER_TAG, selector: [`${TUNNEL_BALANCER_TAG}-`], fallbackTag: `${TUNNEL_BALANCER_TAG}-0`, strategy: { type: 'leastPing' } },
+      { tag: 'dedicated', selector: ['dedicated-'], fallbackTag: 'dedicated-0', strategy: { type: 'leastPing' } }
     ])
     // 通道规则一条都不能还指着老 tag,否则那条流量会落到不存在的出站
     expect(JSON.stringify(config.routing.rules)).not.toContain(TUNNEL_OUTBOUND_TAG)

@@ -33,6 +33,30 @@ describe('网络页状态呈现', () => {
     expect(buildTunnelPresentation(status({ state: '未配置' }))).toMatchObject({ headline: '国外AI需要配置网络', primaryAction: 'guide', primaryLabel: '开始设置网络' })
   })
 
+  it('N-77 连接中把守护阶段透成人话;未识别阶段不显示裸码', () => {
+    const atStage = buildTunnelPresentation(status({ state: '连接中', currentConfig: '版本 1', connectStage: 'bridge-start' }))
+    expect(atStage.hint).toContain('当前步骤：正在建立本地通道')
+    const writing = buildTunnelPresentation(status({ state: '连接中', currentConfig: '版本 1', connectStage: 'settings-write' }))
+    expect(writing.hint).toContain('正在写入系统网络设置')
+    const unknown = buildTunnelPresentation(status({ state: '连接中', currentConfig: '版本 1', connectStage: 'SOMETHING_NEW' }))
+    expect(unknown.hint).not.toContain('SOMETHING_NEW')
+    expect(unknown.hint).toContain('连接结果会自动更新')
+    const noStage = buildTunnelPresentation(status({ state: '连接中', currentConfig: '版本 1' }))
+    expect(noStage.hint).not.toContain('当前步骤')
+  })
+
+  it('N-80 只在真正用上网络且明确未开自启时建议开机自启;读不到状态或已开启就不打扰', async () => {
+    const { autoLaunchSuggestion } = await import('../../app/renderer/src/pages/tunnel')
+    const connected = status({ state: '已连', currentConfig: '版本 1' })
+    expect(autoLaunchSuggestion(connected, { enabled: false, supported: true })).toBe(true)
+    expect(autoLaunchSuggestion(connected, { enabled: true, supported: true })).toBe(false)
+    expect(autoLaunchSuggestion(connected, undefined)).toBe(false)
+    expect(autoLaunchSuggestion(connected, { enabled: false, supported: false })).toBe(false)
+    expect(autoLaunchSuggestion(status({ state: '连接中', currentConfig: '版本 1' }), { enabled: false, supported: true })).toBe(false)
+    expect(autoLaunchSuggestion(undefined, { enabled: false, supported: true })).toBe(false)
+    expect(autoLaunchSuggestion(status({ state: '通道待确认', currentConfig: '版本 1' }), { enabled: false, supported: true })).toBe(true)
+  })
+
   it('只有 bridge 明确报告已连时才显示已连接和断开动作', () => {
     expect(buildTunnelPresentation(status({ state: '已连', currentConfig: '版本 1' }))).toMatchObject({ headline: '已连接', tone: 'positive', primaryAction: 'stop' })
     expect(buildTunnelPresentation(status({ state: '连接中', currentConfig: '版本 1' }))).toMatchObject({ headline: '正在连接', tone: 'warning', primaryAction: 'stop' })

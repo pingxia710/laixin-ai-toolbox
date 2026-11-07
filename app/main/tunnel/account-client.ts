@@ -1,10 +1,18 @@
 import { platformForRuntime } from './sidecar-path'
+import { systemFetch } from '../network/system-fetch'
+import { classifyNetworkPhase, type NetworkPhase } from '../network/net-phase'
 import type { Platform } from '../precheck/software-platform'
 import type { DiagnosticEvent } from '../../diagnostic-event-types'
+import type { ReachabilityEvent } from '../../reachability-types'
+import type { RuntimeObservationEvent } from '../../runtime-observation-types'
 
 export interface NetworkAccountSession { readonly accountId: string; readonly accessToken: string; readonly deviceId?: string }
 export interface NetworkAccountAccess { readonly client: NetworkAccountClient; readonly session: NetworkAccountSession }
-export class NetworkAccountError extends Error {}
+export class NetworkAccountError extends Error {
+  /** N-81 网络阶段;业务码语义不变。 */
+  readonly phase?: NetworkPhase
+  constructor(code: string, phase?: NetworkPhase) { super(code); this.phase = phase }
+}
 export interface ConfigurationCache { readonly id: string; readonly expiresAt: number; readonly etag: string }
 export type AccountConfiguration = { id: string; expiresAt: number; etag?: string; lease?: string } &
   ({ archive: Buffer; unchanged?: false } | { unchanged: true; archive?: never })
@@ -16,7 +24,9 @@ export class NetworkAccountClient {
   private readonly base: URL
   private connectionSupported = true
   constructor(baseUrl: string, private readonly timeoutMs = 10000,
-    private readonly platform: Platform = platformForRuntime(process.platform)) {
+    private readonly platform: Platform = platformForRuntime(process.platform),
+    // N-81:传输注入,缺省 Electron 系统网络栈;用例注入优先。
+    private readonly deps: { fetch?: typeof fetch } = {}) {
     this.base = new URL(baseUrl)
     if ((this.base.protocol !== 'https:' && !(this.base.protocol === 'http:' && ['127.0.0.1', '[::1]'].includes(this.base.hostname))) ||
         this.base.username || this.base.password || this.base.search || this.base.hash ||
@@ -29,10 +39,12 @@ export class NetworkAccountClient {
     return this.base.href === other.base.href && this.platform === other.platform
   }
 
-  async claim(session: NetworkAccountSession, signal: AbortSignal, cached?: ConfigurationCache): Promise<AccountConfiguration> {
+  async claim(session: NetworkAccountSession, signal: AbortSignal, cached?: ConfigurationCache,
+    options: { readonly refreshBinding?: boolean } = {}): Promise<AccountConfiguration> {
     if (this.connectionSupported) {
       try {
-        const response = await this.request('connection', session, signal, 2 * 1024 * 1024, 'application/vnd.laixin.config', cached?.etag)
+        const response = await this.request('connection', session, signal, 2 * 1024 * 1024, 'application/vnd.laixin.config', cached?.etag,
+          undefined, options.refreshBinding === true ? { 'X-Laixin-Refresh-Binding': '1' } : undefined)
         if (!response.authorizationId || !/^lx-[a-f0-9]{32}$/.test(response.authorizationId) ||
             !Number.isSafeInteger(response.expiresAt) || response.expiresAt! <= 0 || !response.lease || !response.etag ||
             response.unchanged && (response.authorizationId !== cached?.id || response.expiresAt !== cached.expiresAt)) {
@@ -102,7 +114,24 @@ export class NetworkAccountClient {
     }
   }
 
-  private async request(path: string, session: NetworkAccountSession, signal: AbortSignal, limit: number, contentType: string, etag?: string, post?: unknown): Promise<NetworkResponse> {
+  /** N-79 connection-attempt 上送(POST 不重试;失败分类由调用方映射)。 */
+  async reportConnectionAttempt(session: NetworkAccountSession, signal: AbortSignal, event: unknown): Promise<void> {
+    await this.request('connection-attempts', session, signal, 2048, 'application/json', undefined, event)
+  }
+
+  /** 0.7.3 客户侧可达性批量上报；服务端未挂载时按永久兼容缺口丢弃。 */
+  async reportReachability(session: NetworkAccountSession, signal: AbortSignal, events: readonly ReachabilityEvent[]): Promise<void> {
+    if (!session.deviceId) throw new NetworkAccountError('NETWORK_LOGIN_REQUIRED')
+    await this.request('reachability', session, signal, 16 * 1024, 'application/json', undefined, { events })
+  }
+
+  /** V1.0 前稳定性/性能运行观测；与用户主动诊断包和失败诊断分开。 */
+  async reportRuntimeObservation(session: NetworkAccountSession, signal: AbortSignal, event: RuntimeObservationEvent): Promise<void> {
+    await this.request('runtime-observations', session, signal, 64 * 1024, 'application/json', undefined, event)
+  }
+
+  private async request(path: string, session: NetworkAccountSession, signal: AbortSignal, limit: number, contentType: string, etag?: string,
+    post?: unknown, extraHeaders?: Record<string, string>): Promise<NetworkResponse> {
     if (!session.accountId || !/^[\x21-\x7e]{1,4096}$/.test(session.accessToken)) throw new NetworkAccountError('NETWORK_LOGIN_REQUIRED')
     // Phase 1:幂等 GET 的瞬时网络抖动重试(3 次尝试,250/750ms)。抖动基线直接变「服务不可用」,
     // 界面误报、接续流程误判;梯子吸收掉。⛔ POST(回执/诊断)不重试——重复提交;服务器给过
@@ -110,7 +139,7 @@ export class NetworkAccountClient {
     const attempts = post === undefined ? 3 : 1
     for (let attempt = 1; ; attempt += 1) {
       try {
-        return await this.attempt(path, session, signal, limit, contentType, etag, post)
+        return await this.attempt(path, session, signal, limit, contentType, etag, post, extraHeaders)
       } catch (error) {
         const retryable = post === undefined && attempt < attempts && !(error instanceof NetworkAccountError) && !signal.aborted
         if (retryable) {
@@ -119,19 +148,20 @@ export class NetworkAccountClient {
         }
         if (error instanceof NetworkAccountError) throw error
         if (signal.aborted) throw new NetworkAccountError('NETWORK_SESSION_CHANGED')
-        throw new NetworkAccountError('NETWORK_SERVICE_UNAVAILABLE')
+        throw new NetworkAccountError('NETWORK_SERVICE_UNAVAILABLE', classifyNetworkPhase(error))
       }
     }
   }
 
-  private async attempt(path: string, session: NetworkAccountSession, signal: AbortSignal, limit: number, contentType: string, etag?: string, post?: unknown): Promise<NetworkResponse> {
+  private async attempt(path: string, session: NetworkAccountSession, signal: AbortSignal, limit: number, contentType: string, etag?: string,
+    post?: unknown, extraHeaders?: Record<string, string>): Promise<NetworkResponse> {
     try {
-      const response = await fetch(new URL(path, this.base), { redirect: 'error', cache: 'no-store',
+      const response = await (this.deps.fetch ?? systemFetch)(new URL(path, this.base), { redirect: 'error', cache: 'no-store',
         ...(post === undefined ? {} : { method: 'POST', body: JSON.stringify(post) }),
         signal: AbortSignal.any([signal, AbortSignal.timeout(this.timeoutMs)]),
         headers: { Authorization: `Bearer ${session.accessToken}`, Accept: contentType,
           'X-Laixin-Platform': this.platform, ...(post === undefined ? {} : { 'Content-Type': 'application/json' }),
-          ...(etag ? { 'If-None-Match': etag } : {}) } })
+          ...(etag ? { 'If-None-Match': etag } : {}), ...(extraHeaders ?? {}) } })
       const metadata = { authorizationId: response.headers.get('x-laixin-authorization-id') ?? undefined,
         expiresAt: response.headers.has('x-laixin-expires-at') ? Number(response.headers.get('x-laixin-expires-at')) : undefined,
         lease: response.headers.get('x-laixin-connection-lease') ?? undefined }
@@ -141,8 +171,20 @@ export class NetworkAccountClient {
         return { body: Buffer.alloc(0), etag, unchanged: true, ...metadata }
       }
       if (!response.ok) {
+        // N-79 connection-attempts 的 4xx 分流(队列靠这些码分 permanent/auth/retryable):
+        // 404=老后台没有该路由(永久);400=验形拒绝(合同不兼容,永久);403=禁止(认证,暂停);
+        // 401 沿用下方既有映射;429/5xx 落 NETWORK_SERVICE_UNAVAILABLE(可重试)。
+        if (['connection-attempts', 'reachability', 'runtime-observations'].includes(path) && [400, 403, 404, 413].includes(response.status)) {
+          await response.body?.cancel()
+          throw new NetworkAccountError(response.status === 404 ? 'NETWORK_ROUTE_NOT_FOUND'
+            : response.status === 400 || response.status === 413 ? 'NETWORK_RESPONSE_INVALID' : 'NETWORK_LOGIN_REQUIRED')
+        }
+        if (path === 'runtime-observations' && response.status === 410) {
+          await response.body?.cancel()
+          throw new NetworkAccountError('RUNTIME_OBSERVATION_VERSION_CLOSED')
+        }
         if ([409, 410].includes(response.status) || path === 'connection' && response.status === 404 ||
-            ['diagnosis', 'diagnostic-events'].includes(path) && response.status === 404) {
+            ['diagnosis', 'diagnostic-events', 'reachability', 'runtime-observations'].includes(path) && response.status === 404) {
           // Older account servers have no connection route. A missing application on a new server is distinct.
           // diagnosis 同理:老后台没有这个端点(404)必须与「后台一时不可达」分开,⛔ 让回传空转入队。
           let size = 0; const chunks: Uint8Array[] = []
@@ -152,10 +194,11 @@ export class NetworkAccountClient {
           if (response.status === 404) throw new NetworkAccountError(code === 'NETWORK_NO_APPLICATION' ? 'NETWORK_NO_APPLICATION' : 'NETWORK_ROUTE_NOT_FOUND')
           if (code === 'NETWORK_APPLICATION_PENDING') throw new NetworkAccountError('NETWORK_APPLICATION_PENDING')
           if (code === 'NETWORK_AUTHORIZATION_UNAVAILABLE' || code === 'CONFIG_EXPIRED') throw new NetworkAccountError('NETWORK_AUTHORIZATION_UNAVAILABLE')
-          throw new NetworkAccountError('NETWORK_SERVICE_UNAVAILABLE')
+          throw new NetworkAccountError('NETWORK_SERVICE_UNAVAILABLE', 'backend')
         }
         await response.body?.cancel()
-        throw new NetworkAccountError(response.status === 401 ? 'NETWORK_LOGIN_REQUIRED' : 'NETWORK_SERVICE_UNAVAILABLE')
+        throw new NetworkAccountError(response.status === 401 ? 'NETWORK_LOGIN_REQUIRED' : 'NETWORK_SERVICE_UNAVAILABLE',
+          response.status >= 500 ? 'backend' : undefined)
       }
       if (response.headers.get('content-type')?.split(';')[0] !== contentType || !response.body) {
         await response.body?.cancel(); throw new NetworkAccountError('NETWORK_RESPONSE_INVALID')

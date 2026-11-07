@@ -37,12 +37,20 @@ if ($ProxyFallbackOnly) {
       exit 0
     }
     $port = [int]$endpoint.Groups[1].Value
-    if ($port -gt 65535 -or $pending.Count -ne 2) { exit 3 }
+    # 新版 WinINET 接管会为 Server/Enable/Override/AutoConfigURL 各留一笔同会话账目；
+    # 旧客户只有 Server/Enable 两条。两种格式都接受，但字段和 sessionToken 必须逐项对上。
+    if ($port -gt 65535 -or $pending.Count -notin @(2,4)) { exit 3 }
     $server = @($pending | Where-Object { $_.service -eq 'WinINET' -and $_.item -eq 'ProxyServer' })
     $enable = @($pending | Where-Object { $_.service -eq 'WinINET' -and $_.item -eq 'ProxyEnable' })
     if ($server.Count -ne 1 -or $enable.Count -ne 1) { exit 3 }
     $server = $server[0]
     $enable = $enable[0]
+    if ($pending.Count -eq 4) {
+      $override = @($pending | Where-Object { $_.service -eq 'WinINET' -and $_.item -eq 'ProxyOverride' })
+      $autoConfig = @($pending | Where-Object { $_.service -eq 'WinINET' -and $_.item -eq 'AutoConfigURL' })
+      if ($override.Count -ne 1 -or $autoConfig.Count -ne 1 -or
+        $override[0].sessionToken -cne $server.sessionToken -or $autoConfig[0].sessionToken -cne $server.sessionToken) { exit 3 }
+    }
     $owned = $server.sessionToken -ceq $enable.sessionToken -and
       $server.writtenValue.type -ceq 'REG_SZ' -and $server.writtenValue.data -ceq [string]$settings.ProxyServer -and
       $enable.writtenValue.type -ceq 'REG_DWORD' -and [string]$enable.writtenValue.data -ceq '1' -and
@@ -67,17 +75,29 @@ if ($ProxyFallbackOnly) {
 }
 
 $label = 'cn.laixin.toolbox.tunnel'
-$isLaixinTask = {
-  $_.TaskName -eq $label -and ($_.TaskPath -eq '\' -or $_.TaskPath -eq '\Laixin\')
+$taskRefs = @(
+  [pscustomobject]@{ TaskPath = '\Laixin\'; TaskName = $label },
+  [pscustomobject]@{ TaskPath = '\'; TaskName = $label }
+)
+
+function Get-LaixinTask([string]$TaskPath, [string]$TaskName) {
+  try { return Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction Stop }
+  catch {
+    if ($_.Exception.HResult -in @(-2147024894,-2147024893,-2147216625)) { return $null }
+    throw
+  }
 }
 
-$matches = @(Get-ScheduledTask -ErrorAction Stop | Where-Object $isLaixinTask)
-foreach ($task in $matches) {
-  Unregister-ScheduledTask -InputObject $task -Confirm:$false -ErrorAction Stop
+foreach ($ref in $taskRefs) {
+  $task = Get-LaixinTask $ref.TaskPath $ref.TaskName
+  if ($null -ne $task) {
+    Unregister-ScheduledTask -InputObject $task -Confirm:$false -ErrorAction Stop
+  }
 }
 
-$left = @(Get-ScheduledTask -ErrorAction Stop | Where-Object $isLaixinTask)
-if ($left.Count -ne 0) { exit 1 }
+foreach ($ref in $taskRefs) {
+  if ($null -ne (Get-LaixinTask $ref.TaskPath $ref.TaskName)) { exit 1 }
+}
 
 function Remove-LaixinTaskFolderIfEmpty {
   try {

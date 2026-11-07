@@ -6,8 +6,10 @@ import {
   ENTRY_STATUS, clearRecoveryMarker, isIntactLedgerEntry, isOptionalSettingService, isSettingLikeEntry, isSettledSetting, loadLedger, loadLedgerCached,
   loadQuarantinedEntries, readRecoveryMarker, saveLedger, ledgerPath, withSettingsLock, assertSettingsLockHeld
 } from './ledger.mjs'
+import { randomBytes } from 'node:crypto'
 import { existsSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { RESTORE_REASONS } from './restore-observation.mjs'
 
 // 系统设置变更通知欠着没发:落一个标记,下一次恢复(哪怕没有待恢复项)或守护定时补发,发成才删。
 export function notifyPendingPath(dataDir) {
@@ -48,7 +50,26 @@ function repairQuarantinedEntry(entry, status, note) {
 
 // 同一连接会话的 WinINET 路由项是一组：Server 看似仍是我们写的值时，第三方也可能
 // 已接管同端口或 PAC。bypass 改动只保护该项，不能让死代理入口留在系统里。
-function wininetGroupOwnership(entries, sessionToken, adapter, equal) {
+// 端口快路径只接受调用方在本轮仍持有的显式证据；state.json 是可过期的诊断快照，不能作归属证明。
+export function ownPortSet(explicit) {
+  const ports = new Set()
+  for (const port of Array.isArray(explicit) ? explicit : []) {
+    if (Number.isSafeInteger(port) && port > 0 && port <= 65535) ports.add(port)
+  }
+  return ports
+}
+
+// 旧会话可能把含重复项的原串写成去重串；集合等价不能证明原始格式已还原。
+// 只在现值逐字等于该会话写入值时尝试，其他格式仍按原有第三方保护处理。
+function isOwnedEquivalentOverride(entry, current, equal) {
+  return entry.service === 'WinINET' && entry.item === 'ProxyOverride' &&
+    entry.originalValue?.type === 'REG_SZ' && entry.writtenValue?.type === 'REG_SZ' &&
+    typeof entry.originalValue.data === 'string' && typeof entry.writtenValue.data === 'string' &&
+    !deepEqual(entry.originalValue, entry.writtenValue) && deepEqual(current, entry.writtenValue) &&
+    equal(current, entry.originalValue, entry)
+}
+
+function wininetGroupOwnership(entries, sessionToken, adapter, equal, knownOwnPorts = new Set()) {
   if (typeof sessionToken !== 'string' || sessionToken === '') return { kind: 'unknown', note: '会话身份缺失' }
   const latest = new Map()
   for (const entry of entries) {
@@ -63,8 +84,8 @@ function wininetGroupOwnership(entries, sessionToken, adapter, equal) {
   const current = new Map()
   for (const [item, entry] of latest) {
     let value
-    try { value = adapter.read({ service: 'WinINET', item }) } catch (error) {
-      return { kind: 'unknown', retryable: true, note: `读取 ${item} 失败:${messageOf(error)}` }
+    try { value = adapter.read({ service: 'WinINET', item }) } catch {
+      return { kind: 'unknown', retryable: true, code: 'SETTINGS_READ_FAILED', note: `读取 ${item} 失败` }
     }
     current.set(item, value)
     if (!Object.hasOwn(entry, 'originalValue')) {
@@ -96,6 +117,9 @@ function wininetGroupOwnership(entries, sessionToken, adapter, equal) {
   const port = Number(match?.[1])
   if (match === null || port > 65535) {
     if (equal(serverValue, server.writtenValue, server) && serverValue !== null) {
+      const writtenMatch = /^127\.0\.0\.1:([1-9][0-9]{0,4})$/.exec(
+        typeof server.writtenValue === 'object' && server.writtenValue !== null ? String(server.writtenValue.data ?? '') : '')
+      if (writtenMatch !== null && knownOwnPorts.has(Number(writtenMatch[1]))) return { kind: 'ours' }
       if (equal(server.originalValue, server.writtenValue, server)) {
         return { kind: 'external', note: '代理地址为第三方现值' }
       }
@@ -103,16 +127,23 @@ function wininetGroupOwnership(entries, sessionToken, adapter, equal) {
     }
     return { kind: 'ours' }
   }
+  // 系统代理指向本守护已经监听/监听过的入口时，端口归属由连接状态本身确定。
+  // 这条恒等路径必须先于系统查询，避免恢复关键路径被慢子进程楔死。
+  if (knownOwnPorts.has(port)) return { kind: 'ours' }
   if (typeof adapter.identifyPortOwner !== 'function') return { kind: 'unknown', note: '端口归属查询不可用' }
   let owner
-  try { owner = adapter.identifyPortOwner(port) } catch (error) {
-    return { kind: 'unknown', retryable: true, note: `读取代理端口归属失败:${messageOf(error)}` }
+  try { owner = adapter.identifyPortOwner(port, { fresh: true }) } catch {
+    return { kind: 'unknown', retryable: true, code: 'PORT_QUERY_FAILED', note: RESTORE_REASONS.PORT_QUERY_FAILED }
   }
   if (owner?.pid === process.pid && (owner.kind === 'other' || owner.kind === 'laixin')) return { kind: 'ours' }
   if (owner?.kind === 'other') return { kind: 'external', note: '代理端口已被其他软件监听' }
   if (owner?.kind === 'none') return { kind: 'ours' }
-  return { kind: 'unknown', retryable: owner?.kind === 'unknown',
-    note: '代理端口由另一进程监听或查询结果不明' }
+  const reasons = { timeout: 'PORT_QUERY_TIMEOUT', 'command-unavailable': 'PORT_QUERY_UNAVAILABLE',
+    'permission-denied': 'PORT_QUERY_PERMISSION_DENIED', 'invalid-result': 'PORT_QUERY_INVALID',
+    'invalid-port': 'PORT_QUERY_INVALID', 'address-ambiguous': 'PORT_ADDRESS_AMBIGUOUS' }
+  const code = owner?.kind === 'laixin' ? 'PORT_OTHER_LAIXIN'
+    : Object.hasOwn(reasons, owner?.reason ?? '') ? reasons[owner.reason] : 'PORT_QUERY_FAILED'
+  return { kind: 'unknown', retryable: owner?.kind === 'unknown', code, note: RESTORE_REASONS[code] }
 }
 
 // 损坏账本的恢复流程(收敛包3·件4):恢复标记存在时,把隔离坏账本里能识别的
@@ -120,11 +151,11 @@ function wininetGroupOwnership(entries, sessionToken, adapter, equal) {
 // 坏账本原样留证;有任何失败保留标记并返回可复制诊断。⛔ 静默清砖。
 // 审计 R1:存疑条目(缺 note 等字段但原值在)照样尝试恢复;只有原文件里没有任何
 // 设置类条目被丢弃时才允许清标记。
-export function recoverLedger(dataDir, adapter) {
-  return withSettingsLock(dataDir, () => recoverLedgerLocked(dataDir, adapter))
+export function recoverLedger(dataDir, adapter, options = {}) {
+  return withSettingsLock(dataDir, () => recoverLedgerLocked(dataDir, adapter, options))
 }
 
-function recoverLedgerLocked(dataDir, adapter) {
+function recoverLedgerLocked(dataDir, adapter, options = {}) {
   const badName = readRecoveryMarker(dataDir)
   if (badName === undefined) return undefined
   const quarantined = loadQuarantinedEntries(dataDir, badName)
@@ -138,6 +169,34 @@ function recoverLedgerLocked(dataDir, adapter) {
   const keptModified = []
   const failed = []
   const outcomes = new Map()
+  const knownOwnPorts = ownPortSet(options.knownOwnPorts)
+  // 隔离原件不改写；可识别的旧豁免项仍须区分逐字恢复与语义等价。
+  const settleEquivalentOverride = (entry, current) => {
+    if (!isOwnedEquivalentOverride(entry, entry.writtenValue, equal) || !equal(current, entry.originalValue, entry)) return false
+    let value = current
+    if (deepEqual(current, entry.writtenValue)) {
+      let writeError
+      try {
+        assertSettingsLockHeld(dataDir)
+        adapter.write({ service: entry.service, item: entry.item }, entry.originalValue, { restoring: true })
+      } catch (error) { writeError = error }
+      value = adapter.read({ service: entry.service, item: entry.item })
+      if (!equal(value, entry.originalValue, entry)) throw writeError ?? new Error('原设置写回后读数不一致')
+    }
+    const exact = deepEqual(value, entry.originalValue)
+    if (!exact && adapter.preserveExternalChanges?.(entry) !== true) throw new Error('原始格式未恢复,未获准保留现值')
+    const settled = repairQuarantinedEntry(entry, exact ? ENTRY_STATUS.restored : ENTRY_STATUS.preserved,
+      exact ? '损坏恢复:已读回原始格式' : '损坏恢复:原始格式未逐字恢复,保留语义等价的现值')
+    const previous = outcomes.get(entry)
+    for (const list of [recovered, keptModified]) {
+      const index = list.indexOf(previous)
+      if (index >= 0) list.splice(index, 1)
+    }
+    outcomes.set(entry, settled)
+    if (exact) recovered.push(settled)
+    else keptModified.push(settled)
+    return true
+  }
   // 逆序恢复:后写的先回滚,与常规恢复同一规则。
   // 待恢复项按「是不是设置账目」挑,⛔ 只认 kind === 'setting':kind 丢失或拼坏的条目
   // (审计 R1 形态 C/D)同样带着原值,漏过去就是系统代理仍指向本机桥却被标记清除。
@@ -145,7 +204,7 @@ function recoverLedgerLocked(dataDir, adapter) {
   const wininetGroups = new Map()
   for (const entry of pending) {
     if (entry.service === 'WinINET' && !wininetGroups.has(entry.sessionToken)) {
-      wininetGroups.set(entry.sessionToken, wininetGroupOwnership(entries, entry.sessionToken, adapter, equal))
+      wininetGroups.set(entry.sessionToken, wininetGroupOwnership(entries, entry.sessionToken, adapter, equal, knownOwnPorts))
     }
   }
   for (const entry of [...pending].reverse()) {
@@ -177,6 +236,12 @@ function recoverLedgerLocked(dataDir, adapter) {
         continue
       }
       failed.push(`${label}:读取失败:${messageOf(error)}`)
+      continue
+    }
+    try {
+      if (settleEquivalentOverride(entry, current)) continue
+    } catch (error) {
+      failed.push(`${label}:格式恢复失败:${messageOf(error)}`)
       continue
     }
     if (equal(current, entry.originalValue, entry)) {
@@ -227,6 +292,18 @@ function recoverLedgerLocked(dataDir, adapter) {
   if (pending.length > 0 || notifyOwed(dataDir)) {
     try { adapter.broadcastSettingsChanged?.(); markNotifyOwed(dataDir, false) } catch { markNotifyOwed(dataDir, true) }
   }
+  for (const entry of pending) {
+    if (outcomes.get(entry)?.status !== ENTRY_STATUS.restored || !isOwnedEquivalentOverride(entry, entry.writtenValue, equal)) continue
+    try {
+      const current = adapter.read({ service: entry.service, item: entry.item })
+      if (!settleEquivalentOverride(entry, current)) throw new Error('通知后原设置已变化,未覆盖现值')
+    } catch (error) {
+      const index = recovered.indexOf(outcomes.get(entry))
+      if (index >= 0) recovered.splice(index, 1)
+      outcomes.delete(entry)
+      failed.push(`${entry.service}/${entry.item}:通知后格式恢复未确认:${messageOf(error)}`)
+    }
+  }
   if (failed.length > 0) {
     return { recovered, keptModified, failed,
       diagnostics: `损坏账本恢复未完成(${badName}):${failed.join(';')}；原设置可能尚未恢复，请联系客服并提供上述信息` }
@@ -243,22 +320,34 @@ function recoverLedgerLocked(dataDir, adapter) {
     return repairQuarantinedEntry(entry, status, typeof entry.note === 'string' ? entry.note : '损坏恢复:账目结构已修补')
   })
   const path = ledgerPath(dataDir)
-  const temporary = `${path}.tmp-recovery`
-  writeFileSync(temporary, `${JSON.stringify(nextEntries, null, 1)}\n`, { mode: 0o600 })
-  renameSync(temporary, path)
+  const temporary = `${path}.tmp-recovery-${randomBytes(8).toString('hex')}`
+  try {
+    writeFileSync(temporary, `${JSON.stringify(nextEntries, null, 1)}\n`, { mode: 0o600 })
+    renameSync(temporary, path)
+  } finally { rmSync(temporary, { force: true }) }
   clearRecoveryMarker(dataDir)
   return { recovered, keptModified, failed: [], diagnostics: undefined }
 }
 
 // 整个「读账本 → 逐项读/写系统设置 → 存回账本」在跨进程锁里做(GPT-6 复核 be04e6a):
 // ⛔ 读了旧账本、另一进程写入、再把旧快照整份存回去。
-export function restoreLedger(dataDir, adapter) {
-  return withSettingsLock(dataDir, () => restoreLedgerLocked(dataDir, adapter))
+export function restoreLedger(dataDir, adapter, options = {}) {
+  return withSettingsLock(dataDir, () => restoreLedgerLocked(dataDir, adapter, options))
 }
 
-function restoreLedgerLocked(dataDir, adapter) {
+function restoreLedgerLocked(dataDir, adapter, options = {}) {
   const entries = loadLedger(dataDir)
-  const result = { restored: [], keptModified: [], failed: [] }
+  const result = { restored: [], keptModified: [], failed: [], reasonCodes: [] }
+  const knownOwnPorts = ownPortSet(options.knownOwnPorts)
+  const preserveEquivalentFormat = (entry, index, value, equal) => {
+    if (adapter.preserveExternalChanges?.(entry) !== true || deepEqual(value, entry.originalValue) ||
+        !equal(value, entry.originalValue, entry)) return false
+    entries[index] = { ...entry, status: ENTRY_STATUS.preserved,
+      note: '原始格式未能逐字恢复，保留语义等价的当前设置' }
+    result.restored = result.restored.filter((candidate) => candidate.id !== entry.id)
+    result.keptModified.push(entries[index])
+    return true
+  }
   // 逆序恢复:后写的先回滚。
   const pending = entries
     .map((entry, index) => ({ entry, index }))
@@ -267,7 +356,8 @@ function restoreLedgerLocked(dataDir, adapter) {
   const wininetGroups = new Map()
   for (const { entry } of pending) {
     if (entry.service === 'WinINET' && !wininetGroups.has(entry.sessionToken)) {
-      wininetGroups.set(entry.sessionToken, wininetGroupOwnership(entries, entry.sessionToken, adapter, adapter.valuesEqual ?? deepEqual))
+      wininetGroups.set(entry.sessionToken,
+        wininetGroupOwnership(entries, entry.sessionToken, adapter, adapter.valuesEqual ?? deepEqual, knownOwnPorts))
     }
   }
 
@@ -281,6 +371,7 @@ function restoreLedgerLocked(dataDir, adapter) {
       continue
     }
     if (ownership?.kind === 'unknown') {
+      result.reasonCodes.push(ownership.code ?? 'RESTORE_UNCONFIRMED')
       entries[index] = { ...entry, status: ownership.retryable ? ENTRY_STATUS.restoreFailed : ENTRY_STATUS.keptModified,
         note: `${ownership.note},未改动整组现值` }
       if (ownership.retryable) result.failed.push(entries[index])
@@ -297,13 +388,17 @@ function restoreLedgerLocked(dataDir, adapter) {
         continue
       }
       entries[index] = { ...entry, status: ENTRY_STATUS.restoreFailed, note: `读取失败:${messageOf(error)}` }
+      result.reasonCodes.push('SETTINGS_READ_FAILED')
       result.failed.push(entries[index])
       continue
     }
     const equal = adapter.valuesEqual ?? deepEqual
     const restoredValueMatches = (value) => equal(value, entry.originalValue, entry) ||
       adapter.restoredValueMatches?.(value, entry.originalValue, entry.writtenValue) === true
-    if (restoredValueMatches(current)) {
+    const exactOverride = isOwnedEquivalentOverride(entry, current, equal)
+    if (restoredValueMatches(current) && !exactOverride) {
+      if (isOwnedEquivalentOverride(entry, entry.writtenValue, equal) &&
+          preserveEquivalentFormat(entry, index, current, equal)) continue
       entries[index] = { ...entry, status: ENTRY_STATUS.restored, note: '' }
       result.restored.push(entries[index])
       continue
@@ -316,13 +411,30 @@ function restoreLedgerLocked(dataDir, adapter) {
     try {
       assertSettingsLockHeld(dataDir)
       adapter.write({ service: entry.service, item: entry.item }, entry.originalValue, { restoring: true })
-      if (!restoredValueMatches(adapter.read({ service: entry.service, item: entry.item }))) {
+      const readback = adapter.read({ service: entry.service, item: entry.item })
+      if (!restoredValueMatches(readback)) {
         throw new Error('原设置写回后读数不一致')
+      }
+      if (exactOverride && !deepEqual(readback, entry.originalValue)) {
+        if (preserveEquivalentFormat(entry, index, readback, equal)) continue
+        throw new Error('原始格式未能逐字恢复')
       }
       entries[index] = { ...entry, status: ENTRY_STATUS.restored, note: '' }
       result.restored.push(entries[index])
     } catch (error) {
+      if (exactOverride) {
+        try {
+          const readback = adapter.read({ service: entry.service, item: entry.item })
+          if (deepEqual(readback, entry.originalValue)) {
+            entries[index] = { ...entry, status: ENTRY_STATUS.restored, note: '' }
+            result.restored.push(entries[index])
+            continue
+          }
+          if (preserveEquivalentFormat(entry, index, readback, equal)) continue
+        } catch { /* 读不到时保留原有恢复失败处理 */ }
+      }
       entries[index] = { ...entry, status: ENTRY_STATUS.restoreFailed, note: `写回失败:${messageOf(error)}` }
+      result.reasonCodes.push('SETTINGS_WRITE_OR_READBACK_FAILED')
       result.failed.push(entries[index])
     }
   }
@@ -354,18 +466,46 @@ function restoreLedgerLocked(dataDir, adapter) {
     let current
     try { current = adapter.read({ service: entry.service, item: entry.item }) } catch { continue }
     const equalFn = adapter.valuesEqual ?? deepEqual
-    if (equalFn(current, entry.originalValue, entry) || !equalFn(current, entry.writtenValue, entry)) continue
+    const exactOverride = isOwnedEquivalentOverride(entry, current, equalFn)
+    if (equalFn(current, entry.originalValue, entry) && !exactOverride) {
+      if (isOwnedEquivalentOverride(entry, entry.writtenValue, equalFn)) {
+        preserveEquivalentFormat(entry, index, current, equalFn)
+      }
+      continue
+    }
+    if (!equalFn(current, entry.writtenValue, entry)) continue
     try {
       assertSettingsLockHeld(dataDir)
       adapter.write({ service: entry.service, item: entry.item }, entry.originalValue, { restoring: true })
-      if (!equalFn(adapter.read({ service: entry.service, item: entry.item }), entry.originalValue, entry)) continue
+      const readback = adapter.read({ service: entry.service, item: entry.item })
+      if (!equalFn(readback, entry.originalValue, entry)) {
+        if (exactOverride) throw new Error('原设置写回后读数不一致')
+        continue
+      }
+      if (exactOverride && !deepEqual(readback, entry.originalValue)) {
+        if (preserveEquivalentFormat(entry, index, readback, equalFn)) continue
+        throw new Error('原始格式未能逐字恢复')
+      }
       entries[index] = { ...entries[index], note: '还原后被系统连带改写回,已重写原值' }
     } catch {
+      if (exactOverride) {
+        try {
+          const readback = adapter.read({ service: entry.service, item: entry.item })
+          if (deepEqual(readback, entry.originalValue)) {
+            entries[index] = { ...entries[index], note: '还原后被系统连带改写回,已重写原值' }
+            continue
+          }
+          if (preserveEquivalentFormat(entry, index, readback, equalFn)) continue
+        } catch { /* 读不到时保留原有恢复失败处理 */ }
+        result.restored = result.restored.filter((candidate) => candidate.id !== entry.id)
+      }
       entries[index] = { ...entries[index], status: ENTRY_STATUS.restoreFailed, note: '还原后被系统连带改写回,重写失败' }
+      result.reasonCodes.push('SETTINGS_WRITE_OR_READBACK_FAILED')
       result.failed.push(entries[index])
     }
   }
   saveLedger(dataDir, entries)
+  if (result.reasonCodes.length === 0) delete result.reasonCodes
   return result
 }
 

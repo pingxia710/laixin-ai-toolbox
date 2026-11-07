@@ -279,6 +279,41 @@ describe('Windows 守护(WinINET 四键,账本驱动)', () => {
     expect(restored.ProxyServer).toBeUndefined()
   })
 
+  it('现场格式:连续三次主动断开都逐字恢复原有 ProxyOverride', async () => {
+    const h = harness()
+    const original = ';localhost.*;;localhost.*;<local>;localhost;127.*'
+    h.adapter.write({ service: 'WinINET', item: 'ProxyOverride' }, { type: 'REG_SZ', data: original })
+
+    for (let cycle = 0; cycle < 3; cycle++) {
+      writeIntentFile(dataDir, { ...connectIntent(), sessionToken: `field-session-${String(cycle)}` })
+      const daemon = spawnDaemon(h)
+      await daemon.run()
+      expect(stateOf().state).toBe('connected')
+      expect(readJsonFile<FakeWininetStore>(storePath).ProxyOverride?.data).toBe(original)
+
+      writeIntentFile(dataDir, { desired: 'user-disconnected' })
+      clock.advance(100)
+      await waitFor(() => stateOf().state === 'stopped-restored')
+      expect(readJsonFile<FakeWininetStore>(storePath).ProxyOverride?.data).toBe(original)
+    }
+  })
+
+  it('连接期间第三方改变等价格式时，断开保留第三方的新格式', async () => {
+    const h = harness()
+    const original = ';localhost.*;;localhost.*;<local>;localhost;127.*'
+    const later = '127.*;LOCALHOST;localhost.*;<LOCAL>'
+    h.adapter.write({ service: 'WinINET', item: 'ProxyOverride' }, { type: 'REG_SZ', data: original })
+    writeIntentFile(dataDir, connectIntent())
+    const daemon = spawnDaemon(h)
+    await daemon.run()
+    h.adapter.write({ service: 'WinINET', item: 'ProxyOverride' }, { type: 'REG_SZ', data: later })
+
+    writeIntentFile(dataDir, { desired: 'user-disconnected' })
+    clock.advance(100)
+    await waitFor(() => stateOf().state === 'stopped-restored')
+    expect(readJsonFile<FakeWininetStore>(storePath).ProxyOverride?.data).toBe(later)
+  })
+
   it('客户点击连接时使用来信代理，退出后恢复原有代理', async () => {
     const h = harness()
     h.adapter.write({ service: 'WinINET', item: 'ProxyServer' }, { type: 'REG_SZ', data: '10.0.0.1:8080' })

@@ -4,11 +4,15 @@ import { connect as netConnect, isIP } from 'node:net'
 import { connect as tlsConnect } from 'node:tls'
 import { CONTROL_CODES, ConnectorError } from './connectors.mjs'
 import { socks5Connect } from './socks5.mjs'
-import { buildVlessOutbound, validVerifyUrl, validVerifyFallbackUrl } from './vless-settings.mjs'
+import { buildVlessOutbound, validProductionVerifyUrl, validProductionVerifyFallbackUrl } from './vless-settings.mjs'
 
 // Xray 由原有 bridge 生命周期持有，本连接器只提供出口配置和通道内复验。
 export function createVlessConnector(spec) {
-  if (!validVerifyUrl(spec.verifyUrl) || (spec.verifyFallbackUrl !== undefined && !validVerifyFallbackUrl(spec.verifyUrl, spec.verifyFallbackUrl))) throw new ConnectorError(CONTROL_CODES.upstreamUnreachable, '复验配置无效')
+  const verifyOptions = { allowLocalVerifyUrls: spec.allowLocalVerifyUrls === true }
+  if (!validProductionVerifyUrl(spec.verifyUrl, verifyOptions) ||
+      (spec.verifyFallbackUrl !== undefined && !validProductionVerifyFallbackUrl(spec.verifyUrl, spec.verifyFallbackUrl, verifyOptions))) {
+    throw new ConnectorError(CONTROL_CODES.upstreamUnreachable, '复验配置无效')
+  }
   const outbound = buildVlessOutbound(spec.node, JSON.parse(readFileSync(spec.credentialPath, 'utf8')))
   return {
     kind: 'vless-reality',
@@ -17,12 +21,13 @@ export function createVlessConnector(spec) {
     onLost() {}, // 内核退出事件由 bridge 统一报告。
     async start() {},
     async stop() {},
-    verify: () => verifyWithFallback(spec.localPort, spec.verifyUrl, spec.verifyFallbackUrl, spec.timeoutMs ?? 10_000)
+    verify: () => verifyWithFallback(spec.localPort, spec.verifyUrl, spec.verifyFallbackUrl, spec.timeoutMs ?? 10_000, undefined, verifyOptions)
   }
 }
 
-export async function verifyWithFallback(port, primary, fallback, timeoutMs = 10_000, probe = verifyThroughProxy) {
-  if (!validVerifyUrl(primary) || (fallback !== undefined && !validVerifyFallbackUrl(primary, fallback))) {
+export async function verifyWithFallback(port, primary, fallback, timeoutMs = 10_000, probe = verifyThroughProxy, options = {}) {
+  if (!validProductionVerifyUrl(primary, options) ||
+      (fallback !== undefined && !validProductionVerifyFallbackUrl(primary, fallback, options))) {
     throw new ConnectorError(CONTROL_CODES.upstreamUnreachable, '复验配置无效')
   }
   try { return await probe(port, primary, timeoutMs) }

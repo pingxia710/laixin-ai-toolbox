@@ -163,7 +163,7 @@ export async function runOneClickReport(deps: {
   if (deps.validateDiagnosis && !(await deps.validateDiagnosis())) throw new Error('DIAGNOSTIC_CONTEXT_CHANGED')
   const createdAt = (deps.now?.() ?? new Date()).toISOString()
   // 未恢复的系统设置：通道状态里那句现成的读数就够客服判断，⛔ 再去 sidecar 里捞一份原始条目。
-  const body = buildReportBody({ tunnel, repair, daemonState: files.daemonState, ledger: files.ledger,
+  const body = buildReportBody({ tunnel, repair, daemonState: files.daemonState, ledger: files.ledger, connectionFunnel: files.connectionFunnel,
     systemProxy, connection: files.connection, daemonLog: files.daemonLog, faults, errorCodes,
     diagnosis: deps.diagnosis, diagnosisUnavailableSoftware: deps.diagnosisUnavailableSoftware,
     supplementalCollectedAt: createdAt, notes: [...files.notes, ...notes] })

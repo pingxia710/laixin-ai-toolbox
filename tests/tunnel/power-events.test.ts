@@ -1,9 +1,50 @@
 // Windows 电源事件源:行解析、注入 spawn 的接线,以及真实 PowerShell 执行实际生成的脚本。
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import type { Readable } from 'node:stream'
 import { createPowerEventSource, parsePowerEvent, watcherScript } from '../../sidecar/win/power-events.mjs'
+
+// N-83:Windows 事件源的第二条腿——node:os 网卡快照轮询。
+// PowerShell 被 kill/放弃时不能全网盲:DHCP 同状态换 IP、网卡地址变化由快照层兜底;
+// 轮询间隙>5s 同样按唤醒处理(与 mac 源同款)。
+function snapshotSource(overrides: Record<string, unknown> = {}) {
+  let tick = () => {}
+  let time = 0
+  let address = '192.0.2.1'
+  let readFails = false
+  const emit = vi.fn()
+  const cancel = vi.fn()
+  const child = fakeChild()
+  const source = createPowerEventSource({
+    emit,
+    spawnProcess: (() => child) as never,
+    interfaces: () => {
+      if (readFails) throw new Error('unavailable')
+      return { 'Ethernet': [{ address, family: 'IPv4', netmask: '255.255.255.0', internal: false, mac: '0'.repeat(17), cidr: `${address}/24` }] }
+    },
+    now: () => time,
+    every: (callback: () => void) => { tick = callback; return 7 },
+    cancel,
+    ...overrides
+  })
+  return { source, emit, cancel, tick: () => tick(), set address(value: string) { address = value }, set readFails(value: boolean) { readFails = value }, advance: (ms: number) => { time += ms } }
+}
+
+it('N-83 PowerShell 无输出时,快照层兜底:网卡地址变化→network-change,轮询间隙→wake', () => {
+  const h = snapshotSource()
+  h.tick(); expect(h.emit).not.toHaveBeenCalled()
+  h.address = '192.0.2.99'; h.tick()
+  expect(h.emit).toHaveBeenLastCalledWith('network-change')
+  h.advance(6_000); h.tick()
+  expect(h.emit).toHaveBeenLastCalledWith('wake')
+  h.readFails = true; h.tick(); h.readFails = false; h.tick()
+  // 读取失败保留旧观察:不把失败当断网,也不重复计事件。
+  const calls = h.emit.mock.calls.length
+  h.source.stop()
+  expect(h.cancel).toHaveBeenCalledWith(7)
+  expect(calls).toBe(2)
+})
 
 function fakeChild() {
   const stdout = new EventEmitter()

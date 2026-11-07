@@ -86,6 +86,39 @@ it('启动恢复遇暂时性写失败:按梯子自动重试,恢复成功后照�
   expect(entryStatus(root, 'w-boot-1')).toBe('restored') // 种子账目真还掉了(连接自己新记的账目仍在生效,不在此断言)
 })
 
+it('启动恢复达到有界梯子上限:不退出留下死代理,保留责任短周期重试后接续', async () => {
+  vi.useFakeTimers()
+  const root = directory()
+  const base = createAdapter({ FAKE_WININET_STORE: join(root, 'registry.json') })
+  seedInterrupted(root)
+  base.write({ service: 'WinINET', item: 'ProxyServer' }, { type: 'REG_SZ', data: '127.0.0.1:18080' })
+  let restoreBlocked = true
+  const exits: number[] = []
+  const adapter = { ...base, write: (ref: Parameters<typeof base.write>[0], value: Parameters<typeof base.write>[1]) => {
+    if (restoreBlocked && ref.item === 'ProxyServer') throw Error('temporary registry lock')
+    base.write(ref, value)
+  } }
+  writeIntentFile(root, connectedIntent)
+  const daemon = createDaemon({ dataDir: root, adapter, clock: fakeWallClock(), parentAlive: () => true, onExit: (code) => exits.push(code),
+    connectorFactory: connector, bridgeFactory: bridge })
+  const running = daemon.run()
+  await vi.advanceTimersByTimeAsync(0)
+  // 快速梯子 68 秒 + 启动慢梯子 30 秒用尽后，守护仍留在原地继续承担恢复责任。
+  for (const delay of [1_000, 2_000, 5_000, 10_000, 20_000, 30_000, 30_000]) {
+    await vi.advanceTimersByTimeAsync(delay)
+  }
+  expect(readState(root).code).toBe('TUNNEL_STARTUP_RECOVERY_TIMEOUT')
+  expect(exits).toEqual([])
+
+  restoreBlocked = false
+  await vi.advanceTimersByTimeAsync(5_000)
+  await vi.advanceTimersByTimeAsync(0)
+  await running
+  expect(exits).toEqual([])
+  expect(readState(root).state).toBe('connected')
+  expect(entryStatus(root, 'w-boot-1')).toBe('restored')
+})
+
 it('启动梯子等待中客户点了连接:连接写下的 ProxyServer ⛔ 被梯子醒来当旧账再删一遍(甲-2 返工,基线:删掉约 29 秒)', async () => {
   vi.useFakeTimers()
   const root = directory()

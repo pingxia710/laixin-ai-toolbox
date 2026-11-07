@@ -4,6 +4,7 @@ export declare const CONTROL_CODES: {
   readonly authFailed: '授权失效'
   readonly quotaOrAuth: '配额或授权问题'
   readonly upstreamUnreachable: '上游不可达'
+  readonly localSocksUnavailable: 'TUNNEL_LOCAL_SOCKS_UNAVAILABLE'
   readonly probeUnavailable: 'TUNNEL_PROBE_UNAVAILABLE'
   readonly proxyConflict: '已有代理控制'
   readonly managedPolicy: '受管理环境'
@@ -48,6 +49,8 @@ export interface SshSocksSpec {
   readonly localPort: number
   readonly verifyUrl: string
   readonly verifyFallbackUrl?: string
+  /** 仅本地测试夹具允许回环 HTTP；生产意图不设置。 */
+  readonly allowLocalVerifyUrls?: boolean
   // 测试注入;生产固定为随包 sidecar/win/bin/ssh.exe(缺失即「组件缺失」拒)。
   readonly sshExecutable?: string
   readonly readyTimeoutMs?: number

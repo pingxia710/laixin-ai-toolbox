@@ -73,6 +73,37 @@ describe('restore 子命令接恢复梯子(甲-2)', () => {
     expect(Date.now() - started).toBeLessThan(900) // 没进梯子空等
   })
 
+  it('仅有 connected 意图、没有 recovery-owner/state 接管证据时，restore 仍写出明确终态', () => {
+    const dataDir = makeTempDir('laixin-restore-intent-only-')
+    roots.push(dataDir)
+    const storePath = join(dataDir, 'fake-wininet.json')
+    appendSettingEntry(dataDir, {
+      service: 'WinINET', item: 'ProxyServer', originalValue: null,
+      writtenValue: { type: 'REG_SZ', data: '127.0.0.1:18080' }, sessionToken: 'entry-test', time: Date.now()
+    })
+    writeFileSync(storePath, JSON.stringify({ ProxyServer: { type: 'REG_SZ', data: '127.0.0.1:18080' } }))
+    writeFileSync(join(dataDir, 'intent.json'), JSON.stringify({ desired: 'connected', sessionToken: 'pending-connect' }))
+    const result = runDaemon(['restore', '--data-dir', dataDir, '--adapter', FLAKY_ADAPTER], { FAKE_WININET_STORE: storePath })
+    expect(result.status).toBe(0)
+    expect(JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8'))).toMatchObject({ state: 'stopped-restored' })
+  })
+
+  it('陈旧 connected 状态快照不能让 restore 跳过恢复', () => {
+    const dataDir = makeTempDir('laixin-restore-stale-state-')
+    roots.push(dataDir)
+    const storePath = join(dataDir, 'fake-wininet.json')
+    appendSettingEntry(dataDir, {
+      service: 'WinINET', item: 'ProxyServer', originalValue: null,
+      writtenValue: { type: 'REG_SZ', data: '127.0.0.1:18080' }, sessionToken: 'stale-state', time: Date.now()
+    })
+    writeFileSync(storePath, JSON.stringify({ ProxyServer: { type: 'REG_SZ', data: '127.0.0.1:18080' } }))
+    writeFileSync(join(dataDir, 'state.json'), JSON.stringify({ state: 'connected', runId: 'old-run' }))
+    const result = runDaemon(['restore', '--data-dir', dataDir, '--adapter', FLAKY_ADAPTER], { FAKE_WININET_STORE: storePath })
+    expect(result.status).toBe(0)
+    expect(readFileSync(storePath, 'utf8').trim()).toBe('{}')
+    expect(JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8'))).toMatchObject({ state: 'stopped-restored', runId: expect.any(String) })
+  })
+
   it('梯子等待中意图变成 connected(新守护接手):醒来复查让位,⛔ 把新守护写下的代理当旧账删掉(甲-2 返工,基线:删掉新连接)', () => {
     const dataDir = makeTempDir('laixin-restore-ladder-takeover-')
     roots.push(dataDir)
@@ -96,6 +127,7 @@ describe('restore 子命令接恢复梯子(甲-2)', () => {
     expect(store.ProxyServer?.data).toBe('127.0.0.1:18081')
     const ledger = JSON.parse(readFileSync(join(dataDir, 'ledger.json'), 'utf8')) as Array<{ sessionToken: string; status: string }>
     expect(ledger.find((entry) => entry.sessionToken === 'takeover-daemon')?.status).toBe('applied')
+    expect(JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8'))).toMatchObject({ state: 'connected', runId: 'takeover-daemon' })
     // 本进程没还账就不算完成:如实报「恢复未完成」(完成与否的既有判据不动)
     expect(result.status).toBe(65)
   })
@@ -124,6 +156,7 @@ describe('restore 子命令接恢复梯子(甲-2)', () => {
     expect(store.ProxyServer?.data).toBe('127.0.0.1:18081')
     const ledger = JSON.parse(readFileSync(join(dataDir, 'ledger.json'), 'utf8')) as Array<{ sessionToken: string; status: string }>
     expect(ledger.find((entry) => entry.sessionToken === 'takeover-daemon')?.status).toBe('applied')
+    expect(JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8'))).toMatchObject({ state: 'connected', runId: 'takeover-daemon' })
     // 本进程没还账就不算完成:如实报「恢复未完成」(完成与否的既有判据不动)
     expect(result.status).toBe(65)
   })

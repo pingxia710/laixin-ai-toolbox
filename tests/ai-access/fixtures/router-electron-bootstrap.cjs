@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-require-imports, no-undef */
 // Isolated real Electron child. Only fixture Keys are read, and no real LaunchAgent is touched.
-const { app, BrowserWindow, Tray, nativeImage, safeStorage } = require('electron')
+const { app, BrowserWindow, Tray, nativeImage, safeStorage, net } = require('electron')
 const { spawn } = require('node:child_process')
 const { createHmac, randomBytes } = require('node:crypto')
 const { mkdirSync, readFileSync, writeFileSync } = require('node:fs')
@@ -17,7 +17,7 @@ if (mode === 'setup' && !app.requestSingleInstanceLock()) throw new Error('fixtu
 if (process.argv.includes('--laixin-ai-router')) {
   const upstreamPort = process.env.TOOLBOX_API15R_UPSTREAM_PORT
   const realFetch = global.fetch
-  global.fetch = (input, init) => {
+  net.fetch = (input, init) => {
     const url = new URL(String(input))
     if (url.protocol === 'https:') {
       const provider = url.hostname.includes('deepseek') ? 'deepseek' : 'zhipu-api'

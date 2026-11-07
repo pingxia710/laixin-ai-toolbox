@@ -159,6 +159,10 @@ describe.each([
 
     await daemon.run()
     expect(currentPid()).toBe(8_101)
+    const entryHealth = (daemon as typeof daemon & { entryHealth: { recordFailure(key: string): void } }).entryHealth
+    const headKey = 'entry-1.test.invalid:443'
+    entryHealth.recordFailure(headKey)
+    entryHealth.recordFailure(headKey)
     lossCallbacks[0](new ConnectorError(CONTROL_CODES.upstreamUnreachable))
     clock.advance(2_000)
     await oldCloseEntered

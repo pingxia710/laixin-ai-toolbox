@@ -1,6 +1,7 @@
 import type { EntryStatus, SettingEntry } from './ledger.d.mts'
 
 export interface RestoreResult {
+  readonly reasonCodes?: string[]
   readonly restored: SettingEntry[]
   readonly keptModified: SettingEntry[]
   readonly failed: SettingEntry[]
@@ -10,7 +11,7 @@ export interface RestoreResult {
 
 export interface SettingsAdapter {
   valuesEqual?(left: unknown, right: unknown, ref?: { service: string; item: string }): boolean
-  identifyPortOwner?(port: number | undefined): { kind: string; pid?: number; name?: string } | undefined
+  identifyPortOwner?(port: number | undefined, options?: { fresh?: boolean }): { kind: string; pid?: number; name?: string; reason?: string } | undefined
   preserveExternalChanges?(ref: { service: string; item: string }): boolean
   restoredValueMatches?(current: unknown, originalValue: unknown, writtenValue: unknown): boolean
   broadcastSettingsChanged?(): void
@@ -25,8 +26,13 @@ export interface RecoveryResult {
   diagnostics: string | undefined
 }
 
-export declare function recoverLedger(dataDir: string, adapter: SettingsAdapter): RecoveryResult | undefined
-export declare function restoreLedger(dataDir: string, adapter: SettingsAdapter): RestoreResult
+export interface RestoreOptions {
+  readonly knownOwnPorts?: readonly number[]
+}
+
+export declare function ownPortSet(explicit?: readonly number[]): Set<number>
+export declare function recoverLedger(dataDir: string, adapter: SettingsAdapter, options?: RestoreOptions): RecoveryResult | undefined
+export declare function restoreLedger(dataDir: string, adapter: SettingsAdapter, options?: RestoreOptions): RestoreResult
 export declare function rebroadcastSettings(dataDir: string, adapter: SettingsAdapter): boolean
 export declare function notifyOwed(dataDir: string): boolean
 export declare function markNotifyOwed(dataDir: string, owed: boolean): void

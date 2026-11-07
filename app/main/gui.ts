@@ -14,6 +14,8 @@ import { createMainCrashLog, createRendererRecovery } from './desktop/renderer-r
 import { actionLocalFault } from './bridge/local-fault'
 import { recordFault } from './diagnostics/context'
 import { wechatLoginPanel } from './account/wechat-panel'
+import { acquireGuiNetworkController } from './tunnel/controller-seat'
+import { resolveTunnelDataDir } from './tunnel/paths'
 
 // 主进程顶层异常落盘(收敛包3·件3):⛔ 静默丢失。
 const logMainCrash = createMainCrashLog((line) => {
@@ -93,6 +95,15 @@ export function startApplication(): void {
   if (!primaryInstance) { app.exit(0); return }
   app.on('second-instance', () => desktop?.show())
   void app.whenReady().then(async () => {
+    let releaseController: () => void
+    try { releaseController = await acquireGuiNetworkController(resolveTunnelDataDir(process.env, app.getPath('userData'))) }
+    catch (error) {
+      logBridgeDiagnostic('APPLICATION_START_FAILED', 'network-controller', error)
+      await dialog.showMessageBox({ type: 'error', title: '来信AI工具箱', message: '后台通道管理尚未完成交接，请稍后重新打开工具箱。' })
+      app.exit(1)
+      return
+    }
+    process.once('exit', releaseController)
     registerDiscoveredActions(bridgeRegistry, actionModules)
     desktop = new DesktopRuntime(bridgeRegistry)
     registerDesktopActions(bridgeRegistry, desktop)

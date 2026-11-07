@@ -1,0 +1,757 @@
+{
+  "schemaVersion": 1,
+  "scope": "network-function",
+  "version": "0.7.4",
+  "evaluatedCommit": "51673b263651525b6d497125ba20da8f90e6109e",
+  "operationalEvidence": {
+    "status": "separate",
+    "reason": "生产/真实客户连续证据单独记录，不阻塞当前功能等级；V1.0 前必须补客户端稳定性、恢复和性能连续监测。安装包、哈希、安装卸载和更新清单不参与本账本。",
+    "v1Monitoring": {
+      "status": "required-before-v1",
+      "signals": [
+        "连接成功率",
+        "首次可用耗时",
+        "重连/恢复耗时",
+        "目标请求成功率",
+        "吞吐与延迟分桶",
+        "CPU/内存/崩溃与死代理",
+        "匿名体验重复领取拦截"
+      ],
+      "privacy": "只上传脱敏阶段码、版本、平台、时间桶、性能分桶和结果；不上传令牌、密钥、原始路径、完整 IP 或 AI 内容。"
+    }
+  },
+  "excluded": [
+    {
+      "id": "NET-12",
+      "reason": "包、平台与原生交付证据属于 release gate，不是网络运行功能。",
+      "separateLedger": "docs/abc-a-plus-evidence.json"
+    }
+  ],
+  "modules": [
+    {
+      "id": "NET-01",
+      "customerOutcome": "首次安装不要求先注册，自动获得一次匿名临时账号和 5 GB/48 小时体验；同一台电脑不能靠重装、清缓存或换账号反复领取，耗尽后转正式账号或付费。",
+      "scenarios": [
+        "首次匿名领取",
+        "同设备重装/清缓存",
+        "匿名额度耗尽",
+        "匿名转正式账号/付费"
+      ],
+      "gates": {
+        "contract": {
+          "status": "partial",
+          "evidence": [
+            "现有 trialTerms=5 GB/48 小时、每账号一次",
+            "现有 deviceId/session 绑定能力"
+          ],
+          "missing": [
+            "匿名临时账号与设备唯一绑定合同",
+            "匿名体验耗尽/到期后的正式路径合同"
+          ]
+        },
+        "normal": {
+          "status": "pending",
+          "evidence": [],
+          "missing": [
+            "首次安装无需登录即可领取匿名 5 GB"
+          ]
+        },
+        "failure": {
+          "status": "pending",
+          "evidence": [],
+          "missing": [
+            "同设备重装、清缓存和换临时账号不能重复领取"
+          ]
+        },
+        "recovery": {
+          "status": "pending",
+          "evidence": [],
+          "missing": [
+            "网络抖动或客户端重启后匿名资格幂等恢复，不重复发放"
+          ]
+        },
+        "customerOutcome": {
+          "status": "pending",
+          "evidence": [],
+          "missing": [
+            "小白用户可看到剩余流量、剩余时间和下一步动作"
+          ]
+        },
+        "boundary": {
+          "status": "pending",
+          "evidence": [],
+          "missing": [
+            "Windows/Mac 首次启动、重装和本地数据保留的设备绑定矩阵"
+          ]
+        }
+      },
+      "missing": [
+        "匿名临时账号服务端入口",
+        "稳定设备绑定和重复领取拦截",
+        "匿名体验耗尽/到期后的转正式账号动作"
+      ],
+      "nextChecks": [
+        "新增匿名体验端点：按设备绑定幂等发放 5 GB/48 小时临时账号；同设备再次请求只返回原资格或明确耗尽。",
+        "在客户端把匿名状态、剩余额度和转正式账号入口做成小白可理解的结果；不显示开通中/撤销等后台状态。"
+      ],
+      "lifecycle": "deferred"
+    },
+    {
+      "id": "NET-02",
+      "customerOutcome": "小白用户在家庭 Wi-Fi、普通网线或手机热点下能知道 AI 通道卡在哪一段，换网后能恢复；不承诺企业网络兼容。",
+      "scenarios": [
+        "家庭 Wi-Fi",
+        "普通网线",
+        "手机热点",
+        "默认路径变化",
+        "基础 DNS/TCP/TLS"
+      ],
+      "gates": {
+        "contract": {
+          "status": "pass",
+          "evidence": [
+            "分层结果码与 unknown 合同",
+            "tests/channel/reachability.test.ts"
+          ],
+          "missing": []
+        },
+        "normal": {
+          "status": "pass",
+          "evidence": [
+            "reachability 定向 9/9",
+            "precheck path matrix tests"
+          ],
+          "missing": []
+        },
+        "failure": {
+          "status": "pass",
+          "evidence": [
+            "缺失/损坏 source map fail-closed",
+            "目标/通用结果分层"
+          ],
+          "missing": []
+        },
+        "recovery": {
+          "status": "pass",
+          "evidence": [
+            "QNET-001/QNET-004 网络变化与唤醒复验"
+          ],
+          "missing": []
+        },
+        "customerOutcome": {
+          "status": "pass",
+          "evidence": [
+            "阶段化诊断结果与可执行动作"
+          ],
+          "missing": []
+        },
+        "boundary": {
+          "status": "partial",
+          "evidence": [
+            "基础路径分层与 reachability 9/9",
+            "QNET-001/QNET-004 换网与唤醒回归"
+          ],
+          "missing": [
+            "真实家庭 Wi-Fi/手机热点样本"
+          ]
+        }
+      },
+      "missing": [
+        "真实家庭/手机热点连续样本"
+      ],
+      "nextChecks": [
+        "在真实客户运行监测中按家庭 Wi-Fi、网线、手机热点记录分桶结果；企业网络/PAC/VPN 不列为产品门槛。"
+      ],
+      "lifecycle": "active"
+    },
+    {
+      "id": "NET-03",
+      "customerOutcome": "普通用户无需理解代理术语；已有本机路径时尽量复用，冲突时保护原设置，不因来信安装误伤其他软件。",
+      "scenarios": [
+        "可用路径复用",
+        "不可用路径接管",
+        "第三方争抢",
+        "未知归属与恢复"
+      ],
+      "gates": {
+        "contract": {
+          "status": "pass",
+          "evidence": [
+            "network-availability-controller 状态合同",
+            "proxy identity/ownership tests"
+          ],
+          "missing": []
+        },
+        "normal": {
+          "status": "pass",
+          "evidence": [
+            "QNET-002/QNET-012",
+            "reuse-existing 与 existing-proxy-adapters tests"
+          ],
+          "missing": []
+        },
+        "failure": {
+          "status": "pass",
+          "evidence": [
+            "yield-to-contender 与 proxy-conflict-scope tests"
+          ],
+          "missing": []
+        },
+        "recovery": {
+          "status": "pass",
+          "evidence": [
+            "ledger/restore/partial-recovery tests"
+          ],
+          "missing": []
+        },
+        "customerOutcome": {
+          "status": "pass",
+          "evidence": [
+            "冲突时保留外部设置、恢复结果可解释"
+          ],
+          "missing": []
+        },
+        "boundary": {
+          "status": "pass",
+          "evidence": [
+            "真实守护进程 + 隔离适配器的复用/接管/让位矩阵"
+          ],
+          "missing": []
+        }
+      },
+      "missing": [],
+      "nextChecks": [
+        "持续收集真实复杂环境反馈；发现独立问题时单独开修复项。"
+      ],
+      "lifecycle": "active"
+    },
+    {
+      "id": "NET-04",
+      "customerOutcome": "AI 请求真正经过本机入口；端口冲突、半开和异常关闭会收尾，用户看到可继续使用或可操作的失败。",
+      "scenarios": [
+        "端口候选",
+        "真实请求承接",
+        "半开/FIN",
+        "端口与子进程清理"
+      ],
+      "gates": {
+        "contract": {
+          "status": "pass",
+          "evidence": [
+            "local-bridge/socks5 合同测试",
+            "bridge teardown contract"
+          ],
+          "missing": []
+        },
+        "normal": {
+          "status": "pass",
+          "evidence": [
+            "verify:bridge PASS",
+            "QNET-003/QNET-007 真实回环请求"
+          ],
+          "missing": []
+        },
+        "failure": {
+          "status": "pass",
+          "evidence": [
+            "bridge-teardown-hang 与异常 FIN 测试"
+          ],
+          "missing": []
+        },
+        "recovery": {
+          "status": "pass",
+          "evidence": [
+            "disconnect-live-bridge 与端口关闭回读"
+          ],
+          "missing": []
+        },
+        "customerOutcome": {
+          "status": "pass",
+          "evidence": [
+            "请求可达/停止后监听关闭/失败码可解释"
+          ],
+          "missing": []
+        },
+        "boundary": {
+          "status": "pass",
+          "evidence": [
+            "真实 Electron bridge、真实子进程、12 个反向变体"
+          ],
+          "missing": []
+        }
+      },
+      "missing": [],
+      "nextChecks": [
+        "持续把真实客户桥故障按 NET-04 归档；无需等待安装包证据才可判功能。"
+      ],
+      "lifecycle": "active"
+    },
+    {
+      "id": "NET-05",
+      "customerOutcome": "AI 通道完成上游握手和出口复验；内核异常时不假报成功，恢复后请求重新可用。",
+      "scenarios": [
+        "REALITY 握手",
+        "出口复验",
+        "内核被杀",
+        "入口故障后的请求恢复"
+      ],
+      "gates": {
+        "contract": {
+          "status": "pass",
+          "evidence": [
+            "vless/xray runner 状态合同",
+            "transport-ready 分层测试"
+          ],
+          "missing": []
+        },
+        "normal": {
+          "status": "pass",
+          "evidence": [
+            "QNET-003/QNET-009",
+            "真实本地 Xray/REALITY 回环"
+          ],
+          "missing": []
+        },
+        "failure": {
+          "status": "pass",
+          "evidence": [
+            "kernel-kill-recovery 与 upstream FIN/半开测试"
+          ],
+          "missing": []
+        },
+        "recovery": {
+          "status": "pass",
+          "evidence": [
+            "被杀后先恢复设置、重拉新 PID、真实请求恢复"
+          ],
+          "missing": []
+        },
+        "customerOutcome": {
+          "status": "pass",
+          "evidence": [
+            "传输状态与请求结果一致，不借旧成功快照"
+          ],
+          "missing": []
+        },
+        "boundary": {
+          "status": "pass",
+          "evidence": [
+            "真实 Xray/回环节点/故障注入矩阵"
+          ],
+          "missing": []
+        }
+      },
+      "missing": [],
+      "nextChecks": [
+        "生产节点和客户长连接属于运营证据，另账记录，不回写为包验收。"
+      ],
+      "lifecycle": "active"
+    },
+    {
+      "id": "NET-06",
+      "customerOutcome": "传输已建立与 AI 目标已确认分开显示，目标失败不会伪装成通道成功或失败。",
+      "scenarios": [
+        "通用通道成功",
+        "目标 AI 失败",
+        "目标恢复",
+        "API-only 目标白名单"
+      ],
+      "gates": {
+        "contract": {
+          "status": "pass",
+          "evidence": [
+            "N-72 target readiness contract",
+            "TUNNEL_TARGET_UNCONFIRMED mapping"
+          ],
+          "missing": []
+        },
+        "normal": {
+          "status": "pass",
+          "evidence": [
+            "recovery-probes/http-probe-terminal tests"
+          ],
+          "missing": []
+        },
+        "failure": {
+          "status": "pass",
+          "evidence": [
+            "目标失败保留传输、不中断通道的回归"
+          ],
+          "missing": []
+        },
+        "recovery": {
+          "status": "pass",
+          "evidence": [
+            "目标恢复后清除待确认状态"
+          ],
+          "missing": []
+        },
+        "customerOutcome": {
+          "status": "pass",
+          "evidence": [
+            "UI/诊断明确显示目标待确认，不冒充登录/额度成功"
+          ],
+          "missing": []
+        },
+        "boundary": {
+          "status": "partial",
+          "evidence": [
+            "隔离目标 HTTP 响应夹具"
+          ],
+          "missing": [
+            "真实 AI 目标请求与权限边界回读"
+          ]
+        }
+      },
+      "missing": [
+        "真实 AI 目标请求"
+      ],
+      "nextChecks": [
+        "用受控真实 AI 目标做轻量请求，记录目标响应类别；不读取或记录账号凭据。"
+      ],
+      "lifecycle": "active"
+    },
+    {
+      "id": "NET-07",
+      "customerOutcome": "普通用户不需要理解系统代理细节；连接时能写入，断开或失败后能恢复，不留下死代理。",
+      "scenarios": [
+        "写入读回",
+        "部分恢复",
+        "第三方修改",
+        "断开/失败恢复"
+      ],
+      "gates": {
+        "contract": {
+          "status": "pass",
+          "evidence": [
+            "ledger/restore/write-right-owner contracts"
+          ],
+          "missing": []
+        },
+        "normal": {
+          "status": "pass",
+          "evidence": [
+            "QNET-002/QNET-007",
+            "disconnect-live-bridge"
+          ],
+          "missing": []
+        },
+        "failure": {
+          "status": "pass",
+          "evidence": [
+            "partial-recovery 与 restore fault tests"
+          ],
+          "missing": []
+        },
+        "recovery": {
+          "status": "pass",
+          "evidence": [
+            "恢复受阻保留现场、成功后关闭实际监听"
+          ],
+          "missing": []
+        },
+        "customerOutcome": {
+          "status": "pass",
+          "evidence": [
+            "不谎报已恢复，失败提供重试/动作终态"
+          ],
+          "missing": []
+        },
+        "boundary": {
+          "status": "partial",
+          "evidence": [
+            "隔离 WinINET/networksetup 适配器与所有权矩阵"
+          ],
+          "missing": [
+            "当前版本真实系统设置读回组合"
+          ]
+        }
+      },
+      "missing": [
+        "真实系统设置/权限组合验证"
+      ],
+      "nextChecks": [
+        "执行真实系统适配器的最小读回场景；不得把安装器或包哈希当作本项证据。"
+      ],
+      "lifecycle": "active"
+    },
+    {
+      "id": "NET-08",
+      "customerOutcome": "断网、强杀、换网和主动断开后能自动恢复或明确停止，用户不用手动清理后台进程。",
+      "scenarios": [
+        "短断",
+        "长断",
+        "内核被杀",
+        "唤醒/换网",
+        "主动断开与旧代 fencing"
+      ],
+      "gates": {
+        "contract": {
+          "status": "pass",
+          "evidence": [
+            "daemon lifecycle/epoch/intent contracts"
+          ],
+          "missing": []
+        },
+        "normal": {
+          "status": "pass",
+          "evidence": [
+            "QNET-001/QNET-004/QNET-005"
+          ],
+          "missing": []
+        },
+        "failure": {
+          "status": "pass",
+          "evidence": [
+            "network-reliability 44 tests、start-disconnect-race"
+          ],
+          "missing": []
+        },
+        "recovery": {
+          "status": "pass",
+          "evidence": [
+            "QNET-001～QNET-012 全部通过"
+          ],
+          "missing": []
+        },
+        "customerOutcome": {
+          "status": "pass",
+          "evidence": [
+            "主动断开优先、失败先恢复普通网络、终态可执行"
+          ],
+          "missing": []
+        },
+        "boundary": {
+          "status": "pass",
+          "evidence": [
+            "真实守护/Xray/回环请求 + 双平台逻辑 + 故障注入"
+          ],
+          "missing": []
+        }
+      },
+      "missing": [],
+      "nextChecks": [
+        "物理睡眠/换网属于现场运营覆盖，发现问题再开独立修复。"
+      ],
+      "lifecycle": "active"
+    },
+    {
+      "id": "NET-09",
+      "customerOutcome": "当前入口故障时能安全换到健康入口；没有证据时停止并说明，不偷偷直连。",
+      "scenarios": [
+        "当前入口故障",
+        "健康备用入口",
+        "目标节点证据不足",
+        "全部耗尽"
+      ],
+      "gates": {
+        "contract": {
+          "status": "pass",
+          "evidence": [
+            "single-address binding and failover contracts"
+          ],
+          "missing": []
+        },
+        "normal": {
+          "status": "pass",
+          "evidence": [
+            "single-address runtime tests",
+            "dual-node isolated A→B"
+          ],
+          "missing": []
+        },
+        "failure": {
+          "status": "pass",
+          "evidence": [
+            "NODE_NOT_ACCEPTING keeps source binding"
+          ],
+          "missing": []
+        },
+        "recovery": {
+          "status": "pass",
+          "evidence": [
+            "bindingVersion 1→2、旧授权退役、新授权启用"
+          ],
+          "missing": []
+        },
+        "customerOutcome": {
+          "status": "pass",
+          "evidence": [
+            "客户入口不变、故障时安全刷新，不发放无证据替代额度"
+          ],
+          "missing": []
+        },
+        "boundary": {
+          "status": "pass",
+          "evidence": [
+            "本地双节点真实 REALITY 数据面 + 节点上联序列测试"
+          ],
+          "missing": []
+        }
+      },
+      "missing": [],
+      "nextChecks": [
+        "生产 canary 和真实客户 A→B 是运营证据，另账记录。"
+      ],
+      "lifecycle": "active"
+    },
+    {
+      "id": "NET-10",
+      "customerOutcome": "入口切换、重试、到期和账号切换不重复计量、不串权益，未知用量不被当作零。",
+      "scenarios": [
+        "并发上传/下载计量",
+        "跨入口迁移",
+        "用量单调",
+        "到期/账号隔离"
+      ],
+      "gates": {
+        "contract": {
+          "status": "pass",
+          "evidence": [
+            "NodeMeter/lease/migration contracts"
+          ],
+          "missing": []
+        },
+        "normal": {
+          "status": "pass",
+          "evidence": [
+            "node-meter concurrent quota tests",
+            "migration usage assertions"
+          ],
+          "missing": []
+        },
+        "failure": {
+          "status": "pass",
+          "evidence": [
+            "write failure、identity mismatch、usage regression guards"
+          ],
+          "missing": []
+        },
+        "recovery": {
+          "status": "pass",
+          "evidence": [
+            "128/1024→剩余896、迁移 complete、重启后账本保持"
+          ],
+          "missing": []
+        },
+        "customerOutcome": {
+          "status": "pass",
+          "evidence": [
+            "未知/在途用量不显示为可用余额，重复扣量被拒绝"
+          ],
+          "missing": []
+        },
+        "boundary": {
+          "status": "pass",
+          "evidence": [
+            "隔离双节点迁移和持久计量文件回读"
+          ],
+          "missing": []
+        }
+      },
+      "missing": [],
+      "nextChecks": [
+        "真实客户连续计量属于运营证据；匿名体验的设备绑定与转正式套餐在 0.8 单独实现。"
+      ],
+      "lifecycle": "active"
+    },
+    {
+      "id": "NET-11",
+      "customerOutcome": "客户端能用脱敏监测说明稳定性和性能问题，上传失败不阻塞通道；客服能知道是连接慢、恢复慢还是目标失败。",
+      "scenarios": [
+        "连接成功/失败",
+        "首次可用耗时",
+        "重连恢复",
+        "延迟/吞吐分桶",
+        "CPU/内存/崩溃",
+        "匿名重复领取拦截",
+        "监测上传失败"
+      ],
+      "gates": {
+        "contract": {
+          "status": "pass",
+          "evidence": [
+            "diagnostic-event queue/redaction/failure-code contracts"
+          ],
+          "missing": []
+        },
+        "normal": {
+          "status": "pass",
+          "evidence": [
+            "customer-diagnosis/customer-diagnostic-events tests"
+          ],
+          "missing": []
+        },
+        "failure": {
+          "status": "pass",
+          "evidence": [
+            "reachability 9/9、缺失/损坏 map fail-closed、上传失败回归"
+          ],
+          "missing": []
+        },
+        "recovery": {
+          "status": "pass",
+          "evidence": [
+            "离线队列重试与幂等事件测试"
+          ],
+          "missing": []
+        },
+        "customerOutcome": {
+          "status": "pass",
+          "evidence": [
+            "诊断包阶段码、动作建议和敏感字段脱敏"
+          ],
+          "missing": []
+        },
+        "boundary": {
+          "status": "partial",
+          "evidence": [
+            "诊断事件队列/脱敏/失败关闭",
+            "来源映射缺失 fail-closed"
+          ],
+          "missing": [
+            "V1.0 前真实客户端连续监测、聚合和容量回读"
+          ]
+        }
+      },
+      "missing": [
+        "V1.0 前真实客户端连续监测和聚合回读"
+      ],
+      "nextChecks": [
+        "复用现有 connection-attempt、diagnostic-event 和 reachability 队列，增加性能分桶与稳定性汇总；先在 V1.0 前持续收集，默认不记录令牌、密钥、原始路径或 AI 内容。"
+      ],
+      "lifecycle": "active"
+    }
+  ],
+  "productScope": {
+    "audience": "以不熟悉电脑的个人客户为主",
+    "promise": "下载安装 Codex 后，用尽量少的操作获得稳定、可恢复、性能可解释的 AI 网络通道。",
+    "anonymousTrial": {
+      "quotaBytes": 5368709120,
+      "termHours": 48,
+      "grant": "首次安装自动获得一次临时账号与 5 GB 体验",
+      "deviceRule": "同一台电脑只允许一次匿名体验；重装、清缓存或换临时账号不能重置资格",
+      "nextState": "额度耗尽或到期后进入正式账号/付费路径",
+      "deferredTo": "0.8"
+    },
+    "inScopeEnvironments": [
+      "家庭 Wi-Fi",
+      "普通网线",
+      "手机热点",
+      "常规公网路径"
+    ],
+    "outOfScope": [
+      "企业网络部署",
+      "PAC/WPAD 企业策略矩阵",
+      "企业 VPN/TUN 兼容承诺"
+    ],
+    "stabilityMonitoring": "在 V1.0 前持续收集脱敏稳定性与性能指标，客户运行证据单独记账。"
+  },
+  "deferred": [
+    {
+      "id": "NET-01",
+      "targetVersion": "0.8",
+      "reason": "匿名临时账号、单机一次 5 GB/48 小时和防重复领取属于 0.8 产品能力；0.7 不实现也不计入当前功能分数。"
+    }
+  ]
+}

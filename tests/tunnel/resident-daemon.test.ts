@@ -114,6 +114,15 @@ describe('守护常驻模式', () => {
     expect(readFakeStore(s.storePath)['Wi-Fi/socks-proxy']).toBeDefined()
   }, 30_000)
 
+  it('fallback 带主进程 run-id 时仍按常驻语义脱离 IPC，状态/席位使用同一身份', async () => {
+    const s = await stage()
+    const first = s.launch(['--resident', '1', '--run-id', 'fallback-run'])
+    await waitFor(() => s.state()?.state === 'connected', 15_000, `fallback 连上；stderr=${first.stderr()}`)
+    expect(s.state()?.runId).toBe('fallback-run')
+    expect(readInstanceLock(s.root)?.holder?.runId).toBe('fallback-run')
+    expect(readFakeStore(s.storePath)['Wi-Fi/socks-proxy']).toBeDefined()
+  }, 30_000)
+
   it('第二个常驻守护安静让位（退出 0），⛔ 踢掉在跑的那个、⛔ 动它的系统设置', async () => {
     const s = await stage()
     const first = s.launch(['--resident', '1'], 'resident-a')

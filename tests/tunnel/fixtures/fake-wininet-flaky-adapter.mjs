@@ -27,6 +27,9 @@ export function createAdapter(env = process.env) {
       })
       writeFileSync(ledgerPath, `${JSON.stringify(settled, null, 1)}\n`)
       writeFileSync(join(takeoverDataDir, 'intent.json'), `${JSON.stringify({ desired: 'connected', sessionToken: 'takeover-daemon' })}\n`)
+      writeFileSync(join(takeoverDataDir, 'state.json'), `${JSON.stringify({ state: 'connected', runId: 'takeover-daemon', sessionToken: 'takeover-daemon' })}\n`)
+      // 真实接管还必须在设置锁内发布更高 recovery-owner 代次；state.json 只是诊断快照。
+      writeFileSync(join(takeoverDataDir, 'recovery-owner.json'), `${JSON.stringify({ runId: 'takeover-daemon', generation: 1, claimedAt: Date.now() })}\n`)
       const store = JSON.parse(readFileSync(storePath, 'utf8'))
       store.ProxyServer = { type: 'REG_SZ', data: '127.0.0.1:18081' }
       writeFileSync(storePath, JSON.stringify(store))

@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "version": "0.7.4",
+  "package": {
+    "windowsSha256": "788a48c239113f0720e28904d1194ccc060dcbd989b64abe70890d47c45125c6"
+  },
+  "cases": [
+    { "id": "U-01", "network": "connected", "app": "open", "status": "pending", "evidence": [] },
+    { "id": "U-02", "network": "connected", "app": "exited", "status": "pending", "evidence": [] },
+    { "id": "U-03", "network": "disconnected", "app": "open", "status": "pending", "evidence": [] },
+    { "id": "U-04", "network": "disconnected", "app": "exited", "status": "pending", "evidence": [] }
+  ]
+}
