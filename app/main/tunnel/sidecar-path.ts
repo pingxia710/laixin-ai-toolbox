@@ -8,15 +8,26 @@ interface SidecarPlatformSpec {
   readonly components: readonly string[]
 }
 
+// shared/ 是运行时唯一源。这里显式列出全部可被 ESM 传递导入的运行文件，
+// 不再只靠入口文件手工猜依赖；新增 shared 运行模块若未进入闸门，typecheck/测试会先暴露。
+const SHARED_RUNTIME_COMPONENTS = [
+  'api-destination-gate.mjs', 'api-network-continuation.mjs', 'connection-funnel.mjs',
+  'connection-settings.mjs', 'continuity-evidence.mjs', 'continuity-probe.mjs', 'daemon-core.mjs',
+  'emergency-recovery-adapter.mjs', 'entry-health.mjs', 'http-verify.mjs', 'instance-lock.mjs', 'ledger.mjs', 'local-bridge.mjs',
+  'net-phase.mjs', 'network-availability-controller.mjs', 'proxy-identity.mjs', 'resident-integrity.mjs', 'runtime-observation.mjs',
+  'restore-observation.mjs', 'restore.mjs', 'routes.default.json', 'socks5.mjs', 'tunnel-daemon.mjs',
+  'vless-connector.mjs', 'vless-settings.mjs', 'write-right-owner.mjs', 'xray-runner.mjs'
+] as const
+
 // 各平台 sidecar 目录与随包组件清单;缺失任何一项 = 「组件缺失」⛔ 静默起连接。
 const SIDECAR_BY_PLATFORM: Record<Platform, SidecarPlatformSpec> = {
   macos: {
     directory: 'mac',
-    components: ['tunnel-daemon.mjs', 'adapter-networksetup.mjs', 'proxy-privilege.mjs', 'bin/proxy-helper', 'active-network-path.mjs', 'managed-adapter.mjs', 'port-owner.mjs', 'macos-write-right.mjs', 'bin/write-lock', 'terminal-environment.mjs', 'power-events.mjs', 'ledger.mjs', 'restore.mjs', 'restore-observation.mjs', 'daemon-core.mjs', 'routes.default.json', 'local-bridge.mjs', 'xray-runner.mjs', 'vless-connector.mjs', 'vless-settings.mjs', 'instance-lock.mjs', 'resident-integrity.mjs']
+    components: [...SHARED_RUNTIME_COMPONENTS, 'adapter-networksetup.mjs', 'proxy-privilege.mjs', 'bin/proxy-helper', 'active-network-path.mjs', 'managed-adapter.mjs', 'port-owner.mjs', 'macos-write-right.mjs', 'bin/write-lock', 'terminal-environment.mjs', 'power-events.mjs', 'connectors.mjs']
   },
   windows: {
     directory: 'win',
-    components: ['tunnel-daemon.mjs', 'adapter-wininet.mjs', 'managed-adapter.mjs', 'terminal-environment.mjs', 'wininet-settings.ps1', 'power-events.mjs', 'ledger.mjs', 'restore.mjs', 'restore-observation.mjs', 'daemon-core.mjs', 'routes.default.json', 'local-bridge.mjs', 'xray-runner.mjs', 'vless-connector.mjs', 'vless-settings.mjs', 'instance-lock.mjs', 'resident-integrity.mjs']
+    components: [...SHARED_RUNTIME_COMPONENTS, 'adapter-wininet.mjs', 'managed-adapter.mjs', 'terminal-environment.mjs', 'wininet-settings.ps1', 'wininet-values.mjs', 'wininet-write-right.mjs', 'power-events.mjs', 'port-owner.mjs', 'connectors.mjs']
   }
 }
 

@@ -80,6 +80,10 @@ function buildProject(tempRoot) {
     encoding: 'utf8',
     stdio: 'pipe'
   })
+  // electron-vite 将主进程代码落在 out/main/chunks;未打包态的相对定位因此
+  // 以 out 为 repoRoot。把源码 sidecar 放到该构建根,让桥自证读到真实运行组件,
+  // 而不是用一整串缺失文件把 componentMissing 顶出 status schema 上限。
+  cpSync(join(tempRoot, 'sidecar'), join(tempRoot, 'out', 'sidecar'), { recursive: true })
 }
 
 // 原始探测:返回 { state, source, pending } 或 { error },不自行断言(供 verifyTunnelBridge 与

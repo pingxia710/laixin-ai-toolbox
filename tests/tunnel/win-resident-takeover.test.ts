@@ -19,6 +19,7 @@ const control = vi.hoisted(() => ({
     + 'Register-ScheduledTask : Access is denied. (Exception from HRESULT: 0x80070005 (E_ACCESSDENIED))',
   taskExists: true,
   taskState: 'Ready',
+  enableFailure: '',
   disableFailure: '',
   disableFailures: {} as Record<string, string>,
   readback: 'json' as 'json' | 'multi' | 'absent',
@@ -50,6 +51,10 @@ vi.mock('node:child_process', async (importOriginal) => {
     }
     if (file === 'schtasks.exe') {
       if ((args as string[])[0] === '/query' && !control.taskExists) error = new Error('ERROR: The scheduled task does not exist')
+      if ((args as string[])[0] === '/change' && (args as string[])[3] === '/enable') {
+        if (control.enableFailure !== '') error = new Error(control.enableFailure)
+        else control.taskState = 'Ready'
+      }
       if ((args as string[])[0] === '/change' && (args as string[])[3] === '/disable') {
         const failure = control.disableFailures[(args as string[])[2]] ?? control.disableFailure
         if (failure !== '') error = new Error(failure)
@@ -91,6 +96,7 @@ afterEach(() => {
     + 'Register-ScheduledTask : Access is denied. (Exception from HRESULT: 0x80070005 (E_ACCESSDENIED))'
   control.taskExists = true
   control.taskState = 'Ready'
+  control.enableFailure = ''
   control.disableFailure = ''
   control.disableFailures = {}
   control.readback = 'json'
@@ -116,6 +122,18 @@ const seedExisting = (action: { execute: string; arguments: string; workingDirec
 }
 
 describe('installWinResident:注册被拒时读回存量任务,逐字段比对', () => {
+  it('新注册回读仍为 Disabled → 显式启用并回读后才上报生效', async () => {
+    control.home = makeTempDir('j10rw-disabled-after-register-')
+    roots.push(control.home)
+    control.taskState = 'Disabled'
+
+    const outcome = await installWinResident(spec, RESIDENT_TASK)
+
+    expect(outcome.installed).toBe(true)
+    expect(control.calls.some((call) => call.file === 'schtasks.exe' && call.args[0] === '/change' && call.args[3] === '/enable')).toBe(true)
+    expect(await winResidentArmed(RESIDENT_TASK)).toBe(true)
+  })
+
   it('路径含 % 时先停当前与历史常驻，再回退直启；不能停则如实标为存量任务，⛔ 把 Ready 误报成当前常驻', async () => {
     control.home = makeTempDir('j10rw-percent-')
     roots.push(control.home)
@@ -177,6 +195,34 @@ describe('installWinResident:注册被拒时读回存量任务,逐字段比对',
     expect(outcome.existingTaskStale).toBeFalsy()
     expect(winResidentStaleTask()).toBe(false)
     expect(await winResidentArmed(RESIDENT_TASK)).toBe(true)
+  })
+
+  it('定义一致但任务被更新前置闸留下 Disabled → 先启用并回读再上报生效', async () => {
+    control.home = makeTempDir('j10rw-disabled-after-update-')
+    roots.push(control.home)
+    seedExisting(winTaskAction(spec))
+    control.taskState = 'Disabled'
+
+    const outcome = await installWinResident(spec, RESIDENT_TASK)
+
+    expect(outcome.installed).toBe(true)
+    expect(control.calls.some((call) => call.file === 'schtasks.exe' && call.args[0] === '/change' && call.args[3] === '/enable')).toBe(true)
+    expect(await winResidentArmed(RESIDENT_TASK)).toBe(true)
+  })
+
+  it('任务仍 Disabled 且启用回读失败 → 如实保持未生效，等待下一次校准', async () => {
+    control.home = makeTempDir('j10rw-disabled-retry-')
+    roots.push(control.home)
+    seedExisting(winTaskAction(spec))
+    control.taskState = 'Disabled'
+    control.enableFailure = 'ERROR: Access is denied.'
+
+    const outcome = await installWinResident(spec, RESIDENT_TASK)
+
+    expect(outcome.installed).toBe(false)
+    expect(outcome.existingTaskStale).toBeFalsy()
+    expect(outcome.reason).toContain('现有常驻任务未启用')
+    expect(await winResidentArmed(RESIDENT_TASK)).toBe(false)
   })
 
   it('参数一字之差 → installed:false + existingTaskStale,识别层答「没生效」(⛔ 模糊匹配)', async () => {

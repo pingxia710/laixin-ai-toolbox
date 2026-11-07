@@ -27,3 +27,11 @@ export declare function armStartupWatchdog(options?: {
   exit?: (code: number) => void
   timeoutMs?: number
 }): () => void
+
+export declare function recoverAfterAdapterLoadFailure(options: {
+  dataDir: string
+  runId: string
+  recoveryOwnershipObserved?: { generation: number }
+  createAdapter?: () => unknown
+  log?: (line: string) => void
+}): Promise<{ restored: boolean; handedOver: boolean }>

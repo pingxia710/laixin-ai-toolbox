@@ -8,8 +8,8 @@
 //  2. **正常退出不许被拉起**。客户点断开、退出账号、退出工具箱 → 守护还原后以 0 退出 → 系统 ⛔ 复活它。
 //     只有非正常退出（崩溃、被杀、还原未完成的 65）才拉起。macOS 用 KeepAlive.SuccessfulExit=false 表达这条
 //     （本机实测过：正常退出后起动次数不再增长，被杀后会被拉回来）。
-//  3. **注册失败不许影响连接**。装不上常驻（系统限制、目录不可写）就回落到主进程自己带守护的老路，
-//     最坏不比上一版差；⛔ 因为常驻装不上就不给客户连网。
+//  3. **注册失败不许影响连接**。装不上常驻（系统限制、目录不可写）时由连接路径改用无父 IPC
+//     的独立生命周期 fallback 守护；只有客户主动关闭常驻选择时才走普通 parent-ipc 手动连接。
 import { execFile } from 'node:child_process'
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -354,6 +354,17 @@ export function winTaskXml(spec: ResidentSpec, author = '来信AI工具箱'): st
 `
 }
 
+/** 更新前置闸会暂时停用任务；更新后若复用同一份管理员任务，重新注册可能因权限被拒。
+ * 这时按客户当前「开启常驻」的选择显式启用并回读，避免把 Disabled 当成已生效。 */
+async function enableWinResidentTask(task: string): Promise<boolean> {
+  try {
+    await runBounded('schtasks.exe', ['/change', '/tn', task, '/enable'], RESIDENT_CMD_TIMEOUT_MS)
+    return await winResidentArmed(task)
+  } catch {
+    return false
+  }
+}
+
 export async function installWinResident(spec: ResidentSpec, task = RESIDENT_TASK): Promise<ResidentOutcome> {
   const unsupportedReason = winTaskSpecUnsupportedReason(spec)
   if (unsupportedReason !== undefined) {
@@ -390,6 +401,14 @@ export async function installWinResident(spec: ResidentSpec, task = RESIDENT_TAS
     await runBounded('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', register], RESIDENT_INSTALL_TIMEOUT_MS)
     // 装完回读确认:创建失败会在这里现形,⛔ 把「任务不在」当装上了报给界面。
     await runBounded('schtasks.exe', ['/query', '/tn', task], RESIDENT_CMD_TIMEOUT_MS)
+    // 上一次普通权限接管被拒且定义不一致时,armed 会暂时锁住这份旧任务。
+    // 本次 Register-ScheduledTask 已经成功覆盖,必须先解除旧锁再按新任务状态回读;
+    // 否则 enableWinResidentTask 也会被同一个 stale 闸挡住,管理员重试永远不能自愈。
+    winResidentTaskStale = false
+    if (!await winResidentArmed(task) && !await enableWinResidentTask(task)) {
+      winResidentTaskStale = false
+      return { installed: false, reason: '常驻任务未启用' }
+    }
     // 旧版写在根文件夹的任务(只有恰好提升运行过的机器上才会有):清掉,⛔ 留着双份常驻。
     try { await runBounded('schtasks.exe', ['/delete', '/tn', RESIDENT_TASK_LEGACY, '/f'], RESIDENT_CMD_TIMEOUT_MS) } catch { /* 没有残账就算了 */ }
     winResidentTaskStale = false
@@ -406,8 +425,12 @@ export async function installWinResident(spec: ResidentSpec, task = RESIDENT_TAS
       return { installed: false, reason }
     }
     if (sameWinTaskAction(existing, winTaskAction(spec))) {
-      // 一致 → 系统里这份就是我们要装的常驻,按装上报;运行时走叫醒,设置页如实显示生效。
+      // 一致 → 系统里这份就是我们要装的常驻。更新前置闸可能留下 Disabled，
+      // 先启用并回读；失败就如实报没生效，下一次打开仍会重试。
       winResidentTaskStale = false
+      if (!await winResidentArmed(task) && !await enableWinResidentTask(task)) {
+        return { installed: false, reason: `${reason};现有常驻任务未启用` }
+      }
       return { installed: true }
     }
     // 不一致(安装位置变了等)→ 存量任务:如实报没装上,交给 armed 取值与设置页的自救文案。

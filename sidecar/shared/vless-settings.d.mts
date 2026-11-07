@@ -2,5 +2,7 @@ export interface VlessCredential { readonly uuid: string; readonly publicKey: st
 export declare function validNodeHost(host: unknown): boolean
 export declare function validVerifyUrl(value: unknown): boolean
 export declare function validVerifyFallbackUrl(primary: unknown, fallback: unknown): boolean
+export declare function validProductionVerifyUrl(value: unknown, options?: { allowLocalVerifyUrls?: boolean }): boolean
+export declare function validProductionVerifyFallbackUrl(primary: unknown, fallback: unknown, options?: { allowLocalVerifyUrls?: boolean }): boolean
 export declare function parseVlessCredential(value: unknown): VlessCredential
 export declare function buildVlessOutbound(node: { host: string; port: number }, credential: VlessCredential): Record<string, unknown>

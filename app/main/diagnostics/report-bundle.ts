@@ -15,6 +15,9 @@ import { REPORT_MAX_BYTES } from '../../report-types'
 import { supportDiagnosticAttemptLimit, type DiagnosticSoftware } from '../../network-diagnostics-types'
 import type { SupportDiagnosis } from './support-snapshot'
 import { normalizeLocalEgressEvidence } from '../../shared/local-egress-evidence'
+import { sanitizeFunnelAttempt, type FunnelAttempt } from '../../../sidecar/shared/connection-funnel.mjs'
+import { readRestoreObservation } from '../../../sidecar/shared/restore-observation.mjs'
+import { connectionAttemptKeyOf } from '../../connection-attempt-types'
 
 /** 通道状态里能出去的字段。⛔ authorization：它是句固定说明，没有诊断价值，反而会被字段名闸抹成问号。 */
 const tunnelStatusFields = ['state', 'message', 'source', 'backend', 'nodeLabel', 'observedNodeLabel', 'exitIp', 'pathSource',
@@ -34,6 +37,12 @@ const MAX_LOG_LINES = 300
 const MAX_LEDGER_ENTRIES = 60
 const MAX_FAULTS = 20
 const MAX_ERROR_CODES = 20
+/** 漏斗阶段行/尝试行的字段白名单(与 sidecar connection-funnel 落盘口径一致)。 */
+const funnelStageFields = ['name', 'durationMs', 'outcome', 'code', 'at', 'phase'] as const
+const MAX_FUNNEL_ATTEMPTS = 10
+const availabilityStatuses = new Set(['examining', 'reusing', 'taking-over', 'reclaiming', 'recovering', 'recovered', 'limited'])
+const availabilityActions = new Set(['inspect', 'reuse', 'takeover', 'reclaim', 'restore'])
+const MAX_OBSERVED_CODES = 20
 
 export interface ReportSources {
   /** 客户刚才在界面看到并可复制的那一次诊断；上报不得重新跑一遍替换它。 */
@@ -56,6 +65,8 @@ export interface ReportSources {
   readonly systemProxy?: unknown
   /** 连接与复验记录。 */
   readonly connection?: unknown
+  /** N-79 连接漏斗台账(守护白名单落盘;这里再过一遍验形)。 */
+  readonly connectionFunnel?: unknown
   /** 守护日志：取自最后若干行；没生成就给 undefined，包里如实写「未生成」。 */
   readonly daemonLog?: { readonly source: string; readonly lines: readonly string[] }
   /** 日志没进包时，是「确实没生成」还是「读不出来」。⛔ 两种都写成「未生成」——
@@ -74,6 +85,8 @@ export interface ReportBody extends Record<string, unknown> {
   readonly supplemental: Record<string, unknown>
   readonly network: Record<string, unknown>
   readonly daemonState: Record<string, unknown>
+  /** 仅供内部优化使用的跨证据摘要；不改变客户可见文案。 */
+  readonly optimization: Record<string, unknown>
   readonly ledger: Record<string, unknown>
   readonly systemProxy: Record<string, unknown>
   readonly connection: Record<string, unknown>
@@ -148,6 +161,120 @@ function daemonLogSection(log: ReportSources['daemonLog'], absence: ReportSource
  * 打包。返回**已封包**的 body：白名单取值 → 字段名与形状闸 → 整包复扫。
  * `filtered` 是复扫又抹掉的处数，正常为 0。
  */
+/** 漏斗台账进包:逐条过 sidecar 验形(被改写的行整条丢弃),再按白名单挑字段。
+ *  台账本体只有阶段码/毫秒/受控码,这里二次验形是双保险——⛔ 把未验形的自由文本带进包。 */
+function sanitizedFunnelAttempts(source: unknown): FunnelAttempt[] | undefined {
+  if (!Array.isArray((source as { attempts?: unknown } | undefined)?.attempts)) return undefined
+  const attempts = (source as { attempts: readonly unknown[] }).attempts
+    .map((row) => sanitizeFunnelAttempt(row))
+    .filter((row): row is FunnelAttempt => row !== undefined)
+    .slice(-MAX_FUNNEL_ATTEMPTS)
+  return attempts.length === 0 ? undefined : attempts
+}
+
+function connectionFunnelSummary(source: unknown): unknown {
+  const attempts = sanitizedFunnelAttempts(source)
+  if (attempts === undefined) return undefined
+  return attempts.map((attempt) => {
+    const attemptKey = connectionAttemptKeyOf(attempt)
+    return {
+      trigger: attempt.trigger,
+      startedAt: attempt.startedAt,
+      ...(attemptKey === undefined ? {} : { attemptKey }),
+      outcome: attempt.outcome,
+      endedAt: attempt.endedAt,
+      ...(attempt.code !== undefined ? { code: attempt.code } : {}),
+      stages: attempt.stages.map((stage) => pickRedacted(stage, [...funnelStageFields]))
+    }
+  })
+}
+
+function safeDaemonState(source: unknown): Record<string, unknown> {
+  const state = pickRedacted(source, [...daemonStateFields])
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return state
+  const value = source as Record<string, unknown>
+  const restoration = readRestoreObservation(value.restoration)
+  if (restoration !== undefined) state.restoration = restoration
+  const availability = value.availability
+  if (availability && typeof availability === 'object' && !Array.isArray(availability)) {
+    const candidate = availability as Record<string, unknown>
+    const status = typeof candidate.status === 'string' && availabilityStatuses.has(candidate.status) ? candidate.status : undefined
+    const action = typeof candidate.action === 'string' && availabilityActions.has(candidate.action) ? candidate.action : undefined
+    const intentGeneration = Number.isSafeInteger(candidate.intentGeneration) && (candidate.intentGeneration as number) >= 0
+      ? candidate.intentGeneration : undefined
+    const code = typeof candidate.code === 'string' && errorCodePattern.test(candidate.code) ? candidate.code : undefined
+    const active = typeof candidate.active === 'boolean' ? candidate.active : undefined
+    if (status !== undefined || action !== undefined || intentGeneration !== undefined || code !== undefined || active !== undefined) {
+      state.availability = { ...(active === undefined ? {} : { active }), ...(status === undefined ? {} : { status }),
+        ...(action === undefined ? {} : { action }), ...(code === undefined ? {} : { code }),
+        ...(intentGeneration === undefined ? {} : { intentGeneration }) }
+    }
+  }
+  const recovery = value.recovery
+  if (recovery && typeof recovery === 'object' && !Array.isArray(recovery)) {
+    const candidate = recovery as Record<string, unknown>
+    const id = Number.isSafeInteger(candidate.id) && (candidate.id as number) >= 0 ? candidate.id : undefined
+    const attempts = Number.isSafeInteger(candidate.attempts) && (candidate.attempts as number) >= 0 ? candidate.attempts : undefined
+    const outageMs = Number.isSafeInteger(candidate.outageMs) && (candidate.outageMs as number) >= 0 ? candidate.outageMs : undefined
+    if (id !== undefined && attempts !== undefined && outageMs !== undefined) state.recovery = { id, attempts, outageMs }
+  }
+  return state
+}
+
+function optimizationSummary(input: {
+  readonly daemonState: unknown
+  readonly repair: unknown
+  readonly connectionFunnel: unknown
+  readonly faults: readonly FaultRecord[] | undefined
+  readonly errorCodes: readonly string[] | undefined
+}): Record<string, unknown> {
+  const attempts = sanitizedFunnelAttempts(input.connectionFunnel) ?? []
+  const terminal = attempts.filter((attempt) => attempt.outcome !== 'in-progress' && attempt.outcome !== 'stopped' && attempt.outcome !== 'superseded')
+  const outcomes = new Map<string, number>()
+  for (const attempt of terminal) outcomes.set(attempt.outcome, (outcomes.get(attempt.outcome) ?? 0) + 1)
+  const latest = terminal.at(-1)
+  const daemon = safeDaemonState(input.daemonState)
+  const repair = input.repair && typeof input.repair === 'object' && !Array.isArray(input.repair) ? input.repair as Record<string, unknown> : undefined
+  const observedCodes = [...new Set([
+    daemon.code,
+    (daemon.restoration as { lastFailureCode?: unknown } | undefined)?.lastFailureCode,
+    (daemon.availability as { code?: unknown } | undefined)?.code,
+    repair?.code,
+    ...(input.errorCodes ?? []),
+    ...(input.faults ?? []).flatMap((fault) => [fault.code, fault.network])
+  ].filter((code): code is string => typeof code === 'string' && errorCodePattern.test(code)))].slice(0, MAX_OBSERVED_CODES)
+  const evidenceSources = [
+    daemon.code !== undefined || daemon.restoration !== undefined || daemon.availability !== undefined ? 'daemon-state' : undefined,
+    typeof repair?.code === 'string' ? 'repair' : undefined,
+    attempts.length > 0 ? 'connection-funnel' : undefined,
+    (input.errorCodes?.length ?? 0) > 0 ? 'error-codes' : undefined,
+    (input.faults?.length ?? 0) > 0 ? 'fault-log' : undefined
+  ].filter((source): source is string => source !== undefined)
+  return {
+    connectionAttempts: {
+      total: attempts.length,
+      terminal: terminal.length,
+      successful: (outcomes.get('connected') ?? 0) + (outcomes.get('reused') ?? 0),
+      failed: (outcomes.get('failed') ?? 0) + (outcomes.get('fatal') ?? 0),
+      abandoned: outcomes.get('abandoned') ?? 0,
+      ...(latest === undefined ? {} : {
+        latestAttemptKey: connectionAttemptKeyOf(latest),
+        latestOutcome: latest.outcome
+      })
+    },
+    lifecycle: {
+      ...(daemon.restoration === undefined ? {} : { restoration: daemon.restoration }),
+      ...(daemon.availability === undefined ? {} : { availability: daemon.availability }),
+      ...(daemon.recovery === undefined ? {} : { recovery: daemon.recovery })
+    },
+    attribution: {
+      unknown: observedCodes.includes('UNKNOWN'),
+      evidenceSources,
+      observedCodes
+    }
+  }
+}
+
 export function buildReportBody(sources: ReportSources): ReportBody {
   const notes = [...(sources.notes ?? [])]
   const draft = {
@@ -157,10 +284,13 @@ export function buildReportBody(sources: ReportSources): ReportBody {
       status: pickRedacted(sources.tunnel, [...tunnelStatusFields]),
       repair: pickRedacted(sources.repair, [...repairFields])
     },
-    daemonState: pickRedacted(sources.daemonState, [...daemonStateFields]),
+    daemonState: safeDaemonState(sources.daemonState),
     ledger: ledgerSummary(sources.ledger, sources.unrestored),
     systemProxy: pickRedacted(sources.systemProxy, [...systemProxySections]),
     connection: redactValue(sources.connection ?? {}) as Record<string, unknown>,
+    connectionFunnel: connectionFunnelSummary(sources.connectionFunnel),
+    optimization: optimizationSummary({ daemonState: sources.daemonState, repair: sources.repair,
+      connectionFunnel: sources.connectionFunnel, faults: sources.faults, errorCodes: sources.errorCodes }),
     daemonLog: daemonLogSection(sources.daemonLog, sources.daemonLogAbsence),
     faults: (sources.faults ?? []).slice(0, MAX_FAULTS).map((fault) => redactValue(fault)),
     errorCodes: [...new Set((sources.errorCodes ?? []).filter((code) => errorCodePattern.test(code)))].slice(0, MAX_ERROR_CODES),

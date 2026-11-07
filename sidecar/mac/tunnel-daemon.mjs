@@ -10,21 +10,22 @@ import process from 'node:process'
 import { setTimeout, setInterval, clearTimeout, clearInterval } from 'node:timers'
 import { spawn } from 'node:child_process'
 import { pathToFileURL } from 'node:url'
-import { dirname, join } from 'node:path'
+import { dirname, isAbsolute, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createLoopbackProbeConnector, createSshSocksConnector } from './connectors.mjs'
 import { createVlessConnector } from './vless-connector.mjs'
-import { createDaemon, installCrashBailout, readIntent, startPowerEvents, statePath, writeState,
+import { createDaemon, installCrashBailout, observeRecoveryOwnership, recoveryOwnedByOther, readIntent, startPowerEvents, statePath, writeState,
   SHUTDOWN_RESTORE_RETRY_MS, SHUTDOWN_RESTORE_SLOW_MS, SHUTDOWN_RESTORE_SLOW_ROUNDS } from './daemon-core.mjs'
 import { acquireInstanceLock } from './instance-lock.mjs'
 import { guardedResidentSelfHeal, withWriteRight, writeRightFailure } from './write-right-owner.mjs'
 import { createResidentIntegrityCheck, runResidentSelfHeal } from './resident-integrity.mjs'
-import { ENTRY_STATUS, lastIntent, ledgerFailure, loadLedger } from './ledger.mjs'
+import { ENTRY_STATUS, lastIntent, ledgerFailure, loadLedger, withSettingsLock } from './ledger.mjs'
 import { createLocalBridge } from './local-bridge.mjs'
 import { rebroadcastSettings, recoverLedger, restoreLedger, unrestoredEntries } from './restore.mjs'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { formatDaemonLogLine, probeProxyFaces } from './continuity-evidence.mjs'
+import { createEmergencyRecoveryAdapter } from './emergency-recovery-adapter.mjs'
 
 function logDaemon(line, runId = '') {
   process.stderr.write(formatDaemonLogLine(line, { now: Date.now(), pid: process.pid, runId }))
@@ -39,6 +40,79 @@ const DEFAULT_ADAPTER = join(here, 'managed-adapter.mjs')
  * 梯子的节奏语义:等持权方这一轮做完交出权,再做恢复;等不到仍按 TUNNEL_WRITE_RIGHT_HELD 如实回报。
  */
 const RESTORE_WRITE_RIGHT_WAIT_MS = 15_000
+
+/** 启动看门狗与主进程监管器同一预算：只处理「没有进入守护状态」的坏启动。 */
+export const STARTUP_WATCHDOG_MS = 120_000
+export const STARTUP_WATCHDOG_EXIT_CODE = 75
+
+function absolutePathFor(value, platform) {
+  if (platform === 'win32') return /^[A-Za-z]:[\\/]/.test(value) || /^\\\\/.test(value)
+  return isAbsolute(value)
+}
+
+/**
+ * 在接管系统设置前检查启动上下文。返回安全的短原因，⛔ 不把完整路径/环境变量写进状态。
+ * 适配器缺失或 Windows 真实适配器没有放行钥匙时，继续启动只会每分钟重复失败并留下半成品。
+ */
+export function startupContextIssue({ dataDir, adapterPath, resident = false, taskPath, platform = process.platform, env = process.env } = {}) {
+  if (typeof dataDir !== 'string' || dataDir === '' || !absolutePathFor(dataDir, platform)) return '数据目录不是绝对路径'
+  if (typeof adapterPath !== 'string' || adapterPath === '' || !absolutePathFor(adapterPath, platform)) return '适配器路径不是绝对路径'
+  if (!existsSync(adapterPath)) return '适配器文件不存在'
+  if (resident && platform === 'win32' && /managed-adapter\.mjs$/i.test(adapterPath) && env.TOOLBOX_REAL_NETWORK_ADAPTER !== '1') {
+    return 'Windows 真实适配器未获运行放行'
+  }
+  if (resident && platform === 'win32' && taskPath !== undefined && !/^\\[^\\]+\\[^\\]+$/.test(taskPath)) {
+    return 'Windows 常驻任务路径无效'
+  }
+  return undefined
+}
+
+/**
+ * 常驻任务没有主进程可以观察。120 秒内连 state.json 都没写出来，说明卡在入口、适配器加载或
+ * 取席位之前；退出 75 让 Windows 计划任务下一分钟重新拉起。state 一旦带上本轮 runId，
+ * 后续慢连接由 daemon-core 的阶段预算负责，⛔ 不因机器慢误杀合法连接。
+ */
+export function armStartupWatchdog({ dataDir, runId, log = () => undefined, exit = (code) => process.exit(code), timeoutMs = STARTUP_WATCHDOG_MS } = {}) {
+  if (typeof runId !== 'string' || runId === '') return () => undefined
+  let settled = false
+  let poll
+  const stop = () => {
+    if (settled) return
+    settled = true
+    clearTimeout(timer)
+    if (poll !== undefined) clearInterval(poll)
+  }
+  const stateReady = () => {
+    try {
+      if (existsSync(statePath(dataDir))) {
+        const state = JSON.parse(readFileSync(statePath(dataDir), 'utf8'))
+        if (state?.runId === runId) return true
+      }
+      // 启动恢复可能先进入同步适配器/账本梯子，再来得及发布 stateDetails；
+      // recovery-owner 是同一数据目录里由本轮 runId 原子发布的进度证据，不能因慢机
+      // 合法恢复超过 120 秒就误杀。旧 owner 不会与本轮随机 runId 相同。
+      const ownerPath = join(dataDir, 'recovery-owner.json')
+      if (!existsSync(ownerPath)) return false
+      const owner = JSON.parse(readFileSync(ownerPath, 'utf8'))
+      return owner?.runId === runId
+    } catch { return false }
+  }
+  const check = () => {
+    if (settled || !stateReady()) return
+    stop()
+  }
+  const timer = setTimeout(() => {
+    if (settled || stateReady()) { stop(); return }
+    stop()
+    log(`启动看门狗超时，退出 ${String(STARTUP_WATCHDOG_EXIT_CODE)} 让计划任务重拉`)
+    exit(STARTUP_WATCHDOG_EXIT_CODE)
+  }, timeoutMs)
+  poll = setInterval(check, 1_000)
+  timer.unref?.()
+  poll.unref?.()
+  check()
+  return stop
+}
 
 function loopbackEndpointsOf(proxyServerData) {
   const endpoints = []
@@ -60,15 +134,25 @@ function loopbackEndpointsOf(proxyServerData) {
 
 function suspectProxyResidue(adapter) {
   try {
-    const enable = adapter.read({ service: 'WinINET', item: 'ProxyEnable' })
-    if (enable?.data !== '1') return undefined
-    const server = adapter.read({ service: 'WinINET', item: 'ProxyServer' })
+    let endpoints
+    if (typeof adapter.readProxyEndpoints === 'function') {
+      endpoints = adapter.readProxyEndpoints()
+    } else {
+      const enable = adapter.read({ service: 'WinINET', item: 'ProxyEnable' })
+      if (enable?.data !== '1') return undefined
+      const server = adapter.read({ service: 'WinINET', item: 'ProxyServer' })
+      endpoints = loopbackEndpointsOf(server?.data)
+    }
     // state.json 会被本次恢复结果覆盖，不能用旧 bridgePort 白名单决定下一次是否检查。
     // 任意启用的本机代理若无明确的第三方活监听，都只读报归属未明，不凭端口自动修改。
     // 当前端口归属探针只验证 IPv4 127.0.0.1；其他回环地址无法据此证明活路由。
-    for (const { host, port } of loopbackEndpointsOf(server?.data)) {
+    for (const { host: rawHost, port } of endpoints) {
+      const host = rawHost.replace(/^\[|\]$/g, '').toLowerCase()
+      if (host !== 'localhost' && !host.startsWith('127.') && host !== '::1') continue
       if (host !== '127.0.0.1') return { kind: 'ownership-unknown', port }
-      const owner = adapter.identifyPortOwner?.(port)
+      // This is a recovery safety check, so a short-lived probe cache is not
+      // evidence: a previous listener may have exited or been replaced already.
+      const owner = adapter.identifyPortOwner?.(port, { fresh: true })
       if (owner?.kind === 'other' || owner?.kind === 'laixin') continue
       if (owner?.kind === 'unknown' && owner.reason !== 'address-ambiguous') return { kind: 'inspection-failed' }
       return { kind: 'ownership-unknown', port }
@@ -101,6 +185,43 @@ async function settleResidentTask(dataDir, taskPath) {
   })
 }
 
+/**
+ * 普通适配器导入失败时的独立恢复入口。它必须与入口 main 共用设置锁、恢复 owner 和账本，
+ * 这样“旧 restore / 新守护 / 组件损坏”三者交错时不会互相覆盖。
+ */
+export async function recoverAfterAdapterLoadFailure({ dataDir, runId, recoveryOwnershipObserved, createAdapter = () => createEmergencyRecoveryAdapter({ platform: process.platform }), log = () => undefined } = {}) {
+  let restored = false
+  let handedOver = false
+  let emergency
+  let emergencyError
+  try { emergency = await createAdapter() } catch (error) { emergencyError = error }
+  withSettingsLock(dataDir, () => {
+    // state.json 是可过期的诊断快照，不能单独证明另一守护仍持有恢复责任。
+    // 交接只认本次启动后在设置锁内发布的更高 recovery-owner 代次。
+    if (recoveryOwnedByOther(dataDir, runId, recoveryOwnershipObserved)) {
+      handedOver = true
+      return
+    }
+    try {
+      if (emergency === undefined) throw emergencyError ?? new Error('EMERGENCY_ADAPTER_UNAVAILABLE')
+      const recovered = withWriteRight(emergency, () => restoreLedger(dataDir, emergency), log)
+      // 空账本/损坏账本时 restoreLedger 可能没有任何可写条目；仍必须检查当前
+      // 本机代理是否残留在来信桥端口，否则会把死代理误报为“已恢复”。
+      const suspect = recovered.ok ? suspectProxyResidue(emergency) : undefined
+      restored = recovered.ok && unrestoredEntries(dataDir).length === 0 && suspect === undefined
+      if (suspect !== undefined) log(`独立恢复通道发现代理残留:${suspect.kind}`)
+    } catch (error) {
+      log(`独立恢复通道不可用:${error instanceof Error ? error.message : String(error)}`)
+    }
+    writeState(dataDir, {
+      state: 'error', runId, code: 'TUNNEL_ADAPTER_LOAD_FAILED',
+      message: restored ? '网络组件不完整，已先恢复原系统代理；请重新安装工具箱'
+        : '网络组件不完整，原系统代理尚未确认恢复；请重新安装工具箱'
+    })
+  }, { owner: `adapter-load-failure:${runId}`, timeoutMs: 5_000 })
+  return { restored, handedOver }
+}
+
 async function main() {
   const [command, ...rest] = process.argv.slice(2)
   const flags = parseFlags(rest)
@@ -117,7 +238,27 @@ async function main() {
   if (command === 'start' && !resident && flags['parent-ipc'] === '1' && !process.connected) throw new Error('PARENT_IPC_REQUIRED')
   // 常驻任务由系统直接启动，不带主进程分配的 --run-id；它必须自行生成非空本轮身份，
   // 且席位、崩溃兜底、恢复 owner、state 全程共用同一个值。
-  const runId = command === 'start' ? (flags['run-id'] || randomUUID()) : ''
+  const runId = command === 'start' || command === 'restore' ? (flags['run-id'] || randomUUID()) : ''
+
+  const adapterPath = flags.adapter ?? DEFAULT_ADAPTER
+  if (command === 'start' || command === 'restore') {
+    try { mkdirSync(dataDir, { recursive: true }) } catch {
+      logDaemon('启动上下文无效:数据目录不可写', runId)
+      process.exitCode = STARTUP_WATCHDOG_EXIT_CODE
+      return
+    }
+    const contextIssue = startupContextIssue({ dataDir, adapterPath, resident, taskPath: flags['task-path'] })
+    if (contextIssue !== undefined) {
+      logDaemon(`启动上下文无效:${contextIssue}`, runId)
+      process.exitCode = STARTUP_WATCHDOG_EXIT_CODE
+      return
+    }
+  }
+
+  // Windows 计划任务没有父进程可监控；先武装看门狗，座位/适配器加载本身卡住时也能自退。
+  const stopStartupWatchdog = command === 'start'
+    ? armStartupWatchdog({ dataDir, runId, log: (line) => logDaemon(line, runId) })
+    : () => undefined
 
   if (command === 'status') {
     const failure = ledgerFailure(dataDir)
@@ -153,13 +294,33 @@ async function main() {
     const seat = acquireInstanceLock(dataDir, { runId })
     if (!seat.acquired) {
       logDaemon(`同一数据目录已有守护在跑(pid ${String(seat.holder?.pid ?? '未知')}),本进程让位`, runId)
+      stopStartupWatchdog()
       return
     }
     releaseInstance = seat.release
     process.on('exit', () => releaseInstance())
   }
 
-  const adapter = await loadAdapter(flags.adapter ?? DEFAULT_ADAPTER)
+  // 先安装兜底，再加载适配器。适配器的任一传递依赖缺失时，入口不能直接落到裸 exit(70)
+  // 把已应用代理留在系统里；至少要在同一把设置锁内留下受控失败状态，且不覆盖已接管的新守护。
+  let adapter
+  const recoveryOwnershipObserved = observeRecoveryOwnership(dataDir)
+  const crashBailout = command === 'start' || command === 'restore'
+    ? installCrashBailout({ dataDir, adapterOf: () => adapter, runId, log: (line) => logDaemon(line, runId) })
+    : undefined
+  try {
+    adapter = await loadAdapter(adapterPath)
+  } catch (error) {
+    try {
+      await recoverAfterAdapterLoadFailure({ dataDir, runId, recoveryOwnershipObserved,
+        log: (line) => logDaemon(line, runId) })
+    } catch { /* 锁忙时保留旧状态，交给下一次守护恢复 */ }
+    logDaemon(`适配器加载失败:${error instanceof Error ? error.message : String(error)}`, runId)
+    crashBailout?.dispose()
+    stopStartupWatchdog()
+    process.exitCode = 70
+    return
+  }
 
   // 损坏账本先走恢复流程(收敛包3·件4):成功即清标记继续;失败才致命停止并给可复制诊断。
   const failure = ledgerFailure(dataDir)
@@ -178,6 +339,8 @@ async function main() {
       logDaemon(recovery?.diagnostics ?? failure.message, runId)
       process.stdout.write(`${JSON.stringify({ state: 'error', ...failure, diagnostics: recovery?.diagnostics ?? failure.message })}\n`)
       process.exitCode = 65
+      crashBailout?.dispose()
+      stopStartupWatchdog()
       return
     }
     logDaemon(`损坏账本已恢复(写回 ${recovery.recovered.length} 项,保留他人现值 ${recovery.keptModified.length} 项),坏账本已留证`, runId)
@@ -233,20 +396,32 @@ async function main() {
       writeState(dataDir, { state: 'error', ...writeRightFailure(guarded.reason) })
       process.exitCode = 65
       process.stdout.write(`${JSON.stringify({ restored: 0, keptModified: [], failed: [], writeRight: guarded.reason })}\n`)
+      crashBailout?.dispose()
+      stopStartupWatchdog()
       return
     }
     const result = guarded.value.inner
     const suspect = guarded.value.suspect
     // 完成与否看账本里还有没有未结算的设置:preserved(保留他人现值)已是终态,⛔ 再按 keptModified 数判失败。
-    const incomplete = unrestoredEntries(dataDir).length > 0 || suspect !== undefined
-    writeState(dataDir, incomplete
-      ? { state: 'error', code: suspect === undefined ? 'TUNNEL_RESTORE_INCOMPLETE'
-          : suspect.kind === 'inspection-failed' ? 'TUNNEL_PROXY_INSPECTION_FAILED' : 'TUNNEL_PROXY_OWNERSHIP_UNKNOWN',
-          message: suspect === undefined ? '原设置尚未恢复，请重试恢复；其他软件修改的设置会保留'
-            : suspect.kind === 'inspection-failed' ? '无法读取系统代理或端口归属，未改动系统代理，请联系客服核实'
-              : '代理端口可能是来信残留，也可能由其他软件接管；未改动系统代理，请联系客服核实' }
-      : { state: 'stopped-restored', code: '', message: '' })
-    process.exitCode = incomplete ? 65 : 0
+    let incomplete = true
+    let handedOver = false
+    withSettingsLock(dataDir, () => {
+      const latestIntent = readIntent(dataDir)
+      // state.json 可能是旧守护崩溃前留下的快照；没有新的 owner 代次时不能让位，
+      // 否则本进程会跳过恢复并留下指向死通道的系统代理。
+      handedOver = recoveryOwnedByOther(dataDir, runId, recoveryOwnershipObserved)
+      if (handedOver) return
+      // 最终判定、意图/代次重读和状态写入必须在同一把锁里，旧 restore 才不能盖掉新守护的 connected。
+      incomplete = unrestoredEntries(dataDir).length > 0 || suspect !== undefined
+      writeState(dataDir, incomplete
+        ? { state: 'error', runId, intentToken: latestIntent?.sessionToken, code: suspect === undefined ? 'TUNNEL_RESTORE_INCOMPLETE'
+            : suspect.kind === 'inspection-failed' ? 'TUNNEL_PROXY_INSPECTION_FAILED' : 'TUNNEL_PROXY_OWNERSHIP_UNKNOWN',
+            message: suspect === undefined ? '原设置尚未恢复，请重试恢复；其他软件修改的设置会保留'
+              : suspect.kind === 'inspection-failed' ? '无法读取系统代理或端口归属，未改动系统代理，请联系客服核实'
+                : '代理端口可能是来信残留，也可能由其他软件接管；未改动系统代理，请联系客服核实' }
+        : { state: 'stopped-restored', runId, intentToken: latestIntent?.sessionToken, code: '', message: '' })
+    }, { owner: `restore-final:${runId}`, timeoutMs: RESTORE_WRITE_RIGHT_WAIT_MS })
+    process.exitCode = handedOver ? 65 : incomplete ? 65 : 0
     process.stdout.write(
       `${JSON.stringify({
         restored: result.restored.length,
@@ -258,16 +433,18 @@ async function main() {
               note: '空账本无法证明代理归属，未改动系统代理' })
       })}\n`
     )
+    crashBailout?.dispose()
+    stopStartupWatchdog()
     return
   }
 
   if (command !== 'start') {
     process.stderr.write(`未知子命令:${command}\n`)
+    stopStartupWatchdog()
     process.exit(64)
   }
 
-  // 顶层兜底(收敛包3·件1):致命异常先恢复系统代理再退出。
-  installCrashBailout({ dataDir, adapterOf: () => adapter, runId, log: (line) => logDaemon(line, runId) })
+  // 顶层兜底已在适配器加载前安装(收敛包3·件1):致命异常先恢复系统代理再退出。
 
   // 常驻席位已在 main() 开头先查后拿(N-23):非常驻模式**不取这把锁**——那边「旧守护慢恢复 +
   // 新守护接手」是合法并存(五轮复核建立的交接机制),取锁会让客户重开工具箱时连不上。
@@ -307,6 +484,7 @@ async function main() {
     intentPollMs: numberFlag(flags, 'intent-poll-ms', 500),
     parentPollMs: numberFlag(flags, 'parent-poll-ms', 500),
     verifyIntervalMs: numberFlag(flags, 'verify-interval-ms', 30_000),
+    ...(typeof flags['client-version'] === 'string' ? { clientVersion: flags['client-version'] } : {}),
     log: (line) => logDaemon(line, runId),
     continuityEvidence: true,
     readContinuityFaces: () => probeProxyFaces(dataDir, flags.adapter ?? DEFAULT_ADAPTER)
@@ -325,6 +503,8 @@ async function main() {
   process.on('SIGTERM', () => daemon.requestShutdown())
   process.on('SIGBREAK', () => daemon.requestShutdown())
   process.on('exit', () => { clearInterval(keepalive); powerSource.stop() })
+  // 看门狗自行观察 state.json/recovery-owner.json 并在进入本轮状态后收口。
+  // 不能把 run() 返回当成 ready：启动恢复梯子是后台任务，慢机上它可能仍在运行。
   await daemon.run()
 }
 

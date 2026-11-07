@@ -116,6 +116,12 @@ function setup(mode: 'bridge' | 'connector' | 'connector-late-dead' | 'rotation'
     bridgeCount: () => bridgeCount, releaseBridgeClose: () => releaseBridgeClose(),
     releaseSecondStart: () => releaseSecondStart(), failSecondStart: (error: Error) => failSecondStart(error),
     killBridge: () => { bridgeAlive = false },
+    markHeadCooling: () => {
+      const health = (daemon as typeof daemon & { entryHealth: { recordFailure(key: string): void } }).entryHealth
+      const key = 'entry-1.invalid:443'
+      health.recordFailure(key)
+      health.recordFailure(key)
+    },
     dieAfterBridgeChecks: (checks: number) => { dieOnCheck = bridgeChecks + checks },
     blockRestore: (blocked: boolean) => { blockRestore = blocked } }
 }
@@ -180,6 +186,7 @@ it('双入口轮转等待旧桥关闭卡死时先还原死代理，并让重连�
   const x = setup('rotation')
   await x.daemon.run()
   expect(x.proxy()).toBe(PROXY)
+  x.markHeadCooling()
   void (x.daemon as unknown as { attemptReconnect(): Promise<void> }).attemptReconnect()
   await settle()
   expect(x.bridgeCloses()).toBe(1)
@@ -251,6 +258,7 @@ it('轮转旧桥关闭等待中新 runId 已接通，旧任务醒来不得再启
   const x = setup('rotation-release-close')
   await x.daemon.run()
   expect(x.connectorStarts()).toBe(1)
+  x.markHeadCooling()
   void (x.daemon as unknown as { attemptReconnect(): Promise<void> }).attemptReconnect()
   await settle()
   expect(x.bridgeCloses()).toBe(1)

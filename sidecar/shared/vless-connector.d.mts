@@ -7,6 +7,8 @@ export interface VlessSpec {
   verifyUrl: string
   verifyFallbackUrl?: string
   timeoutMs?: number
+  /** 仅本地测试夹具允许回环 HTTP；生产意图不设置。 */
+  allowLocalVerifyUrls?: boolean
 }
 export declare function createVlessConnector(spec: VlessSpec): Connector & { xrayOutbound(): Record<string, unknown> }
 export declare function verifyThroughProxy(port: number, verifyUrl: string, timeoutMs?: number): Promise<{ exitIp: string }>
@@ -20,6 +22,6 @@ export declare function probeExistingProxy(existing: ExistingProxy, urls?: reado
 /** 甲-4 补强:AI 探测的响应判据(按探测地址的真实响应特征分形)。 */
 export declare function aiProbeResponseAcceptable(target: URL, statusCode: number | undefined, headers: Record<string, string | string[] | undefined> | undefined): boolean
 
-export declare function verifyWithFallback(port: number, primary: string, fallback?: string, timeoutMs?: number, probe?: typeof verifyThroughProxy): Promise<{ exitIp: string }>
+export declare function verifyWithFallback(port: number, primary: string, fallback?: string, timeoutMs?: number, probe?: typeof verifyThroughProxy, options?: { allowLocalVerifyUrls?: boolean }): Promise<{ exitIp: string }>
 export declare function probeTunnelReachability(port: number, urls?: readonly string[], timeoutMs?: number, probe?: (...args: any[]) => Promise<unknown>, isAcceptable?: (target: URL, response: { statusCode?: number; headers?: Record<string, string | string[] | undefined> }) => boolean): Promise<{ url: string }>
 export declare function probeTargetReachability(port: number, urls?: readonly string[], timeoutMs?: number, probe?: (...args: any[]) => Promise<unknown>): Promise<{ url: string }>

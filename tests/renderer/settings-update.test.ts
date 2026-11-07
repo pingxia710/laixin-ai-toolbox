@@ -429,10 +429,8 @@ it('保存途中的轮询 ⛔ 提前解禁，也 ⛔ 拿后台旧值盖掉客户
   expect(zoom.disabled).toBe(false)
 })
 
-// 客户选了开、但常驻这次没装上：开关显示着开而那件事并没有发生 —— 就是假装成功。
-// 主进程那一侧已经如实回了 active=false，界面这一侧不能把它又装回去（只写日志等于
-// 把诚实停在没人看得见的地方）。
-it('选了开但没生效：说出来，⛔ 把开关拨回去、⛔ 弹窗', async () => {
+// 客户选了开、但系统后台保护设置没有完成：开关显示着开，界面要说清楚但不暴露内部命令。
+it('选了开但后台保护未完成：说出来，⛔ 把开关拨回去、⛔ 弹窗', async () => {
   const x = await mountSettings({
     residentEnabled: async () => ({ enabled: true, supported: true, active: false }),
     loginItem: async () => ({ enabled: false, supported: true })
@@ -443,7 +441,7 @@ it('选了开但没生效：说出来，⛔ 把开关拨回去、⛔ 弹窗', as
   // 开关留在客户选的那一档，也没被置灰（拨回去 = 替客户改了他的选择，比静默失败更糟）
   expect(toggle.checked).toBe(true)
   expect(toggle.disabled).toBe(false)
-  expect(x.text().some((line) => line.includes('这次没能生效'))).toBe(true)
+  expect(x.text().some((line) => line.includes('后台保护设置没有完成'))).toBe(true)
   expect(x.text().some((line) => line.includes('网络本身不受影响'))).toBe(true)
   // 正向证据：默认那句「打开后……网络都照常连着」不能同时还挂着，否则两句话互相打架
   expect(x.text().some((line) => line.includes('网络都照常连着'))).toBe(false)

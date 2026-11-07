@@ -6,10 +6,10 @@ import { connect, createServer, isIP } from 'node:net'
 import { uptime } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { TUNNEL_PROBE_URLS, probeTunnelReachability, verifyWithFallback } from './vless-connector.mjs'
+import { AI_SERVICE_PROBE_URLS, TUNNEL_PROBE_URLS, probeTargetReachability, probeTunnelReachability, verifyWithFallback } from './vless-connector.mjs'
 import { CONTROL_CODES, ConnectorError } from './connectors.mjs'
 import { validVerifyFallbackUrl } from './vless-settings.mjs'
-import { lockHolderAlive } from './ledger.mjs'
+import { lockHolderAlive, readProcessStartedAt as readPidStartedAt } from './ledger.mjs'
 import { createApiDestinationGate } from './api-destination-gate.mjs'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
@@ -111,8 +111,11 @@ export function buildXrayConfig({ listenPort, upstream, routes, outbound, outbou
     routing: {
       domainStrategy: 'AsIs',
       ...(multi ? { balancers: [
-        { tag: TUNNEL_BALANCER_TAG, selector: [`${TUNNEL_BALANCER_TAG}-`], strategy: { type: 'leastPing' } },
-        ...(dedicated.length ? [{ tag: DEDICATED_BALANCER_TAG, selector: [`${DEDICATED_BALANCER_TAG}-`], strategy: { type: 'leastPing' } }] : [])
+        // 探活点暂时不可达时,没有观测结果的入口不能让整组请求悬空。
+        // 先用清单第一条作为确定性兜底,守护层随后会按失败证据轮转到下一条;
+        // 探活恢复后仍由 leastPing 负责无感择路。
+        { tag: TUNNEL_BALANCER_TAG, selector: [`${TUNNEL_BALANCER_TAG}-`], fallbackTag: `${TUNNEL_BALANCER_TAG}-0`, strategy: { type: 'leastPing' } },
+        ...(dedicated.length ? [{ tag: DEDICATED_BALANCER_TAG, selector: [`${DEDICATED_BALANCER_TAG}-`], fallbackTag: `${DEDICATED_BALANCER_TAG}-0`, strategy: { type: 'leastPing' } }] : [])
       ] } : {}),
       rules
     }
@@ -128,6 +131,9 @@ export function createLocalBridge(options) {
   let lost
   let degraded
   let runId
+  let xrayImageName
+  let lifecycleGeneration = 0
+  let starting = false
   let closeInFlight
   let port = options.listenPort
   let kernelPort
@@ -137,6 +143,7 @@ export function createLocalBridge(options) {
   const probeDedicated = options.outbounds?.length > 1 && options.routes?.dedicatedSuffixes?.length > 0 && !!options.verifyUrl
   const spawnImpl = options.spawnImpl ?? spawn
   const platform = options.platform ?? process.platform
+  const readStartedAt = options.readProcessStartedAt ?? ((pid) => readPidStartedAt(pid, Date.now, { platform }))
   const relaySockets = new Set()
   // 在途流(D3):已经回过数据、还没结束的连接数。AI 的流式回答就是这种连接。
   // relay 只看得到本机 xray 怎么收尾,分不出远端是正常结束还是半路截断;
@@ -150,77 +157,106 @@ export function createLocalBridge(options) {
     port: () => port,
     // 流量统计仅累计字节。退出后的目标限制只在内存保留 CONNECT 目标，不记录报文或凭据。
     traffic: () => ({ ...traffic, observedAt: Date.now() }),
-    verify: options.verifyUrl ? () => verifyWithFallback(apiOnly ? kernelPort : port, options.verifyUrl, options.verifyFallbackUrl, options.verifyTimeoutMs) : undefined,
+    verify: options.verifyUrl ? () => verifyWithFallback(apiOnly ? kernelPort : port, options.verifyUrl, options.verifyFallbackUrl, options.verifyTimeoutMs, undefined,
+      { allowLocalVerifyUrls: options.allowLocalVerifyUrls === true }) : undefined,
     // 回显打不通时的第二意见:通用探测点经通道可达 = 通道活着(见 daemon-core.verifyConnection)。
     probeReachability: options.verifyUrl ? () => probeTunnelReachability(apiOnly ? kernelPort : port, options.probeUrls ?? TUNNEL_PROBE_URLS, options.verifyTimeoutMs) : undefined,
+    // 通用探测只能证明 tunnel alive；普通通道还必须有 ChatGPT/Claude 目标证据。
+    // API-only 已经由 apiDestinations 限制到调用方目标，不能拿浏览器服务探测去误伤它。
+    probeTargetReachability: options.verifyUrl && options.routes !== undefined ? () => apiOnly
+      ? Promise.resolve({ url: 'api-only-target-gate' })
+      : probeTargetReachability(port, AI_SERVICE_PROBE_URLS, options.verifyTimeoutMs) : undefined,
     verifyDedicated: probeDedicated ? async () => {
       if (stopped || dedicatedProbePort === undefined) throw fail()
-      try {
-        await verifyWithFallback(dedicatedProbePort, options.verifyUrl, options.verifyFallbackUrl, options.verifyTimeoutMs)
-      } catch (error) {
+      try { await verifyWithFallback(dedicatedProbePort, options.verifyUrl, options.verifyFallbackUrl, options.verifyTimeoutMs, undefined,
+        { allowLocalVerifyUrls: options.allowLocalVerifyUrls === true }) }
+      catch (error) {
         // 回显站故障不等于专用通道故障;第二意见仍须走专用组。
         try { await probeTunnelReachability(dedicatedProbePort, options.probeUrls ?? TUNNEL_PROBE_URLS, options.verifyTimeoutMs) }
         catch { throw error }
       }
+      // The main local entry already routes AI targets through the dedicated
+      // balancer, so verifyConnection's target probe covers this path too.
     } : undefined,
     isAlive: () => child !== undefined && child.exitCode === null && child.signalCode === null && failure === undefined,
     onLost: (callback) => { lost = callback },
     // 被动检测(照 mihomo 的 onDialFailed):客户真实请求在通道里连续失败,就立刻通知守护复验,⛔ 干等 30 秒定时。
     onDegraded: (callback) => { degraded = callback },
     async listen() {
-      if (!stopped || child !== undefined) throw new Error('BRIDGE_ALREADY_STARTED')
+      if (starting || !stopped || child !== undefined) throw new Error('BRIDGE_ALREADY_STARTED')
       if (!options.outbound && !(options.outbounds?.length > 0) && options.upstream?.host !== '127.0.0.1') throw fail()
       const executable = options.executablePath ?? xrayExecutable()
+      xrayImageName = options.executablePath === undefined && platform === 'win32' ? 'xray.exe' : imageNameOf(executable)
       // 内核文件不在(装包不全,或被安全软件隔离)是缺组件 ⛔ 「上游不可达」:按上游不可达报会无限重连,
       // 而每次重连都起不来,系统代理却一直挂着 → 整机断网。缺组件是致命码:守护立刻停、先恢复代理、给人话。
       if (!existsSync(executable)) throw new ConnectorError(CONTROL_CODES.componentMissing, '代理内核缺失或已被安全软件隔离，请把工具箱目录加入安全软件白名单后重新安装')
       const missingAsset = ['geoip.dat', 'geosite.dat'].find((name) => !existsSync(join(dirname(executable), name)))
       if (missingAsset) throw new ConnectorError(CONTROL_CODES.componentMissing, `分流数据缺失（${missingAsset}），请重新安装工具箱`)
-      // 入口端口由 relay 直接占用，避免检查完成到监听之间被其他本机进程抢占。
-      const requestedPort = port ?? 0
-      let xrayPort = await availablePort(0)
-      while (requestedPort > 0 && xrayPort === requestedPort) xrayPort = await availablePort(0)
-      kernelPort = xrayPort
-      if (probeDedicated) {
-        do { dedicatedProbePort = await availablePort(0) }
-        while (dedicatedProbePort === requestedPort || dedicatedProbePort === xrayPort)
-      }
-      mkdirSync(options.dataDir, { recursive: true })
-      const config = join(options.dataDir, 'xray-bridge.json')
-      runId = randomUUID()
-      // 上次 runner 被硬杀(Windows TerminateProcess)时 close 钩子不跑,pid 记档留在磁盘、
-      // 内核还活着。启动前清扫失去 runner 的旧记录；活 runner 的记录保留。
-      sweepOrphanXrays(config, platform, imageNameOf(executable), spawnImpl)
-      writeFileSync(config, JSON.stringify(buildXrayConfig({ ...options, listenPort: xrayPort, dedicatedProbePort })), { mode: 0o600 })
+      const generation = ++lifecycleGeneration
+      starting = true
       stopped = false
-      failure = undefined
-      // runner 的 stdin 是停止管道:close() 关闭它,runner 见 EOF 即停 xray(跨平台可靠)。
-      // stderr 接进守护的 stderr(甲-6:runner 把内核 stderr 转发到那里 → 守护日志 → 诊断包)。
-      child = spawnImpl(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), 'xray-runner.mjs'), executable, config, String(process.pid), runId], {
-        env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
-        stdio: ['pipe', 'ignore', 'inherit'], windowsHide: true
-      })
-      exited = new Promise((resolve) => {
-        child.once('error', () => { failure = fail() })
-        child.once('close', () => {
-          failure ??= fail()
-          void closeTrafficRelay(relay, relaySockets)
-          relay = undefined
-          resolve()
-          if (!stopped) lost?.(failure)
-        })
-      })
+      const assertActive = () => {
+        if (generation !== lifecycleGeneration || stopped) {
+          throw Object.assign(new Error('本地桥启动已取消'), { code: 'TUNNEL_CONNECTION_CANCELLED' })
+        }
+      }
       try {
+        // 入口端口由 relay 直接占用，避免检查完成到监听之间被其他本机进程抢占。
+        const requestedPort = port ?? 0
+        let xrayPort = await availablePort(0)
+        assertActive()
+        while (requestedPort > 0 && xrayPort === requestedPort) {
+          xrayPort = await availablePort(0)
+          assertActive()
+        }
+        kernelPort = xrayPort
+        if (probeDedicated) {
+          do {
+            dedicatedProbePort = await availablePort(0)
+            assertActive()
+          } while (dedicatedProbePort === requestedPort || dedicatedProbePort === xrayPort)
+        }
+        mkdirSync(options.dataDir, { recursive: true })
+        const config = join(options.dataDir, 'xray-bridge.json')
+        runId = randomUUID()
+        // 上次 runner 被硬杀(Windows TerminateProcess)时 close 钩子不跑,pid 记档留在磁盘、
+        // 内核还活着。启动前清扫失去 runner 的旧记录；活 runner 的记录保留。
+        sweepOrphanXrays(config, platform, xrayImageName, spawnImpl, readStartedAt)
+        assertActive()
+        writeFileSync(config, JSON.stringify(buildXrayConfig({ ...options, listenPort: xrayPort, dedicatedProbePort })), { mode: 0o600 })
+        failure = undefined
+        // runner 的 stdin 是停止管道:close() 关闭它,runner 见 EOF 即停 xray(跨平台可靠)。
+        // stderr 接进守护的 stderr(甲-6:runner 把内核 stderr 转发到那里 → 守护日志 → 诊断包)。
+        child = spawnImpl(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), 'xray-runner.mjs'), executable, config, String(process.pid), runId], {
+          env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+          stdio: ['pipe', 'ignore', 'inherit'], windowsHide: true
+        })
+        exited = new Promise((resolve) => {
+          child.once('error', () => { failure = fail() })
+          child.once('close', () => {
+            failure ??= fail()
+            void closeTrafficRelay(relay, relaySockets)
+            relay = undefined
+            resolve()
+            if (!stopped) lost?.(failure)
+          })
+        })
         const deadline = Date.now() + 5_000
         while (Date.now() < deadline) {
           await new Promise((resolve) => setTimeout(resolve, 100))
+          assertActive()
           if (failure !== undefined) break
           if (await probeSocks(xrayPort)) {
+            assertActive()
             const detector = createFailureDetector({ onDegraded: () => degraded?.() })
             const listener = await startTrafficRelay(requestedPort, xrayPort, traffic, relaySockets, options.idleStreamMs, detector, apiDestinations)
             relay = listener.server
+            assertActive()
             port = listener.port
-            if (await probeSocks(port)) return
+            if (await probeSocks(port)) {
+              assertActive()
+              return
+            }
             break
           }
         }
@@ -228,11 +264,14 @@ export function createLocalBridge(options) {
       } catch (error) {
         await this.close()
         throw error
+      } finally {
+        starting = false
       }
     },
     async close() {
-      if (closeInFlight !== undefined) return closeInFlight
+      lifecycleGeneration += 1
       stopped = true
+      if (closeInFlight !== undefined) return closeInFlight
       const closing = Promise.resolve().then(async () => {
         const closingChild = child
         const closingRunId = runId
@@ -251,9 +290,19 @@ export function createLocalBridge(options) {
           // 兜底只处理本次 runner 与本次 runId 记档。
           if (platform === 'win32') {
             const record = readXrayRecord(join(options.dataDir, `xray-bridge.json.${closingRunId}.pid`))
-            const pid = record?.runId === closingRunId ? record.pid : undefined
-            if (pid !== undefined) {
-              try { spawnImpl('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true }) } catch { /* 强杀失败时下方仍杀 runner。 */ }
+            const expectedImage = xrayImageName ?? 'xray.exe'
+            // The pid file is untrusted local state: an image mismatch means the
+            // pid may have been reused, so do not let the record choose a kill target.
+            const pid = record?.runId === closingRunId && record.image === expectedImage && Number.isFinite(record.startedAt)
+              ? record.pid : undefined
+            let actualStartedAt
+            try { actualStartedAt = pid !== undefined ? readStartedAt(pid) : undefined } catch { actualStartedAt = undefined }
+            const startedAtMatches = pid !== undefined && Number.isFinite(actualStartedAt) &&
+              Math.abs(actualStartedAt - record.startedAt) <= 2_000
+            if (startedAtMatches) {
+              try {
+                spawnImpl('taskkill', ['/PID', String(pid), '/T', '/F', '/FI', `IMAGENAME eq ${expectedImage}`], { stdio: 'ignore', windowsHide: true })
+              } catch { /* 强杀失败时下方仍杀 runner。 */ }
             }
           }
           closingChild.kill('SIGKILL')
@@ -270,7 +319,8 @@ export function createLocalBridge(options) {
   }
 }
 
-function startTrafficRelay(port, targetPort, traffic, sockets, idleStreamMs = IDLE_STREAM_MS, detector = createFailureDetector(), apiDestinations = createApiDestinationGate()) {  return new Promise((resolve, reject) => {
+// 导出供转发对收尾语义的直接用例(纯 socket 对,不经 xray;与 upstreamPayloadReader 同例)。
+export function startTrafficRelay(port, targetPort, traffic, sockets, idleStreamMs = IDLE_STREAM_MS, detector = createFailureDetector(), apiDestinations = createApiDestinationGate()) {  return new Promise((resolve, reject) => {
     const server = createServer((client) => {
       const upstream = connect({ host: '127.0.0.1', port: targetPort })
       sockets.add(client); sockets.add(upstream)
@@ -320,7 +370,12 @@ function startTrafficRelay(port, targetPort, traffic, sockets, idleStreamMs = ID
       })
       client.once('error', close); upstream.once('error', close)
       // 上游把回答发完并收尾(FIN):这条回答结束了,⛔ 等空闲窗口才销账。
-      upstream.once('end', settle)
+      // 上游 FIN 同时意味着整条隧道使命完成(远端已收口):必须把转发对整体拆掉,
+      // ⛔ 只销账不拆——对端若还开着就是半开滞留,正是 2026-10-08 复现的收尾悬挂
+      // (server.close 等不到那半条)与节点侧半开连接累积的来源。
+      upstream.once('end', () => { settle(); close() })
+      // 转发对同生共死:客户端整条关闭后,它到上游的那半条必须同步销毁——forget 会把
+      // 两端同时移出清理集合,不在这里销毁,半开的上游就轮不到任何收尾路径(节点侧半开累积)。
       client.once('close', () => { settle(); forget(); report() })
       upstream.once('close', () => { settle(); forget(); report() })
       // DL-03: all destinations use ordinary forwarding; download scheduling belongs to the client.
@@ -499,32 +554,43 @@ function readXrayRecord(pidPath) {
   }
 }
 
-function sweepOrphanXrays(config, platform, imageName, spawnImpl) {
+function sweepOrphanXrays(config, platform, imageName, spawnImpl, readStartedAt) {
   const name = basename(config)
   let files
   try { files = readdirSync(dirname(config)) } catch { return }
   for (const file of files) {
     if (file !== `${name}.pid` && !file.startsWith(`${name}.`)) continue
-    if (file !== `${name}.pid` && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.pid$/.test(file.slice(name.length + 1))) continue
-    sweepOrphanXray(join(dirname(config), file), platform, imageName, spawnImpl)
+    const runId = file === `${name}.pid` ? undefined : file.slice(name.length + 1, -'.pid'.length)
+    if (runId !== undefined && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(runId)) continue
+    sweepOrphanXray(join(dirname(config), file), platform, imageName, runId, spawnImpl, readStartedAt)
   }
 }
 
 // 启动前清扫:记档里的内核若还活着就先杀掉,再起新的。
-// 防 PID 复用误杀两道闸:①记档的启动时刻早于本次开机 ⇒ 那个进程必已消失,只删记档不杀;
-// ②taskkill 带映像名过滤,只有这个 pid 现在仍是我们的内核映像才会被终止。
-function sweepOrphanXray(pidPath, platform, imageName, spawnImpl) {
+// 防 PID 复用误杀三道闸:①记档的启动时刻早于本次开机 ⇒ 那个进程必已消失,只删记档不杀;
+// ②同一次开机也要复核实际启动时刻,不能只靠映像名(同名 PID 仍会复用);
+// ③taskkill 带映像名过滤,只有这个 pid 现在仍是我们的内核映像才会被终止。
+function sweepOrphanXray(pidPath, platform, imageName, expectedRunId, spawnImpl, readStartedAt) {
   const record = readXrayRecord(pidPath)
   if (record === undefined) return
   if (record.owner !== undefined && lockHolderAlive(record.owner)) return
   const bootedAt = Date.now() - uptime() * 1_000
-  const beforeThisBoot = record.startedAt !== undefined && record.startedAt < bootedAt - 60_000
+  const beforeThisBoot = Number.isFinite(record.startedAt) && record.startedAt < bootedAt - 60_000
   if (platform === 'win32' && !beforeThisBoot) {
-    const image = record.image ?? imageName
-    try {
-      spawnImpl('taskkill', ['/F', '/T', '/FI', `PID eq ${String(record.pid)}`, '/FI', `IMAGENAME eq ${image}`],
-        { stdio: 'ignore', windowsHide: true })
-    } catch { /* 清扫失败不挡启动:新内核用新端口,旧孤儿下次启动再扫。 */ }
+    const identityComplete = expectedRunId !== undefined && record.runId === expectedRunId &&
+      record.image === imageName && Number.isFinite(record.startedAt)
+    let startedAtMatches = false
+    if (identityComplete) {
+      let actualStartedAt
+      try { actualStartedAt = readStartedAt(record.pid) } catch { actualStartedAt = undefined }
+      startedAtMatches = Number.isFinite(actualStartedAt) && Math.abs(actualStartedAt - record.startedAt) <= 2_000
+    }
+    if (identityComplete && startedAtMatches) {
+      try {
+        spawnImpl('taskkill', ['/F', '/T', '/FI', `PID eq ${String(record.pid)}`, '/FI', `IMAGENAME eq ${imageName}`],
+          { stdio: 'ignore', windowsHide: true })
+      } catch { /* 清扫失败不挡启动:新内核用新端口,旧孤儿下次启动再扫。 */ }
+    }
   }
   // 旧记录已作废；新 runner 使用自己的 runId 文件。
   try { rmSync(pidPath, { force: true }) } catch { /* 删不掉也不挡启动。 */ }

@@ -202,6 +202,17 @@ function fixture(options: FixtureOptions = {}) {
         return { code: options.exportCode ?? (tasks.get(task) === 'missing' || tasks.get(task) === 'unknown' ? 1 : 0),
           stdout: options.exportPayload ?? Buffer.from(xml, 'utf8').toString('base64'), stderr: '' }
       }
+      if (encodedScript?.includes('LAIXIN_TASK_COM_QUERY')) {
+        const fullPathToken = Buffer.from('\\Laixin\\', 'utf8').toString('base64')
+        const task = encodedScript.includes(fullPathToken) ? TASKS[0] : TASKS[1]
+        if (options.timeout?.verb === 'query' && options.timeout.task === task) {
+          return { code: null, stdout: '', stderr: '', timedOut: true }
+        }
+        const state = tasks.get(task)
+        const code = options.existenceQueryCode ?? (state === 'missing' ? 3 : state === 'unknown' ? 2 : 0)
+        const xml = options.queryXml?.[task] ?? `<Task><Settings><Enabled>${state === 'Enabled' ? 'true' : 'false'}</Enabled></Settings></Task>`
+        return { code, stdout: code === 0 ? Buffer.from(xml, 'utf8').toString('base64') : '', stderr: '' }
+      }
       if (encodedScript?.includes('LAIXIN_TASK_EXISTENCE_QUERY')) {
         const fullPathToken = Buffer.from('\\Laixin\\', 'utf8').toString('base64')
         const task = encodedScript.includes(fullPathToken) ? TASKS[0] : TASKS[1]
@@ -287,8 +298,28 @@ describe('Windows 更新/卸载前置闸', () => {
 
     expect(await runBeforeInstallWrite(f, 'uninstall')).toEqual(['install-directory-write'])
     expect(f.tasks.get(TASKS[0])).toBe('missing')
-    expect(f.calls.some((call) => call.script?.includes('LAIXIN_TASK_EXISTENCE_QUERY') &&
-      call.script.includes('Get-ScheduledTask -ErrorAction Stop'))).toBe(true)
+    expect(f.calls.some((call) => call.script?.includes('LAIXIN_TASK_COM_QUERY') &&
+      call.script.includes('Schedule.Service'))).toBe(true)
+  })
+
+  it('真卸载任务查询走 Task Scheduler COM，不依赖 WMI 导出 XML', async () => {
+    const f = fixture({ tasks: { [TASKS[0]]: 'Enabled', [TASKS[1]]: 'Disabled' } })
+
+    await expect(runBeforeInstallWrite(f, 'uninstall')).resolves.toEqual(['install-directory-write'])
+
+    expect(f.calls.filter((call) => call.script?.includes('LAIXIN_TASK_COM_QUERY'))).toHaveLength(4)
+    expect(f.calls.some((call) => call.script?.includes('LAIXIN_TASK_XML_QUERY'))).toBe(false)
+    expect(f.calls.some((call) => call.script?.includes('LAIXIN_TASK_EXISTENCE_QUERY'))).toBe(false)
+  })
+
+  it('真卸载的 COM 查询在安装器 spawn 环境失败时，降级到固定任务的 schtasks XML 查询', async () => {
+    const f = fixture({ tasks: { [TASKS[0]]: 'Enabled', [TASKS[1]]: 'Disabled' }, existenceQueryCode: 2 })
+
+    await expect(runBeforeInstallWrite(f, 'uninstall')).resolves.toEqual(['install-directory-write'])
+
+    expect(f.calls.some((call) => call.script?.includes('LAIXIN_TASK_COM_QUERY'))).toBe(true)
+    expect(f.calls.some((call) => call.file === 'schtasks.exe' && call.args.includes('/xml'))).toBe(true)
+    expect(f.calls.some((call) => call.script?.includes('Get-ScheduledTask -ErrorAction Stop | Where-Object'))).toBe(false)
   })
 
   it('预检失败把错误码写入本地恢复目录，并保持非零退出码', async () => {
@@ -695,7 +726,8 @@ describe('Windows 更新/卸载前置闸', () => {
         rebootConsumer.indexOf('function Get-RecoveryTask'),
         rebootConsumer.indexOf('function Disabled-TaskXml')
       )
-      expect(taskLookup).toContain('Get-ScheduledTask -ErrorAction Stop')
+      expect(taskLookup).toContain('Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction Stop')
+      expect(taskLookup).not.toContain('Get-ScheduledTask -ErrorAction Stop | Where-Object')
       expect(taskLookup).not.toContain('SilentlyContinue')
       expect(rebootConsumer).toContain('$failures=@()')
       expect(rebootConsumer).toContain("$failures+='task-prepare:'")
@@ -1379,9 +1411,10 @@ describe('真实入口守卫', () => {
     expect(missingBranch).not.toMatch(/Pop \$7[\s\S]*StrCpy \$7\s+"0"/)
     expect(body).toContain('File /oname=laixin-uninstall-task-cleanup.ps1')
     const cleanup = await readFile(join(__dirname, '..', '..', 'resources', 'uninstall-task-cleanup.ps1'), 'utf8')
-    expect(cleanup.match(/Get-ScheduledTask/g)).toHaveLength(2)
+    expect(cleanup.match(/Get-ScheduledTask/g)).toHaveLength(1)
     expect(cleanup).toContain('Unregister-ScheduledTask')
-    expect(cleanup).toMatch(/if \(\$left\.Count -ne 0\) \{ exit 1 \}/)
+    expect(cleanup).toContain('Get-LaixinTask')
+    expect(cleanup).not.toContain('Get-ScheduledTask -ErrorAction Stop | Where-Object')
     expect(cleanup).toContain('LAIXIN_UNINSTALL_PROXY_FALLBACK')
     expect(cleanup).toContain('InternetSetOption')
     expect(cleanup).toMatch(/if \(\$mustDisable -and \[int\]\$after\.ProxyEnable -ne 0\) \{ exit 2 \}/)
@@ -1395,7 +1428,7 @@ describe('真实入口守卫', () => {
 
   it('卸载只在 Laixin 计划任务文件夹完全为空时删除该文件夹', async () => {
     const cleanup = await readFile(join(__dirname, '..', '..', 'resources', 'uninstall-task-cleanup.ps1'), 'utf8')
-    const tasksVerified = cleanup.indexOf('if ($left.Count -ne 0) { exit 1 }')
+    const tasksVerified = cleanup.indexOf('foreach ($ref in $taskRefs) {')
     const deleteFolder = cleanup.indexOf("DeleteFolder('Laixin', 0)")
 
     expect(cleanup.startsWith('\uFEFF')).toBe(true)
@@ -1490,8 +1523,26 @@ describe('真实入口守卫', () => {
     }
     expect(init).toContain('!ifdef UNINSTALL_REGISTRY_KEY_2')
     expect(init.match(/\$R9 != ""[\s\S]*?StrCpy \$R8 "1"/g)).toHaveLength(3)
-    expect(init).toMatch(/\$R8 == "1"[\s\S]+readLaixinWindowsPreflightHandoff \$R7[\s\S]+\$R7 != "1"[\s\S]+SetErrorLevel 1[\s\S]+Abort/)
+    // P1 修复后分两类:目标 EXE 已丢(残缺安装)维持硬拦;健康旧安装降级放行给旧卸载器 update 闸。
+    // 分支顺序:handoff 失败 → 先试 EXE(在=DEGRADED 放行),Else(EXE 丢=硬拦)。用顺序断言而非切片。
+    expect(init).toMatch(/\$R7 != "1"[\s\S]*?\${If} \$\{FileExists\} "\$INSTDIR\\\$\{APP_EXECUTABLE_FILENAME\}"[\s\S]*?INSTALLER_HANDOFF_DEGRADED[\s\S]*?Goto laixinCustomInitDone[\s\S]*?\${Else}[\s\S]*?INSTALLER_HANDOFF_REQUIRED[\s\S]*?SetErrorLevel 1[\s\S]*?Abort[\s\S]*?\${EndIf}[\s\S]*?laixinCustomInitDone/)
     expect(init).not.toContain('runLaixinWindowsPreflight')
+  })
+
+  it('P1 回归:健康旧安装双击升级不再被 customInit 拦死,降级给旧卸载器 update 前置闸', async () => {
+    const source = await readFile(join(__dirname, '..', '..', 'build', 'installer.nsh'), 'utf8')
+    const init = source.slice(source.indexOf('!macro customInit'), source.indexOf('!macroend', source.indexOf('!macro customInit')))
+    // 降级分支:EXE 在 → 记 DEGRADED 日志 → 跳过 Abort 继续安装(由 uninstallOldVersion 的旧卸载器闸兜底)。
+    expect(init).toContain('INSTALLER_HANDOFF_DEGRADED')
+    expect(init).toContain('PROCEED_VIA_OLD_UNINSTALLER_GATE')
+    // Abort 只允许出现在「EXE 已丢」的 Else 分支;DEGRADED 分支到 label 之间不得有 Abort。
+    const degradedStart = init.indexOf('INSTALLER_HANDOFF_DEGRADED')
+    const degradedBranch = init.slice(degradedStart, init.indexOf('Goto laixinCustomInitDone'))
+    expect(degradedBranch).not.toContain('SetErrorLevel 1')
+    expect(degradedBranch).not.toContain('Abort')
+    const labelIndex = init.indexOf('laixinCustomInitDone:')
+    const afterLabel = init.slice(labelIndex, init.indexOf('!macroend', labelIndex))
+    expect(afterLabel).not.toContain('Abort')
   })
 
   it('0.6.1 首跳有据：更新助手交接由新安装器和旧卸载器共同复验', async () => {

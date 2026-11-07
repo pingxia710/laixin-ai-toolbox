@@ -20,9 +20,16 @@ import { recordFault } from '../diagnostics/context'
 import { detachAiRouterConnections } from './router-cleanup'
 import { electronSystemFetch } from './electron-fetch'
 import { API_NETWORK_PATH } from '../../../sidecar/shared/api-network-continuation.mjs'
+import { BackgroundNetworkController } from '../tunnel/background-controller'
+import { backgroundTunnelDeps } from '../actions/tunnel'
+import { createSessionStore } from '../account/store'
+import { NetworkAccountClient } from '../tunnel/account-client'
+import { resolveTunnelDataDir } from '../tunnel/paths'
+import type { AccountSession } from '../../account-types'
 
 declare const __TOOLBOX_UPDATE_PUBLIC_KEY__: string
 declare const __TOOLBOX_UPDATE_ORIGIN__: string
+declare const __TOOLBOX_ACCOUNT_ORIGIN__: string
 
 export interface ExecutableRemovalMonitorOptions {
   readonly intervalMs?: number
@@ -172,10 +179,12 @@ export async function runHeadlessRouter(userData = app.getPath('userData')): Pro
   const gatewayHolder: { current?: AiRouterGateway } = {}
   let stopping = false
   let stopRemovalMonitor: (() => void) | undefined
+  let networkController: BackgroundNetworkController | undefined
   const stop = async (): Promise<void> => {
     if (stopping) return
     stopping = true
     stopRemovalMonitor?.()
+    await networkController?.stop()
     await gatewayHolder.current?.stop(routerDrainTimeoutMs).catch(() => undefined)
     await removeAiRouterRuntime(root, seat.bootId)
     await seat.release()
@@ -215,6 +224,24 @@ export async function runHeadlessRouter(userData = app.getPath('userData')): Pro
     await seat.assertOwnership()
     process.once('SIGTERM', () => { void stop() })
     process.once('SIGINT', () => { void stop() })
+    const sessionStore = createSessionStore(join(userData, 'account'))
+    const accountOrigin = new URL(__TOOLBOX_ACCOUNT_ORIGIN__).href
+    networkController = new BackgroundNetworkController({
+      dataDir: resolveTunnelDataDir(process.env, userData),
+      router: { ...binding, pid: process.pid, bootId: seat.bootId },
+      serviceDeps: backgroundTunnelDeps,
+      loadAccount: async () => {
+        const saved = await sessionStore.read() as (AccountSession & { serviceOrigin?: string }) | null
+        if (!saved || saved.serviceOrigin !== accountOrigin || saved.expiresAt <= Date.now()) return undefined
+        const deviceId = await sessionStore.deviceId?.()
+        return { expiresAt: saved.expiresAt, access: {
+          client: new NetworkAccountClient(new URL('v1/network/', accountOrigin).href),
+          session: { accountId: saved.account.id, accessToken: saved.accessToken, deviceId }
+        } }
+      },
+      onFailure: () => { console.error('[ai-router] background network management unavailable') }
+    })
+    networkController.start()
     if (app.isPackaged) {
       stopRemovalMonitor = startExecutableRemovalMonitor(process.execPath, async () => {
         await detachAiRouterConnections(userData)
@@ -223,6 +250,7 @@ export async function runHeadlessRouter(userData = app.getPath('userData')): Pro
       })
     }
   } catch (error) {
+    await networkController?.stop().catch(() => undefined)
     await gateway.stop(0).catch(() => undefined)
     await seat.release()
     throw error

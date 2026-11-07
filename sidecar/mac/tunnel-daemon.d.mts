@@ -9,3 +9,29 @@ export interface RealClock {
 }
 
 export declare function makeRealClock(): RealClock
+
+export declare const STARTUP_WATCHDOG_MS: 120000
+export declare const STARTUP_WATCHDOG_EXIT_CODE: 75
+export declare function startupContextIssue(options?: {
+  dataDir?: string
+  adapterPath?: string
+  resident?: boolean
+  taskPath?: string
+  platform?: string
+  env?: Record<string, string | undefined>
+}): string | undefined
+export declare function armStartupWatchdog(options?: {
+  dataDir?: string
+  runId?: string
+  log?: (line: string) => void
+  exit?: (code: number) => void
+  timeoutMs?: number
+}): () => void
+
+export declare function recoverAfterAdapterLoadFailure(options: {
+  dataDir: string
+  runId: string
+  recoveryOwnershipObserved?: { generation: number }
+  createAdapter?: () => unknown
+  log?: (line: string) => void
+}): Promise<{ restored: boolean; handedOver: boolean }>
