@@ -336,12 +336,14 @@ describe('local-bridge 停止(win32 注入模拟)', () => {
   })
 
   it('启动前清扫上次硬杀留下的内核:先对旧记档 pid 恰好 1 次 taskkill(带映像名过滤),再起新 runner', async () => {
-    const pidPath = join(dataDir, 'xray-bridge.json.pid')
-    writeFileSync(pidPath, `${JSON.stringify({ pid: 4001, startedAt: Date.now(), image: 'xray.exe' })}\n`, { mode: 0o600 })
+    const runId = '33333333-3333-4333-8333-333333333333'
+    const pidPath = join(dataDir, `xray-bridge.json.${runId}.pid`)
+    writeFileSync(pidPath, `${JSON.stringify({ pid: 4001, startedAt: Date.now(), image: 'xray.exe', runId })}\n`, { mode: 0o600 })
     const calls: Array<{ cmd: string, args: readonly string[] }> = []
     const bridge = createLocalBridge({
       listenPort: 0, dataDir, routes: undefined, upstream: { host: '127.0.0.1', port: 1 },
-      spawnImpl: fakeRunnerSpawn(calls, (server) => { socksServer = server }) as never, platform: 'win32'
+      spawnImpl: fakeRunnerSpawn(calls, (server) => { socksServer = server }) as never, platform: 'win32',
+      readProcessStartedAt: () => Date.now()
     })
 
     await bridge.listen()
@@ -356,6 +358,24 @@ describe('local-bridge 停止(win32 注入模拟)', () => {
     const runner = calls.find((call) => call.cmd !== 'taskkill')
     expect(JSON.parse(readFileSync(runPidPath(join(dataDir, 'xray-bridge.json'), runner!.args), 'utf8')) as { pid: number })
       .toEqual(expect.objectContaining({ pid: 4002 }))
+    await bridge.close()
+  })
+
+  it('启动清扫同名 PID 但启动时刻不符时不强杀', async () => {
+    const runId = '33333333-3333-4333-8333-333333333333'
+    const pidPath = join(dataDir, `xray-bridge.json.${runId}.pid`)
+    writeFileSync(pidPath, `${JSON.stringify({ pid: 4001, startedAt: Date.now(), image: 'xray.exe', runId })}\n`, { mode: 0o600 })
+    const calls: Array<{ cmd: string, args: readonly string[] }> = []
+    const bridge = createLocalBridge({
+      listenPort: 0, dataDir, routes: undefined, upstream: { host: '127.0.0.1', port: 1 },
+      spawnImpl: fakeRunnerSpawn(calls, (server) => { socksServer = server }) as never, platform: 'win32',
+      readProcessStartedAt: () => 0
+    })
+
+    await bridge.listen()
+
+    expect(calls.filter((call) => call.cmd === 'taskkill')).toHaveLength(0)
+    expect(existsSync(pidPath)).toBe(false)
     await bridge.close()
   })
 
@@ -399,7 +419,8 @@ describe('local-bridge 停止(win32 注入模拟)', () => {
     const calls: Array<{ cmd: string, args: readonly string[] }> = []
     const bridge = createLocalBridge({
       listenPort: 0, dataDir, routes: undefined, upstream: { host: '127.0.0.1', port: 1 },
-      spawnImpl: fakeRunnerSpawn(calls, (server) => { socksServer = server }) as never, platform: 'win32'
+      spawnImpl: fakeRunnerSpawn(calls, (server) => { socksServer = server }) as never, platform: 'win32',
+      readProcessStartedAt: () => Date.now()
     })
 
     await bridge.listen()
@@ -415,15 +436,34 @@ describe('local-bridge 停止(win32 注入模拟)', () => {
     const calls: Array<{ cmd: string, args: readonly string[] }> = []
     const bridge = createLocalBridge({
       listenPort: 0, dataDir, routes: undefined, upstream: { host: '127.0.0.1', port: 1 },
-      spawnImpl: fakeRunnerSpawn(calls, (server) => { socksServer = server }) as never, platform: 'win32'
+      spawnImpl: fakeRunnerSpawn(calls, (server) => { socksServer = server }) as never, platform: 'win32',
+      readProcessStartedAt: () => Date.now()
     })
     await bridge.listen()
-    expect(calls.filter((call) => call.cmd === 'taskkill')).toEqual([
-      { cmd: 'taskkill', args: ['/F', '/T', '/FI', `PID eq ${FAKE_XRAY_PID}`, '/FI', 'IMAGENAME eq xray'] }
-    ])
+    expect(calls.filter((call) => call.cmd === 'taskkill')).toEqual([])
     expect(existsSync(pidPath)).toBe(false)
     await bridge.close()
     expect(bridge.isAlive()).toBe(false)
+  })
+
+  it.each([
+    ['缺少 image', { startedAt: Date.now(), runId: '33333333-3333-4333-8333-333333333333' }],
+    ['缺少 startedAt', { image: 'xray.exe', runId: '33333333-3333-4333-8333-333333333333' }],
+    ['image 被篡改', { startedAt: Date.now(), image: '*', runId: '33333333-3333-4333-8333-333333333333' }]
+  ])('启动清扫身份字段%s时只删记录不强杀', async (_label, fields) => {
+    const runId = '33333333-3333-4333-8333-333333333333'
+    const pidPath = join(dataDir, `xray-bridge.json.${runId}.pid`)
+    writeFileSync(pidPath, `${JSON.stringify({ pid: 4001, ...fields })}\n`, { mode: 0o600 })
+    const calls: Array<{ cmd: string, args: readonly string[] }> = []
+    const bridge = createLocalBridge({
+      listenPort: 0, dataDir, routes: undefined, upstream: { host: '127.0.0.1', port: 1 },
+      spawnImpl: fakeRunnerSpawn(calls, (server) => { socksServer = server }) as never, platform: 'win32',
+      readProcessStartedAt: () => Date.now()
+    })
+    await bridge.listen()
+    expect(calls.filter((call) => call.cmd === 'taskkill')).toEqual([])
+    expect(existsSync(pidPath)).toBe(false)
+    await bridge.close()
   })
 
   it('启动清扫跳过仍有原 runner 持有的独占记档', async () => {
@@ -452,7 +492,8 @@ describe('local-bridge 停止(win32 注入模拟)', () => {
     const calls: Array<{ cmd: string, args: readonly string[] }> = []
     const bridge = createLocalBridge({
       listenPort: 0, dataDir, routes: undefined, upstream: { host: '127.0.0.1', port: 1 },
-      spawnImpl: fakeRunnerSpawn(calls, (server) => { socksServer = server }) as never, platform: 'win32'
+      spawnImpl: fakeRunnerSpawn(calls, (server) => { socksServer = server }) as never, platform: 'win32',
+      readProcessStartedAt: () => Date.now()
     })
 
     await bridge.listen()
@@ -469,7 +510,7 @@ describe('local-bridge 停止(win32 注入模拟)', () => {
     const bridge = createLocalBridge({
       listenPort: 0, dataDir, routes: undefined, upstream: { host: '127.0.0.1', port: 1 },
       spawnImpl: fakeRunnerSpawn(calls, (server) => { socksServer = server }) as never,
-      platform: 'win32'
+      platform: 'win32', readProcessStartedAt: () => Date.now()
     })
     await bridge.listen()
     const pidPath = join(dataDir, 'xray-bridge.json.pid')
@@ -479,7 +520,7 @@ describe('local-bridge 停止(win32 注入模拟)', () => {
     await bridge.close()
 
     expect(calls.filter((call) => call.cmd === 'taskkill')).toEqual([
-      { cmd: 'taskkill', args: ['/PID', '4002', '/T', '/F'] }
+      { cmd: 'taskkill', args: ['/PID', '4002', '/T', '/F', '/FI', 'IMAGENAME eq xray.exe'] }
     ])
     expect(readFileSync(pidPath, 'utf8')).toBe(newerRecord)
   })
@@ -489,15 +530,44 @@ describe('local-bridge 停止(win32 注入模拟)', () => {
     const bridge = createLocalBridge({
       listenPort: 0, dataDir, routes: undefined, upstream: { host: '127.0.0.1', port: 1 },
       spawnImpl: fakeRunnerSpawn(calls, (server) => { socksServer = server }) as never,
-      platform: 'win32'
+      platform: 'win32', readProcessStartedAt: () => Date.now()
     })
     await bridge.listen()
 
     await bridge.close()
 
     expect(calls.filter((call) => call.cmd === 'taskkill')).toEqual([
-      { cmd: 'taskkill', args: ['/PID', '4002', '/T', '/F'] }
+      { cmd: 'taskkill', args: ['/PID', '4002', '/T', '/F', '/FI', 'IMAGENAME eq xray.exe'] }
     ])
+  })
+
+  it('当前 runId 但映像名不符时不按 PID 强杀可能被复用的进程', async () => {
+    const calls: Array<{ cmd: string, args: readonly string[] }> = []
+    const bridge = createLocalBridge({
+      listenPort: 0, dataDir, routes: undefined, upstream: { host: '127.0.0.1', port: 1 },
+      spawnImpl: fakeRunnerSpawn(calls, (server) => { socksServer = server }) as never,
+      platform: 'win32', readProcessStartedAt: () => Date.now()
+    })
+    await bridge.listen()
+    const records = readdirSync(dataDir).filter((name) => /^xray-bridge\.json\.[0-9a-f-]+\.pid$/.test(name))
+    expect(records).toHaveLength(1)
+    const pidPath = join(dataDir, records[0])
+    const record = JSON.parse(readFileSync(pidPath, 'utf8')) as Record<string, unknown>
+    writeFileSync(pidPath, `${JSON.stringify({ ...record, image: 'other.exe' })}\n`, { mode: 0o600 })
+    await bridge.close()
+    expect(calls.filter((call) => call.cmd === 'taskkill')).toEqual([])
+  })
+
+  it('当前 runId 与映像名一致但启动时刻不符时不按 PID 强杀可能被复用的进程', async () => {
+    const calls: Array<{ cmd: string, args: readonly string[] }> = []
+    const bridge = createLocalBridge({
+      listenPort: 0, dataDir, routes: undefined, upstream: { host: '127.0.0.1', port: 1 },
+      spawnImpl: fakeRunnerSpawn(calls, (server) => { socksServer = server }) as never,
+      platform: 'win32', readProcessStartedAt: () => 0
+    })
+    await bridge.listen()
+    await bridge.close()
+    expect(calls.filter((call) => call.cmd === 'taskkill')).toEqual([])
   })
 })
 

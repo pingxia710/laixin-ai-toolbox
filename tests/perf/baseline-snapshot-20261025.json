@@ -1,0 +1,200 @@
+{
+  "generatedAt": "2026-10-24T19:37:55.817Z",
+  "machine": "dev-mac-arm64 单机参考(⛔ 全机型 SLA)",
+  "normal": {
+    "scenario": "connection-normal",
+    "runs": 20,
+    "totalMsP50": 63.16666699999996,
+    "totalMsP95": 66.95428999999996,
+    "stages": [
+      {
+        "stage": "account-request",
+        "count": 20,
+        "p50Ms": 0.9565000000000055,
+        "p95Ms": 2.4830420000000117,
+        "timeouts": 0,
+        "errors": 0
+      },
+      {
+        "stage": "config-claim",
+        "count": 20,
+        "p50Ms": 1.9387499999999136,
+        "p95Ms": 3.008499999999998,
+        "timeouts": 0,
+        "errors": 0
+      },
+      {
+        "stage": "provisioning-wait",
+        "count": 20,
+        "p50Ms": 5.7095419999998285,
+        "p95Ms": 5.9665410000000065,
+        "timeouts": 0,
+        "errors": 0
+      },
+      {
+        "stage": "bridge-start",
+        "count": 20,
+        "p50Ms": 11.068665999999894,
+        "p95Ms": 11.967000000000098,
+        "timeouts": 0,
+        "errors": 0
+      },
+      {
+        "stage": "settings-write",
+        "count": 20,
+        "p50Ms": 0.020916000000056556,
+        "p95Ms": 0.03170899999986432,
+        "timeouts": 0,
+        "errors": 0
+      },
+      {
+        "stage": "settings-restore",
+        "count": 20,
+        "p50Ms": 13.820000000000164,
+        "p95Ms": 21.64866599999982,
+        "timeouts": 0,
+        "errors": 0
+      },
+      {
+        "stage": "tunnel-establish",
+        "count": 20,
+        "p50Ms": 0.01608299999998053,
+        "p95Ms": 0.02279199999998127,
+        "timeouts": 0,
+        "errors": 0
+      },
+      {
+        "stage": "path-identity",
+        "count": 20,
+        "p50Ms": 0.015999999999849024,
+        "p95Ms": 0.02174999999999727,
+        "timeouts": 0,
+        "errors": 0
+      },
+      {
+        "stage": "target-confirm",
+        "count": 20,
+        "p50Ms": 0.01525000000003729,
+        "p95Ms": 0.06037500000002183,
+        "timeouts": 0,
+        "errors": 0
+      },
+      {
+        "stage": "reconnect-recovery",
+        "count": 20,
+        "p50Ms": 24.52083300000004,
+        "p95Ms": 32.0865,
+        "timeouts": 0,
+        "errors": 0
+      }
+    ],
+    "resourceCeiling": {
+      "rssBytes": 21299200,
+      "heapUsedBytes": 3925136,
+      "handles": 8
+    },
+    "boundaries": [
+      "本机单机毫秒数,只作回归门槛相对比较,⛔ 全机型 SLA",
+      "资源为各 run 起止差值(⛔ 运行中峰值);句柄数为 process._getActiveHandleCount 近似(平台边界),CPU 时间在 CI 噪声下不采集",
+      "注入慢化: slowFactor=1; slowFactor=1; slowFactor=1; slowFactor=1; slowFactor=1; slowFactor=1; slowFactor=1; slowFactor=1; slowFactor=1; slowFactor=1; slowFactor=1; slowFactor=1; slowFactor=1; slowFactor=1; slowFactor=1; slowFactor=1; slowFactor=1; slowFactor=1; slowFactor=1; slowFactor=1"
+    ]
+  },
+  "slowFactor6": {
+    "scenario": "connection-slow-machine",
+    "runs": 8,
+    "totalMsP50": 1141.8742519999996,
+    "totalMsP95": 1146.9238339999993,
+    "stages": [
+      {
+        "stage": "account-request",
+        "count": 8,
+        "p50Ms": 102.185833,
+        "p95Ms": 103.65308300000015,
+        "timeouts": 0,
+        "errors": 0
+      },
+      {
+        "stage": "config-claim",
+        "count": 8,
+        "p50Ms": 53.60341700000026,
+        "p95Ms": 55.12162499999977,
+        "timeouts": 0,
+        "errors": 0
+      },
+      {
+        "stage": "provisioning-wait",
+        "count": 8,
+        "p50Ms": 155.88683300000048,
+        "p95Ms": 157.00220799999988,
+        "timeouts": 0,
+        "errors": 0
+      },
+      {
+        "stage": "bridge-start",
+        "count": 8,
+        "p50Ms": 88.06495799999993,
+        "p95Ms": 90.4242919999997,
+        "timeouts": 0,
+        "errors": 0
+      },
+      {
+        "stage": "settings-write",
+        "count": 8,
+        "p50Ms": 236.46612499999992,
+        "p95Ms": 240.84912499999973,
+        "timeouts": 0,
+        "errors": 0
+      },
+      {
+        "stage": "settings-restore",
+        "count": 8,
+        "p50Ms": 89.90925000000061,
+        "p95Ms": 101.71079099999952,
+        "timeouts": 0,
+        "errors": 0
+      },
+      {
+        "stage": "tunnel-establish",
+        "count": 8,
+        "p50Ms": 0.03500000000030923,
+        "p95Ms": 0.053584000000228116,
+        "timeouts": 0,
+        "errors": 0
+      },
+      {
+        "stage": "path-identity",
+        "count": 8,
+        "p50Ms": 25.78991699999915,
+        "p95Ms": 26.4917089999999,
+        "timeouts": 0,
+        "errors": 0
+      },
+      {
+        "stage": "target-confirm",
+        "count": 8,
+        "p50Ms": 25.60991699999977,
+        "p95Ms": 26.73720800000001,
+        "timeouts": 0,
+        "errors": 0
+      },
+      {
+        "stage": "reconnect-recovery",
+        "count": 8,
+        "p50Ms": 358.7936659999996,
+        "p95Ms": 369.2637500000001,
+        "timeouts": 0,
+        "errors": 0
+      }
+    ],
+    "resourceCeiling": {
+      "rssBytes": 4308992,
+      "heapUsedBytes": 4410416,
+      "handles": 10
+    },
+    "boundaries": [
+      "本机单机毫秒数,只作回归门槛相对比较,⛔ 全机型 SLA",
+      "资源为各 run 起止差值(⛔ 运行中峰值);句柄数为 process._getActiveHandleCount 近似(平台边界),CPU 时间在 CI 噪声下不采集",
+      "注入慢化: slowFactor=6; slowFactor=6; slowFactor=6; slowFactor=6; slowFactor=6; slowFactor=6; slowFactor=6; slowFactor=6"
+    ]
+  }
+}

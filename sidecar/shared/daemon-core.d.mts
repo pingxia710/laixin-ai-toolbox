@@ -8,7 +8,8 @@ export declare function intentDiskReads(): number
 /** 同一数据目录的恢复权规则(退出流程与崩溃兜底共用):启动后出现更高接管代次才算别的守护已实际接手。 */
 /** 上一轮实际监听的入口端口(候选口占满时会是系统随机分的那个)。 */
 export declare function lastBridgePort(dataDir: string): number | undefined
-export declare function recoveryOwnedByOther(dataDir: string, runId: string): boolean
+export declare function observeRecoveryOwnership(dataDir: string): { generation: number }
+export declare function recoveryOwnedByOther(dataDir: string, runId: string, observed?: { generation: number }): boolean
 export declare function installCrashBailout(options: {
   dataDir: string
   adapterOf: () => ManagedAdapter
@@ -25,7 +26,11 @@ export declare const BRIDGE_START_TIMEOUT_MS: number
 export declare const CONNECTION_VERIFY_TIMEOUT_MS: number
 export declare const EXISTING_PROXY_READ_TIMEOUT_MS: number
 export declare const REUSE_PATH_PROBE_TIMEOUT_MS: number
+/** 本机运行观测的默认采样周期；用于 V1.0 前稳定性/性能上报，不是连接判定或产品 SLA。 */
+export declare const RUNTIME_OBSERVATION_INTERVAL_MS: number
 export declare const SHUTDOWN_RESTORE_RETRY_MS: readonly number[]
+/** 启动恢复达到有界慢梯子后，守护继续承担恢复责任的重试间隔。 */
+export declare const STARTUP_RESTORE_RETRY_MS: number
 /** 网络抖动闸:事件驱动的立即恢复每这么久只放行一次;窗口内的网络变化交给常规退避。 */
 export declare const NETWORK_SETTLE_MS: number
 /** 按平台创建电源/网络事件源(mac 与 Windows 都要);platform 与 create 仅供用例注入。 */
@@ -49,6 +54,8 @@ export interface DaemonIntent {
   readonly desired: 'connected' | 'user-disconnected' | 'shutdown'
   readonly authorization?: { readonly id: string; readonly expiresAt: number }
   readonly connector?: ConnectorSpec
+  /** 新客户单地址契约:connector 是唯一当前承载入口,不执行本地节点轮转。 */
+  readonly singleAddressMode?: boolean
   /** 隐藏多节点:这份授权的全部入口(第一项即 `connector`)。全是 vless-reality 时守护把它们一起交给内核探活择路。 */
   readonly connectors?: readonly ConnectorSpec[]
   readonly bridgePort?: number
@@ -182,6 +189,10 @@ export interface DaemonOptions {
   readonly residentIntegrity?: { check(): { missing: boolean } }
   /** 程序被删后的自愈:还原 + 卸常驻。返回 shouldExit=true 才允许退出。 */
   readonly residentSelfHeal?: () => { shouldExit: boolean } | undefined
+  /** 仅供测试缩短本机运行观测采样周期；生产使用默认 5 分钟。 */
+  readonly runtimeObservationIntervalMs?: number
+  /** 生产入口必须传入客户端版本；缺失或达到 1.0 时停止运行观测。 */
+  readonly clientVersion?: string
 }
 
 export interface Daemon {

@@ -60,6 +60,7 @@ export const KNOWN_FAILURE_CODES: ReadonlySet<string> = new Set([
   // N-07:本地写入失败(磁盘满/数据目录不可写)的细分码,与「恢复在途」的 NETWORK_LOCAL_BUSY 分开,
   // ⛔ 让磁盘满以已知「本地忙」的身份污染归因。
   'TUNNEL_LOCAL_WRITE_FAILED',
+  'TUNNEL_LOCAL_SOCKS_UNAVAILABLE',
   // 甲-6返工(④):读客户选的配置包失败(被移走/没有读取权限)与写数据目录失败分开归因——
   // ⛔ 让「请重新选择包」的读失败在后台被聚合成「清磁盘」的写失败。
   'TUNNEL_LOCAL_READ_FAILED',

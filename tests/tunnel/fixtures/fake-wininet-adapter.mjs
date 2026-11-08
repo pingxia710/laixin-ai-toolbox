@@ -130,11 +130,15 @@ export function createAdapter(env = process.env) {
           entries.push(trimmed)
         }
       }
+      const overrideRef = { service: 'WinINET', item: 'ProxyOverride' }
+      const mergedOverride = { type: 'REG_SZ', data: entries.join(';') }
+      const managedOverride = wininetValuesEqual(store.ProxyOverride ?? null, mergedOverride, overrideRef)
+        ? store.ProxyOverride : mergedOverride
       // 与真实 adapter-wininet.mjs 同形:先 Server 后 Enable,恢复(账本逆序)时反过来。
       const items = [
         { ref: { service: 'WinINET', item: 'ProxyServer' }, value: { type: 'REG_SZ', data: `127.0.0.1:${String(proxy.port)}` } },
         { ref: { service: 'WinINET', item: 'ProxyEnable' }, value: { type: 'REG_DWORD', data: '1' } },
-        { ref: { service: 'WinINET', item: 'ProxyOverride' }, value: { type: 'REG_SZ', data: entries.join(';') } },
+        { ref: overrideRef, value: managedOverride },
         { ref: { service: 'WinINET', item: 'AutoConfigURL' }, value: null }
       ]
       // 「自动检测设置」(WPAD)与生产适配器共用同一份判断,⛔ 夹具再复刻一遍。

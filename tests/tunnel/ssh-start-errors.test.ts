@@ -1,10 +1,40 @@
 import { describe, expect, it, vi } from 'vitest'
 import { EventEmitter } from 'node:events'
+import { createServer, type AddressInfo } from 'node:net'
 import { PassThrough } from 'node:stream'
 import { createSshSocksConnector as macConnector } from '../../sidecar/mac/connectors.mjs'
 import { createSshSocksConnector as winConnector } from '../../sidecar/win/connectors.mjs'
 
 describe.each([['macOS', macConnector], ['Windows', winConnector]] as const)('%s SSH 启动错误', (_platform, createConnector) => {
+  it('stop 等待 SSH 子进程退出后才完成', async () => {
+    const child = Object.assign(new EventEmitter(), { stderr: new PassThrough(), exitCode: null as number | null, kill: vi.fn() })
+    const server = createServer()
+    await new Promise<void>((resolvePromise) => server.listen(0, '127.0.0.1', () => resolvePromise()))
+    const localPort = (server.address() as AddressInfo).port
+    const spec = {
+      kind: 'ssh-socks' as const, node: { host: 'unused.invalid', port: 22, sshUser: 'fixture' },
+      keyPath: '/unused-key', knownHostsPath: '/unused-hosts', localPort,
+      verifyUrl: 'https://unused.invalid', readyTimeoutMs: 1_000, sshExecutable: process.execPath
+    }
+    const connector = createConnector(spec, { spawn: () => child })
+    try {
+      await connector.start()
+      const stop = Promise.resolve(connector.stop())
+      let settled = false
+      void stop.then(() => { settled = true })
+      await Promise.resolve()
+      expect(child.kill).toHaveBeenCalledWith('SIGTERM')
+      expect(settled).toBe(false)
+      child.exitCode = 0
+      child.emit('exit', 0)
+      await stop
+      expect(settled).toBe(true)
+    } finally {
+      child.stderr.destroy()
+      await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()))
+    }
+  })
+
   it.each([
     ['Host key verification failed.', '节点身份不符'],
     ['Permission denied (publickey).', '授权失效'],
@@ -15,7 +45,7 @@ describe.each([['macOS', macConnector], ['Windows', winConnector]] as const)('%s
     const spec = {
       kind: 'ssh-socks' as const, node: { host: 'unused.invalid', port: 22, sshUser: 'fixture' },
       keyPath: '/unused-key', knownHostsPath: '/unused-hosts', localPort: 0,
-      verifyUrl: 'http://unused.invalid', readyTimeoutMs: 1_000, sshExecutable: process.execPath
+      verifyUrl: 'https://unused.invalid', readyTimeoutMs: 1_000, sshExecutable: process.execPath
     }
     const connector = createConnector(spec, { spawn: () => {
       queueMicrotask(() => {
@@ -41,7 +71,7 @@ describe.each([['macOS', macConnector], ['Windows', winConnector]] as const)('%s
     const spec = {
       kind: 'ssh-socks' as const, node: { host: 'unused.invalid', port: 22, sshUser: 'fixture' },
       keyPath: '/unused-key', knownHostsPath: '/unused-hosts', localPort: 0,
-      verifyUrl: 'http://unused.invalid', readyTimeoutMs: 1_000, sshExecutable: process.execPath
+      verifyUrl: 'https://unused.invalid', readyTimeoutMs: 1_000, sshExecutable: process.execPath
     }
     const connector = createConnector(spec, { spawn: () => {
       // spawn 本身失败只发 'error',不发 'exit';没有 error 监听它就是未捕获异常。
@@ -64,5 +94,7 @@ describe('受控码表完整性', () => {
     // ⛔ undefined:致命码表里塞 undefined 等于这一类永远判不出来。
     expect(mac.CONTROL_CODES.componentMissing).toBe('组件缺失')
     expect(mac.CONTROL_CODES.componentMissing).toBe(win.CONTROL_CODES.componentMissing)
+    expect(mac.CONTROL_CODES.localSocksUnavailable).toBe('TUNNEL_LOCAL_SOCKS_UNAVAILABLE')
+    expect(mac.CONTROL_CODES.localSocksUnavailable).toBe(win.CONTROL_CODES.localSocksUnavailable)
   })
 })

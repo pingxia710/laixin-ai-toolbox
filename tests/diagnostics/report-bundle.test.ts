@@ -96,6 +96,64 @@ it('诊断包保留连接阶段超时的受控阶段，同时不带进状态令�
   expect(JSON.stringify(body.daemonState)).not.toContain('secret-session-token')
 })
 
+it('诊断包保留恢复/占用/自恢复的安全状态，供内部优化关联且不带自由对象', () => {
+  const body = buildReportBody({
+    daemonState: {
+      state: 'error',
+      code: 'TUNNEL_RESTORE_INCOMPLETE',
+      restoration: {
+        phase: 'waiting', result: 'unconfirmed', attempts: 3,
+        startedAt: 1_757_000_000_000, updatedAt: 1_757_000_000_100, nextRetryAt: 1_757_000_010_000,
+        lastFailureCode: 'SETTINGS_BUSY', secret: 'DO_NOT_COPY'
+      },
+      availability: {
+        active: true, status: 'limited', action: 'restore', code: 'TUNNEL_AVAILABILITY_SETTINGS_BUSY',
+        intentGeneration: 4, secret: 'DO_NOT_COPY'
+      },
+      recovery: { id: 1_757_000_000_200, attempts: 2, outageMs: 1_500, secret: 'DO_NOT_COPY' }
+    }
+  })
+  expect(body.daemonState).toMatchObject({
+    state: 'error',
+    restoration: {
+      phase: 'waiting', result: 'unconfirmed', attempts: 3,
+      lastFailureCode: 'SETTINGS_BUSY'
+    },
+    availability: { active: true, status: 'limited', action: 'restore', intentGeneration: 4 },
+    recovery: { id: 1_757_000_000_200, attempts: 2, outageMs: 1_500 }
+  })
+  expect(JSON.stringify(body.daemonState)).not.toContain('DO_NOT_COPY')
+})
+
+it('内部优化摘要汇总尝试终态、恢复阶段和观测到的受控码，不猜根因', () => {
+  const body = buildReportBody({
+    daemonState: {
+      state: 'error', code: 'TUNNEL_RESTORE_INCOMPLETE',
+      restoration: {
+        phase: 'complete', result: 'restored', attempts: 2,
+        startedAt: 1_757_000_000_000, updatedAt: 1_757_000_000_100, nextRetryAt: 0,
+        lastFailureCode: ''
+      }
+    },
+    repair: { phase: 'verify', outcome: 'failed', code: 'TUNNEL_RESTORE_TIMEOUT' },
+    connectionFunnel: { attempts: [
+      { trigger: 'connect', startedAt: 1_700_000_000_010, stages: [], outcome: 'connected', endedAt: 1_700_000_000_020 },
+      { trigger: 'reconnect', startedAt: 1_700_000_000_030, stages: [], outcome: 'failed', endedAt: 1_700_000_000_040 },
+      { trigger: 'connect', startedAt: 1_700_000_000_050, stages: [], outcome: 'abandoned', endedAt: 1_700_000_000_060 }
+    ] },
+    errorCodes: ['UNKNOWN', 'TUNNEL_RESTORE_TIMEOUT', 'not-a-code']
+  })
+  expect(body.optimization).toMatchObject({
+    connectionAttempts: {
+      total: 3, terminal: 3, successful: 1, failed: 1, abandoned: 1,
+      latestAttemptKey: 'connect:1700000000050', latestOutcome: 'abandoned'
+    },
+    lifecycle: { restoration: { phase: 'complete', result: 'restored', attempts: 2 } },
+    attribution: { unknown: true, evidenceSources: ['daemon-state', 'repair', 'connection-funnel', 'error-codes'] }
+  })
+  expect(JSON.stringify(body.optimization)).not.toContain('根因')
+})
+
 it('采集本机诊断文件不跟随符号链接', async () => {
   const root = makeTempDir('report-symlink-'); roots.push(root)
   const outside = join(root, 'outside.json')

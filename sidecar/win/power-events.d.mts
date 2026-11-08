@@ -21,4 +21,9 @@ export declare function createPowerEventSource(options: {
     setTimeout: (fn: () => void, ms?: number) => unknown
     clearTimeout: (id: unknown) => void
   }
+  // N-83 快照兜底层注入点(与 mac 源同款;缺省 node:os/Date.now/setInterval)
+  interfaces?: () => Record<string, Array<{ address: string; netmask: string; family: string; internal: boolean; mac: string; cidr?: string }>>
+  now?: () => number
+  every?: (callback: () => void, intervalMs: number) => unknown
+  cancel?: (id: unknown) => void
 }): PowerEventSource

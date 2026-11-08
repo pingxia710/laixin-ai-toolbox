@@ -152,6 +152,8 @@ export interface FakeSocks5 {
   hits(): Array<{ host: string; port: number }>
   /** 掐断当前所有已建连接但继续监听:模拟通道中途重连(D3 演练)。 */
   dropAll(): number
+  /** 当前仍在途的已接受连接数:观察对端是否把半开连接滞留在我这一侧。 */
+  liveConnections(): number
   close(): Promise<void>
 }
 
@@ -238,6 +240,7 @@ export async function startFakeSocks5Server(dialMap: Readonly<Record<string, [st
       sockets.clear()
       return count
     },
+    liveConnections: () => sockets.size,
     close: () =>
       new Promise<void>((resolveClose) => {
         for (const socket of sockets) {

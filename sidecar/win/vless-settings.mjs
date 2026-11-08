@@ -26,8 +26,59 @@ export function validVerifyUrl(value) {
   try {
     const url = new URL(value)
     return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password && !url.hash &&
-      !['deepseek.com', 'deepseek.cn', 'deepseek.ai'].some((suffix) => url.hostname === suffix || url.hostname.endsWith(`.${suffix}`))
+      !isProtectedVerifyHost(url.hostname)
   } catch { return false }
+}
+
+const LOCAL_VERIFY_HOSTS = new Set(['localhost', 'localhost.localdomain', 'metadata.google.internal'])
+const PROTECTED_VERIFY_HOSTS = new Set(['deepseek.com', 'deepseek.cn', 'deepseek.ai'])
+
+function canonicalVerifyHost(hostname) {
+  return hostname.replace(/^\[|\]$/g, '').toLowerCase().replace(/\.+$/, '')
+}
+
+function isProtectedVerifyHost(hostname) {
+  const host = canonicalVerifyHost(hostname)
+  return [...PROTECTED_VERIFY_HOSTS].some((suffix) => host === suffix || host.endsWith(`.${suffix}`))
+}
+
+function isPrivateOrLocalIp(hostname) {
+  const normalized = hostname.replace(/^\[|\]$/g, '').toLowerCase()
+  const family = isIP(normalized)
+  if (family === 0) return false
+  if (family === 4) {
+    const octets = normalized.split('.').map(Number)
+    const [a, b] = octets
+    return a === 0 || a === 10 || a === 127 || (a === 100 && b >= 64 && b <= 127) ||
+      (a === 169 && b === 254) || a === 192 && b === 168 || a === 172 && b >= 16 && b <= 31 ||
+      a >= 224 || a === 198 && (b === 18 || b === 19)
+  }
+  if (normalized.startsWith('::ffff:')) {
+    const mapped = normalized.slice('::ffff:'.length)
+    if (isIP(mapped) === 4) return isPrivateOrLocalIp(mapped)
+  }
+  const compact = normalized.replace(/:/g, '')
+  return normalized === '::1' || normalized === '::' || compact.startsWith('fc') || compact.startsWith('fd') ||
+    compact.startsWith('fe8') || compact.startsWith('fe9') || compact.startsWith('fea') || compact.startsWith('feb') ||
+    compact.startsWith('ff')
+}
+
+/** Production package boundary: public HTTPS probe on the standard TLS port only. */
+export function validProductionVerifyUrl(value, options = {}) {
+  if (options.allowLocalVerifyUrls === true) return validVerifyUrl(value)
+  if (!validVerifyUrl(value)) return false
+  const url = new URL(value)
+  const host = canonicalVerifyHost(url.hostname)
+  if (url.protocol !== 'https:' || (url.port !== '' && url.port !== '443') || isIP(host) !== 0 || isPrivateOrLocalIp(host)) return false
+  if (LOCAL_VERIFY_HOSTS.has(host) || host.endsWith('.localhost') || host === 'localdomain' || host.endsWith('.localdomain') ||
+      host.endsWith('.local') || host.endsWith('.lan') || host.endsWith('.internal') || host.endsWith('.home.arpa')) return false
+  return true
+}
+
+export function validProductionVerifyFallbackUrl(primary, fallback, options = {}) {
+  if (options.allowLocalVerifyUrls === true) return validVerifyFallbackUrl(primary, fallback)
+  if (!validProductionVerifyUrl(primary) || !validProductionVerifyUrl(fallback)) return false
+  return canonicalVerifyHost(new URL(primary).hostname) !== canonicalVerifyHost(new URL(fallback).hostname)
 }
 
 export function validVerifyFallbackUrl(primary, fallback) {

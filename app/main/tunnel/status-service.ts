@@ -73,6 +73,8 @@ export interface TunnelStatus {
   /** N-55 主动冲突控制器的脱敏阶段。 */
   readonly availabilityStatus: '' | 'examining' | 'reusing' | 'taking-over' | 'reclaiming' | 'recovering' | 'recovered' | 'limited'
   readonly availabilityReason: string
+  /** N-77 连接中的当前守护阶段(脱敏阶段码);非「连接中」为空串。恒为字符串,与 availabilityStatus 同规。 */
+  readonly connectStage: string
 }
 
 export interface TrafficObservation {
@@ -248,7 +250,7 @@ export function computeStatus(input: StatusInput): TunnelStatus {
     authorization: info === undefined ? '' : STATUS_LINES.authorization,
     backend: info === undefined ? '' : STATUS_LINES.backend,
     observedNodeLabel: observedNodeLabel(current, daemon, state),
-    nodeLabel: info === undefined ? '' : `${info.node.host}:${String(info.node.port)}`,
+    nodeLabel: info === undefined ? '' : `${(info.customerEntry ?? info.node).host}:${String((info.customerEntry ?? info.node).port)}`,
     exitIp: state === DISPLAY_STATES.connected ? (daemon?.exitIp ?? '') : '',
     pathVerified: state === DISPLAY_STATES.connected && daemon?.pathVerified === true,
     pathSource: state === DISPLAY_STATES.connected ? (isReusedPath(daemon) ? 'reused' : 'laixin') : '',
@@ -273,12 +275,14 @@ export function computeStatus(input: StatusInput): TunnelStatus {
               : '未恢复:待恢复确认'
         }`
       )),
-    componentMissing:
-      input.componentMissing.length > 0 ? `组件缺失:${input.componentMissing.join(',')}` : '',
+    componentMissing: summarizeComponentMissing(input.componentMissing),
     sshBinary: input.sshBinary,
     traffic: active ? trafficSummary(input.dataDir) : '',
     availabilityStatus,
-    availabilityReason
+    availabilityReason,
+    connectStage: state === DISPLAY_STATES.connecting && typeof daemon?.connectStage === 'string' && daemon.connectStage !== ''
+      ? daemon.connectStage
+      : ''
   }
 }
 
@@ -329,6 +333,31 @@ export function summarizeUnresolved(entries: readonly string[]): string {
   }
   if (text === '') return `${joined.slice(0, Math.max(0, 300 - suffix.length - 1))}…${suffix}`
   return `${text}${suffix}`
+}
+
+// 组件清单来自随包静态文件,macOS 当前完整清单已接近桥字段上限。保留前三项和
+// 关键入口/内核文件作为现场线索,再填充原始顺序中的其余项;超出时标注总数,让
+// tunnel.status 始终能通过桥 schema,同时不把客户界面变成一串不可操作的文件名。
+const COMPONENT_MISSING_MAX = 600
+const COMPONENT_MISSING_KEY_FILES = ['tunnel-daemon.mjs', 'bin/proxy-helper', 'xray', 'geoip.dat', 'geosite.dat']
+
+export function summarizeComponentMissing(entries: readonly string[]): string {
+  if (entries.length === 0) return ''
+  const unique = [...new Set(entries)]
+  const prefix = '组件缺失:'
+  const suffix = `,等${String(unique.length)}项`
+  const preferred = [...unique.slice(0, 3), ...COMPONENT_MISSING_KEY_FILES.filter((name) => unique.includes(name))]
+  const selected: string[] = []
+  const add = (name: string) => {
+    if (selected.includes(name)) return
+    const next = `${prefix}${[...selected, name].join(',')}${suffix}`
+    if (next.length <= COMPONENT_MISSING_MAX) selected.push(name)
+  }
+  preferred.forEach(add)
+  unique.forEach(add)
+  const full = `${prefix}${unique.join(',')}`
+  if (full.length <= COMPONENT_MISSING_MAX) return full
+  return `${prefix}${selected.join(',')}${suffix}`
 }
 
 /** Reads only the numeric, locally-produced aggregate. No request metadata is stored or surfaced. */
@@ -383,7 +412,8 @@ const CONFIG_SUMMARY_MAX = 300
 
 function configSummary(info: ReturnType<typeof readCurrentInfo>): string {
   if (info === undefined) return ''
-  const summary = `版本 ${String(info.configVersion)} · ${info.protocol === 'vless-reality' ? 'VLESS/REALITY' : 'SSH'} · ${info.node.host}:${String(info.node.port)} · 到期 ${info.expiresAt}`
+  const entry = info.customerEntry ?? info.node
+  const summary = `版本 ${String(info.configVersion)} · ${info.protocol === 'vless-reality' ? 'VLESS/REALITY' : 'SSH'} · ${entry.host}:${String(entry.port)} · 到期 ${info.expiresAt}`
   return summary.length <= CONFIG_SUMMARY_MAX ? summary : `${summary.slice(0, CONFIG_SUMMARY_MAX - 1)}…`
 }
 
@@ -452,6 +482,7 @@ export function connectionMessage(daemon: DaemonStateView): string {
     '上游不可达': '通道出口暂时不可达，来信已自动重连；持续失败请换一个网络（如手机热点）重试，或复制诊断给客服',
     'TUNNEL_CONNECTION_TIMEOUT': '连接在限定时间内没有完成，来信已自动重连；请先检查当前网络，或换一个网络（如手机热点）后重试，持续失败请复制诊断给客服',
     'TUNNEL_TARGET_UNCONFIRMED': '通道已建立，但目标 AI 服务暂未确认；来信正在自动重试，持续失败请换一个网络（如手机热点）后重试，或复制诊断给客服',
+    'TUNNEL_LOCAL_SOCKS_UNAVAILABLE': '本机网络组件未能启动，来信正在重试；持续失败请重新连接或复制诊断给客服',
     // 连接争抢止损的四个码(2026-09-15)。⛔ 漏掉映射:失败路径上 message 就是 code 本身,
     // 漏一个客户就会看到「TUNNEL_PEER_LAIXIN_RUNNING」这种内部码——上面那段注释记的
     // 正是 0.4.9 同一个坑。每条都要说清**客户能做什么**。
@@ -467,7 +498,8 @@ export function connectionMessage(daemon: DaemonStateView): string {
     'TUNNEL_RESTORE_PROCESS_FAILED': '恢复程序意外退出，尚未确认恢复完成；请点击「重试恢复原设置」，仍失败请导出诊断给客服',
     // N-23:一次性恢复的两类受控失败(supervisor 落盘)。基线是静默吞掉,客户对着「未完成(进程中断)」永远转圈。
     'TUNNEL_RESTORE_TIMEOUT': '恢复原设置这一轮没有在限定时间内完成，已中止。请再点一次「重试恢复原设置」；电脑很卡时请等它跑完，不要连续点击',
-    'TUNNEL_RESTORE_SPAWN_FAILED': '恢复程序未能启动，原设置还没有恢复。请再点一次「重试恢复原设置」；仍不行请重启电脑后重试'
+    'TUNNEL_RESTORE_SPAWN_FAILED': '恢复程序未能启动，原设置还没有恢复。请再点一次「重试恢复原设置」；仍不行请重启电脑后重试',
+    'TUNNEL_STARTUP_RECOVERY_TIMEOUT': '启动时恢复原网络设置超时，守护正在继续重试；若仍未恢复，请点击「重试恢复原设置」'
   }
   // 查表按 message;但两类动态 message 永远查不到——失败路径的裸码(message=code)和重连期的
   // 「连接中断,自动重连中(n/5)」计数文案。只有这两类才回落到 code 查表;机器/旧版写好的

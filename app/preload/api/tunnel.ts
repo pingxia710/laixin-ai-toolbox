@@ -45,6 +45,8 @@ export interface TunnelStatusView {
   /** N-55 控制器阶段；为空表示当前没有受控网络设置动作。 */
   readonly availabilityStatus?: '' | 'examining' | 'reusing' | 'taking-over' | 'reclaiming' | 'recovering' | 'recovered' | 'limited'
   readonly availabilityReason?: string
+  /** N-77 连接中的当前守护阶段码(脱敏);仅「连接中」出现。 */
+  readonly connectStage?: string
 }
 
 export interface RouteExplanationView {

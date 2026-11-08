@@ -18,7 +18,7 @@ it('生产守护接 VLESS：真实回环连接、失败状态、自动恢复、�
     const port = await freePort()
     const credentialPath = join(root, 'vless.json')
     writeFileSync(credentialPath, JSON.stringify(node.credential), { mode: 0o600 })
-    writeFileAtomic(layout.intent(dataDir), JSON.stringify({ desired: 'connected', authorization: { id: 'local-test', expiresAt: Date.now() + 60000 }, bridgePort: port, connector: { kind: 'vless-reality', node: node.node, credentialPath, verifyUrl: node.verifyUrl, localPort: port, timeoutMs: 500 } }))
+    writeFileAtomic(layout.intent(dataDir), JSON.stringify({ desired: 'connected', authorization: { id: 'local-test', expiresAt: Date.now() + 60000 }, bridgePort: port, connector: { kind: 'vless-reality', node: node.node, credentialPath, verifyUrl: node.verifyUrl, localPort: port, timeoutMs: 500, allowLocalVerifyUrls: true } }))
     const packagedExecutable = process.env.TOOLBOX_TEST_PACKAGED_EXECUTABLE
     const daemonPath = process.env.TOOLBOX_TEST_PACKAGED_RESOURCES
       ? join(process.env.TOOLBOX_TEST_PACKAGED_RESOURCES, 'sidecar/mac/tunnel-daemon.mjs')

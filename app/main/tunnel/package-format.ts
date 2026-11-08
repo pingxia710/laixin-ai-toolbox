@@ -3,7 +3,7 @@
 import { createHash } from 'node:crypto'
 import { isIP } from 'node:net'
 import type { RouteTable } from '../../../sidecar/mac/daemon-core.mjs'
-import { parseVlessCredential, validNodeHost, validVerifyUrl, validVerifyFallbackUrl } from '../../../sidecar/mac/vless-settings.mjs'
+import { parseVlessCredential, validNodeHost, validProductionVerifyUrl, validProductionVerifyFallbackUrl } from '../../../sidecar/mac/vless-settings.mjs'
 import { platformForRuntime } from './sidecar-path'
 import type { Platform } from '../precheck/software-platform'
 import type { TrustContext, TrustOutcome } from './trust'
@@ -51,6 +51,28 @@ export interface PackageEntry {
   readonly data: Buffer
 }
 
+/**
+ * 新客户单地址契约:当前客户入口只有一个逻辑地址。
+ * bindingVersion/leaseExpiresAt 由中台绑定刷新使用;缺省保持旧包语义。
+ */
+export interface CustomerEntry {
+  readonly host: string
+  readonly port: number
+  readonly credentialFile?: string
+  readonly verifyUrl?: string
+  readonly bindingVersion?: number
+  readonly leaseExpiresAt?: string
+}
+
+export interface TunnelPackageNode {
+  readonly host: string
+  readonly port: number
+  /** 稳定的后台节点标识；旧包缺省，客户端只在存在时上报可达性。 */
+  readonly nodeId?: string
+  readonly hostKeyFingerprint?: string
+  readonly sshUser?: string
+}
+
 export interface TunnelPackageManifest {
   readonly protocol?: 'ssh-socks' | 'vless-reality'
   readonly verifyUrl?: string
@@ -59,19 +81,18 @@ export interface TunnelPackageManifest {
   readonly configVersion: number
   readonly authorizationId: string
   readonly platform: string
-  readonly node: {
-    readonly host: string
-    readonly port: number
-    readonly hostKeyFingerprint?: string
-    readonly sshUser?: string
-  }
-  /** 隐藏多节点(创始人 09-13 晚放行):同一份授权里带多个入口/节点,客户端自动挑能用的、坏了自动换,
+  /** Legacy physical node metadata. New customerEntry packages omit this field. */
+  readonly node?: TunnelPackageNode
+  /** 单地址新合同。出现时客户端不得读取 nodes[] 或执行本地多入口轮转。 */
+  readonly customerEntry?: CustomerEntry
+  /** Legacy hidden multi-node packages:同一份授权里带多个入口/节点,客户端自动挑能用的、坏了自动换,
    * 客户界面上仍只有「连接」。⛔ 节点列表、⛔ 让客户选。
-   * 向后兼容:缺省即单节点(等价于 [node]);存在时第一项必须与 `node` 同址——单一事实源,⛔ 两处说法不一。
-   * 旧客户端读新包:忽略本字段只用 `node`,签名照样对得上(载荷是整份 manifest 的稳定序列化)。 */
+   * 仅旧包使用；新 customerEntry 包不携带本字段或物理 node 元数据。 */
   readonly nodes?: readonly {
     readonly host: string
     readonly port: number
+    /** 与后台 ChannelNode.id 对齐；旧包缺省。 */
+    readonly nodeId?: string
     /** 该入口自己的凭据文件名(credentials/ 下);缺省用 credentials/vless.json。 */
     readonly credentialFile?: string
     /** 该入口自己的回显地址;缺省用 manifest.verifyUrl。 */
@@ -157,18 +178,33 @@ export const MAX_PACKAGE_NODES = 8
 export const MAX_PACKAGE_ENTRY_BYTES = 1024 * 1024
 export const MAX_PACKAGE_TOTAL_BYTES = 8 * 1024 * 1024
 
-/** 多入口清单的校验:每项地址端口合法;第一项必须与 `node` 同址(单一事实源);数量有上限;⛔ 重复入口。 */
+/** Resolve the one connection endpoint exposed by either a legacy or new package. */
+export function primaryNodeOf(manifest: Pick<TunnelPackageManifest, 'node' | 'customerEntry'>): TunnelPackageNode | undefined {
+  if (manifest.node !== undefined) return manifest.node
+  if (manifest.customerEntry !== undefined) return { host: manifest.customerEntry.host, port: manifest.customerEntry.port }
+  return undefined
+}
+
+/** Legacy multi-entry list validation: first entry must match the legacy physical node. */
 function validateNodeList(manifest: TunnelPackageManifest): void {
   const nodes = manifest.nodes
   if (nodes === undefined) return
+  const primary = manifest.node
+  if (primary === undefined) throw new PackageReject('PACKAGE_MALFORMED')
   if (!Array.isArray(nodes) || nodes.length === 0 || nodes.length > MAX_PACKAGE_NODES) {
     throw new PackageReject('PACKAGE_MALFORMED')
   }
   const seen = new Set<string>()
+  const nodeIds = new Set<string>()
+  const hasNodeIds = primary.nodeId !== undefined
   for (const node of nodes) {
     if (node === null || typeof node !== 'object') throw new PackageReject('PACKAGE_MALFORMED')
     if (!validNodeHost(node.host)) throw new PackageReject('PACKAGE_MALFORMED')
     if (!Number.isInteger(node.port) || node.port < 1 || node.port > 65535) throw new PackageReject('PACKAGE_PORT_INVALID')
+    if (node.nodeId !== undefined && (typeof node.nodeId !== 'string' || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(node.nodeId))) throw new PackageReject('PACKAGE_MALFORMED')
+    if ((node.nodeId !== undefined) !== hasNodeIds) throw new PackageReject('PACKAGE_MALFORMED')
+    if (node.nodeId !== undefined && nodeIds.has(node.nodeId)) throw new PackageReject('PACKAGE_MALFORMED')
+    if (node.nodeId !== undefined) nodeIds.add(node.nodeId)
     if (node.credentialFile !== undefined &&
         (typeof node.credentialFile !== 'string' || !VLESS_CREDENTIAL_FILE.test(`credentials/${node.credentialFile}`))) {
       throw new PackageReject('PACKAGE_MALFORMED')
@@ -177,8 +213,37 @@ function validateNodeList(manifest: TunnelPackageManifest): void {
     if (seen.has(key)) throw new PackageReject('PACKAGE_MALFORMED')
     seen.add(key)
   }
-  if (nodes[0].host !== manifest.node.host || nodes[0].port !== manifest.node.port) {
+  if (nodes[0].host !== primary.host || nodes[0].port !== primary.port) {
     throw new PackageReject('PACKAGE_MALFORMED')
+  }
+  if (nodes[0].nodeId !== primary.nodeId) throw new PackageReject('PACKAGE_MALFORMED')
+}
+
+function validateCustomerEntry(manifest: TunnelPackageManifest, context: ValidateContext): void {
+  const entry = manifest.customerEntry
+  if (entry === undefined) return
+  // 单地址合同与旧多入口清单互斥；否则客户端虽然只用一个入口，包仍会继续携带节点池。
+  if (manifest.nodes !== undefined) throw new PackageReject('PACKAGE_MALFORMED')
+  if (manifest.protocol !== 'vless-reality') throw new PackageReject('PACKAGE_PROTOCOL_INVALID')
+  if (!validNodeHost(entry.host)) throw new PackageReject('PACKAGE_MALFORMED')
+  if (!Number.isInteger(entry.port) || entry.port < 1 || entry.port > 65535) throw new PackageReject('PACKAGE_PORT_INVALID')
+  if (manifest.node !== undefined && (manifest.node.host !== entry.host || manifest.node.port !== entry.port)) {
+    throw new PackageReject('PACKAGE_MALFORMED')
+  }
+  if (entry.credentialFile !== undefined &&
+      (typeof entry.credentialFile !== 'string' || !CREDENTIAL_PATH_PATTERN.test(`credentials/${entry.credentialFile}`))) {
+    throw new PackageReject('PACKAGE_CREDENTIAL_ESCAPE')
+  }
+  if (entry.verifyUrl !== undefined && !validProductionVerifyUrl(entry.verifyUrl,
+    { allowLocalVerifyUrls: context.allowLocalVerifyUrls === true })) {
+    throw new PackageReject('PACKAGE_PROTOCOL_INVALID')
+  }
+  if (entry.bindingVersion !== undefined && (!Number.isSafeInteger(entry.bindingVersion) || entry.bindingVersion < 1)) {
+    throw new PackageReject('PACKAGE_MALFORMED')
+  }
+  if (entry.leaseExpiresAt !== undefined) {
+    const lease = Date.parse(entry.leaseExpiresAt)
+    if (!Number.isFinite(lease) || lease <= 0) throw new PackageReject('PACKAGE_MALFORMED')
   }
 }
 
@@ -233,15 +298,16 @@ function isManifest(value: unknown): value is TunnelPackageManifest {
   }
   const candidate = value as Record<string, unknown>
   const node = candidate.node as Record<string, unknown> | undefined
+  const customerEntry = candidate.customerEntry as Record<string, unknown> | undefined
+  const hasNode = typeof node === 'object' && node !== null && typeof node.host === 'string' && typeof node.port === 'number'
+  const hasCustomerEntry = typeof customerEntry === 'object' && customerEntry !== null &&
+    typeof customerEntry.host === 'string' && typeof customerEntry.port === 'number'
   return (
     typeof candidate.issuer === 'string' &&
     typeof candidate.configVersion === 'number' &&
     typeof candidate.authorizationId === 'string' &&
     typeof candidate.platform === 'string' &&
-    typeof node === 'object' &&
-    node !== null &&
-    typeof node.host === 'string' &&
-    typeof node.port === 'number' &&
+    (hasNode || hasCustomerEntry) &&
     typeof candidate.issuedAt === 'string' &&
     typeof candidate.expiresAt === 'string' &&
     typeof candidate.files === 'object' &&
@@ -253,12 +319,16 @@ function isManifest(value: unknown): value is TunnelPackageManifest {
 export interface ValidateContext {
   readonly now: number
   readonly currentVersion: number | undefined
+  /** 当前单地址绑定代次；新包不得丢失或回退该代次。 */
+  readonly currentBindingVersion?: number
   readonly currentAuthorizationId: string | undefined
   // 已接受当前包的摘要。仅在同一授权、同一版本时用于拒绝不同内容；缺省保持旧调用方兼容。
   readonly currentPackageDigest?: string
   readonly trust: TrustContext
   // 接收方运行平台;缺省按进程平台推导。manifest 平台与它不符 = 拒(PACKAGE_PLATFORM_MISMATCH)。
   readonly runtimePlatform?: Platform
+  /** 仅本地测试夹具允许回环 HTTP；生产包始终走公共 HTTPS 复验地址。 */
+  readonly allowLocalVerifyUrls?: boolean
 }
 
 // manifest 平台词汇:macos 端沿用现行签发口径 'mac';windows 端为 'windows'。
@@ -271,14 +341,18 @@ export function validatePackage(entries: readonly PackageEntry[], context: Valid
   // 凭据引用越界先核(判据 6):manifest 尚未解析前,先按「清单键的允许形态」预核——
   // 解析后还会再核一次(那时有 files 表)。
   const manifest = parseManifest(entries)
+  const verifyOptions = { allowLocalVerifyUrls: context.allowLocalVerifyUrls === true }
   if (manifest.verifyFallbackUrl !== undefined && (manifest.protocol !== 'vless-reality' ||
-      !validVerifyFallbackUrl(manifest.verifyUrl, manifest.verifyFallbackUrl))) {
+      !validProductionVerifyFallbackUrl(manifest.verifyUrl, manifest.verifyFallbackUrl, verifyOptions))) {
     throw new PackageReject('PACKAGE_PROTOCOL_INVALID')
   }
   if (!Number.isSafeInteger(manifest.configVersion) || manifest.configVersion < 1) {
     throw new PackageReject('PACKAGE_MALFORMED')
   }
   if (manifest.protocol !== undefined && !['ssh-socks', 'vless-reality'].includes(manifest.protocol)) {
+    throw new PackageReject('PACKAGE_PROTOCOL_INVALID')
+  }
+  if (manifest.verifyUrl !== undefined && !validProductionVerifyUrl(manifest.verifyUrl, verifyOptions)) {
     throw new PackageReject('PACKAGE_PROTOCOL_INVALID')
   }
 
@@ -310,12 +384,13 @@ export function validatePackage(entries: readonly PackageEntry[], context: Valid
   if (!packagePlatformMatches(manifest.platform, context.runtimePlatform ?? platformForRuntime(process.platform))) {
     throw new PackageReject('PACKAGE_PLATFORM_MISMATCH')
   }
-  if (!validNodeHost(manifest.node.host)) {
+  const primary = primaryNodeOf(manifest)
+  if (primary === undefined || !validNodeHost(primary.host)) throw new PackageReject('PACKAGE_MALFORMED')
+  if (!Number.isInteger(primary.port) || primary.port < 1 || primary.port > 65535) throw new PackageReject('PACKAGE_PORT_INVALID')
+  if (manifest.node?.nodeId !== undefined && (typeof manifest.node.nodeId !== 'string' || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(manifest.node.nodeId))) {
     throw new PackageReject('PACKAGE_MALFORMED')
   }
-  if (!Number.isInteger(manifest.node.port) || manifest.node.port < 1 || manifest.node.port > 65535) {
-    throw new PackageReject('PACKAGE_PORT_INVALID')
-  }
+  validateCustomerEntry(manifest, context)
   validateNodeList(manifest)
 
   // hostkey.pub:known_hosts 行「主机 算法 密钥」;主机名须与 manifest 一致,指纹须与清单一致。
@@ -324,7 +399,7 @@ export function validatePackage(entries: readonly PackageEntry[], context: Valid
     try {
       // 多入口:每个入口可以有自己的凭据(不同 uuid/公钥/shortId),文件名 credentials/vless.json 或 credentials/vless-<名>.json。
       // 白名单仍是白名单——⛔ 放开成「credentials/ 下随便放」,那等于取消了这道闸。
-      if (!validVerifyUrl(manifest.verifyUrl) ||
+      if (!validProductionVerifyUrl(manifest.verifyUrl, verifyOptions) ||
           Object.keys(manifest.files).some((path) => path !== 'overlay.json' && !VLESS_CREDENTIAL_FILE.test(path))) {
         throw new Error('VLESS_CONFIG_INVALID')
       }
@@ -333,7 +408,12 @@ export function validatePackage(entries: readonly PackageEntry[], context: Valid
       // 每个入口指名的凭据都必须真在包里;每份凭据都要能解析——⛔ 只验第一份,坏的那份要等客户连到它才炸
       for (const node of manifest.nodes ?? []) {
         if (node.credentialFile !== undefined && !credentialFiles.has(`credentials/${node.credentialFile}`)) throw new Error('VLESS_CONFIG_INVALID')
-        if (node.verifyUrl !== undefined && !validVerifyUrl(node.verifyUrl)) throw new Error('VLESS_CONFIG_INVALID')
+        if (node.verifyUrl !== undefined && !validProductionVerifyUrl(node.verifyUrl, verifyOptions)) throw new Error('VLESS_CONFIG_INVALID')
+      }
+      if (manifest.customerEntry?.credentialFile !== undefined &&
+          !credentialFiles.has(`credentials/${manifest.customerEntry.credentialFile}`)) throw new Error('VLESS_CONFIG_INVALID')
+      if (manifest.customerEntry?.verifyUrl !== undefined && !validProductionVerifyUrl(manifest.customerEntry.verifyUrl, verifyOptions)) {
+        throw new Error('VLESS_CONFIG_INVALID')
       }
       for (const path of credentialFiles) {
         const credential = byPath.get(path)
@@ -342,6 +422,7 @@ export function validatePackage(entries: readonly PackageEntry[], context: Valid
       }
     } catch { throw new PackageReject('PACKAGE_PROTOCOL_INVALID') }
   } else {
+    if (manifest.node === undefined) throw new PackageReject('PACKAGE_PROTOCOL_INVALID')
     const hostKeyEntry = byPath.get('hostkey.pub')
     if (hostKeyEntry === undefined) {
       throw new PackageReject('PACKAGE_HOST_FINGERPRINT_MISSING')
@@ -352,7 +433,7 @@ export function validatePackage(entries: readonly PackageEntry[], context: Valid
     if (keyHost !== expectedKeyHost) {
       throw new PackageReject('PACKAGE_NODE_HOST_MISMATCH')
     }
-    const fingerprintField = (manifest.node as Record<string, unknown>).hostKeyFingerprint
+    const fingerprintField = (manifest.node as unknown as Record<string, unknown>).hostKeyFingerprint
     if (typeof fingerprintField !== 'string' || fingerprintField === '') {
       throw new PackageReject('PACKAGE_HOST_FINGERPRINT_MISSING')
     }
@@ -360,7 +441,7 @@ export function validatePackage(entries: readonly PackageEntry[], context: Valid
       throw new PackageReject('PACKAGE_HOST_FINGERPRINT_MISMATCH')
     }
 
-    const sshUserField = (manifest.node as Record<string, unknown>).sshUser
+    const sshUserField = (manifest.node as unknown as Record<string, unknown>).sshUser
     if (typeof sshUserField !== 'string' || !/^[a-z_][a-z0-9_-]{0,31}$/.test(sshUserField)) {
       throw new PackageReject('PACKAGE_SSH_USER_MISSING')
     }
@@ -389,6 +470,10 @@ export function validatePackage(entries: readonly PackageEntry[], context: Valid
     throw new PackageReject('PACKAGE_AUTH_ID_MISMATCH')
   }
   if (context.currentVersion !== undefined && manifest.configVersion < context.currentVersion) {
+    throw new PackageReject('PACKAGE_VERSION_REGRESSION')
+  }
+  if (context.currentBindingVersion !== undefined &&
+      (manifest.customerEntry?.bindingVersion === undefined || manifest.customerEntry.bindingVersion < context.currentBindingVersion)) {
     throw new PackageReject('PACKAGE_VERSION_REGRESSION')
   }
 

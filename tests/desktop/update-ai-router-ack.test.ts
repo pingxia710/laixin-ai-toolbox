@@ -46,6 +46,36 @@ afterEach(async () => {
 })
 
 describe('更新启动回执等待 AI router 恢复', () => {
+  it('Windows 更新回执先等待常驻校准，避免前置闸留下 Disabled 任务', async () => {
+    await pending()
+    const order: string[] = []
+    const deps = {
+      residentReady: async () => { order.push('resident'); return true },
+      outcome: () => { order.push('outcome'); return 'connected' as const },
+      giveUp: vi.fn()
+    } as unknown as AcknowledgeDeps
+
+    await expect(acknowledgeUpdate(directory, electron.version, deps)).resolves.toMatchObject({ previous: '0.5.19' })
+    expect(order).toEqual(['resident'])
+    expect(await acknowledgementExists()).toBe(true)
+  })
+
+  it('常驻校准失败时零回执、退出新版但不写网络回退拒绝记录', async () => {
+    await pending()
+    const giveUp = vi.fn()
+    const deps = {
+      residentReady: async () => false,
+      outcome: () => 'connected' as const,
+      giveUp
+    } as unknown as AcknowledgeDeps
+
+    await expect(acknowledgeUpdate(directory, electron.version, deps)).resolves.toBeUndefined()
+
+    expect(await acknowledgementExists()).toBe(false)
+    expect(giveUp).toHaveBeenCalledTimes(1)
+    await expect(access(join(directory, 'rejected.json'))).rejects.toThrow()
+  })
+
   it('多模型路由延迟成功时，回执只能在 router HMAC/runtime/seat 证明后出现', async () => {
     await pending()
     let release: (outcome: 'ready') => void = () => undefined

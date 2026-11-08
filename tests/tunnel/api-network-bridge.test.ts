@@ -13,7 +13,8 @@ it('API 目标限制启用后，通用与专用线路仍能通过内部入口核
   const routes = JSON.parse(readFileSync(new URL('../../sidecar/shared/routes.default.json', import.meta.url), 'utf8')) as RouteTable
   const bridge = createLocalBridge({ listenPort: 0, dataDir: root, routes, upstream: undefined,
     outbounds: ['a', 'b'].map(tag => ({ tag, protocol: 'socks', settings: { servers: [{ address: '127.0.0.1', port: upstream.port }] } })),
-    verifyUrl: 'http://echo.invalid/ip', probeUrls: ['http://probe.invalid/'], verifyTimeoutMs: 500 })
+    verifyUrl: 'http://echo.invalid/ip', probeUrls: ['http://probe.invalid/'], verifyTimeoutMs: 500,
+    allowLocalVerifyUrls: true })
   try {
     await bridge.listen()
     bridge.restrict(['api.example:443'])

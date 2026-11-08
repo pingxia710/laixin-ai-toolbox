@@ -380,6 +380,32 @@ describe('WinINET 写序与瞬时重试(收敛包2 件5,放行闸内,子进程�
   })
 })
 
+describe('WinINET 现场回环豁免格式', () => {
+  it('必要豁免已齐时，真实适配器计划保留用户的原始字符串', () => {
+    const original = ';localhost.*;;localhost.*;<local>;localhost;127.*'
+    const script = `
+      process.env.TOOLBOX_REAL_NETWORK_ADAPTER = '1'
+      const mod = await import(${JSON.stringify(ADAPTER_URL)})
+      const adapter = mod.createAdapter({
+        nativeNotify: null,
+        nativePathIdentity: null,
+        sleep: () => undefined,
+        execFile: (command, _args, options) => {
+          if (command !== 'powershell.exe') throw new Error('reg.exe failed')
+          const request = JSON.parse(options.input)
+          if (request.operation !== 'read') throw new Error('UNEXPECTED_REQUEST')
+          return JSON.stringify(request.item === 'ProxyOverride' ? { type: 'REG_SZ', data: ${JSON.stringify(original)} } : null)
+        }
+      })
+      const entry = adapter.managedItems({ host: '127.0.0.1', port: 18080 }).find((item) => item.ref.item === 'ProxyOverride')
+      console.log(JSON.stringify(entry.value))
+    `
+    const spawned = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 20_000 })
+    expect(spawned.status).toBe(0)
+    expect(JSON.parse(spawned.stdout)).toEqual({ type: 'REG_SZ', data: original })
+  })
+})
+
 interface BehaviorProbeResult {
   managedItemsOrder: string[]
   managedValues: Record<string, unknown>

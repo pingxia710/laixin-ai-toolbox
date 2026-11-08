@@ -10,6 +10,12 @@ export interface DaemonLaunch {
   readonly env: Record<string, string>
 }
 
+/** 主进程回落 spawn 的守护启动参数；与常驻参数分开，避免把 parent IPC 语义带进常驻任务。 */
+export function daemonStartArgs(launch: DaemonLaunch, dataDir: string, runId: string | undefined, clientVersion: string): string[] {
+  return [launch.daemonPath, 'start', '--data-dir', dataDir, '--adapter', launch.adapterPath,
+    '--parent-ipc', '1', '--client-version', clientVersion, '--run-id', runId ?? '']
+}
+
 const DAEMON_LAUNCHERS = {
   macos: macDaemonLaunch,
   windows: windowsDaemonLaunch
