@@ -294,6 +294,7 @@ export class ToolboxUpdater {
       } catch (error) {
         if (this.controller?.signal.aborted) throw error
       } finally {
+        source.abort()
         clearTimeout(sourceTimeout)
         this.controller?.signal.removeEventListener('abort', abort)
       }
@@ -331,6 +332,7 @@ export class ToolboxUpdater {
       } finally { await file.close() }
       if (size !== asset.size || hash.digest('hex') !== asset.sha256) throw new Error('UPDATE_DIGEST_INVALID')
     } finally {
+      source.abort()
       clearTimeout(stalled)
       this.controller?.signal.removeEventListener('abort', abort)
     }

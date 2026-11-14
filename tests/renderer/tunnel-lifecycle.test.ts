@@ -22,7 +22,7 @@ function matches(node: Element, selector: string): boolean {
 
 class Element {
   tag = ''
-  textContent = ''; className = ''; disabled = false; value = ''; open = false
+  textContent = ''; className = ''; disabled = false; checked = false; value = ''; open = false
   dataset: Record<string, string> = {}; children: Element[] = []
   parent: Element | undefined
   selectionStart: number | null = null; selectionEnd: number | null = null
@@ -81,7 +81,11 @@ async function setup(
   const runForReport = vi.fn<(_params: { software: string }) => Promise<{ snapshot: string }>>().mockImplementation(diagnostic)
   const report = vi.fn<(_params: { id: string }) => Promise<{ snapshot: string }>>().mockResolvedValue({ snapshot: JSON.stringify({ receipt: 'LX-7K3M-9QZP', uploaded: true, message: '已上报，回执号 LX-7K3M-9QZP。把它告诉客服即可。' }) })
   const reportIncomplete = vi.fn<(_params: { software: string }) => Promise<{ snapshot: string }>>().mockResolvedValue({ snapshot: JSON.stringify({ receipt: 'LX-7K3M-9QZP', uploaded: true, message: '已上报，回执号 LX-7K3M-9QZP。把它告诉客服即可。' }) })
-  vi.stubGlobal('window', { toolbox: { tunnel: { status, start, explainRoute, repairStatus, repair, stop }, diagnostics: { run, runForReport, copy, report, reportIncomplete } } })
+  const qualityRun = vi.fn().mockResolvedValue({ snapshot: JSON.stringify({ state: 'complete', sharing: 'shared',
+    measurement: { measuredAt: Date.now(), responseMs: 300, responseSpreadMs: 25, downloadMbps: 12.5, uploadMbps: 6.7, downloadBytes: 1024, uploadBytes: 1024 } }) })
+  const qualityCancel = vi.fn().mockResolvedValue({ cancelled: true })
+  vi.stubGlobal('window', { toolbox: { tunnel: { status, start, explainRoute, repairStatus, repair, stop },
+    networkquality: { run: qualityRun, cancel: qualityCancel }, diagnostics: { run, runForReport, copy, report, reportIncomplete } } })
   if (withDiagnosticSession) {
     const { rememberDiagnosticSession } = await import('../../app/renderer/src/diagnostic-session')
     rememberDiagnosticSession({ id: 'DG-ABCDEF-123456', software: 'codex', checkedAt: Date.now() })
@@ -105,9 +109,47 @@ async function setup(
   }
   const root = new Element(); page.mount(root as unknown as HTMLElement, { tab: 'tunnel' }); cleanup = page.unmount
   await flush()
-  return { page, root, status, start, explainRoute, repairStatus, repair, stop, run, runForReport, copy, report, reportIncomplete,
+  return { page, root, status, start, explainRoute, repairStatus, repair, stop, run, runForReport, copy, report, reportIncomplete, qualityRun, qualityCancel,
     text: () => root.all().map((node) => node.textContent) }
 }
+
+it('来信网络主动测速时默认用于服务器评估，并展示指定名称', async () => {
+  const x = await setup(vi.fn<() => Promise<TunnelStatusView>>().mockResolvedValue({ ...connected, pathSource: 'laixin' }))
+  expect(x.root.querySelector('[data-network-action="quality-share"]')).toBeUndefined()
+  x.root.querySelector('[data-network-action="quality-start"]')!.click()
+  await flush()
+  expect(x.qualityRun).toHaveBeenCalledWith({ share: true })
+  expect(x.text()).toEqual(expect.arrayContaining(['网络响应', '网络下载', '网络上传', '300 ', '12.5 ', '6.7 ', 'ms', 'Mbps']))
+  expect(x.root.querySelector('.network-quality')!.all().map(node => node.textContent).join(' ')).not.toContain('通道')
+})
+
+it('测速结果上传失败时保留本次数字并提示实际状态', async () => {
+  const x = await setup(vi.fn<() => Promise<TunnelStatusView>>().mockResolvedValue({ ...connected, pathSource: 'laixin' }))
+  x.qualityRun.mockResolvedValue({ snapshot: JSON.stringify({ state: 'complete', sharing: 'not-shared',
+    measurement: { measuredAt: Date.now(), responseMs: 300, responseSpreadMs: 25, downloadMbps: 12.5, uploadMbps: 6.7, downloadBytes: 1024, uploadBytes: 1024 } }) })
+  x.root.querySelector('[data-network-action="quality-start"]')!.click()
+  await flush()
+  expect(x.text()).toEqual(expect.arrayContaining(['300 ', '12.5 ', '6.7 ', '测速结果未能上传。']))
+})
+
+it('网络页面不展示内部入口，且将原有状态提示转为客户可理解的网络文案', async () => {
+  const x = await setup(vi.fn<() => Promise<TunnelStatusView>>().mockResolvedValue({ ...connected,
+    state: '通道待确认', pathSource: 'laixin', nodeLabel: 'private-entry.invalid:12345', message: '通道已建立，正在重新检查' }))
+  const text = x.text().join(' ')
+  expect(text).toContain('正在重新确认网络')
+  expect(text).toContain('连接已建立，正在重新检查')
+  expect(text).not.toContain('通道')
+  expect(text).not.toContain('private-entry.invalid')
+  expect(text).not.toContain('当前节点')
+})
+
+it('复用已有网络可以测速，但不能将结果算到来信服务器', async () => {
+  const x = await setup(vi.fn<() => Promise<TunnelStatusView>>().mockResolvedValue({ ...connected, pathSource: 'reused' }))
+  expect(x.root.querySelector('[data-network-action="quality-share"]')).toBeUndefined()
+  x.root.querySelector('[data-network-action="quality-start"]')!.click()
+  await flush()
+  expect(x.qualityRun).toHaveBeenCalledWith({ share: false })
+})
 
 it('恢复项合并同一原因并默认折叠，轮询保留展开且不吞原始字段', async () => {
   const reason = '未恢复:失败:代理端口归属暂未确认'

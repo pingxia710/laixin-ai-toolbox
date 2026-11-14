@@ -1,3 +1,4 @@
+/* global process */
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
@@ -30,8 +31,8 @@ for (const archive of archives) {
   const path = resolve(archive)
   const sources = packagedMainSources(path)
   const packagedVersion = JSON.parse(extractFile(path, 'package.json').toString('utf8')).version
-  const origins = matches(sources, /new\s+AccountClient\(\s*("(?:[^"\\]|\\.)*")\s*,/g)
-  const updateOrigins = matches(sources, /new\s+ToolboxUpdater\(\{[\s\S]*?\borigin:\s*("(?:[^"\\]|\\.)*")/g)
+  const origins = matches(sources, /new\s+(?:[A-Za-z_$][\w$]*\.)*AccountClient\(\s*("(?:[^"\\]|\\.)*")\s*,/g)
+  const updateOrigins = matches(sources, /new\s+(?:[A-Za-z_$][\w$]*\.)*ToolboxUpdater\(\{[\s\S]*?\borigin:\s*("(?:[^"\\]|\\.)*")/g)
   assert.equal(packagedVersion, expectedVersion, `PACKAGED_VERSION_MISMATCH:${path}`)
   assert.ok(origins.length > 0 && origins.every(origin => origin === expectedOrigin), `ACCOUNT_ORIGIN_MISMATCH:${path}`)
   assert.ok(updateOrigins.length > 0 && updateOrigins.every(origin => origin === expectedOrigin), `UPDATE_ORIGIN_MISMATCH:${path}`)

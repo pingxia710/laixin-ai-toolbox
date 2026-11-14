@@ -26,6 +26,37 @@ describe('客户端可达性加密队列', () => {
     return { queue, queuePath, send, setNow: (value: number) => { clock = value } }
   }
 
+  it('并发批量补传不重复移除下一批失败事件', async () => {
+    const f = fixture()
+    let release!: () => void
+    const held = new Promise<void>(resolve => { release = resolve })
+    f.send.mockImplementation(async events => {
+      if ((events[0] as { at: number }).at === 1_100) await held
+      else throw new ReachabilitySendError('retryable', 'NETWORK')
+    })
+    f.queue.collect(attempts(60))
+    const first = f.queue.flush(), second = f.queue.flush()
+    release(); await Promise.all([first, second])
+    // One first batch succeeds. All later batches must fail, regardless of
+    // whether a buggy second uploader repeats that first batch.
+    const batches = f.send.mock.calls.map(([events]) => events)
+    expect(f.queue.pendingCount()).toBe(40)
+    expect(batches[0]).not.toEqual(batches[1])
+  })
+
+  it('在途批次被容量裁剪后只按已确认 ID 删除，不丢新事件', async () => {
+    const f = fixture()
+    let release!: () => void
+    const held = new Promise<void>(resolve => { release = resolve })
+    f.send.mockImplementationOnce(async () => { await held })
+      .mockRejectedValue(new ReachabilitySendError('retryable', 'NETWORK'))
+    f.queue.collect(attempts(20))
+    const sending = f.queue.flush()
+    f.queue.collect(attempts(100, 10_000))
+    release(); await sending
+    expect(f.queue.pendingCount()).toBe(100)
+  })
+
   it('开关关闭时不采集、不落盘、不发请求', async () => {
     const f = fixture(false)
     expect(f.queue.collect(attempts())).toBe(0)

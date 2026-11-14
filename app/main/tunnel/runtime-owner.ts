@@ -48,6 +48,11 @@ export function readReportRuntimeProvenance(): ReturnType<TunnelService['reportR
   return tunnelService?.reportRuntimeProvenance()
 }
 
+/** Private to the main process; contains the account session and must never enter IPC results. */
+export function readQualityRuntime(): ReturnType<TunnelService['qualityRuntime']> {
+  try { return tunnelService?.qualityRuntime() } catch { return undefined }
+}
+
 /** 私有诊断会话跟随当前通路；undefined 仅表示已确认的复用直连，不代表使用系统代理。 */
 export function readNetworkDiagnosticProxy(): string | undefined {
   const reused = tunnelService?.reusedProxy()

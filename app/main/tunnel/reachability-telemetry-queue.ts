@@ -36,6 +36,7 @@ export class ReachabilityTelemetryQueue {
   // -1 表示尚未失败；首次失败使用 BACKOFF_MS[0]。
   private backoffStep = -1
   private pausedForAuth = false
+  private flushing?: Promise<void>
 
   constructor(private readonly deps: ReachabilityTelemetryQueueDeps) { this.load() }
 
@@ -92,21 +93,28 @@ export class ReachabilityTelemetryQueue {
     return appended
   }
 
-  async flush(): Promise<void> {
+  flush(): Promise<void> {
+    if (this.flushing) return this.flushing
+    this.flushing = this.flushPending().finally(() => { this.flushing = undefined })
+    return this.flushing
+  }
+
+  private async flushPending(): Promise<void> {
     if (!this.deps.enabled() || this.pausedForAuth || this.events.length === 0) return
     const now = this.now()
     if (now - this.lastFlushAt < this.backoffDelayMs()) return
     this.lastFlushAt = now
     while (this.events.length > 0) {
       const batch = this.events.slice(0, REACHABILITY_BATCH_LIMIT)
+      const ids = new Set(batch.map(event => event.eventId))
       try {
         await this.deps.send(batch)
-        this.events = this.events.slice(batch.length)
+        this.events = this.events.filter(event => !ids.has(event.eventId))
         this.backoffStep = -1
         this.persist()
       } catch (error) {
         if (error instanceof ReachabilitySendError && error.kind === 'permanent') {
-          this.events = this.events.slice(batch.length)
+          this.events = this.events.filter(event => !ids.has(event.eventId))
           this.backoffStep = -1
           this.deps.logFailure?.('reachability-dropped', `${batch.length}:${error.message}`)
           this.persist()

@@ -130,6 +130,43 @@ describe('connection-attempt 队列(N-79 客户端)', () => {
       send, now: () => clock, logFailure: (event, detail) => { failures.push(`${event}:${detail}`) }
     }
   }
+
+  it('并发补传只发送一份队首，可重试失败与后续事件保留到重启', async () => {
+    let release!: () => void
+    const held = new Promise<void>(resolve => { release = resolve })
+    const send = vi.fn<AttemptQueueDeps['send']>(async event => {
+      if (event.attemptKey === 'connect:601') await held
+      if (event.attemptKey === 'connect:602') throw new AttemptSendError('retryable', 'NETWORK')
+    })
+    const queue = new ConnectionAttemptQueue(makeDeps(send))
+    queue.collect([failedAttempt(601), failedAttempt(602), failedAttempt(603)])
+    const first = queue.flush(), second = queue.flush()
+    release(); await Promise.all([first, second])
+    expect(queue.pendingCount()).toBe(2)
+    expect(send.mock.calls.filter(([event]) => event.attemptKey === 'connect:601')).toHaveLength(1)
+    const resumed = new ConnectionAttemptQueue(makeDeps(send))
+    expect(resumed.pendingCount()).toBe(2)
+    send.mockResolvedValue(undefined)
+    await resumed.flush()
+    expect(send.mock.calls.slice(-2).map(([event]) => event.attemptKey)).toEqual(['connect:602', 'connect:603'])
+    expect(resumed.pendingCount()).toBe(0)
+  })
+
+  it('在途队首被容量裁剪后，旧成功回执不能删除新队首', async () => {
+    let release!: () => void
+    const held = new Promise<void>(resolve => { release = resolve })
+    const send = vi.fn<AttemptQueueDeps['send']>(async event => {
+      if (event.attemptKey === 'connect:701') await held
+      else throw new AttemptSendError('retryable', 'NETWORK')
+    })
+    const queue = new ConnectionAttemptQueue(makeDeps(send))
+    queue.collect([failedAttempt(701)])
+    const sending = queue.flush()
+    queue.collect(Array.from({ length: 50 }, (_, index) => failedAttempt(702 + index)))
+    release(); await sending
+    expect(queue.pendingCount()).toBe(50)
+    expect(send.mock.calls[1][0].attemptKey).toBe('connect:702')
+  })
 })
 
 afterEachCleanup()

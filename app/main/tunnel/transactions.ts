@@ -102,21 +102,22 @@ export function applyPending(
     return { outcome: 'rejected', code: 'TUNNEL_PENDING_MISSING' }
   }
   const previousId = currentBatchId(dataDir)
-  // 下一次成功应用后清理上一份回退候选。
   const previousRollback = readPointer(layout.rollbackPointer(dataDir))
-  if (previousRollback !== undefined && previousRollback !== pendingId && previousRollback !== previousId) {
-    removeBatch(dataDir, previousRollback)
+  // 先保护旧 current，再发布新 current；进程在切换后退出时，启动清扫仍能保留回退批次。
+  if (previousId !== undefined && previousId !== pendingId) {
+    writeFileAtomic(layout.rollbackPointer(dataDir), `${previousId}\n`)
+    invalidatePointer(layout.rollbackPointer(dataDir))
   }
   hooks.beforeCurrentWrite?.()
   writeFileAtomic(layout.currentPointer(dataDir), `${pendingId}\n`) // ← 原子切换点
+  invalidatePointer(layout.currentPointer(dataDir))
   hooks.afterCurrentWrite?.()
   writeFileAtomic(layout.pendingPointer(dataDir), '')
-  if (previousId !== undefined) {
-    writeFileAtomic(layout.rollbackPointer(dataDir), `${previousId}\n`)
-  }
-  // 写后失效:指针事务内的后续读取(含记忆化)必拿新值。
-  for (const path of [layout.currentPointer(dataDir), layout.pendingPointer(dataDir), layout.rollbackPointer(dataDir)]) {
-    invalidatePointer(path)
+  invalidatePointer(layout.pendingPointer(dataDir))
+  // 指针提交后，才清理已不再被引用的更早回退候选。
+  if (previousRollback !== undefined && previousRollback !== pendingId && previousRollback !== previousId &&
+    previousRollback !== readPointer(layout.rollbackPointer(dataDir))) {
+    removeBatch(dataDir, previousRollback)
   }
   return { outcome: 'applied', batchId: pendingId, previousBatchId: previousId }
 }

@@ -29,13 +29,13 @@ describe('网络页状态呈现', () => {
   })
 
   it('读取失败或加载中不把状态描绘成已连接', () => {
-    expect(buildTunnelPresentation(undefined)).toMatchObject({ headline: '正在读取通道状态', tone: 'neutral', primaryAction: 'none' })
+    expect(buildTunnelPresentation(undefined)).toMatchObject({ headline: '正在读取网络状态', tone: 'neutral', primaryAction: 'none' })
     expect(buildTunnelPresentation(status({ state: '未配置' }))).toMatchObject({ headline: '国外AI需要配置网络', primaryAction: 'guide', primaryLabel: '开始设置网络' })
   })
 
   it('N-77 连接中把守护阶段透成人话;未识别阶段不显示裸码', () => {
     const atStage = buildTunnelPresentation(status({ state: '连接中', currentConfig: '版本 1', connectStage: 'bridge-start' }))
-    expect(atStage.hint).toContain('当前步骤：正在建立本地通道')
+    expect(atStage.hint).toContain('当前步骤：正在建立本地连接')
     const writing = buildTunnelPresentation(status({ state: '连接中', currentConfig: '版本 1', connectStage: 'settings-write' }))
     expect(writing.hint).toContain('正在写入系统网络设置')
     const unknown = buildTunnelPresentation(status({ state: '连接中', currentConfig: '版本 1', connectStage: 'SOMETHING_NEW' }))
@@ -64,7 +64,7 @@ describe('网络页状态呈现', () => {
 
   it('异常与已停止状态都保留实际的下一步，不伪造权益或线路数据', () => {
     expect(buildTunnelPresentation(status({ state: '异常', currentConfig: '版本 1', message: '原网络设置已恢复，但后台通道未能停止' }))).toMatchObject({
-      tone: 'danger', headline: '通道需要处理', primaryAction: 'repair', primaryLabel: '检测并修复连接'
+      tone: 'danger', headline: '网络需要处理', primaryAction: 'repair', primaryLabel: '检测并修复连接'
     })
     expect(buildTunnelPresentation(status({ state: '已停止并恢复原设置', currentConfig: '' }))).toMatchObject({ primaryAction: 'import' })
   })
@@ -116,7 +116,7 @@ describe('网络页状态呈现', () => {
   it('N-55 接管失败后即使旧设置已恢复，也不以“已恢复”覆盖连接异常', () => {
     expect(buildTunnelPresentation(status({ state: '异常', availabilityStatus: 'recovered',
       availabilityReason: '无法安全自动处理：设置读回一致，但目标服务仍不可达' }))).toMatchObject({
-      tone: 'danger', headline: '通道需要处理', hint: '无法安全自动处理：设置读回一致，但目标服务仍不可达'
+      tone: 'danger', headline: '网络需要处理', hint: '无法安全自动处理：设置读回一致，但目标服务仍不可达'
     })
   })
 
@@ -125,7 +125,7 @@ describe('网络页状态呈现', () => {
       headline: '已暂停使用'
     })
     expect(buildTunnelPresentation(status({ state: '异常', availabilityStatus: '', message: '连接端口被其他软件占用' }))).toMatchObject({
-      headline: '通道需要处理', hint: '连接端口被其他软件占用'
+      headline: '网络需要处理', hint: '连接端口被其他软件占用'
     })
   })
 })
@@ -133,5 +133,5 @@ describe('网络页状态呈现', () => {
 it('恢复失败优先显示恢复入口；不诱导重连，损坏账本指向客服', () => {
   expect(buildTunnelPresentation(status({ state: '异常', currentConfig: '版本 1', unrestored: 'Wi-Fi/socks-proxy:未恢复:失败' }))).toMatchObject({ primaryAction: 'stop', headline: '原设置尚未恢复' })
   expect(buildTunnelPresentation(status({ state: '异常', unrestored: '恢复记录损坏或无法读取' }))).toMatchObject({ primaryAction: 'support' })
-  expect(buildTunnelPresentation(status({ state: '异常', authorization: '等待重新确认账号权益' }))).toMatchObject({ primaryAction: 'stop', headline: '通道已暂时暂停' })
+  expect(buildTunnelPresentation(status({ state: '异常', authorization: '等待重新确认账号权益' }))).toMatchObject({ primaryAction: 'stop', headline: '网络已暂时暂停' })
 })

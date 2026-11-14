@@ -30,7 +30,7 @@ export async function readPlanQuota(source: PlanQuotaSource, key: string | undef
       : await readKimiQuota(key, fetchImpl, controller.signal)
   } catch {
     return { source, quota: null, status: 'network-error' }
-  } finally { clearTimeout(timer) }
+  } finally { controller.abort(); clearTimeout(timer) }
 }
 
 /**
@@ -44,6 +44,8 @@ async function readZhipuQuota(key: string, fetchImpl: typeof fetch, signal: Abor
 
 async function callZhipu(authorization: string, fetchImpl: typeof fetch, signal: AbortSignal): Promise<PlanQuotaResult> {
   const response = await fetchImpl(endpoints.zhipu, { headers: { Authorization: authorization, Accept: 'application/json' }, signal, redirect: 'error' })
+  // 认证重试共用超时，但上一响应必须先释放，避免错误长连接累积。
+  if (!response.ok) await response.body?.cancel().catch(() => undefined)
   if (response.status === 401 || response.status === 403) return { source: 'zhipu', quota: null, status: 'key-rejected' }
   if (!response.ok) return { source: 'zhipu', quota: null, status: 'invalid-reply' }
   const data = await readJsonBody(response, signal)
@@ -67,6 +69,7 @@ async function callZhipu(authorization: string, fetchImpl: typeof fetch, signal:
 
 async function readKimiQuota(key: string, fetchImpl: typeof fetch, signal: AbortSignal): Promise<PlanQuotaResult> {
   const response = await fetchImpl(endpoints.kimi, { headers: { Authorization: `Bearer ${key}`, Accept: 'application/json' }, signal, redirect: 'error' })
+  if (!response.ok) await response.body?.cancel().catch(() => undefined)
   if (response.status === 401 || response.status === 403) return { source: 'kimi', quota: null, status: 'key-rejected' }
   if (!response.ok) return { source: 'kimi', quota: null, status: 'invalid-reply' }
   const data = await readJsonBody(response, signal)

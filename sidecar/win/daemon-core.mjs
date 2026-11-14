@@ -3671,7 +3671,7 @@ class DaemonCore {
         this.stateDetails = extra
         // 持权期间写出的每一份 state 都盖上本轮令牌:后启动者据此确认「这份状态确实是当前持权者写的」。
         writeState(this.dataDir, { state, runId: this.runId, sessionToken: this.sessionToken,
-          intentToken: this.intent?.sessionToken ?? '', bridgePort: this.activeBridgePort(), apiOnly: !!this.intent?.apiOnly,
+          intentToken: this.intent?.sessionToken ?? '', connectionEpoch: this.reconnectEpoch, bridgePort: this.activeBridgePort(), apiOnly: !!this.intent?.apiOnly,
           note: this.optionalNote, code: '', message: '',
           ...(typeof this.writeRightToken === 'string' ? { writeRightToken: this.writeRightToken } : {}), ...extra,
           availability: this.availabilityView(),

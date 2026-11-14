@@ -21,8 +21,9 @@ export class BackgroundNetworkController {
   private timer?: ReturnType<typeof setInterval>
   private pending?: Promise<void>
   private stopped = false
-  private active?: { service: TunnelService; release: () => void; ready: Promise<unknown>; account: BackgroundAccount }
+  private active?: { service: TunnelService; release: () => void; ready: Promise<unknown>; account: BackgroundAccount; refreshing: boolean }
   private nextAccountCheck = 0
+  private nextConfigurationCheck = 0
 
   constructor(private readonly options: BackgroundControllerOptions) {}
 
@@ -59,6 +60,15 @@ export class BackgroundNetworkController {
     finally { active.release() }
   }
 
+  private refreshConfiguration(): void {
+    const active = this.active
+    if (!active || active.refreshing || Date.now() < this.nextConfigurationCheck) return
+    this.nextConfigurationCheck = Date.now() + 30_000
+    active.refreshing = true
+    active.ready = active.service.syncAccountConfig().catch(() => this.options.onFailure?.())
+      .finally(() => { active.refreshing = false })
+  }
+
   private async check(): Promise<void> {
     const guiPresent = guiNetworkControllerPresent(this.options.dataDir)
     if (this.stopped || guiPresent) { await this.detach(guiPresent && !this.stopped); return }
@@ -81,6 +91,7 @@ export class BackgroundNetworkController {
       if (previous.session.accessToken === account.access.session.accessToken &&
           previous.session.accountId === account.access.session.accountId && previous.client.sameEndpoint(account.access.client)) {
         this.active.account = account
+        this.refreshConfiguration()
         return
       }
       await this.detach()
@@ -94,9 +105,11 @@ export class BackgroundNetworkController {
       service = new TunnelService({ ...this.options.serviceDeps(), backgroundContinuation: { binding: freshBinding,
         isCurrent: () => this.active !== undefined && this.active.service === service && this.active.account.expiresAt > Date.now() &&
           !this.stopped && !guiNetworkControllerPresent(this.options.dataDir) } })
-      const active = { service, release, account, ready: Promise.resolve() as Promise<unknown> }
+      const active = { service, release, account, ready: Promise.resolve() as Promise<unknown>, refreshing: true }
       this.active = active
+      this.nextConfigurationCheck = Date.now() + 30_000
       active.ready = service.setAccountAccess(account.access).catch(() => this.options.onFailure?.())
+        .finally(() => { active.refreshing = false })
     } catch (error) { release(); throw error }
   }
 

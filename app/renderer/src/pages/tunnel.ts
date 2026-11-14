@@ -8,6 +8,8 @@ import { buildNetworkOnboarding, type OnboardingAction } from '../ui/network-onb
 import { idleNetworkRepair, type NetworkRepairStatus } from '../../../shared/network-repair'
 import type { DiagnosticSoftware } from '../../../network-diagnostics-types'
 import { currentDiagnosticSession, forgetDiagnosticSession, parseDiagnosticRunSnapshot, rememberDiagnosticSession } from '../diagnostic-session'
+import { parseQualityResult, qualityCard } from '../ui/network-quality'
+import type { QualityResult } from '../../../main/network-quality/controller'
 
 type Tone = 'neutral' | 'positive' | 'warning' | 'danger'
 type PrimaryAction = 'guide' | 'sync' | 'import' | 'start' | 'stop' | 'repair' | 'support' | 'none'
@@ -31,6 +33,8 @@ interface TunnelPageState {
   /** 没送出去时诊断包落在本机哪儿；送出去了为空串。 */
   reportFile: string
   reportSoftware: DiagnosticSoftware
+  qualityRunning: boolean
+  qualityResult: QualityResult | undefined
 }
 
 export interface TunnelPresentation {
@@ -58,7 +62,8 @@ const state: TunnelPageState = {
   status: undefined, statusReadError: '', lastActionMessage: '', lastActionTone: 'neutral', lastActionAwaitingRestore: false,
   routeHost: '', routeResult: undefined, routeError: '', routeBusy: false,
   repair: { ...idleNetworkRepair }, repairReadError: false,
-  reportReceipt: '', reportFile: '', reportSoftware: 'codex'
+  reportReceipt: '', reportFile: '', reportSoftware: 'codex',
+  qualityRunning: false, qualityResult: undefined
 }
 /** UI-10: technical evidence remains available, but starts collapsed. */
 const networkExtraClass = 'technical-details network-extra'
@@ -75,6 +80,8 @@ let lastRefreshedRequest = 0
 let lastRender = ''
 let busy = false
 let reportInProgress = false
+let qualityGeneration = 0
+let qualityOwner = ''
 let stopAccount = (): void => undefined
 const listeners: Array<() => void> = []
 
@@ -101,7 +108,16 @@ export const page: PageModule = {
     if (!reportInProgress && !state.reportReceipt) state.reportSoftware = 'codex'
     lastRender = ''
     busy = reportInProgress
-    stopAccount = onAccountChange(() => render(element))
+    stopAccount = onAccountChange((view) => {
+      const nextOwner = view.state === 'signed-in' ? view.account?.id ?? '' : view.state === 'signed-out' ? '' : qualityOwner
+      if (qualityOwner && nextOwner !== qualityOwner) {
+        qualityGeneration++
+        if (state.qualityRunning) void window.toolbox.networkquality.cancel().catch(() => undefined)
+        state.qualityRunning = false; state.qualityResult = undefined
+      }
+      qualityOwner = nextOwner
+      render(element)
+    })
     void readLoginItem().then(() => render(element))
     render(element)
     void refresh(version)
@@ -134,7 +150,7 @@ export function autoLaunchSuggestion(status: TunnelStatusView | undefined,
 export function buildTunnelPresentation(status: TunnelStatusView | undefined): TunnelPresentation {
   if (status === undefined) {
     return {
-      tone: 'neutral', headline: '正在读取通道状态', description: '工具箱正在读取本机保存的配置和连接状态。',
+      tone: 'neutral', headline: '正在读取网络状态', description: '工具箱正在读取本机保存的配置和连接状态。',
       hint: '状态未确认前不会显示已连接。', primaryAction: 'none', primaryLabel: '读取中'
     }
   }
@@ -158,12 +174,12 @@ export function buildTunnelPresentation(status: TunnelStatusView | undefined): T
       primaryAction: 'none', primaryLabel: '恢复中' }
   }
   if (status.authorization === '等待重新确认账号权益') {
-    return { tone: 'warning', headline: '通道已暂时暂停', description: '账号服务暂时无法确认权益。确认有效后将接续先前连接。',
+    return { tone: 'warning', headline: '网络已暂时暂停', description: '账号服务暂时无法确认权益。确认有效后将接续先前连接。',
       hint: '点击断开可取消自动恢复；也可手动同步账号状态。', primaryAction: 'stop', primaryLabel: '断开并取消自动恢复' }
   }
   if (status.authorization === '保留先前连接，等待重新核验') {
     return { tone: 'warning', headline: '原连接暂时保留', description: status.message,
-      hint: '正在自动重试账号校验；你也可以随时断开。', primaryAction: 'stop', primaryLabel: '断开通道' }
+      hint: '正在自动重试账号校验；你也可以随时断开。', primaryAction: 'stop', primaryLabel: '断开网络' }
   }
   const availability = status.availabilityStatus ?? ''
   // 接管失败后恢复原设置时，守护仍须保留“异常”的连接结果；不能用“已恢复设置”盖掉它。
@@ -174,7 +190,7 @@ export function buildTunnelPresentation(status: TunnelStatusView | undefined): T
       'taking-over': { tone: 'warning', headline: '正在接管', description: '正在保存原设置、建立写入租约，并在写后读回和实测目标服务。', primaryLabel: '取消连接' },
       reclaiming: { tone: 'warning', headline: '正在夺回', description: '检测到设置被改写，正在按当前证据进行有界夺回和复验。', primaryLabel: '取消连接' },
       recovering: { tone: 'warning', headline: '正在恢复', description: '正在只恢复仍由本次租约拥有且未被外部再次修改的设置。', primaryLabel: '恢复中' },
-      recovered: { tone: 'positive', headline: '已恢复', description: '原网络设置已读回确认；外部后来修改的值已保留。', primaryLabel: '连接通道' },
+      recovered: { tone: 'positive', headline: '已恢复', description: '原网络设置已读回确认；外部后来修改的值已保留。', primaryLabel: '连接网络' },
       limited: { tone: 'danger', headline: '无法安全自动处理', description: status.availabilityReason || '当前网络设置缺少可验证的处理条件。', primaryLabel: '联系来信客服' }
     }
     const presentation = labels[availability]
@@ -183,8 +199,8 @@ export function buildTunnelPresentation(status: TunnelStatusView | undefined): T
   }
   switch (status.state) {
     case '通道待确认':
-      return { tone: 'warning', headline: '正在重新确认通道', description: status.message,
-        hint: '保留原通道继续检查，尚未确认恢复；可以随时断开。', primaryAction: 'stop', primaryLabel: '断开通道' }
+      return { tone: 'warning', headline: '正在重新确认网络', description: status.message,
+        hint: '保留原连接继续检查，尚未确认恢复；可以随时断开。', primaryAction: 'stop', primaryLabel: '断开网络' }
     case '已连':
       // 复用态:我们一个字节都没改客户的系统设置,走的是他电脑上本来就有的那条外网。
       // ⛔ 说「本机代理设置和通道出口已完成校验」——那是来信自己通道才有的事(GPT-6 网络加强研究 §六)。
@@ -196,10 +212,10 @@ export function buildTunnelPresentation(status: TunnelStatusView | undefined): T
         }
         : {
           tone: 'positive', headline: '已连接', description: status.exitIp === '' && status.pathVerified === true
-            ? '本机代理设置和通道可达性已完成校验，出口地址暂未取得。请打开目标 AI 软件，确认登录并尝试一次对话。'
-            : '本机代理设置和通道出口已完成校验。请打开目标 AI 软件，确认登录并尝试一次对话。',
+            ? '本机代理设置和网络可达性已完成校验，出口地址暂未取得。请打开目标 AI 软件，确认登录并尝试一次对话。'
+            : '本机代理设置和网络出口已完成校验。请打开目标 AI 软件，确认登录并尝试一次对话。',
           hint: status.lastVerifiedAt === '' ? '等待最近一次校验信息。' : `最近复验：${formatTime(status.lastVerifiedAt)}`,
-          primaryAction: 'stop', primaryLabel: '断开通道'
+          primaryAction: 'stop', primaryLabel: '断开网络'
         }
     case '连接中': {
       // N-77:把守护阶段透成人话——各阶段有界预算合计可达约两分钟,只给一句静态文案
@@ -210,14 +226,14 @@ export function buildTunnelPresentation(status: TunnelStatusView | undefined): T
         'existing-proxy-probe': '正在探测电脑现有网络',
         'direct-path-probe': '正在确认直连路径',
         'connector-start': '正在启动安全连接器',
-        'bridge-start': '正在建立本地通道',
-        'path-verify-before-settings': '正在验证通道可达',
+        'bridge-start': '正在建立本地连接',
+        'path-verify-before-settings': '正在验证网络可达',
         'settings-write': '正在写入系统网络设置',
         'path-verify-after-settings': '正在校验设置生效'
       }
       const stageLine = typeof status.connectStage === 'string' && status.connectStage !== '' ? stageCopy[status.connectStage] : undefined
       return {
-        tone: 'warning', headline: '正在连接', description: '正在等待通道建立和校验完成，请不要重复点击连接。',
+        tone: 'warning', headline: '正在连接', description: '正在等待网络建立和校验完成，请不要重复点击连接。',
         hint: stageLine !== undefined ? `当前步骤：${stageLine}。连接结果会自动更新，也可以随时取消。` : '连接结果会自动更新，也可以随时取消。',
         primaryAction: 'stop', primaryLabel: '取消连接'
       }
@@ -228,7 +244,7 @@ export function buildTunnelPresentation(status: TunnelStatusView | undefined): T
       // 主按钮保留「连接通道」:此刻点击不再另起一份,而是并进同一轮,校准落定后走同一套判断接续。
       return {
         tone: 'warning', headline: '正在接续', description: '正在接续你上次的连接，稍候自动连上。',
-        hint: '等待期间也可以点击连接，会并进同一轮接续；不会重复启动通道。', primaryAction: 'start', primaryLabel: '连接通道'
+        hint: '等待期间也可以点击连接，会并进同一轮接续；不会重复启动连接。', primaryAction: 'start', primaryLabel: '连接网络'
       }
     case '未配置':
       return {
@@ -237,7 +253,7 @@ export function buildTunnelPresentation(status: TunnelStatusView | undefined): T
       }
     case '异常':
       return {
-        tone: 'danger', headline: '通道需要处理', description: '请查看下方状态说明；原设置未恢复前，不能应用新的配置。',
+        tone: 'danger', headline: '网络需要处理', description: '请查看下方状态说明；原设置未恢复前，不能应用新的配置。',
         hint: status.availabilityStatus === 'recovered' && status.availabilityReason
           ? status.availabilityReason : status.message === '' ? '连接状态异常。' : status.message,
         primaryAction: status.currentConfig === '' ? 'import' : 'repair', primaryLabel: status.currentConfig === '' ? '导入配置包' : '检测并修复连接'
@@ -251,7 +267,7 @@ export function buildTunnelPresentation(status: TunnelStatusView | undefined): T
         primaryAction: status.currentConfig === '' ? 'import' : 'start', primaryLabel: status.currentConfig === '' ? '导入配置包' : '恢复使用'
       }
       return {
-        tone: 'neutral', headline: '已暂停使用', description: '通道已暂停，正在恢复你的原网络设置；开机不会自动连接。',
+        tone: 'neutral', headline: '已暂停使用', description: '网络已暂停，正在恢复你的原网络设置；开机不会自动连接。',
         hint: '需要时点「恢复使用」即可继续。', primaryAction: status.currentConfig === '' ? 'import' : 'start', primaryLabel: status.currentConfig === '' ? '导入配置包' : '恢复使用'
       }
     case '已停止并恢复原设置':
@@ -349,12 +365,34 @@ function render(element: HTMLElement): void {
     ? { ...buildTunnelPresentation(status), headline: '暂时无法确认连接状态', description: '状态读取失败，正在等待重新读取。', hint: '请稍后重试，或联系来信客服。' }
     : buildTunnelPresentation(status)
   element.append(connectionCard(presentation))
+  element.append(qualityCard({ running: state.qualityRunning,
+    canStart: status?.state === '已连' && ['laixin', 'reused'].includes(status.pathSource), isLaixin: status?.pathSource === 'laixin', result: state.qualityResult }, {
+    start: () => { void runQuality() }, cancel: () => { void window.toolbox.networkquality.cancel().catch(() => undefined) }
+  }))
   appendAutoLaunchSuggestion(element, status)
   appendFeedback(element, status, now)
   element.querySelectorAll<HTMLDetailsElement>('details').forEach(details => { details.open = opened.has(details.className) })
   renderAdvanced()
   renderRepair()
   if (focusedAction) element.querySelectorAll<HTMLElement>('[data-network-action]').forEach((action) => { if (action.dataset.networkAction === focusedAction) action.focus({ preventScroll: true }) })
+}
+
+async function runQuality(): Promise<void> {
+  if (state.qualityRunning || state.status?.state !== '已连' || !['laixin', 'reused'].includes(state.status.pathSource)) return
+  const generation = ++qualityGeneration
+  state.qualityRunning = true; state.qualityResult = undefined
+  if (activeElement) render(activeElement)
+  try {
+    const response = await window.toolbox.networkquality.run({ share: state.status?.pathSource === 'laixin' })
+    if (generation === qualityGeneration) state.qualityResult = parseQualityResult(response.snapshot)
+  } catch {
+    if (generation === qualityGeneration) state.qualityResult = { state: 'failed', reason: 'unavailable' }
+  } finally {
+    if (generation === qualityGeneration) {
+      state.qualityRunning = false
+      if (activeElement) render(activeElement)
+    }
+  }
 }
 
 /** 轮询会整页重建；输入中的分流查询框按原位置恢复焦点与光标。 */
@@ -437,10 +475,19 @@ function runSetup(action: OnboardingAction): void {
   })
 }
 
+/** Existing daemon messages use internal terms; translate only when rendering this page. */
+export function customerNetworkCopy(value: string): string {
+  return value.replaceAll('走专用通道', '使用专用网络').replaceAll('走通道', '使用来信网络')
+    .replaceAll('网络通道', '网络连接').replaceAll('通道出口', '网络出口')
+    .replaceAll('来信通道', '来信网络').replaceAll('通道', '连接')
+}
+
 function connectionCard(presentation: TunnelPresentation): HTMLElement {
   if (state.repair.running && state.status?.state !== '断开中') presentation = { tone: 'warning', headline: '正在检测并修复连接',
-    description: state.repair.message, hint: '修复期间会短暂断开来信通道；可以随时取消。',
+    description: state.repair.message, hint: '修复期间会短暂断开来信网络；可以随时取消。',
     primaryAction: 'stop', primaryLabel: '取消修复并断开' }
+  presentation = { ...presentation, headline: customerNetworkCopy(presentation.headline), description: customerNetworkCopy(presentation.description),
+    hint: customerNetworkCopy(presentation.hint), primaryLabel: customerNetworkCopy(presentation.primaryLabel) }
   const card = document.createElement('section')
   card.className = 'panel connection-card'
   card.dataset.tone = presentation.tone
@@ -460,7 +507,7 @@ function connectionCard(presentation: TunnelPresentation): HTMLElement {
   const hint = document.createElement('div')
   hint.className = 'connection-hint'
   hint.append(icon(presentation.tone === 'danger' ? 'warning' : presentation.tone === 'positive' ? 'check' : 'clock'), document.createTextNode(presentation.hint))
-  if (!unconfigured && state.status?.state !== '已连' && presentation.hint !== statusFeedback(state.status, Date.now())) copy.append(hint)
+  if (!unconfigured && state.status?.state !== '已连' && presentation.hint !== customerNetworkCopy(statusFeedback(state.status, Date.now()))) copy.append(hint)
   const power = document.createElement('div')
   power.className = 'connection-actions'
   const action = primaryAction(presentation.primaryAction)
@@ -574,7 +621,7 @@ function repairCard(): HTMLElement {
   feedback.setAttribute('role', 'status'); feedback.setAttribute('aria-live', 'polite')
   feedback.dataset.outcome = repair.outcome
   feedback.textContent = state.repairReadError ? '修复状态暂时读不到，请稍后刷新；不要把它当作已经修好。'
-    : repair.message
+    : customerNetworkCopy(repair.message)
   card.append(feedback)
   return card
 }
@@ -589,11 +636,10 @@ function detailsCard(status: TunnelStatusView | undefined): HTMLElement {
   const details = document.createElement('dl')
   details.className = 'detail-list'
   appendDetail(details, '当前配置', status?.currentConfig, '尚未应用配置')
-  appendDetail(details, '当前节点', status?.nodeLabel, '尚未配置节点')
   appendDetail(details, '配置版本', status?.configVersion, '尚未应用')
   appendDetail(details, '最近复验', status?.lastVerifiedAt ? formatTime(status.lastVerifiedAt) : '', '尚未复验')
   appendDetail(details, '本机代理', status?.state === '已连' ? '设置已读回核验' : status?.unrestored ? '恢复未完成' : '', '连接后核验')
-  appendDetail(details, '通道出口', status?.state === '已连' ? '出口探测已通过' : '', '尚未通过当前连接校验')
+  appendDetail(details, '网络出口', status?.state === '已连' ? '出口探测已通过' : '', '尚未通过当前连接校验')
   appendDetail(details, '目标 AI 软件', '请在软件内确认登录并尝试对话', '')
   appendDetail(details, '待用配置', status?.pendingConfig, '没有待应用配置')
   appendDetail(details, '配置来源', status?.source, '尚未取得')
@@ -610,8 +656,8 @@ function detailsCard(status: TunnelStatusView | undefined): HTMLElement {
 /** 一眼看懂的结论：走哪条路、是不是局域网、还是得交给内核判。 */
 export function routeVerdict(explanation: RouteExplanationView): string {
   if (explanation.outcome === 'kernel-check') return '交内核判定'
-  if (explanation.outcome === 'tunnel') return '走通道'
-  if (explanation.outcome === 'dedicated') return '走专用通道'
+  if (explanation.outcome === 'tunnel') return '使用来信网络'
+  if (explanation.outcome === 'dedicated') return '使用专用网络'
   if (explanation.outcome !== 'direct') return ''
   return explanation.reasonCode === 'LOCAL_NETWORK_DIRECT' || explanation.reasonCode === 'PRIVATE_IP_DIRECT' ? '直连（局域网）' : '直连'
 }
@@ -654,11 +700,11 @@ function routeExplanationCard(status: TunnelStatusView | undefined): HTMLElement
     result.dataset.outcome = explanation.outcome
     const heading = document.createElement('div')
     heading.className = 'route-explanation-heading'
-    heading.append(Object.assign(document.createElement('strong'), { textContent: explanation.title }))
+    heading.append(Object.assign(document.createElement('strong'), { textContent: customerNetworkCopy(explanation.title) }))
     const verdict = routeVerdict(explanation)
     // 「知不知道答案」才是这里的轴：命中了明确规则给正向，交内核判定是中性的未知。
     if (verdict) heading.append(statusPill(verdict, explanation.outcome === 'kernel-check' ? 'neutral' : 'positive'))
-    result.append(heading, Object.assign(document.createElement('span'), { textContent: explanation.detail }))
+    result.append(heading, Object.assign(document.createElement('span'), { textContent: customerNetworkCopy(explanation.detail) }))
     if (explanation.outcome !== 'invalid' && explanation.outcome !== 'unconfigured') {
       const rule = document.createElement('p')
       rule.className = 'route-explanation-rule'
@@ -701,7 +747,7 @@ function appendDetail(list: HTMLDListElement, label: string, value: string | und
   row.className = 'detail-row'
   row.append(Object.assign(document.createElement('dt'), { textContent: label }))
   const content = document.createElement('dd')
-  content.textContent = value === undefined || value === '' ? fallback : value
+  content.textContent = customerNetworkCopy(value === undefined || value === '' ? fallback : value)
   if (value === undefined || value === '') content.className = 'is-empty'
   row.append(content)
   list.append(row)
@@ -723,12 +769,12 @@ function actionSection(status: TunnelStatusView | undefined): HTMLElement {
   actions.append(
     actionCard('同步账号配置', '登录来信账号后，领取已开通的网络配置。', 'refresh', '同步配置', () => window.toolbox.tunnel.syncAccountConfig(), status === undefined || disconnecting),
     actionCard('导入配置包', '从本机选择来信签发的配置包；不会读取第三方订阅。', 'upload', '导入配置包', () => window.toolbox.tunnel.importConfig(), status === undefined),
-    actionCard('应用待用配置', '仅在通道断开且原设置已恢复时可应用。', 'check', '应用新配置', () => window.toolbox.tunnel.applyPending(), status?.canApplyPending !== true),
+    actionCard('应用待用配置', '仅在网络断开且原设置已恢复时可应用。', 'check', '应用新配置', () => window.toolbox.tunnel.applyPending(), status?.canApplyPending !== true),
     // 启动/恢复一颗:暂停态换文案;通道活动中原设置未恢复时都不可发起(恢复入口在上方「重试恢复原设置」)。
-    actionCard(paused ? '恢复使用' : '连接通道', paused ? '回到暂停前的用法：重新连接并核验，随时可再暂停。' : '使用当前配置重新连接并核验。',
+    actionCard(paused ? '恢复使用' : '连接网络', paused ? '回到暂停前的用法：重新连接并核验，随时可再暂停。' : '使用当前配置重新连接并核验。',
       paused ? 'play' : 'power', paused ? '恢复' : '连接', () => window.toolbox.tunnel.start(),
       status === undefined || disconnecting || channelActive || Boolean(status.unrestored) || status.currentConfig === ''),
-    actionCard('暂停使用', '断开通道并恢复你的原网络设置；开机不会自动连接。', 'pause', '暂停',
+    actionCard('暂停使用', '断开网络并恢复你的原网络设置；开机不会自动连接。', 'pause', '暂停',
       () => window.toolbox.tunnel.stop(), status === undefined || !channelActive)
   )
   section.append(heading, actions)
@@ -800,7 +846,7 @@ function appendFeedback(element: HTMLElement, status: TunnelStatusView | undefin
     const feedback = document.createElement('div')
     feedback.className = 'network-feedback'
     feedback.dataset.tone = message.tone
-    feedback.append(icon(message.iconName), document.createTextNode(message.text))
+    feedback.append(icon(message.iconName), document.createTextNode(customerNetworkCopy(message.text)))
     element.append(feedback)
   }
   if (status?.unrestored || status?.recoveryDetail) {
@@ -810,7 +856,7 @@ function appendFeedback(element: HTMLElement, status: TunnelStatusView | undefin
     summary.textContent = '恢复详情（可提供给客服）'
     summary.dataset.networkAction = 'recovery-details'
     details.append(summary)
-    if (status.recoveryDetail) details.append(Object.assign(document.createElement('p'), { textContent: status.recoveryDetail }))
+    if (status.recoveryDetail) details.append(Object.assign(document.createElement('p'), { textContent: customerNetworkCopy(status.recoveryDetail) }))
     const groups = new Map<string, string[]>()
     for (const item of (status.unrestored ? status.unrestored.split(';') : [])) {
       const separator = item.indexOf(':未恢复:')
@@ -820,7 +866,7 @@ function appendFeedback(element: HTMLElement, status: TunnelStatusView | undefin
       groups.set(reason, fields)
     }
     for (const [reason, fields] of groups) {
-      details.append(Object.assign(document.createElement('p'), { textContent: fields.length ? `${fields.join('、')}：${reason}` : reason }))
+      details.append(Object.assign(document.createElement('p'), { textContent: customerNetworkCopy(fields.length ? `${fields.join('、')}：${reason}` : reason) }))
     }
     element.append(details)
   }

@@ -1,7 +1,7 @@
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
 import { generateKeyPairSync, randomUUID } from 'node:crypto'
 import { readFileSync, writeFileSync } from 'node:fs'
-import { createServer as httpServer } from 'node:http'
+import { createServer as httpServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { connect, createServer, type AddressInfo, type Server, type Socket } from 'node:net'
 import { createServer as tlsServer } from 'node:tls'
 import { join } from 'node:path'
@@ -63,7 +63,12 @@ export async function startRealityNode(root: string) {
   let requests = 0
   let response = '203.0.113.42'
   let statusCode = 200
-  const echo = httpServer((_req, res) => { requests += 1; res.writeHead(statusCode); res.end(response) })
+  let extraHandler: ((req: IncomingMessage, res: ServerResponse) => void) | undefined
+  const echo = httpServer((req, res) => {
+    requests += 1
+    if (req.url?.startsWith('/v1/network/') && extraHandler) { extraHandler(req, res); return }
+    res.writeHead(statusCode); res.end(response)
+  })
   echo.on('connection', track)
   const echoPort = await listen(echo)
   const port = await freePort()
@@ -104,6 +109,7 @@ export async function startRealityNode(root: string) {
   return {
     node: { host: '127.0.0.1', port }, credential, verifyUrl: `http://127.0.0.1:${echoPort}/toolbox-exit-ip`,
     requests: () => requests, setResponse: (body: string, code = 200) => { response = body; statusCode = code },
+    setNetworkHandler: (handler: (req: IncomingMessage, res: ServerResponse) => void) => { extraHandler = handler },
     stop, start,
     close: async () => { await stop(); sockets.forEach((socket) => socket.destroy()); await Promise.all([tls, echo].map((server) => new Promise<void>((resolve) => server.close(() => resolve())))) }
   }
