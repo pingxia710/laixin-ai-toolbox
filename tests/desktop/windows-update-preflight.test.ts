@@ -1,5 +1,6 @@
 import { createRequire } from 'node:module'
 import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -75,6 +76,7 @@ interface WindowsHelper {
   }): Promise<number>
   runNative(file: string, args: readonly string[], options?: { timeoutMs?: number }): Promise<NativeResult>
   windowsPreflight(options: WindowsPreflightOptions, runner?: NativeRunner): Promise<WindowsPreflightOutcome>
+  knownWindowsLegacyUninstaller(path: string, known?: ReadonlySet<string>): Promise<boolean>
   recoverWindowsPreflight(markerPath: string, runner: NativeRunner, transactionId: string): Promise<void>
   commitWindowsPreflight(recoveryDirectory: string, runner: NativeRunner, ownerPid: number, transactionId?: string): Promise<void>
   commitWindowsPreflightCommand(recoveryDirectory: string, runner: NativeRunner, ownerPid: number, transactionId?: string): Promise<void>
@@ -269,6 +271,55 @@ async function runBeforeInstallWrite(f: ReturnType<typeof fixture>, mode: 'updat
 }
 
 describe('Windows 更新/卸载前置闸', () => {
+  it('旧卸载器兼容只认完整文件摘要，不认不存在或变化后的文件', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'laixin-known-uninstaller-'))
+    try {
+      const file = join(directory, 'uninstaller.exe')
+      const bytes = Buffer.from('known-uninstaller-fixture')
+      const known = new Set([createHash('sha256').update(bytes).digest('hex')])
+      await writeFile(file, bytes)
+      await expect(helper.knownWindowsLegacyUninstaller(file, known)).resolves.toBe(true)
+      await writeFile(file, Buffer.from('changed-uninstaller-fixture'))
+      await expect(helper.knownWindowsLegacyUninstaller(file, known)).resolves.toBe(false)
+      await expect(helper.knownWindowsLegacyUninstaller(join(directory, 'missing.exe'), known)).resolves.toBe(false)
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it.skipIf(process.platform !== 'win32')('Windows 原生预检正确识别缺失任务并拒绝账户错误', () => {
+    const env = { ...process.env }
+    delete env.LAIXIN_W01_TEST_OUTPUT
+    delete env.LAIXIN_W01_TEST_EXISTING
+    const result = spawnSync(process.execPath, [
+      join(__dirname, '..', 'fixtures', 'windows-task-lookup-readonly.mjs'),
+      join(__dirname, '..', '..', 'resources', 'update-helper.cjs')
+    ], { encoding: 'utf8', env, timeout: 60_000 })
+    expect(result.status, result.stdout + result.stderr).toBe(0)
+  }, 60_000)
+
+  it.skipIf(process.platform !== 'win32')('Windows 原生 COM 查询不得把账户错误当成缺失任务', () => {
+    const env = { ...process.env }
+    delete env.LAIXIN_W01_TEST_OUTPUT
+    const result = spawnSync(process.execPath, [
+      join(__dirname, '..', 'fixtures', 'windows-task-lookup-readonly.mjs'),
+      join(__dirname, '..', '..', 'resources', 'update-helper.cjs'),
+      'LaixinW01LookupNative', 'com-account-error'
+    ], { encoding: 'utf8', env, timeout: 60_000 })
+    expect(result.status, result.stdout + result.stderr).toBe(0)
+  }, 60_000)
+
+  it.skipIf(process.platform !== 'win32')('Windows 原生恢复守卫正确识别缺失并保留权限错误', () => {
+    const env = { ...process.env }
+    delete env.LAIXIN_W01_TEST_OUTPUT
+    delete env.LAIXIN_W01_TEST_EXISTING
+    const result = spawnSync(process.execPath, [
+      join(__dirname, '..', 'fixtures', 'windows-recovery-task-readonly.mjs'),
+      join(__dirname, '..', '..', 'resources', 'update-helper.cjs')
+    ], { encoding: 'utf8', env, timeout: 60_000 })
+    expect(result.status, result.stdout + result.stderr).toBe(0)
+  }, 60_000)
+
   it('原生命令超时后必须等同一子进程真正退出，不能带着未确认的后台写入返回', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'laixin-native-timeout-'))
     const pidPath = join(directory, 'pid.txt')

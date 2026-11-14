@@ -42,6 +42,7 @@ import { idleNetworkRepair, type NetworkRepairStatus } from '../../shared/networ
 import { readActiveMacNetworkPath } from './platform/mac-active-network'
 import type { ActiveNetworkPath } from '../../../sidecar/mac/active-network-path.mjs'
 import type { NetworkAccessOptions } from '../account/client'
+import { qualityRuntimeFrom, type QualityRuntime } from '../network-quality/runtime-context'
 
 export const DEFAULT_BRIDGE_PORT = 18080
 
@@ -167,6 +168,7 @@ interface SingleAddressRefresh {
   inFlight: boolean
   completed: boolean
   timer?: ReturnType<typeof setTimeout>
+  stopToken?: string
 }
 
 export interface ActionResult {
@@ -644,6 +646,17 @@ export class TunnelService {
       }
       return synced
     }
+    // A transient account read cannot cancel an owned configuration refresh:
+    // its original session still has to claim/validate the replacement normally.
+    if (!access && reason === 'temporary-unavailable' && active && this.configRefreshRequested(active) &&
+        this.retainLocalConnection()) return localContinuation()
+    // Refreshing account access during our internal disconnect must retain the
+    // connection request. Only the same account/service may inherit it; normal
+    // logout, account switching and explicit stop still clear the pending resume.
+    if (active && access && this.configRefreshRequested(active) && access.session.accountId === active.session.accountId &&
+        access.session.deviceId === active.session.deviceId && active.client.sameEndpoint(access.client)) {
+      this.pausedAccount = active.session.accountId
+    }
     this.cancelSingleAddressRefresh()
     if (this.repairController) {
       this.repairController.abort()
@@ -1068,7 +1081,8 @@ export class TunnelService {
           if (Object.hasOwn(REJECT_REASONS, imported.code)) throw new PackageReject(imported.code as RejectCode)
           return { outcome: 'rejected', code: imported.code, message: imported.message }
         }
-        let resume = this.configRefreshRequested(access)
+        let resume = this.configRefreshRequested(access) ||
+          this.deps.backgroundContinuation !== undefined && this.pausedAccount === access.session.accountId
         if (current?.accountId === access.session.accountId) {
           const pendingBeforeWait = pendingBatchId(this.deps.dataDir)
           const intentPath = layout.intent(this.deps.dataDir)
@@ -1712,6 +1726,13 @@ export class TunnelService {
     return `http://127.0.0.1:${String(port)}`
   }
 
+  /** Read current, owned path evidence for one user-triggered quality measurement. */
+  qualityRuntime(): QualityRuntime | undefined {
+    return qualityRuntimeFrom({ info: readCurrentInfo(this.deps.dataDir), daemon: readDaemonState(this.deps.dataDir),
+      intent: this.intentSnapshot(), access: this.accountAccess, status: this.status(), now: this.deps.now(),
+      allowLocalForTests: this.deps.allowLocalVerifyUrls === true })
+  }
+
   /** 只读取本轮接管前的恢复证据；候选地址不经 bridge，也不进诊断报告。 */
   diagnosticExistingProxy(): string | undefined {
     return this.diagnosticExistingProxyEvidence()?.proxyUrl
@@ -1965,7 +1986,10 @@ export class TunnelService {
       // Keep a completed episode fenced until the daemon leaves the failure state.
       // A later failure then gets a new generation instead of starting the same
       // binding operation on every status poll.
-      if (this.singleAddressRefresh !== undefined && !this.singleAddressRefresh.inFlight) this.cancelSingleAddressRefresh()
+      const restoringForRefresh = this.singleAddressRefresh?.stopToken !== undefined &&
+        this.singleAddressRefresh.stopToken === intent?.sessionToken && this.accountAccess !== undefined &&
+        this.configRefreshRequested(this.accountAccess)
+      if (this.singleAddressRefresh !== undefined && !this.singleAddressRefresh.inFlight && !restoringForRefresh) this.cancelSingleAddressRefresh()
       return
     }
     const sessionToken = intent.sessionToken
@@ -2005,7 +2029,10 @@ export class TunnelService {
     refresh.attempt += 1
     const generation = refresh.generation
     refresh.inFlight = true
-    void this.syncAccountConfiguration(true).then((result) => {
+    const work = refresh.stopToken !== undefined || pendingSettingEntriesCached(this.deps.dataDir).length > 0
+      ? this.restoreSingleAddressControlPath(refresh).then((failure) => failure ?? this.syncAccountConfiguration(true))
+      : this.syncAccountConfiguration(true)
+    void work.then((result) => {
       if (this.singleAddressRefresh !== refresh || refresh.generation !== generation) return
       if (result.outcome === 'rejected' && result.code !== 'NETWORK_SESSION_CHANGED') {
         this.deps.logFailure?.('single-address-refresh-failed', result.code)
@@ -2044,6 +2071,37 @@ export class TunnelService {
     }).finally(() => {
       if (this.singleAddressRefresh === refresh && refresh.generation === generation) refresh.inFlight = false
     })
+  }
+
+  private async restoreSingleAddressControlPath(refresh: SingleAddressRefresh): Promise<ActionResult | undefined> {
+    const access = this.accountAccess
+    if (!access || this.singleAddressRefresh !== refresh || !this.backgroundControlCurrent()) return accountFailure('NETWORK_SESSION_CHANGED')
+    if (refresh.stopToken === undefined) {
+      const intent = this.intentSnapshot()
+      const entries = pendingSettingEntriesCached(this.deps.dataDir)
+      if (intent?.desired !== 'connected' || intent.sessionToken !== refresh.sessionToken) return accountFailure('NETWORK_SESSION_CHANGED')
+      if (!entries.length) return undefined
+      if (!this.supervisor.isRunning() || ledgerFailureCached(this.deps.dataDir) ||
+          entries.some((entry) => entry.status !== 'applied' || entry.sessionToken !== refresh.sessionToken)) {
+        return accountFailure('NETWORK_DISCONNECT_REQUIRED')
+      }
+      const release = this.mutex.tryAcquire()
+      if (!release) return accountFailure('NETWORK_LOCAL_BUSY')
+      try {
+        // The failed bridge may carry Electron's account requests too. Restore only
+        // our own settings before fetching, retaining the existing reconnect intent.
+        this.disconnect('config-refresh')
+        refresh.stopToken = this.intentSnapshot()!.sessionToken!
+        this.configRefreshResume = { access, stopToken: refresh.stopToken, stopSequence: this.userStopSequence }
+      } finally { release() }
+    }
+    const verdict = await this.awaitRestoreVerdict(5_000)
+    if (this.singleAddressRefresh !== refresh || this.accountAccess !== access ||
+        !this.configRefreshRequested(access) || this.intentSnapshot()?.sessionToken !== refresh.stopToken ||
+        !this.backgroundControlCurrent()) return accountFailure('NETWORK_SESSION_CHANGED')
+    if (verdict === 'failed') return accountFailure('NETWORK_DISCONNECT_REQUIRED')
+    if (verdict === 'pending') return accountFailure('NETWORK_LOCAL_BUSY')
+    return undefined
   }
 
   private cancelSingleAddressRefresh(): void {
@@ -2213,10 +2271,12 @@ export class TunnelService {
     const background = this.deps.backgroundContinuation
     if (!background) return true
     if (!background.isCurrent()) return false
-    const expiresAt = readCurrentInfo(this.deps.dataDir)?.expiresAt
-    if (!expiresAt || !(Date.parse(expiresAt) > this.deps.now())) return false
-    if (this.accountAccess && this.configRefreshRequested(this.accountAccess)) return true
     const intent = this.readFullIntent()
+    // Management may obtain a renewed signed package after expiry. Forwarding
+    // still requires the package/daemon authorization checks; user stops win.
+    if (this.accountAccess && (this.configRefreshRequested(this.accountAccess) ||
+        this.pausedAccount === this.accountAccess.session.accountId && intent?.desired === 'user-disconnected' &&
+        intent.reason === 'authorization-expired')) return true
     const actual = intent?.apiOnly as Partial<ApiNetworkBinding> | undefined
     const expected = background.binding
     return intent?.desired === 'connected' && actual?.pid === expected.pid && actual.bootId === expected.bootId &&
@@ -2246,6 +2306,8 @@ export class TunnelService {
 
   // GUI 退出交接：已验证的 API 依赖保留必要通道；其余情况由守护恢复并退出。
   async requestShutdown(): Promise<void> {
+    const resumeRefresh = this.accountAccess !== undefined && this.configRefreshRequested(this.accountAccess) &&
+      this.localAuthorizationValid()
     if (this.runtimeObservationCollectTimer !== undefined) {
       clearInterval(this.runtimeObservationCollectTimer)
       this.runtimeObservationCollectTimer = undefined
@@ -2270,8 +2332,8 @@ export class TunnelService {
       writeFileAtomic(layout.intent(this.deps.dataDir), `${JSON.stringify({ ...current, apiOnly: continuation, updatedAt: this.deps.now() })}\n`)
       return
     }
-    if (wasRunning || this.supervisor.isRunning()) {
-      if (this.intentSnapshot()?.desired === 'connected') this.markResumeOnLaunch(true)
+    if (wasRunning || this.supervisor.isRunning() || resumeRefresh) {
+      if (this.intentSnapshot()?.desired === 'connected' || resumeRefresh) this.markResumeOnLaunch(true)
       writeFileAtomic(layout.intent(this.deps.dataDir), `${JSON.stringify({ desired: 'shutdown', updatedAt: this.deps.now() })}\n`)
     } else {
       this.supervisor.recoverOnBoot()
@@ -2389,12 +2451,13 @@ export class TunnelService {
     return access !== undefined && access.session.accountId !== accountId
   }
 
-  // 后台问不到时保住客户正在用的网:意图是 connected 且本地配置没到期就继续(⛔ 再按 3 分钟租约算)。
+  // 后台问不到时保留连接或当前内部换配置的接续意图；本地配置必须未到期。
   // 守护自己按 authorization.expiresAt 到期即停,主进程这里不再另起定时器。
   private retainLocalConnection(): boolean {
     if (ledgerFailure(this.deps.dataDir)) return false
     if (!this.localAuthorizationValid()) return false
-    if (this.intentSnapshot()?.desired !== 'connected') return false
+    if (this.intentSnapshot()?.desired !== 'connected' &&
+        !(this.accountAccess && this.configRefreshRequested(this.accountAccess))) return false
     this.accountTemporary = true
     this.syncContinuationTimer()
     if (this.leaseTimer) clearTimeout(this.leaseTimer)
@@ -2521,6 +2584,13 @@ export class TunnelService {
     // 等待位不在这里清:内部流程(账号切换等)也会走 disconnect,清掉会让「并进同一轮」失效。
     // 客户意愿由意图文件表达,completeResidentTakeover 落定时看它;界面映射另有意图闸。
     this.markResumeOnLaunch(false)
+    const intent = this.intentSnapshot()
+    // 账号抖动或迟到的配置刷新不能覆盖客户明确的断开；更新确认也需要识别这一意愿。
+    if (intent?.desired === 'user-disconnected' && intent.reason === 'user-stop' &&
+        (reason === 'account-temporary-unavailable' || reason === 'config-refresh')) {
+      if (!this.supervisor.isRunning()) this.supervisor.recoverOnBoot()
+      return
+    }
     writeFileAtomic(layout.intent(this.deps.dataDir), `${JSON.stringify({ desired: 'user-disconnected', reason,
       ...(autoPauseCode === undefined ? {} : { autoPauseCode }), sessionToken: generateSessionToken(), updatedAt: this.deps.now() })}\n`)
     this.deps.logFailure?.('disconnect-intent', reason)

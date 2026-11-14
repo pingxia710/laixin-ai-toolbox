@@ -39,6 +39,7 @@ export class ConnectionAttemptQueue {
   // -1 表示尚未失败；首次失败使用 ATTEMPT_FLUSH_BACKOFF_MS[0]。
   private backoffStep = -1
   private pausedForAuth = false
+  private flushing?: Promise<void>
 
   constructor (private readonly deps: AttemptQueueDeps) { this.load() }
 
@@ -109,7 +110,13 @@ export class ConnectionAttemptQueue {
   }
 
   /** 补传:退避窗内不空转;permanent 丢弃留痕,retryable 保留退避,auth 暂停。 */
-  async flush (): Promise<void> {
+  flush (): Promise<void> {
+    if (this.flushing) return this.flushing
+    this.flushing = this.flushPending().finally(() => { this.flushing = undefined })
+    return this.flushing
+  }
+
+  private async flushPending (): Promise<void> {
     if (this.pausedForAuth || this.events.length === 0) return
     const now = this.now()
     if (now - this.lastFlushAt < this.backoffDelayMs()) return
@@ -118,7 +125,7 @@ export class ConnectionAttemptQueue {
       const { event } = this.events[0]
       try {
         await this.deps.send(event)
-        this.events = this.events.slice(1)
+        this.events = this.events.filter(entry => entry.event.eventId !== event.eventId)
         this.backoffStep = -1
         this.persist()
       } catch (error) {
@@ -128,7 +135,7 @@ export class ConnectionAttemptQueue {
           return
         }
         if (error.kind === 'permanent') {
-          this.events = this.events.slice(1)
+          this.events = this.events.filter(entry => entry.event.eventId !== event.eventId)
           this.backoffStep = -1
           this.deps.logFailure?.('connection-attempt-dropped', `${event.attemptKey}:${error.message}`)
           this.persist()

@@ -86,6 +86,48 @@ Var /GLOBAL laixinUninstallRetrying
 !macroend
 !endif
 
+; 已核定的旧卸载器内嵌旧 helper。仅对同一安装目录及完整摘要匹配的历史版本，
+; 让 electron-builder 的原卸载流程运行本安装包自带的新卸载器；参数、数据保留和失败处理不变。
+; 未知版本或任何检查失败时维持原路径，不删除登记或事务。
+!ifndef BUILD_UNINSTALLER
+!macro useLaixinCompatibleUninstaller
+  Push $R6
+  Push $7
+  Push $8
+  Push $R9
+  ${If} ${FileExists} "$INSTDIR\${APP_EXECUTABLE_FILENAME}"
+    System::Call 'Kernel32::lstrcmpiW(w "$installationDir", w "$INSTDIR") i .r7'
+    System::Call 'Kernel32::lstrcmpiW(w "$uninstallerFileName", w "$INSTDIR\${UNINSTALL_FILENAME}") i .r8'
+    ${If} $7 == 0
+    ${AndIf} $8 == 0
+      InitPluginsDir
+      SetOutPath "$PLUGINSDIR"
+      File /oname=laixin-update-helper.cjs "${PROJECT_DIR}/resources/update-helper.cjs"
+      ReadEnvStr $R6 "ELECTRON_RUN_AS_NODE"
+      System::Call 'Kernel32::SetEnvironmentVariable(t "ELECTRON_RUN_AS_NODE", t "1")'
+      nsExec::ExecToLog '"$INSTDIR\${APP_EXECUTABLE_FILENAME}" "$PLUGINSDIR\laixin-update-helper.cjs" windows-known-uninstaller "$uninstallerFileName"'
+      Pop $R9
+      ${If} $R6 == ""
+        System::Call 'Kernel32::SetEnvironmentVariable(t "ELECTRON_RUN_AS_NODE", i 0)'
+      ${Else}
+        System::Call 'Kernel32::SetEnvironmentVariable(t "ELECTRON_RUN_AS_NODE", t "$R6")'
+      ${EndIf}
+      ${If} $R9 == "0"
+        ClearErrors
+        File /oname=laixin-compatible-uninstaller.exe "${UNINSTALLER_OUT_FILE}"
+        ${IfNot} ${Errors}
+          StrCpy $uninstallerFileName "$PLUGINSDIR\laixin-compatible-uninstaller.exe"
+        ${EndIf}
+      ${EndIf}
+    ${EndIf}
+  ${EndIf}
+  Pop $R9
+  Pop $8
+  Pop $7
+  Pop $R6
+!macroend
+!endif
+
 ; 同一次覆盖安装可能依次经过更新助手、新安装器 customInit、旧卸载器 customUnInstall，后者失败时
 ; 只看得到已经 Disabled 的任务，无法恢复第一次调用前的 Enabled 状态。用仅随当前进程树继承的
 ; 安装目录标记把第一次成功交给后续钩子；它只是提示，必须再读本地恢复事务、看守身份、

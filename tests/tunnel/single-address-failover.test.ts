@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { readFileSync } from 'node:fs'
 import { writeFileAtomic } from '../../app/main/tunnel/paths'
 import { layout } from '../../app/main/tunnel/paths'
 import { TunnelService, type ActionResult } from '../../app/main/tunnel/tunnel-service'
@@ -128,6 +129,7 @@ it('同一故障片段只启动一个刷新，状态离开异常后新片段获�
   const refresh = wireSingleAddressFailure(f, pending)
 
   expect(f.service.status().state).toBe('异常')
+  expect(f.service.status().componentMissing).toBe('')
   expect(f.service.status().state).toBe('异常')
   expect(refresh).toHaveBeenCalledTimes(1)
 
@@ -154,6 +156,7 @@ it('本机恢复或组件状态未收敛时不触发绑定刷新', async () => {
 
 it.each(['current', 'old-session', 'restore-failed', 'dead-owner'])(
   '故障期间 %s 的系统设置账目按真实归属决定是否刷新', async (kind) => {
+    vi.useFakeTimers()
     const f = setupService()
     await f.service.importConfig()
     await f.service.applyPending()
@@ -165,7 +168,45 @@ it.each(['current', 'old-session', 'restore-failed', 'dead-owner'])(
       sessionToken: kind === 'old-session' ? 'session-0' : 'session-1', time: 1 })
     if (kind === 'restore-failed') markEntry(f.dataDir, entry.id, { status: 'restore-failed', note: '写回失败' })
     f.service.status()
-    expect(refresh).toHaveBeenCalledTimes(kind === 'current' ? 1 : 0)
+    expect(refresh).not.toHaveBeenCalled()
+    if (kind === 'current') {
+      const intent = JSON.parse(readFileSync(layout.intent(f.dataDir), 'utf8'))
+      expect(intent).toMatchObject({ desired: 'user-disconnected', reason: 'config-refresh' })
+      markEntry(f.dataDir, entry.id, { status: 'restored', note: '原代理已恢复' })
+      writeFileAtomic(layout.state(f.dataDir), JSON.stringify({ state: 'stopped-restored', intentToken: intent.sessionToken }))
+      await vi.advanceTimersByTimeAsync(200)
+      expect(refresh).toHaveBeenCalledTimes(1)
+    }
+  })
+
+it.each(['user-stop', 'logout', 'restore-failed', 'slow-restore'])(
+  '取新配置前恢复旧代理：%s 不得绕过或丢失原连接意图', async (mode) => {
+    vi.useFakeTimers()
+    const f = setupService()
+    await f.service.importConfig(); await f.service.applyPending()
+    const refresh = wireSingleAddressFailure(f, { outcome: 'applied', code: '', message: '完成' })
+    const internals = f.service as unknown as { supervisor: { isRunning(): boolean } }
+    vi.spyOn(internals.supervisor, 'isRunning').mockReturnValue(true)
+    const entry = appendSettingEntry(f.dataDir, { service: 'Wi-Fi', item: 'socks-proxy', originalValue: null,
+      writtenValue: { enabled: true, host: '127.0.0.1', port: 18080 }, sessionToken: 'session-1', time: 1 })
+    f.service.status()
+    expect(refresh).not.toHaveBeenCalled()
+    const intent = JSON.parse(readFileSync(layout.intent(f.dataDir), 'utf8'))
+    expect(intent.reason).toBe('config-refresh')
+    if (mode === 'user-stop') await f.service.stop()
+    if (mode === 'logout') await f.service.setAccountAccess(undefined)
+    if (mode === 'slow-restore') {
+      await vi.advanceTimersByTimeAsync(5_200)
+      f.service.status() // UI polling must not cancel the pending internal restoration retry.
+      expect(refresh).not.toHaveBeenCalled()
+    }
+    markEntry(f.dataDir, entry.id, { status: mode === 'restore-failed' ? 'restore-failed' : 'restored', note: mode })
+    const latest = JSON.parse(readFileSync(layout.intent(f.dataDir), 'utf8'))
+    writeFileAtomic(layout.state(f.dataDir), JSON.stringify({ state: mode === 'restore-failed' ? 'error' : 'stopped-restored',
+      code: mode === 'restore-failed' ? 'TUNNEL_RESTORE_INCOMPLETE' : undefined, intentToken: latest.sessionToken }))
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(refresh).toHaveBeenCalledTimes(mode === 'slow-restore' ? 1 : 0)
+    if (mode === 'user-stop') expect(JSON.parse(readFileSync(layout.intent(f.dataDir), 'utf8')).reason).toBe('user-stop')
   })
 
 it('真实账号同步遇到后台瞬时不可用时保留原始瞬时码，供刷新回路退避', async () => {

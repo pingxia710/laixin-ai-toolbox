@@ -8,7 +8,7 @@ import { icon, type IconName } from '../icons'
 import { platformIcon } from '../platform-icons'
 import { buildNetworkOnboarding, renderNetworkOnboarding, type NetworkOnboardingView, type OnboardingAction } from '../ui/network-onboarding'
 import { revealSupport } from '../support-widget'
-import { buildTunnelPresentation, mountTunnelDetails, page as networkPage } from './tunnel'
+import { buildTunnelPresentation, customerNetworkCopy, mountTunnelDetails, page as networkPage } from './tunnel'
 import { page as networkAccountPage } from './network-account'
 import { observeNetworkActivity, refreshNetworkActivity, renderTrafficMeter, type NetworkActivity } from '../ui/network-activity'
 import { page as networkDiagnosticsPage } from './network-diagnostics'
@@ -116,7 +116,7 @@ function mountOverview(element: HTMLElement, showNetwork: () => void): () => voi
       const focusedLabel = focused?.getAttribute('aria-label')
       const guide = document.createElement('section')
       const guideView = buildNetworkOnboarding(accountSnapshot(), state.kind === 'ready' ? state.status : state.kind === 'loading' ? undefined : null)
-      renderNetworkOnboarding(guide, guideView, busy, onboardingMessage, (action) => { void runOnboarding(action) }, (step) => {
+      renderNetworkOnboarding(guide, guideView, busy, customerNetworkCopy(onboardingMessage), (action) => { void runOnboarding(action) }, (step) => {
         selectedStep = step === guideView.step ? undefined : step; render()
       }, selectedStep)
       guide.classList.add('dashboard-guide')
@@ -126,13 +126,13 @@ function mountOverview(element: HTMLElement, showNetwork: () => void): () => voi
       eyebrow.className = 'section-eyebrow'
       eyebrow.textContent = view.eyebrow
       const title = document.createElement('h2')
-      title.textContent = state.kind === 'ready' ? presentation.primaryAction === 'guide' ? '尚未配置' : presentation.headline : state.kind === 'loading' ? '正在读取' : '状态待确认'
+      title.textContent = customerNetworkCopy(state.kind === 'ready' ? presentation.primaryAction === 'guide' ? '尚未配置' : presentation.headline : state.kind === 'loading' ? '正在读取' : '状态待确认')
       const description = document.createElement('p')
       description.className = 'dashboard-description'
-      description.textContent = state.kind === 'ready' ? presentation.hint : view.description
+      description.textContent = customerNetworkCopy(state.kind === 'ready' ? presentation.hint : view.description)
       const action = document.createElement('button'); action.type = 'button'; action.className = 'dashboard-power'
       action.append(icon('power'))
-      const actionLabel = state.kind === 'unavailable' ? '重新读取状态' : presentation.primaryLabel
+      const actionLabel = customerNetworkCopy(state.kind === 'unavailable' ? '重新读取状态' : presentation.primaryLabel)
       action.setAttribute('aria-label', actionLabel); action.title = actionLabel
       action.disabled = busy || state.kind === 'loading' || (state.kind === 'ready' && presentation.primaryAction === 'none')
       action.addEventListener('click', () => { void runNetworkAction() })
@@ -145,11 +145,11 @@ function mountOverview(element: HTMLElement, showNetwork: () => void): () => voi
       primary.dataset.tone = state.kind === 'ready' ? presentation.tone : 'neutral'
       primary.setAttribute('aria-live', 'polite')
       primary.append(power, copy)
-      if (networkMessage) primary.append(Object.assign(document.createElement('p'), { className: 'dashboard-action-feedback', textContent: networkMessage }))
+      if (networkMessage) primary.append(Object.assign(document.createElement('p'), { className: 'dashboard-action-feedback', textContent: customerNetworkCopy(networkMessage) }))
 
       const node = document.createElement('section'); node.className = 'dashboard-node'
-      const nodeLabel = Object.assign(document.createElement('p'), { className: 'activity-label', textContent: '当前节点' })
-      const nodeName = Object.assign(document.createElement('h3'), { textContent: state.kind === 'ready' ? state.status.nodeLabel || '尚未配置节点' : '尚未取得' })
+      const nodeLabel = Object.assign(document.createElement('p'), { className: 'activity-label', textContent: '网络信息' })
+      const nodeName = Object.assign(document.createElement('h3'), { textContent: state.kind === 'ready' ? '当前连接' : '等待网络状态' })
       const details = document.createElement('dl'); details.className = 'dashboard-facts'
       details.append(fact('配置版本', view.configVersion), fact('最近复验', view.lastVerifiedAt))
       const networkDetails = document.createElement('button'); networkDetails.type = 'button'; networkDetails.className = 'text-action'

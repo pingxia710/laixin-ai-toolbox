@@ -328,7 +328,7 @@ export function startTrafficRelay(port, targetPort, traffic, sockets, idleStream
       // 起算点是正文第一个字节,⛔ 上游回的第一个字节——relay 与 xray 之间走 SOCKS5,
       // 上游回的第一个字节是 xray 的问候应答,那时客户连请求都还没发出去。
       // 销账有两条:连接结束,或者静下来超过空闲窗口(回答回完的 keep-alive 连接就停在这)。
-      const life = { streaming: false, idle: undefined, reported: false }
+      const life = { streaming: false, idle: undefined, closing: undefined, reported: false }
       const payload = upstreamPayloadReader()
       // 连接收尾时给被动检测器一个结论:失败(握手应答明说失败 / 请求发出去了却一个字节都没回)或成功(回过正文)。
       const report = () => {
@@ -354,7 +354,7 @@ export function startTrafficRelay(port, targetPort, traffic, sockets, idleStream
         life.idle = setTimeout(settle, idleStreamMs)
         life.idle.unref?.()
       }
-      const close = () => { client.destroy(); upstream.destroy() }
+      const close = () => { clearTimeout(life.closing); client.destroy(); upstream.destroy() }
       const deny = () => { life.reported = true; close() }
       const destination = apiDestinations.track(deny)
       const forget = () => { sockets.delete(client); sockets.delete(upstream); destination.forget() }
@@ -370,14 +370,21 @@ export function startTrafficRelay(port, targetPort, traffic, sockets, idleStream
       })
       client.once('error', close); upstream.once('error', close)
       // 上游把回答发完并收尾(FIN):这条回答结束了,⛔ 等空闲窗口才销账。
-      // 上游 FIN 同时意味着整条隧道使命完成(远端已收口):必须把转发对整体拆掉,
-      // ⛔ 只销账不拆——对端若还开着就是半开滞留,正是 2026-10-08 复现的收尾悬挂
-      // (server.close 等不到那半条)与节点侧半开连接累积的来源。
-      upstream.once('end', () => { settle(); close() })
+      // 先冲刷已转发到客户端缓冲区的末尾响应，再成对拆除；直接 destroy 会截断慢读响应。
+      upstream.once('end', () => {
+        settle()
+        life.closing = setTimeout(close, 10_000)
+        life.closing.unref?.()
+        client.end(close)
+      })
       // 转发对同生共死:客户端整条关闭后,它到上游的那半条必须同步销毁——forget 会把
       // 两端同时移出清理集合,不在这里销毁,半开的上游就轮不到任何收尾路径(节点侧半开累积)。
-      client.once('close', () => { settle(); forget(); report() })
-      upstream.once('close', () => { settle(); forget(); report() })
+      client.once('close', () => { close(); settle(); forget(); report() })
+      upstream.once('close', () => {
+        // 正常 FIN 的尾部仍可能等待客户端写完，由 end 回调或 client.close 完成清理。
+        if (upstream.readableEnded && !client.writableFinished && !client.destroyed) return
+        close(); settle(); forget(); report()
+      })
       // DL-03: all destinations use ordinary forwarding; download scheduling belongs to the client.
       client.pipe(upstream); upstream.pipe(client)
     })

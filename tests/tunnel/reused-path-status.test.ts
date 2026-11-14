@@ -116,7 +116,7 @@ describe('复用本机已有外网时的状态', () => {
     expect(networkPathReady(statusOf({ ...reusedDaemon, reusedProxy: undefined }))).toBe(false)
   })
 
-  it('网络页在复用态说的是「用你原有的外网、没改设置」，⛔ 说通道出口已校验', () => {
+  it('网络页在复用态说的是「用你原有的外网、没改设置」，不宣称来信出口已校验', () => {
     const view = (partial: Partial<TunnelStatusView>): TunnelStatusView => ({
       pauseReason: '',
       currentConfig: '', pendingConfig: '', canApplyPending: false, state: DISPLAY_STATES.connected, message: '', source: '',
@@ -125,13 +125,13 @@ describe('复用本机已有外网时的状态', () => {
     })
     const reused = buildTunnelPresentation(view({ pathSource: 'reused' }))
     expect(reused.description).toContain('原有的外网')
-    expect(reused.description).not.toContain('通道出口已完成校验')
-    expect(reused.primaryLabel).not.toBe('断开通道') // ⛔ 让客户以为点一下会关掉别人的软件
+    expect(reused.description).not.toContain('网络出口已完成校验')
+    expect(reused.primaryLabel).not.toBe('断开网络') // ⛔ 让客户以为点一下会关掉别人的软件
     const laixin = buildTunnelPresentation(view({ pathSource: 'laixin', exitIp: '203.0.113.42' }))
-    expect(laixin.description).toContain('通道出口已完成校验')
+    expect(laixin.description).toContain('网络出口已完成校验')
     const noIp = buildTunnelPresentation(view({ pathSource: 'laixin', pathVerified: true }))
     expect(noIp.description).toContain('出口地址暂未取得')
-    expect(noIp.description).not.toContain('通道出口已完成校验')
+    expect(noIp.description).not.toContain('网络出口已完成校验')
   })
 
   it('N-55 只有执行中的当前动作才优先展示阶段：被动 examining 不覆盖断开或真实错误', () => {

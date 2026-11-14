@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { importConfig, type ImportOutcome } from '../../app/main/tunnel/import-service'
 import { ActionMutex } from '../../app/main/tunnel/mutex'
 import { layout } from '../../app/main/tunnel/paths'
-import { applyPending, currentBatchId, pendingBatchId, reconcilePointers } from '../../app/main/tunnel/transactions'
+import { applyPending, currentBatchId, pendingBatchId, readPointer, reconcilePointers, sweepOrphanBatches } from '../../app/main/tunnel/transactions'
 import { TRUST_LINES } from '../../app/main/tunnel/trust'
 import { buildPackageEntries, writePackageDir, type BuiltPackage } from './fixtures/package-builder'
 import { makeTempDir, removeTempDir, waitFor } from './helpers'
@@ -216,13 +216,36 @@ describe('导入事务与隔离(判据 13 五组、判据 17 互斥)', () => {
 
     // 重起幂等收尾:pending==current 清掉
     reconcilePointers(dataDir)
+    sweepOrphanBatches(dataDir)
     expect(pendingBatchId(dataDir)).toBeUndefined()
     expect(currentBatchId(dataDir)).toBe(second.batchId)
+    expect(readPointer(layout.rollbackPointer(dataDir))).toBe(first.batchId)
 
     // 指针内容必须是完整批次 id(⛔ 半状态):两份批次目录都完整存在
     expect(existsSync(layout.batchDir(dataDir, first.batchId))).toBe(true)
     expect(existsSync(layout.batchDir(dataDir, second.batchId))).toBe(true)
   }, 30_000)
+
+  it('切换成功后才清理更早的回退配置，保留刚替换的完整批次', async () => {
+    const batches: string[] = []
+    for (let version = 1; version <= 3; version += 1) {
+      const imported = await importPackage(buildPackageEntries({ configVersion: version }), `pkg-${String(version)}`)
+      if (imported.outcome !== 'imported') throw new Error('导入应成功')
+      batches.push(imported.batchId)
+      if (version < 3) expect(applyPending(dataDir).outcome).toBe('applied')
+    }
+    expect(() => applyPending(dataDir, { beforeCurrentWrite: () => { throw new Error('INTERRUPTED') } })).toThrow('INTERRUPTED')
+    expect(existsSync(layout.batchDir(dataDir, batches[0]))).toBe(true)
+    reconcilePointers(dataDir)
+    expect(currentBatchId(dataDir)).toBe(batches[1])
+    expect(pendingBatchId(dataDir)).toBe(batches[2])
+    expect(applyPending(dataDir).outcome).toBe('applied')
+    sweepOrphanBatches(dataDir)
+    expect(readPointer(layout.rollbackPointer(dataDir))).toBe(batches[1])
+    expect(existsSync(layout.batchDir(dataDir, batches[0]))).toBe(false)
+    expect(existsSync(layout.batchDir(dataDir, batches[1]))).toBe(true)
+    expect(existsSync(layout.batchDir(dataDir, batches[2]))).toBe(true)
+  })
 
   it('⑤ 应用后 current 凭据字节 = 该批次导入时的字节', async () => {
     const built = buildPackageEntries({ configVersion: 1 })

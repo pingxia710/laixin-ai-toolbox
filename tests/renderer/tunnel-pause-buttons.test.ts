@@ -96,7 +96,7 @@ describe('N-26 启动与暂停拆两颗卡', () => {
   it('活动态两卡并存且暂停可点:连接通道卡禁用,暂停卡点了走既有 stop', async () => {
     const x = await setup(connected)
     const pause = x.advanced.querySelector('[data-network-action="暂停使用"]')
-    const resume = x.advanced.querySelector('[data-network-action="连接通道"]')
+    const resume = x.advanced.querySelector('[data-network-action="连接网络"]')
     expect(pause).toBeTruthy()
     expect(resume).toBeTruthy()
     expect(pause!.disabled).toBe(false)
@@ -135,7 +135,7 @@ describe('N-48 断开在途', () => {
     const x = await setup({ ...connected, state: '断开中', authorization: '等待重新确认账号权益',
       pauseReason: 'entitlement-denied', message: '后台权益校验未通过，网络正在暂停并恢复原网络设置。' })
     const primary = x.root.querySelector('[data-network-action="primary"]')
-    const connect = x.advanced.querySelector('[data-network-action="连接通道"]')
+    const connect = x.advanced.querySelector('[data-network-action="连接网络"]')
     const pause = x.advanced.querySelector('[data-network-action="暂停使用"]')
     const repair = x.root.querySelector('[data-network-action="repair"]')
     expect(primary?.disabled).toBe(true)

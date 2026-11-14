@@ -12,6 +12,17 @@ const exec = promisify(execFile);
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 const alive = pid => { try { process.kill(pid, 0); return true; } catch (error) { return error.code !== 'ESRCH'; } };
 const digest = async file => { const hash = createHash('sha256'); for await (const chunk of createReadStream(file)) hash.update(chunk); return hash.digest('hex'); };
+const WINDOWS_KNOWN_LEGACY_UNINSTALLER_HASHES = new Set([
+  '816821a26af03212629af8f6bf4f5ba9731945f0d967f3e3e9fa56695da15d1a', // 0.7.10
+  'c2d9d5e510662ab92d0397f14bde177f21dc77109823614d006e2a937e78dbf8', // 0.7.12
+  '16b7e44083bea50dfc90e8b0be5498f163e785c04bc87f6293e1a260c5bc2e8e'  // 0.7.13
+]);
+async function knownWindowsLegacyUninstaller(file, known = WINDOWS_KNOWN_LEGACY_UNINSTALLER_HASHES) {
+  try {
+    const stat = await fs.lstat(file);
+    return stat.isFile() && !stat.isSymbolicLink() && known.has(await digest(file));
+  } catch { return false; }
+}
 const cleanEnv = { ...process.env }; delete cleanEnv.ELECTRON_RUN_AS_NODE;
 // 拿主程序当 node 跑的随包进程（守护、内核看门狗）的判据：参数里带 sidecar 目录下的 .mjs。
 const RUNS_SIDECAR_SCRIPT = /(?:^|\s)\S*[/\\]sidecar[/\\]\S*\.mjs(?:\s|$)/;
@@ -172,10 +183,16 @@ async function taskConfirmedMissing(task, commands, schtasks, deadlineAt, now) {
   const { taskPath, taskName } = taskParts(task);
   const powershell = win32.join(win32.dirname(schtasks), 'WindowsPowerShell', 'v1.0', 'powershell.exe');
   const script = `# LAIXIN_TASK_EXISTENCE_QUERY\n` +
-    `$taskPath=${decodeBase64PowerShell(taskPath)};$taskName=${decodeBase64PowerShell(taskName)};` +
+    `$ErrorActionPreference='Stop';$taskPath=${decodeBase64PowerShell(taskPath)};$taskName=${decodeBase64PowerShell(taskName)};` +
     `try {$task=Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction Stop;` +
-    `if($null -eq $task){exit 3};exit 0} catch {` +
-    `if($_.Exception.HResult -in @(-2147024894,-2147024893,-2147216625)){exit 3};exit 2}`;
+    `if($null -ne $task){exit 0}} catch {` +
+    `if($_.Exception.HResult -in @(-2147024894,-2147024893)){exit 3}};` +
+    // Cmdletization can wrap an absent task in a generic CimJobException. Confirm it with the
+    // scheduler's own HRESULT; an access error or an existing but unreadable task stays unknown.
+    `try {$service=New-Object -ComObject Schedule.Service;$service.Connect();` +
+    `$folderPath=$taskPath.TrimEnd([char]92);if($folderPath -eq ''){$folderPath='\\'};` +
+    `$folder=$service.GetFolder($folderPath);[void]$folder.GetTask($taskName);exit 0} catch {` +
+    `if($_.Exception.HResult -in @(-2147024894,-2147024893)){exit 3};exit 2}`;
   const result = await boundedCommand(commands, powershell, encodedPowerShell(script), deadlineAt, now);
   assertNotTimedOut(result, 'UPDATE_RESIDENT_TASK_QUERY_TIMEOUT');
   return result.code === 3;
@@ -193,10 +210,10 @@ async function queryResidentTaskViaCom(task, commands, powershell, deadlineAt, n
   const script = `# LAIXIN_TASK_COM_QUERY\n$ErrorActionPreference='Stop';` +
     `$service=New-Object -ComObject Schedule.Service;$service.Connect();` +
     `try {$folder=$service.GetFolder(${decodeBase64PowerShell(taskPath)});}` +
-    `catch {if($_.Exception.HResult -in @(-2147024894,-2147024893,-2147216625)){exit 3};exit 2};` +
+    `catch {if($_.Exception.HResult -in @(-2147024894,-2147024893)){exit 3};exit 2};` +
     `try {$task=$folder.GetTask(${decodeBase64PowerShell(taskName)});` +
     `[Console]::Out.Write([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$task.Xml)));}` +
-    `catch {if($_.Exception.HResult -in @(-2147024894,-2147024893,-2147216625)){exit 3};exit 2}`;
+    `catch {if($_.Exception.HResult -in @(-2147024894,-2147024893)){exit 3};exit 2}`;
   const result = await boundedCommand(commands, powershell, encodedPowerShell(script), deadlineAt, now);
   assertNotTimedOut(result, 'UPDATE_RESIDENT_TASK_QUERY_TIMEOUT');
   if (result.code === 3) return { task, state: 'missing', xml: '' };
@@ -559,11 +576,26 @@ function Complete-Recovery {
   }
 }
 function Get-RecoveryTask([string]$TaskPath,[string]$TaskName) {
-  try { return Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction Stop }
-  catch {
-    if($_.Exception.HResult -in @(-2147024894,-2147024893,-2147216625)){return $null}
+  try {
+    $task=Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction Stop
+    if($null -ne $task){return $task}
+  } catch {
+    if($_.Exception.HResult -in @(-2147024894,-2147024893)){return $null}
+  }
+  # Cmdletization may hide the scheduler's missing-task HRESULT in a generic exception.
+  # Only an explicit scheduler not-found result may turn the failed query into "missing".
+  try {
+    $service=New-Object -ComObject Schedule.Service
+    $service.Connect()
+    $folderPath=$TaskPath.TrimEnd([char]92)
+    if($folderPath -eq ''){$folderPath='\'}
+    $folder=$service.GetFolder($folderPath)
+    [void]$folder.GetTask($TaskName)
+  } catch {
+    if($_.Exception.HResult -in @(-2147024894,-2147024893)){return $null}
     throw 'UPDATE_RESIDENT_TASK_STATE_UNKNOWN'
   }
+  throw 'UPDATE_RESIDENT_TASK_STATE_UNKNOWN'
 }
 function Disabled-TaskXml([string]$Xml) {
   $options=[Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [Text.RegularExpressions.RegexOptions]::Singleline
@@ -1558,6 +1590,10 @@ async function pruneOldBackups(directory, keep) {
 }
 
 async function main() {
+  if (process.argv[2] === 'windows-known-uninstaller') {
+    if (!await knownWindowsLegacyUninstaller(process.argv[3])) process.exitCode = 2;
+    return;
+  }
   if (process.argv[2] === 'windows-preflight') {
     const mode = process.argv[3];
     const jobPath = process.argv[4];
@@ -1631,4 +1667,5 @@ if (require.main === module) main().catch(async error => {
 });
 module.exports = { run, pruneOldBackups, handOffResident, windowsPreflight, recoverWindowsPreflight,
   commitWindowsPreflight, commitWindowsPreflightCommand, verifyWindowsPreflightHandoff,
-  defaultRecoveryGuardLauncher, runNative, decodeNativeOutput, disableTaskXml, proxyFallbackScript };
+  defaultRecoveryGuardLauncher, runNative, decodeNativeOutput, disableTaskXml, proxyFallbackScript,
+  knownWindowsLegacyUninstaller };

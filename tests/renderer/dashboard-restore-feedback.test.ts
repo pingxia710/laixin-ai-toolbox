@@ -48,7 +48,8 @@ async function setup(code = '') {
   for (let i = 0; i < 10; i++) await Promise.resolve()
   expect(stop).toHaveBeenCalledOnce()
   const update = (status: TunnelStatusView) => feed.listen({ kind: 'ready', status, samples: [] })
-  return { update, feedback: () => root.querySelector('.dashboard-action-feedback')?.textContent }
+  return { update, feedback: () => root.querySelector('.dashboard-action-feedback')?.textContent,
+    text: () => root.all().map(node => node.textContent).join(' ') }
 }
 
 it('断开反馈直到确认恢复才消失，读取失败或不完整恢复不冒充完成', async () => {
@@ -73,4 +74,13 @@ it('有错误码的断开结果不被正常状态静默清除', async () => {
   const ui = await setup('RESTORE_FAILED')
   ui.update(restored)
   expect(ui.feedback()).toContain('恢复中')
+})
+
+it('首页不展示内部服务器入口，并以网络文案显示异常提示', async () => {
+  const ui = await setup()
+  ui.update({ ...connected, state: '通道待确认', nodeLabel: 'private-entry.invalid:12345', message: '通道正在重新检查' })
+  expect(ui.text()).toContain('网络信息')
+  expect(ui.text()).not.toContain('private-entry.invalid')
+  expect(ui.text()).not.toContain('当前节点')
+  expect(ui.text()).not.toContain('通道')
 })

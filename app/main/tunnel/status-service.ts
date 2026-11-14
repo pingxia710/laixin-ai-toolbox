@@ -16,6 +16,8 @@ export interface DaemonStateView {
   readonly runId?: string
   readonly sessionToken?: string
   readonly intentToken?: string
+  readonly writeRightToken?: string
+  readonly connectionEpoch?: number
   readonly code?: string
   readonly message?: string
   readonly exitIp?: string

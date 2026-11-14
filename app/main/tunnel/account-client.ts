@@ -39,6 +39,9 @@ export class NetworkAccountClient {
     return this.base.href === other.base.href && this.platform === other.platform
   }
 
+  /** Main-process-only origin for the account service; never supplied by the renderer. */
+  qualityOrigin(): string { return this.base.origin }
+
   async claim(session: NetworkAccountSession, signal: AbortSignal, cached?: ConfigurationCache,
     options: { readonly refreshBinding?: boolean } = {}): Promise<AccountConfiguration> {
     if (this.connectionSupported) {

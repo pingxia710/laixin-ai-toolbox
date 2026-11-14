@@ -15,16 +15,16 @@ import { makeTempDir, removeTempDir, waitFor } from './helpers'
 const cleanups: Array<() => void | Promise<void>> = []
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); vi.restoreAllMocks() })
 
-async function fixture(resident = false) {
+async function fixture(resident = false, expiresAt?: string) {
   const root = makeTempDir('background-network-controller-'), dataDir = join(root, 'data')
   cleanups.push(() => removeTempDir(root))
-  const built = buildPackageEntries()
+  const built = buildPackageEntries({ expiresAt })
   const next = buildPackageEntries({ configVersion: 2 })
   const packageDir = writePackageDir(join(root, 'package'), built)
   const sidecarDir = fileURLToPath(new URL('../../sidecar/mac', import.meta.url))
   const spawn = vi.fn(() => ({ on: () => undefined }))
   const deps: TunnelServiceDeps = { dataDir, sidecarDir, picker: async () => packageDir,
-    trust: { whitelistDigests: [built.digest, next.digest], signingPublicKeys: [] }, now: Date.now,
+    trust: { whitelistDigests: [built.digest, next.digest], signingPublicKeys: [] }, now: () => Date.now(),
     routesFile: join(sidecarDir, 'routes.default.json'), spawnDaemon: spawn, spawnRestore: () => undefined,
     ...(resident ? { resident: { armed: () => true, alive: () => true, seatRunId: () => 'fixture-run', wake: async () => true } } : {}) }
   const setup = new TunnelService(deps)
@@ -47,7 +47,7 @@ async function fixture(resident = false) {
   cleanups.push(() => setup.releaseBackgroundControl())
   return { dataDir, deps, controller, claim, spawn, loadAccount, onFailure, originalIntent, writeIntent,
     account: () => account, setAccount: (value: BackgroundAccount | undefined) => { account = value },
-    response: { id: current.authorizationId, expiresAt: Date.parse(current.expiresAt), archive: tarFromPackageEntries(next.entries) } as AccountConfiguration }
+    response: { id: current.authorizationId, expiresAt: Date.parse(next.manifest.expiresAt), archive: tarFromPackageEntries(next.entries) } as AccountConfiguration }
 }
 
 it.each(['no-dependency', 'disconnected', 'wrong-router', 'expired', 'wrong-account', 'no-login'])(
@@ -155,4 +155,69 @@ it('前台交接超时保留活跃后台管理权，清理自己的占位', asyn
     expect(guiNetworkControllerPresent(f.dataDir)).toBe(false)
     expect(acquireBackgroundNetworkController(f.dataDir)).toBeUndefined()
   } finally { release() }
+})
+
+it.each([30_001, 61_000])('后台同会话在 %i ms 重试配置并恢复有效新包', async elapsed => {
+  const started = Date.now()
+  const f = await fixture(false, new Date(started + 60_000).toISOString())
+  f.setAccount({ ...f.account()!, expiresAt: started + 24 * 3600_000 })
+  vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] })
+  try {
+    await f.controller.poll()
+    await new Promise(resolve => setTimeout(resolve, 20))
+    f.claim.mockResolvedValue(f.response)
+    await vi.advanceTimersByTimeAsync(5_001)
+    await f.controller.poll()
+    expect(f.claim).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(elapsed - 5_001)
+    if (elapsed > 60_000) expect(JSON.parse(readFileSync(layout.intent(f.dataDir), 'utf8')))
+      .toMatchObject({ desired: 'user-disconnected', reason: 'authorization-expired' })
+    await f.controller.poll()
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(f.claim).toHaveBeenCalledTimes(2)
+    await waitFor(() => readCurrentInfo(f.dataDir)?.configVersion === 2)
+    expect(JSON.parse(readFileSync(layout.intent(f.dataDir), 'utf8'))).toMatchObject({ desired: 'connected', apiOnly: f.originalIntent.apiOnly })
+  } finally { await f.controller.stop(); vi.useRealTimers() }
+})
+
+it('后台到期后拒绝无效续期，主动断开终止后续配置重试', async () => {
+  const started = Date.now()
+  const f = await fixture(false, new Date(started + 60_000).toISOString())
+  f.setAccount({ ...f.account()!, expiresAt: started + 24 * 3600_000 })
+  vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] })
+  try {
+    await f.controller.poll(); await new Promise(resolve => setTimeout(resolve, 20))
+    await vi.advanceTimersByTimeAsync(61_000)
+    f.claim.mockResolvedValue({ ...f.response, expiresAt: started + 60_000 })
+    await f.controller.poll(); await new Promise(resolve => setTimeout(resolve, 20))
+    expect(f.claim).toHaveBeenCalledTimes(2)
+    expect(readCurrentInfo(f.dataDir)?.configVersion).toBe(1)
+    expect(JSON.parse(readFileSync(layout.intent(f.dataDir), 'utf8')))
+      .toMatchObject({ desired: 'user-disconnected', reason: 'authorization-expired' })
+    f.writeIntent({ desired: 'user-disconnected', reason: 'user-stop' })
+    await f.controller.poll()
+    await vi.advanceTimersByTimeAsync(31_000); await f.controller.poll()
+    expect(f.claim).toHaveBeenCalledTimes(2)
+  } finally { await f.controller.stop(); vi.useRealTimers() }
+})
+
+it('后台配置重试在途时不重入，GUI 接管会取消迟到结果', async () => {
+  const f = await fixture()
+  f.setAccount({ ...f.account()!, expiresAt: Date.now() + 24 * 3600_000 })
+  let finish!: (value: AccountConfiguration) => void, signal!: AbortSignal
+  f.claim.mockImplementationOnce((_session, input) => { signal = input; return new Promise(resolve => { finish = resolve }) })
+  await f.controller.poll(); await waitFor(() => finish !== undefined)
+  vi.useFakeTimers({ toFake: ['Date'] })
+  try {
+    vi.setSystemTime(Date.now() + 90_000)
+    await f.controller.poll(); await f.controller.poll()
+    expect(f.claim).toHaveBeenCalledTimes(1)
+    const acquiring = acquireGuiNetworkController(f.dataDir)
+    const detach = f.controller.poll()
+    await waitFor(() => signal.aborted)
+    finish(f.response)
+    await detach
+    const release = await acquiring
+    try { expect(readCurrentInfo(f.dataDir)?.configVersion).toBe(1) } finally { release() }
+  } finally { vi.useRealTimers() }
 })

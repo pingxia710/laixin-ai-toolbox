@@ -30,6 +30,7 @@ export async function readProviderBalance(provider: ModelProviderId, key: string
   const timer = setTimeout(() => controller.abort(), 10_000)
   try {
     const response = await fetchImpl(endpoint, { headers: { Authorization: `Bearer ${key}`, Accept: 'application/json' }, signal: controller.signal, redirect: 'error' })
+    if (!response.ok) await response.body?.cancel().catch(() => undefined)
     if (response.status === 401 || response.status === 403) return { provider, supported: true, total: null, currency: '', at, error: 'key_rejected' }
     if (response.status === 429 || response.status >= 500) return { provider, supported: true, total: null, currency: '', at, error: 'provider_busy' }
     if (!response.ok) return { provider, supported: true, total: null, currency: '', at, error: 'invalid_reply' }
@@ -38,7 +39,7 @@ export async function readProviderBalance(provider: ModelProviderId, key: string
     return parsed ? { provider, supported: true, total: parsed.total, currency: parsed.currency, at } : { provider, supported: true, total: null, currency: '', at, error: 'invalid_reply' }
   } catch {
     return { provider, supported: true, total: null, currency: '', at, error: 'network_error' }
-  } finally { clearTimeout(timer) }
+  } finally { controller.abort(); clearTimeout(timer) }
 }
 
 /**

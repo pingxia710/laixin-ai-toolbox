@@ -1,6 +1,6 @@
 // 导入动作(定稿第 4 轮 2):批次目录隔离 + 解包安全 + 校验 + 原子落 pending。
 // current 指针与它指向的批次目录在导入全程一个字节不动;取消 / 失败 / 崩溃只清本次 staging。
-import { lstatSync, readdirSync, readFileSync, realpathSync, rmSync, mkdirSync, writeFileSync, renameSync } from 'node:fs'
+import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, readdirSync, readFileSync, realpathSync, rmSync, mkdirSync, writeFileSync, renameSync } from 'node:fs'
 import { dirname, join, relative, resolve, sep } from 'node:path'
 import {
   PackageReject,
@@ -84,11 +84,30 @@ export function readPackageEntries(packagePath: string): PackageEntry[] {
   if (stat.isDirectory()) {
     return readDirectoryEntries(packagePath)
   }
+  if (!stat.isFile()) throw new UnsafePackageEntry('配置包必须是常规文件')
   // 单文件形态 = 整包,按总量上限闸。
   if (stat.size > MAX_PACKAGE_TOTAL_BYTES) {
     throw new PackageReject('PACKAGE_TOO_LARGE')
   }
-  return parseTarEntries(readFileSync(packagePath))
+  // 绑定已打开的常规文件，不跟随检查后替换的软链，也不阻塞在特殊文件上。
+  const fd = openSync(packagePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0))
+  try {
+    const actual = fstatSync(fd)
+    if (!actual.isFile()) throw new UnsafePackageEntry('配置包必须是常规文件')
+    if (actual.size > MAX_PACKAGE_TOTAL_BYTES) throw new PackageReject('PACKAGE_TOO_LARGE')
+    const chunks: Buffer[] = []
+    let size = 0
+    for (;;) {
+      const chunk = Buffer.alloc(Math.min(64 * 1024, MAX_PACKAGE_TOTAL_BYTES + 1 - size))
+      const read = readSync(fd, chunk, 0, chunk.length, null)
+      if (read === 0) break
+      size += read
+      // 即使文件在读取期间增长，也最多读到上限之外一个字节。
+      if (size > MAX_PACKAGE_TOTAL_BYTES) throw new PackageReject('PACKAGE_TOO_LARGE')
+      chunks.push(chunk.subarray(0, read))
+    }
+    return parseTarEntries(Buffer.concat(chunks, size))
+  } finally { closeSync(fd) }
 }
 
 function readDirectoryEntries(root: string): PackageEntry[] {

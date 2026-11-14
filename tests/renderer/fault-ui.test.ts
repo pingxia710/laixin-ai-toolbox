@@ -134,7 +134,7 @@ describe('分流说明', () => {
 
   it('三种结论各有说法：命中直连 / 命中通道 / 交内核判定', () => {
     expect(routeVerdict(explanation('direct', 'EXPLICIT_DIRECT_SUFFIX'))).toBe('直连')
-    expect(routeVerdict(explanation('tunnel', 'SIGNED_TUNNEL_SUFFIX'))).toBe('走通道')
+    expect(routeVerdict(explanation('tunnel', 'SIGNED_TUNNEL_SUFFIX'))).toBe('使用来信网络')
     expect(routeVerdict(explanation('kernel-check', 'XRAY_GEOSITE_OR_DEFAULT'))).toBe('交内核判定')
   })
 

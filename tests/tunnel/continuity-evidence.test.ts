@@ -74,9 +74,13 @@ describe('网络连续性留证', () => {
       parentAlive: () => true, onExit: () => {},
       log: (line) => lines.push(line), continuityEvidence: true,
       readContinuityFaces: () => pending
-    }) as unknown as { writeStateNow(state: string): boolean }
+    }) as unknown as { writeStateNow(state: string): boolean; reconnectEpoch: number }
     expect(daemon.writeStateNow('connected')).toBe(true)
     expect(JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')).state).toBe('connected')
+    expect(JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')).connectionEpoch).toBe(0)
+    daemon.reconnectEpoch += 1
+    expect(daemon.writeStateNow('connected')).toBe(true)
+    expect(JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')).connectionEpoch).toBe(1)
     expect(lines.some((line) => line.includes('"phase":"transition"'))).toBe(true)
     await flushMicrotasks()
     finish?.({ wininet: { written: 1, original: 0, changed: 0, unreadable: 0 } })
